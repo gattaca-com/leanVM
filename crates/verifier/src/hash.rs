@@ -71,9 +71,10 @@ pub(crate) const fn out_source(i: usize) -> (usize, usize) {
     }
 }
 
-fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+const fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut p = 0u8;
-    for _ in 0..8 {
+    let mut i = 0;
+    while i < 8 {
         if b & 1 == 1 {
             p ^= a;
         }
@@ -83,27 +84,57 @@ fn gf_mul(mut a: u8, mut b: u8) -> u8 {
             a ^= 0x1b;
         }
         b >>= 1;
+        i += 1;
     }
     p
 }
 
-fn sbox(x: u8) -> u8 {
+const fn sbox_of(x: u8) -> u8 {
     let mut r = x;
     if x != 0 {
-        for _ in 0..6 {
+        let mut i = 0;
+        while i < 6 {
             r = gf_mul(gf_mul(r, r), x);
+            i += 1;
         }
         r = gf_mul(r, r);
     }
     r ^ r.rotate_left(1) ^ r.rotate_left(2) ^ r.rotate_left(3) ^ r.rotate_left(4) ^ 0x63
 }
 
+/// The AES S-box, `aff(x^-1)`, tabulated at compile time.
+const SBOX: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut x = 0;
+    while x < 256 {
+        table[x] = sbox_of(x as u8);
+        x += 1;
+    }
+    table
+};
+
+/// `2 · x` in GF(2^8), tabulated.
+const XTIME: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut x = 0;
+    while x < 256 {
+        table[x] = gf_mul(x as u8, 2);
+        x += 1;
+    }
+    table
+};
+
 /// One AES round on a column-major state: SubBytes, ShiftRows, MixColumns, then the round constant.
 fn aes_round(s: &[u8; 16], rc: usize) -> [u8; 16] {
-    let y: [u8; 16] = std::array::from_fn(|i| sbox(s[4 * ((i / 4 + i % 4) % 4) + i % 4]));
+    let y: [u8; 16] = std::array::from_fn(|i| SBOX[s[4 * ((i / 4 + i % 4) % 4) + i % 4] as usize]);
+    let scale = |c: u8, v: u8| match c {
+        1 => v,
+        2 => XTIME[v as usize],
+        _ => XTIME[v as usize] ^ v,
+    };
     std::array::from_fn(|i| {
         let (c, r) = (i / 4, i % 4);
-        (0..4).fold(rc_byte(rc, i), |acc, t| acc ^ gf_mul(MIX_COLUMNS[r][t], y[4 * c + t]))
+        (0..4).fold(rc_byte(rc, i), |acc, t| acc ^ scale(MIX_COLUMNS[r][t], y[4 * c + t]))
     })
 }
 
