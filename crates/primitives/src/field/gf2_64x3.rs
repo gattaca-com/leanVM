@@ -350,6 +350,18 @@ pub struct F192Unreduced {
 impl F192Unreduced {
     pub const ZERO: Self = Self { coeffs: [[0; 2]; 3] };
 
+    /// The three 128-bit coefficients as `[low, high]` words.
+    #[inline]
+    pub(crate) const fn coeffs(self) -> [[u64; 2]; 3] {
+        self.coeffs
+    }
+
+    /// Build from three 128-bit coefficients given as `[low, high]` words.
+    #[inline]
+    pub(crate) const fn from_coeffs(coeffs: [[u64; 2]; 3]) -> Self {
+        Self { coeffs }
+    }
+
     /// Build from three 128-bit coefficients.
     #[inline]
     fn from_wide(coeffs: [u128; 3]) -> Self {
@@ -617,7 +629,7 @@ pub mod x86_64 {
 
     /// Two 64-bit words as one register, `lo` in the low qword.
     #[inline(always)]
-    fn pair(lo: u64, hi: u64) -> __m128i {
+    pub(crate) fn pair(lo: u64, hi: u64) -> __m128i {
         // SAFETY: SSE2 is part of the x86-64 baseline.
         unsafe { _mm_set_epi64x(hi as i64, lo as i64) }
     }
@@ -656,7 +668,7 @@ pub mod x86_64 {
     ///     d2 = p0 ^ p1 ^ p02
     /// ```
     #[inline(always)]
-    fn fold<V: Copy>(p0: V, p1: V, p2: V, p01: V, p02: V, p12: V, xor: impl Fn(V, V) -> V) -> [V; 3] {
+    pub(crate) fn fold<V: Copy>(p0: V, p1: V, p2: V, p01: V, p02: V, p12: V, xor: impl Fn(V, V) -> V) -> [V; 3] {
         // Shared by d0 and d1.
         let q = xor(p0, p12);
         [xor(xor(q, p1), p2), xor(q, p01), xor(xor(p0, p1), p02)]
@@ -737,7 +749,7 @@ pub mod x86_64 {
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "avx512f")]
-    unsafe fn reduce_lanes512(lo: __m512i, hi: __m512i) -> __m512i {
+    pub(crate) unsafe fn reduce_lanes512(lo: __m512i, hi: __m512i) -> __m512i {
         // The bits of `hi * 0x1B` shifted past x^63.
         let spill = _mm512_xor_si512(
             _mm512_xor_si512(_mm512_srli_epi64::<63>(hi), _mm512_srli_epi64::<61>(hi)),
@@ -892,7 +904,7 @@ pub mod x86_64 {
     /// Requires the `vpclmulqdq` and `avx512f` target features.
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    unsafe fn mul_by_pairs(lo: __m512i, hi: __m512i, c2: __m512i, k: __m512i) -> [__m512i; 6] {
+    pub(crate) unsafe fn mul_by_pairs(lo: __m512i, hi: __m512i, c2: __m512i, k: __m512i) -> [__m512i; 6] {
         // Immediate bit 0 picks the qword of the first operand, bit 4 that of the second.
         [
             _mm512_clmulepi64_epi128::<0x00>(lo, k),

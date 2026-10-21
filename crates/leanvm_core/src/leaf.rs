@@ -11,7 +11,7 @@ use crate::PAR_THRESHOLD;
 use crate::colval::ColVal;
 use crate::gkr;
 use crate::transcript::ProverState;
-use primitives::field::{F64, F192, F192Unreduced, g_pow, index_mle};
+use primitives::field::{Acc8, F64, F192, F192Unreduced, g_pow, index_mle, mul_base_splat8};
 use primitives::multilinear::{eq_eval, eq_table, mle_eval};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -273,10 +273,46 @@ pub fn build_leaves(
             }
             const_part + acc.reduce()
         };
+        // Eight rows at a time: every mixed product of a term is one wide kernel call, and the
+        // row's reduction happens once per eight rows.
+        let rows8 = |z: usize, out: &mut [F192; 8]| {
+            let mut acc = Acc8::ZERO;
+            let mut prods = [F64::ZERO; 8];
+            for t in &terms {
+                let k: &[F64; 8] = match t {
+                    Term::Col(i, _) => cols[*i][z..z + 8].try_into().expect("eight words"),
+                    Term::Prod(i, j, _) => {
+                        for (p, (a, b)) in prods.iter_mut().zip(cols[*i][z..z + 8].iter().zip(&cols[*j][z..z + 8])) {
+                            *p = *a * *b;
+                        }
+                        &prods
+                    }
+                    Term::Index(_) => gpow[z..z + 8].try_into().expect("eight words"),
+                    Term::Public(vals, _) => vals[z..z + 8].try_into().expect("eight words"),
+                };
+                let c = match t {
+                    Term::Col(_, c) | Term::Prod(_, _, c) | Term::Index(c) | Term::Public(_, c) => *c,
+                };
+                acc ^= mul_base_splat8(c, k);
+            }
+            *out = acc.reduce_each();
+            for o in out.iter_mut() {
+                *o += const_part;
+            }
+        };
         let off = lay.offsets[b];
         let (real, padding) = leaves[off..off + (1usize << blk.kappa)].split_at_mut(blk.rows);
         if real.len() >= PAR_THRESHOLD {
-            parallel::fill(real, row);
+            let (real8, real_r) = real.as_chunks_mut::<8>();
+            const GROUPS: usize = 64;
+            parallel::chunks_mut(real8, GROUPS, |c, group| {
+                for (k, out) in group.iter_mut().enumerate() {
+                    rows8(8 * (c * GROUPS + k), out);
+                }
+            });
+            for (k, o) in real_r.iter_mut().enumerate() {
+                *o = row(8 * real8.len() + k);
+            }
         } else {
             for (z, slot) in real.iter_mut().enumerate() {
                 *slot = row(z);

@@ -60,13 +60,29 @@ pub type RowSink<'a> = dyn Fn(usize, &[F64]) + Sync + 'a;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF64 {
     evals: Vec<Vec<F64>>,
+    /// Per eval row, the subset sums of `row[1..]` over each byte of a block index:
+    /// a twiddle of a block below `2^24` is three loads and two XORs.
+    tables: Vec<Box<[[F64; 256]; 3]>>,
 }
 
 impl AdditiveNttF64 {
     fn new(basis: &[F64]) -> Self {
-        Self {
-            evals: generate_evals_from_subspace(basis),
-        }
+        let evals = generate_evals_from_subspace(basis);
+        let tables = evals
+            .iter()
+            .map(|row| {
+                let basis = &row[1..];
+                let mut t = Box::new([[F64::ZERO; 256]; 3]);
+                for (k, part) in t.iter_mut().enumerate() {
+                    let sub = &basis[(8 * k).min(basis.len())..(8 * k + 8).min(basis.len())];
+                    for (x, slot) in part.iter_mut().enumerate() {
+                        *slot = span_get(sub, x);
+                    }
+                }
+                t
+            })
+            .collect();
+        Self { evals, tables }
     }
 
     /// Standard NTT with basis `{1, x, …, x^(dim-1)}`. Requires `dim ≤ 63` so
@@ -86,9 +102,15 @@ impl AdditiveNttF64 {
     ///
     /// - It is `s_i(sum_j bit_j(block) * b_(i+1+j))`, with `i = L - layer - 1` on a `2^L`-point domain.
     /// - The normalized `s_i` is F_2-linear, so this is a subset sum of row `i` of the table.
+    #[inline]
     pub fn twiddle(&self, layer: usize, block: usize) -> F64 {
-        let v = &self.evals[self.log_domain_size() - layer - 1];
-        span_get(&v[1..], block)
+        let row = self.log_domain_size() - layer - 1;
+        if block < 1 << 24 {
+            let t = &self.tables[row];
+            t[0][block & 255] + t[1][(block >> 8) & 255] + t[2][(block >> 16) & 255]
+        } else {
+            span_get(&self.evals[row][1..], block)
+        }
     }
 
     /// The seven twiddles a radix-8 group needs, breadth-first: layer `layer`,
@@ -99,19 +121,11 @@ impl AdditiveNttF64 {
     /// one scan of the three basis rows replaces seven.
     pub(crate) fn twiddles_radix8(&self, layer: usize, block: usize) -> [F64; 7] {
         let l = self.log_domain_size();
-        let (v0, v1, v2) = (
-            &self.evals[l - layer - 1],
-            &self.evals[l - layer - 2],
-            &self.evals[l - layer - 3],
-        );
-        let (mut t0, mut a, mut c) = (F64::ZERO, F64::ZERO, F64::ZERO);
-        for j in 0..layer {
-            if (block >> j) & 1 == 1 {
-                t0 += v0[1 + j];
-                a += v1[2 + j];
-                c += v2[3 + j];
-            }
-        }
+        let (v1, v2) = (&self.evals[l - layer - 2], &self.evals[l - layer - 3]);
+        // `a` and `c` are the deeper layers' twiddles of this block's first sub-block.
+        let t0 = self.twiddle(layer, block);
+        let a = self.twiddle(layer + 1, 2 * block);
+        let c = self.twiddle(layer + 2, 4 * block);
         let (d, e0, e1) = (v1[1], v2[1], v2[2]);
         [t0, a, a + d, c, c + e0, c + e1, c + e0 + e1]
     }
@@ -821,14 +835,13 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
         // iteration reads and writes exactly eight elements from both rows.
         unsafe {
             for i in 0..vectors {
-                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0);
+                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0, 0xFF);
             }
-        }
-        for lane in 8 * vectors..top.len() {
-            let v = bot[lane];
-            let new_u = top[lane] + v * twiddle;
-            top[lane] = new_u;
-            bot[lane] = v + new_u;
+            let tail = top.len() - 8 * vectors;
+            if tail > 0 {
+                let mask = (1u8 << tail) - 1;
+                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * vectors), bot.as_mut_ptr().add(8 * vectors), twiddle.0, mask);
+            }
         }
     }
     #[cfg(all(
@@ -1034,20 +1047,20 @@ unsafe fn butterfly_lanes_neon_8(top: *mut F64, bot: *mut F64, twiddle: u64) {
 /// # Safety
 ///
 /// - Requires VPCLMULQDQ and AVX-512F.
-/// - Each pointer must address eight readable and writable words.
+/// - Each pointer must address the words `mask` selects, readable and writable.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline]
 #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx2")]
-unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64) {
+unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64, mask: u8) {
     use core::arch::x86_64::*;
 
     // SAFETY:
-    // - The caller supplies two valid eight-word rows.
+    // - The caller supplies two rows valid for the lanes `mask` selects.
     // - This function's target features cover every intrinsic below.
     unsafe {
         // Load both rows and broadcast the twiddle to every lane.
-        let u = _mm512_loadu_si512(top.cast());
-        let v = _mm512_loadu_si512(bot.cast());
+        let u = _mm512_maskz_loadu_epi64(mask, top.cast());
+        let v = _mm512_maskz_loadu_epi64(mask, bot.cast());
         let tw = _mm512_set1_epi64(twiddle as i64);
 
         // Products v * t: even lanes, then odd lanes, one 128-bit product per 128-bit lane.
@@ -1073,8 +1086,8 @@ unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64) {
         let new_u = _mm512_ternarylogic_epi64::<XOR3>(u, lo, _mm512_xor_si512(fx, _mm512_slli_epi64::<4>(x)));
         // Butterfly bottom: v' = v + u'.
         let new_v = _mm512_xor_si512(v, new_u);
-        _mm512_storeu_si512(top.cast(), new_u);
-        _mm512_storeu_si512(bot.cast(), new_v);
+        _mm512_mask_storeu_epi64(top.cast(), mask, new_u);
+        _mm512_mask_storeu_epi64(bot.cast(), mask, new_v);
     }
 }
 

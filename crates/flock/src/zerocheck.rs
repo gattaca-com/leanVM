@@ -23,7 +23,7 @@ use primitives::field::{F8, F192};
 
 use pcs::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 
-pub mod bit_fold;
+pub use primitives::bit_fold;
 pub mod multilinear;
 pub mod univariate_skip;
 pub mod univariate_skip_optimized;

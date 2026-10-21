@@ -64,7 +64,11 @@
 //! `Phi`'s challenges.
 
 use fiat_shamir::transcript::ProverState;
-use primitives::field::{F64, F192};
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+use primitives::bit_fold::{BLOCK, BitFold};
+use primitives::field::{F64, F192, mul4};
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+use primitives::field::xor_into8;
 
 use super::pack::PACKING_WIDTH;
 use super::tensor_algebra::{DEGREE_E, transpose_s_hat};
@@ -244,14 +248,17 @@ pub fn fold_ext_elems_naive(suffix_tensor: &[F192], coordinate_weights: &[F192])
 }
 
 /// Number of bytes in an E element (= lookup tables for the fold).
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 const FOLD_N_BYTES: usize = 24;
 /// Entries per byte-lookup table.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 const FOLD_TABLE_SIZE: usize = 256;
 
 /// Build the 24x256 byte-lookup table for [`fold_ext_elems`]:
 /// `table[k * 256 + v] = sum_{bit b set in v} coordinate_weights[k * 8 + b]`.
 /// Byte order: bytes 0..8 are the little-endian bytes of `c0` (bits 0..64),
 /// bytes 8..16 those of `c1` (bits 64..128), and bytes 16..24 those of `c2`.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 fn build_fold_byte_table_ext(coordinate_weights: &[F192]) -> Box<FoldByteTable> {
     assert_eq!(coordinate_weights.len(), DEGREE_E);
     let mut tables: Box<FoldByteTable> = Box::new([[F192::ZERO; FOLD_TABLE_SIZE]; FOLD_N_BYTES]);
@@ -275,10 +282,12 @@ fn build_fold_byte_table_ext(coordinate_weights: &[F192]) -> Box<FoldByteTable> 
 /// loop, so neither lookup carries a bounds check and the row stride folds into
 /// the address. Flat, this is 24 bounds checks and 24 stride multiplies per
 /// output slot, and the address registers they force live do not fit.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 type FoldByteTable = [[F192; FOLD_TABLE_SIZE]; FOLD_N_BYTES];
 
 /// One folded output slot: `sum_{k=0..24} tables[k][byte_k(elem)]`, tree-reduced
 /// so the XORs pipeline.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 #[inline(always)]
 fn fold_one_slot_ext(elem: F192, tables: &FoldByteTable) -> F192 {
     let bytes = [elem.c0.to_le_bytes(), elem.c1.to_le_bytes(), elem.c2.to_le_bytes()];
@@ -300,8 +309,17 @@ pub(crate) struct DeferredRingSwitchOutput {
     pub(crate) batched_sumcheck_claim: F192,
     eq_lo: Vec<F192>,
     eq_hi: Vec<F192>,
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
     table: Box<FoldByteTable>,
+    /// The scaled coordinate weights, one per bit of a product row (an F192 padded to
+    /// [`FOLD_ROW_BYTES`]), for the GFNI fold of 64 rows at a time.
+    #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+    fold: BitFold,
 }
+
+/// A product row for the GFNI fold: an F192 zero-padded to the next power of two the kernel takes.
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+const FOLD_ROW_BYTES: usize = 32;
 
 /// Finish a ring-switch claim without materializing its dense weight vector.
 /// The batching scalar is baked into both the target and the byte table.
@@ -313,11 +331,20 @@ pub(crate) fn prove_finish_deferred(
     let s_hat_u = transpose_s_hat(&state.s_hat_v);
     let sumcheck_claim = inner_product_base_ext(&s_hat_u, coordinate_weights);
     let scaled_weights: Vec<F192> = coordinate_weights.iter().map(|&x| lambda * x).collect();
+    #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+    let fold = {
+        let mut weights = scaled_weights;
+        weights.resize(8 * FOLD_ROW_BYTES, F192::ZERO);
+        BitFold::new(&weights)
+    };
     DeferredRingSwitchOutput {
         batched_sumcheck_claim: lambda * sumcheck_claim,
         eq_lo: state.eq_lo,
         eq_hi: state.eq_hi,
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
         table: build_fold_byte_table_ext(&scaled_weights),
+        #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+        fold,
     }
 }
 
@@ -335,10 +362,57 @@ pub(crate) fn combine_deferred_chunk(outputs: &[DeferredRingSwitchOutput], start
             let lo = index % block_len;
             let len = (block_len - lo).min(out.len() - done);
             let e_hi = claim.eq_hi[index / block_len];
-            for (slot, &e_lo) in out[done..done + len].iter_mut().zip(&claim.eq_lo[lo..lo + len]) {
-                *slot += fold_one_slot_ext(e_lo * e_hi, &claim.table);
+            #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+            claim.fold_products_gfni(&claim.eq_lo[lo..lo + len], e_hi, &mut out[done..done + len]);
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
+            {
+                let (slots4, slots_r) = out[done..done + len].as_chunks_mut::<4>();
+                let (lo4, lo_r) = claim.eq_lo[lo..lo + len].as_chunks::<4>();
+                for (slots, e_lo) in slots4.iter_mut().zip(lo4) {
+                    let products = mul4(*e_lo, [e_hi; 4]);
+                    for (slot, product) in slots.iter_mut().zip(products) {
+                        *slot += fold_one_slot_ext(product, &claim.table);
+                    }
+                }
+                for (slot, &e_lo) in slots_r.iter_mut().zip(lo_r) {
+                    *slot += fold_one_slot_ext(e_lo * e_hi, &claim.table);
+                }
             }
             done += len;
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+impl DeferredRingSwitchOutput {
+    /// `out[j] += Phi(e_lo[j] * e_hi)`, 64 products at a time through the GFNI fold.
+    #[inline]
+    fn fold_products_gfni(&self, e_lo: &[F192], e_hi: F192, out: &mut [F192]) {
+        debug_assert_eq!(e_lo.len(), out.len());
+        let mut rows = [[0u64; FOLD_ROW_BYTES / 8]; BLOCK];
+        let mut folded = [F192::ZERO; BLOCK];
+        for (e_lo, out) in e_lo.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
+            let n = e_lo.len();
+            let (lo4, lo_r) = e_lo.as_chunks::<4>();
+            for (k, e_lo) in lo4.iter().enumerate() {
+                for (j, p) in mul4(*e_lo, [e_hi; 4]).into_iter().enumerate() {
+                    rows[4 * k + j] = [p.c0, p.c1, p.c2, 0];
+                }
+            }
+            for (j, &e_lo) in lo_r.iter().enumerate() {
+                let p = e_lo * e_hi;
+                rows[4 * lo4.len() + j] = [p.c0, p.c1, p.c2, 0];
+            }
+            // SAFETY: `[u64; 4]` and `[u8; 32]` have the same size, and every bit pattern is a valid byte row.
+            let bytes: &[[u8; FOLD_ROW_BYTES]; BLOCK] = unsafe { &*rows.as_ptr().cast() };
+            self.fold.fold_block(&bytes[..n], &mut folded);
+            let (out8, out_r) = out.as_chunks_mut::<8>();
+            for (o, f) in out8.iter_mut().zip(folded.as_chunks::<8>().0) {
+                xor_into8(o, f);
+            }
+            for (o, f) in out_r.iter_mut().zip(&folded[8 * out8.len()..]) {
+                *o += *f;
+            }
         }
     }
 }
