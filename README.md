@@ -81,6 +81,15 @@ back to back.
 | verify (one thread, scalar) | 4.3 ms | 14 ms | |
 | hash batch, 262,144 calls | 530K compressions/s | 960K calls/s | 1.81× |
 
+On a c7i.4xlarge (Sapphire Rapids, 16 vCPU), the same binaries:
+
+| benchmark | `main` (BLAKE2s) | this branch (Haraka-512) | |
+| --- | --- | --- | --- |
+| `aggregate --xmss 1100` | 1.735 s, 634 sig/s | 1.034 s, 1,064 sig/s | 1.68× |
+| `aggregate --xmss 1290` | 1.884 s, 685 sig/s | 1.835 s, 703 sig/s | 1.03× |
+| `aggregate --sphincs 650` | 1.837 s, 354 sig/s | 1.354 s, 480 sig/s | 1.36× |
+| `recursion --n 2 --xmss-per-leaf 900` | 0.590 s | 0.581 s | 1.02× |
+
 What the table says. A Haraka call proves for half of a BLAKE2s compression (a padded `2^13`-bit block
 against `2^14`), but a signature takes more calls: 234 against 201 for leanXMSS and 394 against 307 for
 leanSPHINCS, because the chain absorbs 32 bytes a call where BLAKE2s absorbs 64 (a 58-chain-end leaf is 31
