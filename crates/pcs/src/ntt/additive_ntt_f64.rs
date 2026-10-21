@@ -257,7 +257,7 @@ impl AdditiveNttF64 {
 
         // How many rows, as a log, each cache budget holds.
         //
-        //     56 lanes:  2^16 / 56 -> 2^10 rows in L2,  2^18 / 56 -> 2^12 rows in L3
+        //     51 lanes:  2^17 / 51 -> 2^11 rows in L2,  2^18 / 51 -> 2^12 rows in L3
         let fit = |words: usize| (words / num_ntts).max(1).ilog2() as usize;
         let (fit2, fit3) = (fit(L2_WORDS), fit(L3_WORDS));
 
@@ -684,8 +684,9 @@ pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, log_ro
 ///
 /// # Why this value
 ///
-/// - 2^16 words is 512 KiB.
-/// - Two SMT threads share a core's L2 of 1 MiB, so each budgets for half.
+/// - 2^17 words is 1 MiB, a whole Zen 5 L2.
+/// - Two SMT threads then spill each other's units into L3, which costs far less than a DRAM sweep.
+/// - At 51 lanes it plans one gathered pass plus the deep pass, where 2^16 words planned two plus one.
 ///
 /// # On Apple silicon
 ///
@@ -694,7 +695,7 @@ pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, log_ro
 /// - So the budget is sized to push layers into the deep pass, not to fit a cache.
 /// - It exceeds [`L3_WORDS`], which then changes no plan.
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-const L2_WORDS: usize = 1 << 16;
+const L2_WORDS: usize = 1 << 17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const L2_WORDS: usize = 1 << 21;
 
