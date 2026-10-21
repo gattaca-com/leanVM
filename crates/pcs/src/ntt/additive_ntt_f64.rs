@@ -835,14 +835,13 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
         // iteration reads and writes exactly eight elements from both rows.
         unsafe {
             for i in 0..vectors {
-                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0);
+                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0, 0xFF);
             }
-        }
-        for lane in 8 * vectors..top.len() {
-            let v = bot[lane];
-            let new_u = top[lane] + v * twiddle;
-            top[lane] = new_u;
-            bot[lane] = v + new_u;
+            let tail = top.len() - 8 * vectors;
+            if tail > 0 {
+                let mask = (1u8 << tail) - 1;
+                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * vectors), bot.as_mut_ptr().add(8 * vectors), twiddle.0, mask);
+            }
         }
     }
     #[cfg(all(
@@ -1048,20 +1047,20 @@ unsafe fn butterfly_lanes_neon_8(top: *mut F64, bot: *mut F64, twiddle: u64) {
 /// # Safety
 ///
 /// - Requires VPCLMULQDQ and AVX-512F.
-/// - Each pointer must address eight readable and writable words.
+/// - Each pointer must address the words `mask` selects, readable and writable.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline]
 #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx2")]
-unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64) {
+unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64, mask: u8) {
     use core::arch::x86_64::*;
 
     // SAFETY:
-    // - The caller supplies two valid eight-word rows.
+    // - The caller supplies two rows valid for the lanes `mask` selects.
     // - This function's target features cover every intrinsic below.
     unsafe {
         // Load both rows and broadcast the twiddle to every lane.
-        let u = _mm512_loadu_si512(top.cast());
-        let v = _mm512_loadu_si512(bot.cast());
+        let u = _mm512_maskz_loadu_epi64(mask, top.cast());
+        let v = _mm512_maskz_loadu_epi64(mask, bot.cast());
         let tw = _mm512_set1_epi64(twiddle as i64);
 
         // Products v * t: even lanes, then odd lanes, one 128-bit product per 128-bit lane.
@@ -1087,8 +1086,8 @@ unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64) {
         let new_u = _mm512_ternarylogic_epi64::<XOR3>(u, lo, _mm512_xor_si512(fx, _mm512_slli_epi64::<4>(x)));
         // Butterfly bottom: v' = v + u'.
         let new_v = _mm512_xor_si512(v, new_u);
-        _mm512_storeu_si512(top.cast(), new_u);
-        _mm512_storeu_si512(bot.cast(), new_v);
+        _mm512_mask_storeu_epi64(top.cast(), mask, new_u);
+        _mm512_mask_storeu_epi64(bot.cast(), mask, new_v);
     }
 }
 
