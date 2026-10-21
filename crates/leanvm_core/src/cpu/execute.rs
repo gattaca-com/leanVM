@@ -189,32 +189,36 @@ fn in_k(what: &'static str, v: F192) -> Result<F64, Fault> {
     as_addr(v).ok_or(Fault::NotInK { what, value: v })
 }
 
-fn pop_witness<'a>(
-    witness: &'a HashMap<String, Vec<Vec<F192>>>,
-    positions: &mut HashMap<&'a str, usize>,
+/// One named witness stream and the next entry a `hint_witness` pops from it.
+struct WitnessStream<'a> {
     name: &'a str,
-    len: u32,
-) -> Result<&'a [F192], Fault> {
-    let entries = witness
-        .get(name)
-        .ok_or_else(|| Fault::Witness(format!("no witness stream `{name}` (Program::set_witness)")))?;
-    let position = positions.entry(name).or_default();
-    let entry = entries.get(*position).ok_or_else(|| {
-        Fault::Witness(format!(
-            "witness stream `{name}` exhausted (needs entry {}, has {})",
-            *position + 1,
-            entries.len()
-        ))
-    })?;
-    if entry.len() != len as usize {
-        return Err(Fault::Witness(format!(
-            "witness `{name}` entry {} holds {} values, the destination {len}",
-            *position,
-            entry.len()
-        )));
+    entries: Option<&'a Vec<Vec<F192>>>,
+    position: usize,
+}
+
+impl<'a> WitnessStream<'a> {
+    fn pop(&mut self, len: u32) -> Result<&'a [F192], Fault> {
+        let name = self.name;
+        let entries = self
+            .entries
+            .ok_or_else(|| Fault::Witness(format!("no witness stream `{name}` (Program::set_witness)")))?;
+        let entry = entries.get(self.position).ok_or_else(|| {
+            Fault::Witness(format!(
+                "witness stream `{name}` exhausted (needs entry {}, has {})",
+                self.position + 1,
+                entries.len()
+            ))
+        })?;
+        if entry.len() != len as usize {
+            return Err(Fault::Witness(format!(
+                "witness `{name}` entry {} holds {} values, the destination {len}",
+                self.position,
+                entry.len()
+            )));
+        }
+        self.position += 1;
+        Ok(entry)
     }
-    *position += 1;
-    Ok(entry)
 }
 
 impl Program {
@@ -274,8 +278,29 @@ impl Program {
         let mut prof: Option<Vec<u64>> = std::env::var("DBG_PROF").is_ok().then(|| vec![0u64; self.prog.len()]);
 
         // Per-stream cursor into the named witness data (`hint_witness` pops
-        // sequentially).
-        let mut witness_positions: HashMap<&str, usize> = HashMap::new();
+        // sequentially). Each witness hint resolves its stream once, here, so a pop
+        // indexes `streams` rather than hashing the stream's name twice.
+        let mut streams: Vec<WitnessStream<'_>> = Vec::new();
+        let stream_of: Vec<Vec<usize>> = hint_lists
+            .iter()
+            .map(|hs| {
+                hs.iter()
+                    .map(|h| match h {
+                        RHint::WitnessStack { name, .. } | RHint::WitnessHeap { name, .. } => {
+                            streams.iter().position(|s| s.name == name).unwrap_or_else(|| {
+                                streams.push(WitnessStream {
+                                    name,
+                                    entries: self.witness.get(name.as_str()),
+                                    position: 0,
+                                });
+                                streams.len() - 1
+                            })
+                        }
+                        _ => usize::MAX,
+                    })
+                    .collect()
+            })
+            .collect();
         // Baby-step table for `hint_decompose_bits_exponent`, built on first use.
         let mut dlog_cache: Option<(GPow, F64)> = None;
 
@@ -484,8 +509,8 @@ impl Program {
 
             // Apply the hints scheduled before this instruction.
             if hint_at[pc as usize] != 0 {
-                let hs = hint_lists[hint_at[pc as usize] as usize - 1];
-                for h in hs {
+                let list = hint_at[pc as usize] as usize - 1;
+                for (h, &stream) in hint_lists[list].iter().zip(&stream_of[list]) {
                     m.dbg_hint = Some(match h {
                         RHint::FrameAddress { .. } => "FrameAddress",
                         RHint::AllocFrames { .. } => "AllocFrames",
@@ -585,17 +610,17 @@ impl Program {
                                 eprintln!("[print] {label} = <unwritten>");
                             }
                         }
-                        RHint::WitnessStack { name, base, len } => {
+                        RHint::WitnessStack { base, len, .. } => {
                             let values =
-                                pop_witness(&self.witness, &mut witness_positions, name, *len).map_err(fail)?;
+                                streams[stream].pop(*len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
                                 m.put(fp + base + k as u32, value)?;
                             }
                         }
-                        RHint::WitnessHeap { name, ptr, lo, len } => {
+                        RHint::WitnessHeap { ptr, lo, len, .. } => {
                             let b = heap_base(&m, &mut g, fp + ptr, "hint_witness heap pointer").map_err(fail)?;
                             let values =
-                                pop_witness(&self.witness, &mut witness_positions, name, *len).map_err(fail)?;
+                                streams[stream].pop(*len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
                                 m.put(b + lo + k as u32, value)?;
                             }
