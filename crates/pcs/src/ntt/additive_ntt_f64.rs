@@ -199,6 +199,25 @@ impl AdditiveNttF64 {
         self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
     }
 
+    /// [`Self::encode_interleaved_with`] without writing the deep pass back, as
+    /// [`Self::encode_interleaved_in_place_without_deep`] does.
+    pub fn encode_interleaved_without_deep(
+        &self,
+        data: &mut [F64],
+        msg: &[F64],
+        num_ntts: usize,
+        log_inv_rate: usize,
+        on_rows: &RowSink<'_>,
+    ) -> Option<DeepRows> {
+        assert_eq!(
+            msg.len() << log_inv_rate,
+            data.len(),
+            "the codeword is 2^log_inv_rate messages"
+        );
+        let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
+        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
+    }
+
     /// Codeword rows `positions` of a buffer left by [`Self::encode_interleaved_in_place_without_deep`].
     pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
         let DeepRows { log_d, num_ntts, deep_start } = *deep;

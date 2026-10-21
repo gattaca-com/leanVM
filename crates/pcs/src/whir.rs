@@ -226,18 +226,31 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
 /// Codeword + Merkle tree for one deeper WHIR commitment level.
 /// `mat[pos * num_interleaved + lane]`; each row (one `pos` across all lanes)
 /// is one Merkle leaf of `num_interleaved * 16` bytes.
+///
+/// With `deep` set, `mat` holds the rows before the encode's deep layers, which
+/// [`LigeroWitness::opened_words`] finishes for the rows a query opens.
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F192>,
     pub tree: Vec<Hash>,
     pub block_len: usize,
     pub num_interleaved: usize,
+    deep: Option<(AdditiveNttF64, DeepRows)>,
 }
 
 impl LigeroWitness {
-    #[inline]
-    pub fn row(&self, pos: usize) -> &[F192] {
-        let start = pos * self.num_interleaved;
-        &self.mat[start..start + self.num_interleaved]
+    /// The rows at `positions`, each as the K words its Merkle leaf is hashed from.
+    fn opened_words(&self, positions: &[usize]) -> Vec<Vec<F64>> {
+        match &self.deep {
+            Some((ntt, deep)) => {
+                // SAFETY: an E element is laid out as three K words, so the view covers exactly `mat`.
+                let words = unsafe { std::slice::from_raw_parts(self.mat.as_ptr().cast::<F64>(), 3 * self.mat.len()) };
+                ntt.finish_rows(words, deep, positions)
+            }
+            None => positions
+                .iter()
+                .map(|&q| ext_row_words(&self.mat[q * self.num_interleaved..(q + 1) * self.num_interleaved]))
+                .collect(),
+        }
     }
 
     #[inline]
@@ -273,16 +286,21 @@ pub(crate) fn ligero_commit_ext(
     // One leaf per row, its F192s as K words: hashed as the encode finishes each block.
     let row_words = 3 * num_interleaved;
     let builder = merkle::MerkleBuilder::new(block_len, row_words, row_words);
-    tracing::info_span!(
+    let deep = tracing::info_span!(
         "NTT",
         kind = "extension encode",
         log_domain = log_block_len,
         lanes = num_interleaved
     )
     .in_scope(|| {
-        encode_interleaved_ext(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &|row, rows| {
-            builder.absorb(row, rows)
-        })
+        let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
+        if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
+            encode_interleaved_ext_without_deep(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows)
+                .map(|rows| (ntt.clone(), rows))
+        } else {
+            encode_interleaved_ext(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows);
+            None
+        }
     });
     let tree = tracing::info_span!("Merkle").in_scope(|| builder.finish());
 
@@ -291,6 +309,7 @@ pub(crate) fn ligero_commit_ext(
         tree,
         block_len,
         num_interleaved,
+        deep,
     }
 }
 
@@ -1273,6 +1292,16 @@ fn ext_row_words(row: &[F192]) -> Vec<F64> {
     row.iter().flat_map(|v| [F64(v.c0), F64(v.c1), F64(v.c2)]).collect()
 }
 
+/// The `E` row behind the `F64` words of its Merkle leaf.
+fn ext_row(words: &[F64]) -> Vec<F192> {
+    words.chunks_exact(3).map(|w| F192::new(w[0].0, w[1].0, w[2].0)).collect()
+}
+
+/// The opened row at a queried position, for the Merkle pruning: `rows[i]` is the row at `queries[i]`.
+fn opened_row<'a>(queries: &'a [usize], rows: &'a [Vec<F64>]) -> impl Fn(usize) -> Vec<F64> + 'a {
+    move |q| rows[queries.iter().position(|&p| p == q).expect("a queried row")].clone()
+}
+
 /// Prove `Σ_x witness(x) · b_initial(x) = target` against the L0 commitment
 /// produced by [`commit`] (with `log_batch_size = config.initial_k` and
 /// `log_inv_rate = config.log_inv_rates[0]`).
@@ -1437,8 +1466,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     let opened_rows_0: Vec<Vec<F64>> = images_0.iter().map(|image| l0_fold_row(image)).collect();
     // ... but the stored proof carries the sorted-unique rows + one octopus over
     // the sorted-unique positions (the verifier re-fans them to ordered).
-    let l0_row = |q: usize| -> Vec<F64> { images_0[queries_0.iter().position(|&p| p == q).expect("a queried row")].clone() };
-    ps.hint_merkle(PrunedMerklePaths::prune(l0_tree, block_len_0, &queries_0, l0_row));
+    ps.hint_merkle(PrunedMerklePaths::prune(l0_tree, block_len_0, &queries_0, opened_row(&queries_0, &images_0)));
     drop(span);
 
     // Induce basis_0 from the L0 opens. L0 dominates the induce phase, where
@@ -1492,17 +1520,18 @@ pub(crate) fn recursive_prover_with_prepared_basis(
             let span = tracing::info_span!("Final level").entered();
             // Final level: stored (sorted-unique) only, no local induce; the
             // verifier fans these to ordered for its last-level induce.
+            let words_last = wtns_prev.opened_words(&queries_last);
             ps.hint_merkle(PrunedMerklePaths::prune(
                 &wtns_prev.tree,
                 wtns_prev.block_len,
                 &queries_last,
-                |q| ext_row_words(wtns_prev.row(q)),
+                opened_row(&queries_last, &words_last),
             ));
             // Tie the last commitment into the running claim through the same
             // intro/glue step as every other level, then finish the remaining
             // sumcheck rounds. This closes on one weight evaluation instead of
             // a sweep over the residual cube.
-            let rows_last: Vec<Vec<F192>> = queries_last.iter().map(|&q| wtns_prev.row(q).to_vec()).collect();
+            let rows_last: Vec<Vec<F192>> = words_last.iter().map(|words| ext_row(words)).collect();
             let enforced_sum_last = induce_sumcheck_enforced_sum(&rows_last, &level_rs, &queries_last, &weights_last);
             let n_res = sc_prover.f_ext().len().trailing_zeros() as usize;
             let basis_last = induce_sumcheck_evaluate_at_residual(
@@ -1556,12 +1585,13 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         let weights_i = powers(lambda_i, num_queries_i);
         let span = tracing::info_span!("Open", level = i + 1).entered();
         // Ordered rows for the local induce; sorted-unique rows + octopus stored.
-        let opened_rows_i: Vec<Vec<F192>> = queries_i.iter().map(|&q| wtns_prev.row(q).to_vec()).collect();
+        let words_i = wtns_prev.opened_words(&queries_i);
+        let opened_rows_i: Vec<Vec<F192>> = words_i.iter().map(|words| ext_row(words)).collect();
         ps.hint_merkle(PrunedMerklePaths::prune(
             &wtns_prev.tree,
             wtns_prev.block_len,
             &queries_i,
-            |q| ext_row_words(wtns_prev.row(q)),
+            opened_row(&queries_i, &words_i),
         ));
         drop(span);
 
