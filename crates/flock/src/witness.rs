@@ -151,6 +151,27 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    let total_words = (1usize << n_blocks_log) * ((1usize << k_log) / 64);
+    // SAFETY: `drive_witness_packed_and_lincheck_into` writes every word of `z`.
+    let mut z = unsafe { primitives::uninit_vec::<u64>(total_words) };
+    let (a, b, z_lincheck) =
+        drive_witness_packed_and_lincheck_into(initial_states, padding, n_blocks_log, k_log, &mut z, per_block);
+    (z, a, b, z_lincheck)
+}
+
+/// [`drive_witness_packed_and_lincheck`] with `z` written into the caller's buffer, which may
+/// be uninitialized: every word is written.
+pub(crate) fn drive_witness_packed_and_lincheck_into<S: Sync, F>(
+    initial_states: &[S],
+    padding: Option<&S>,
+    n_blocks_log: usize,
+    k_log: usize,
+    z: &mut [u64],
+    per_block: F,
+) -> (Vec<u64>, Vec<u64>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
     let k = 1usize << k_log;
     let u64_per_block = k / 64;
     let n_total = 1usize << n_blocks_log;
@@ -164,9 +185,9 @@ where
     let n_groups = n_total / group_blocks;
 
     let total_words = n_total * u64_per_block;
-    // SAFETY (x4): group `g` publishes chunk `g` of every table in full below, and the chunk counts match.
+    assert_eq!(z.len(), total_words, "z holds every instance's packed words");
+    // SAFETY (x3): group `g` publishes chunk `g` of every table in full below, and the chunk counts match.
     // The z/a/b chunks are a group's blocks of packed words, and the stripe chunk is the transpose's k bytes.
-    let mut z = unsafe { primitives::uninit_vec::<u64>(total_words) };
     let mut a = unsafe { primitives::uninit_vec::<u64>(total_words) };
     let mut b = unsafe { primitives::uninit_vec::<u64>(total_words) };
     let mut z_lincheck = unsafe { primitives::uninit_vec::<u8>(n_groups * k) };
@@ -175,7 +196,7 @@ where
     // take the group's blocks' packed words, `z_lincheck` takes one byte stripe.
     let group_words = group_blocks * u64_per_block;
     let scratch_words = 8 * u64_per_block;
-    let z_chunks = parallel::Chunks::new(&mut z, group_words);
+    let z_chunks = parallel::Chunks::new(z, group_words);
     let a_chunks = parallel::Chunks::new(&mut a, group_words);
     let b_chunks = parallel::Chunks::new(&mut b, group_words);
     let stripe_chunks = parallel::Chunks::new(&mut z_lincheck, k);
@@ -235,5 +256,5 @@ where
         |(), ()| (),
     );
 
-    (z, a, b, z_lincheck)
+    (a, b, z_lincheck)
 }

@@ -52,7 +52,13 @@ use fiat_shamir::transcript::ProverState;
 use primitives::field::{F64, F192, powers};
 
 use super::ring_switch;
-use super::whir::{ProverConfig, ProverData};
+use super::whir::{
+    GeneratedBasis, InitialBasis, ProverConfig, ProverData, build_initial_basis, initial_basis_message,
+};
+
+/// Pool size from which the first lane fold refills the basis instead of reading it back.
+/// Measured on a 16-core Zen 5 at 1,290 signatures: 2 workers +5%, 4 workers -1%, 32 workers -6%.
+const REFILL_BASIS_MIN_THREADS: usize = 8;
 
 mod basis;
 
@@ -229,12 +235,25 @@ pub fn open_batch_mixed_whir_stacked(
             .zip(lambdas_pd)
             .fold(F192::ZERO, |sum, (claim, &lambda)| sum + lambda * claim.value());
 
-    // The lifted weight is built and consumed in one pass: each lane window is
-    // filled from the ring-switch outputs and the point claims, then feeds
-    // round 0's message while it is still hot, so nothing re-reads the buffer.
+    // The lifted weight is filled chunk by chunk from the ring-switch outputs and the point
+    // claims while round 0's message reads it. Below a DRAM-saturating pool it is stored
+    // for the first lane fold; from there the fold fills it again, because a fill is cheaper
+    // than writing and reading back 24 bytes a slot once DRAM is the bottleneck.
     let lane_block = 1usize << (log_n - config.initial_k);
-    let (b_stack, message) = tracing::info_span!("Basis")
-        .in_scope(|| basis::build(stack, lane_block, point_claims, lambdas_pd, ring, &rs_outputs));
+    let weight = basis::StackWeight::new(stack.len(), lane_block, point_claims, lambdas_pd, ring, &rs_outputs);
+    let fill = |start: usize, dst: &mut [F192]| weight.fill(start, dst);
+    let (initial_basis, message) = tracing::info_span!("Basis").in_scope(|| {
+        if parallel::num_threads() >= REFILL_BASIS_MIN_THREADS {
+            let generated = GeneratedBasis {
+                len: stack.len(),
+                fill: &fill,
+            };
+            (InitialBasis::Generated(generated), initial_basis_message(stack, lane_block, &fill))
+        } else {
+            let (dense, message) = build_initial_basis(stack, lane_block, fill);
+            (InitialBasis::Dense(dense), message)
+        }
+    });
 
     // 4. One WHIR over the full stack against the combined claim (the
     //    stack is borrowed by the prover; no copy).
@@ -242,7 +261,7 @@ pub fn open_batch_mixed_whir_stacked(
         config,
         log_n,
         stack,
-        b_stack,
+        initial_basis,
         target,
         &prover_data.codeword,
         &prover_data.merkle_tree,

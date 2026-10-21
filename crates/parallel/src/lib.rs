@@ -11,7 +11,7 @@ use std::thread::Thread;
 mod topology;
 
 use topology::{Qos, set_qos};
-pub use topology::{Topology, num_threads, topology};
+pub use topology::{Topology, num_threads, smt_width, topology};
 
 /// Idle spins before a worker parks: long enough to stay hot across back-to-back
 /// dispatches, short enough to yield the core during a sequential stretch.

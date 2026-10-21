@@ -162,7 +162,8 @@ fn default_topology_reserves_no_worker_on_a_homogeneous_host() {
     }
     let topo = parallel::topology();
     if topo.efficiency == 0 {
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let cores = (logical / parallel::smt_width()).max(1);
         assert_eq!(topo.perf, cores, "nothing may be reserved without efficiency workers");
     }
 }

@@ -19,16 +19,43 @@ fn window_rows(total: usize) -> usize {
     total.div_ceil(tasks).clamp(64, 1 << 10)
 }
 
+/// A product tree's leaves with its first radix-four layer, `quads[k] = leaves[4k] · … ·
+/// leaves[4k + 3]` (absent leaves are the identity), built by whoever wrote the leaves.
+pub struct Leaves {
+    pub leaves: Vec<F192>,
+    pub quads: Vec<F192>,
+}
+
+impl Leaves {
+    pub fn new(leaves: Vec<F192>) -> Self {
+        let quads = (0..leaves.len().div_ceil(4)).map(|k| quad_at(&leaves, k)).collect();
+        Self { leaves, quads }
+    }
+}
+
+/// `leaves[4k] · … · leaves[4k + 3]`, an absent leaf being the identity.
+pub(crate) fn quad_at(leaves: &[F192], k: usize) -> F192 {
+    let at = |i: usize| leaves.get(i).copied().unwrap_or(F192::ONE);
+    let [lo, hi] = mul2([at(4 * k), at(4 * k + 2)], [at(4 * k + 1), at(4 * k + 3)]);
+    lo * hi
+}
+
 /// Build only the levels consumed by radix four: `0,2,4,…`, plus a final
 /// binary root when the logical depth is odd.
-fn build_layers(leaves: Vec<F192>, mu: usize) -> Vec<Vec<F192>> {
+fn build_layers(leaves: Leaves, mu: usize) -> Vec<Vec<F192>> {
+    let Leaves { leaves, quads } = leaves;
     assert!(!leaves.is_empty());
     assert!(leaves.len() <= 1usize << mu);
+    assert_eq!(quads.len(), leaves.len().div_ceil(4));
     // At mu = 22 the leaf level alone is hundreds of megabytes, and every level
     // dies with the proof.
     let mut layers: Vec<Vec<F192>> = (0..=mu).map(|_| Vec::new()).collect();
     layers[0] = leaves;
     let mut level = 0;
+    if mu >= 2 {
+        layers[2] = quads;
+        level = 2;
+    }
     while level + 2 <= mu {
         let current = &layers[level];
         let full_rows = current.len() / 4;
@@ -310,9 +337,14 @@ pub enum RootShape {
 
 /// Prove three identity-padded grand products as one RLC-batched radix-four GKR.
 pub fn prove_product_triple(leaves: [Vec<F192>; 3], ps: &mut ProverState, shape: RootShape) -> ProductTriple {
-    let mu = crate::log2_ceil_usize(leaves[0].len());
+    prove_product_triple_from(leaves.map(Leaves::new), ps, shape)
+}
+
+/// [`prove_product_triple`] over leaves whose first radix-four layer is already built.
+pub fn prove_product_triple_from(leaves: [Leaves; 3], ps: &mut ProverState, shape: RootShape) -> ProductTriple {
+    let mu = crate::log2_ceil_usize(leaves[0].leaves.len());
     assert!(
-        leaves.iter().all(|lane| !lane.is_empty() && lane.len() <= 1 << mu),
+        leaves.iter().all(|lane| !lane.leaves.is_empty() && lane.leaves.len() <= 1 << mu),
         "batched trees must be nonempty prefixes of the first tree's logical tree"
     );
     let mut layers = leaves.map(|lane| build_layers(lane, mu));

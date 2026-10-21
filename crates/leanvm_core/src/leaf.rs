@@ -11,8 +11,9 @@ use crate::PAR_THRESHOLD;
 use crate::colval::ColVal;
 use crate::gkr;
 use crate::transcript::ProverState;
-use primitives::field::{Acc8, F64, F192, F192Unreduced, g_pow, index_mle, mul_base_splat8};
+use primitives::field::{Acc8, F64, F192, F192Unreduced, g_pow, index_mle, mul2, mul_base_splat8};
 use primitives::multilinear::{eq_eval, eq_table, mle_eval};
+use primitives::stream::Stream;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -223,7 +224,7 @@ pub fn build_leaves(
     w: &[F192],
     beta: F192,
     gpow: &[F64],
-) -> Vec<F192> {
+) -> gkr::Leaves {
     let explicit = blocks
         .iter()
         .enumerate()
@@ -240,7 +241,8 @@ pub fn build_leaves(
     // pads this level to that before reading it, and growing it here would copy it.
     let covered: usize = blocks.iter().map(|blk| 1usize << blk.kappa).sum();
     let capacity = explicit.next_multiple_of(4);
-    let mut leaves = if covered == explicit {
+    let tiled = covered == explicit;
+    let mut leaves = if tiled {
         // SAFETY: the per-block fills below cover `0..explicit` exactly, and each
         // joins before this function returns.
         let mut values = unsafe { primitives::uninit_vec(capacity) };
@@ -251,6 +253,14 @@ pub fn build_leaves(
         values.resize(explicit, F192::ONE);
         values
     };
+    // The first radix-four layer, `quads[k] = leaves[4k] · … · leaves[4k + 3]`, built from the
+    // staged rows while they are in L1, so GKR never reads the leaves to build it.
+    //
+    // SAFETY: every slot is written before this function returns: the staged groups write
+    // theirs, and `finish_quads` writes every slot past them.
+    let mut quads = unsafe { primitives::uninit_vec::<F192>(explicit.div_ceil(4)) };
+    let quads_ptr = parallel::SendPtr(quads.as_mut_ptr());
+    let mut quads_done = vec![0usize; blocks.len()];
     for (b, blk) in blocks.iter().enumerate() {
         let mut const_part = beta;
         let mut terms: Vec<Term> = Vec::with_capacity(blk.coords.len());
@@ -301,15 +311,31 @@ pub fn build_leaves(
             }
         };
         let off = lay.offsets[b];
+        quads_done[b] = off;
         let (real, padding) = leaves[off..off + (1usize << blk.kappa)].split_at_mut(blk.rows);
-        if real.len() >= PAR_THRESHOLD {
+        if real.len() >= PAR_THRESHOLD && off.is_multiple_of(8) {
             let (real8, real_r) = real.as_chunks_mut::<8>();
             const GROUPS: usize = 64;
+            // Staged in L1 and published with streaming stores: nothing reads a leaf until
+            // GKR, long after a vector this size is evicted, so an ordinary store's fetch
+            // of every line it overwrites would double the DRAM traffic of the write.
             parallel::chunks_mut(real8, GROUPS, |c, group| {
-                for (k, out) in group.iter_mut().enumerate() {
+                let n = group.len();
+                let mut stage = [[F192::ZERO; 8]; GROUPS];
+                let mut stage_quads = [F192::ZERO; 2 * GROUPS];
+                for (k, out) in stage[..n].iter_mut().enumerate() {
                     rows8(8 * (c * GROUPS + k), out);
+                    let [lo, hi] = mul2([out[0], out[4]], [out[1], out[5]]);
+                    let [lo2, hi2] = mul2([out[2], out[6]], [out[3], out[7]]);
+                    [stage_quads[2 * k], stage_quads[2 * k + 1]] = mul2([lo, hi], [lo2, hi2]);
                 }
+                let stream = Stream::new();
+                stream.copy(group.as_flattened_mut(), stage[..n].as_flattened());
+                // SAFETY: group `c` owns quads `(off + 8 · c · GROUPS) / 4 ..` for its `2n` rows' worth,
+                // disjoint from every other group, inside the allocation.
+                unsafe { stream.copy(quads_ptr.slice((off + 8 * c * GROUPS) / 4, 2 * n), &stage_quads[..2 * n]) };
             });
+            quads_done[b] = off + 8 * real8.len();
             for (k, o) in real_r.iter_mut().enumerate() {
                 *o = row(8 * real8.len() + k);
             }
@@ -320,12 +346,66 @@ pub fn build_leaves(
         }
         // A padding row's leaf is the identity, so it leaves the product alone.
         if padding.len() >= PAR_THRESHOLD {
-            parallel::fill(padding, |_| F192::ONE);
+            const ONES: [F192; 256] = [F192::ONE; 256];
+            parallel::chunks_mut(padding, 1 << 14, |_, chunk| {
+                let stream = Stream::new();
+                for part in chunk.chunks_mut(ONES.len()) {
+                    stream.copy(part, &ONES[..part.len()]);
+                }
+            });
         } else {
             padding.fill(F192::ONE);
         }
     }
-    leaves
+    if tiled {
+        finish_quads(&leaves, &mut quads, blocks, lay, &quads_done);
+    } else {
+        parallel::fill(&mut quads, |k| gkr::quad_at(&leaves, k));
+    }
+    gkr::Leaves { leaves, quads }
+}
+
+/// Write every quad the staged groups did not: the rest of each block from its leaves, and
+/// whole-identity runs of its padding as the identity.
+fn finish_quads(leaves: &[F192], quads: &mut [F192], blocks: &[Block], lay: &Layout, quads_done: &[usize]) {
+    let quad = |k: usize| gkr::quad_at(leaves, k);
+    // Blocks below four slots share quads with their neighbours, so the quads from the first
+    // of them on are computed from the finished leaves. They sit last: blocks are placed
+    // largest first.
+    let small_from = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, blk)| blk.kappa < 2)
+        .map(|(b, _)| lay.offsets[b] / 4)
+        .min()
+        .unwrap_or(quads.len());
+    for (b, blk) in blocks.iter().enumerate() {
+        if blk.kappa < 2 {
+            continue;
+        }
+        let (start, end) = (quads_done[b] / 4, ((lay.offsets[b] + (1usize << blk.kappa)) / 4).min(small_from));
+        if start >= end {
+            continue;
+        }
+        let ones_from = (lay.offsets[b] + blk.rows).div_ceil(4).clamp(start, end);
+        let computed = &mut quads[start..ones_from];
+        if computed.len() >= PAR_THRESHOLD {
+            parallel::fill(computed, |i| quad(start + i));
+        } else {
+            for (i, q) in computed.iter_mut().enumerate() {
+                *q = quad(start + i);
+            }
+        }
+        let ones = &mut quads[ones_from..end];
+        if ones.len() >= PAR_THRESHOLD {
+            parallel::fill(ones, |_| F192::ONE);
+        } else {
+            ones.fill(F192::ONE);
+        }
+    }
+    for k in small_from..quads.len() {
+        quads[k] = quad(k);
+    }
 }
 
 /// One table's bus contribution on one side, as a form over that table's committed
@@ -739,7 +819,7 @@ pub fn prove_balance(
     // All three trees run as ONE RLC-batched GKR (equal μ: push/pull match
     // block-for-block, count is padded), so every claim lands on ONE point ζ.
     let bus_gkr = crate::stage!("Bus GKR", || {
-        gkr::prove_product_triple(
+        gkr::prove_product_triple_from(
             [push_leaves, pull_leaves, count_leaves],
             ps,
             gkr::RootShape::FirstTwoShared,

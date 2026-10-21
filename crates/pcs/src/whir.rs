@@ -675,19 +675,38 @@ fn round_msg_blocks<T: RoundWitness>(f: &[T], b: &[F192], block: usize) -> Sumch
     }
 }
 
-pub(crate) const INITIAL_BASIS_CHUNK: usize = 256;
+/// Slots one basis fill covers: the lane fold's stage, so a fold can rebuild its basis chunk by chunk.
+pub(crate) const INITIAL_BASIS_CHUNK: usize = LANE_FOLD_STAGE;
 
 pub(crate) fn build_initial_basis(
     f: &[F64],
     block: usize,
     fill: impl Fn(usize, &mut [F192]) + Sync,
 ) -> (Vec<F192>, SumcheckMessage) {
+    // SAFETY: the pass fills and publishes every lane window before returning.
+    let mut basis = unsafe { primitives::uninit_vec::<F192>(f.len()) };
+    let message = initial_basis_pass(f, block, &fill, Some(parallel::SendPtr(basis.as_mut_ptr())));
+    (basis, message)
+}
+
+/// The first round message over a basis that is filled chunk by chunk and never stored.
+pub(crate) fn initial_basis_message(
+    f: &[F64],
+    block: usize,
+    fill: &(dyn Fn(usize, &mut [F192]) + Sync),
+) -> SumcheckMessage {
+    initial_basis_pass(f, block, fill, None)
+}
+
+fn initial_basis_pass(
+    f: &[F64],
+    block: usize,
+    fill: &(dyn Fn(usize, &mut [F192]) + Sync),
+    dst: Option<parallel::SendPtr<F192>>,
+) -> SumcheckMessage {
     assert!(block.is_power_of_two() && f.len().is_multiple_of(block));
     let n_blocks = f.len() / block;
     let per = block.div_ceil(INITIAL_BASIS_CHUNK);
-    // SAFETY: each task fills and publishes its disjoint lane windows before returning.
-    let mut basis = unsafe { primitives::uninit_vec::<F192>(f.len()) };
-    let dst = parallel::SendPtr(basis.as_mut_ptr());
     let task = |t: usize| {
         let (pair, chunk) = (t / per, t % per);
         let offset = chunk * INITIAL_BASIS_CHUNK;
@@ -701,24 +720,80 @@ pub(crate) fn build_initial_basis(
             let hi = lo + block;
             fill(hi, &mut b1[..len]);
             let message = msg_terms_pair(&f[lo..lo + len], &f[hi..hi + len], &b0[..len], &b1[..len]);
-            // SAFETY: this task owns the high lane window, disjoint from every other task.
-            unsafe { stream.copy(dst.slice(hi, len), &b1[..len]) };
+            if let Some(dst) = dst {
+                // SAFETY: this task owns the high lane window, disjoint from every other task.
+                unsafe { stream.copy(dst.slice(hi, len), &b1[..len]) };
+            }
             message
         } else {
             msg_terms_lone(&f[lo..lo + len], &b0[..len])
         };
-        // SAFETY: this task owns the low lane window, disjoint from every other task.
-        unsafe { stream.copy(dst.slice(lo, len), &b0[..len]) };
+        if let Some(dst) = dst {
+            // SAFETY: this task owns the low lane window, disjoint from every other task.
+            unsafe { stream.copy(dst.slice(lo, len), &b0[..len]) };
+        }
         message
     };
     let (u_0, u_2) = accumulate_msg(n_blocks.div_ceil(2) * per, f.len() / 2, Acc8::ZERO, task);
-    (
-        basis,
-        SumcheckMessage {
-            u_0: u_0.reduce(),
-            u_2: u_2.reduce(),
-        },
-    )
+    SumcheckMessage {
+        u_0: u_0.reduce(),
+        u_2: u_2.reduce(),
+    }
+}
+
+/// A lane fold's view of its basis: stored densely, or rebuilt one stage at a time.
+///
+/// Rebuilding trades a fill per slot for a DRAM write and read of 24 bytes per slot,
+/// which wins wherever the fold is bandwidth bound.
+trait BasisChunks: Sync {
+    fn len(&self) -> usize;
+    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192];
+}
+
+impl BasisChunks for Vec<F192> {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[inline]
+    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192] {
+        &self[start..start + scratch.len()]
+    }
+}
+
+/// A basis that exists only as its fill: `fill(start, dst)` writes slots `start..start + dst.len()`,
+/// for `dst` one aligned [`INITIAL_BASIS_CHUNK`].
+#[derive(Clone, Copy)]
+pub(crate) struct GeneratedBasis<'a> {
+    pub len: usize,
+    pub fill: &'a (dyn Fn(usize, &mut [F192]) + Sync),
+}
+
+impl BasisChunks for GeneratedBasis<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192] {
+        (self.fill)(start, scratch);
+        scratch
+    }
+}
+
+/// The basis the sumcheck starts from.
+pub(crate) enum InitialBasis<'a> {
+    Dense(Vec<F192>),
+    Generated(GeneratedBasis<'a>),
+}
+
+impl InitialBasis<'_> {
+    fn len(&self) -> usize {
+        match self {
+            InitialBasis::Dense(b) => b.len(),
+            InitialBasis::Generated(g) => g.len,
+        }
+    }
 }
 
 /// `out[i] = fold_pair(x0[i], x1[i], r)`, eight at a time where the multiplier is wide.
@@ -746,6 +821,9 @@ fn fold_lones_batched<T: RoundWitness>(out: &mut [F192], x0: &[T], r: F192) {
     }
 }
 
+/// Slots a lane fold stages in L1 at a time.
+const LANE_FOLD_STAGE: usize = 128;
+
 /// Fused lane fold + next-round message. Mirror of [`fold_and_msg_lsb`] for the
 /// block pairing: a task owns one output *pair* (so four input blocks), because
 /// that is the smallest unit the next round's message is local to.
@@ -754,9 +832,9 @@ fn fold_lones_batched<T: RoundWitness>(out: &mut [F192], x0: &[T], r: F192) {
 /// elements of the single output block rather than another pair of blocks. Which
 /// pairing comes next is what lets the message be built here, while the folded
 /// values are still in L1.
-fn fold_and_msg_blocks<T: RoundWitness>(
+fn fold_and_msg_blocks<T: RoundWitness, B: BasisChunks + ?Sized>(
     f: &[T],
-    b: &[F192],
+    b: &B,
     r: F192,
     block: usize,
     last: bool,
@@ -783,16 +861,22 @@ fn fold_and_msg_blocks<T: RoundWitness>(
     // streaming stores: nothing else touches it until the next round, by which
     // time a buffer this size is long evicted, so the fetch an ordinary store
     // would make of every line it overwrites is pure waste.
-    const STAGE: usize = 128;
-    let fold_block = |stage: &mut [F192], stage_b: &mut [F192], out_blk: usize, x0: usize, stream: &Stream| {
+    const STAGE: usize = LANE_FOLD_STAGE;
+    let fold_block = |stage: &mut [F192],
+                      stage_b: &mut [F192],
+                      raw: &mut [[F192; STAGE]; 2],
+                      out_blk: usize,
+                      x0: usize,
+                      stream: &Stream| {
         let len = stage.len();
         let src0 = 2 * out_blk * block + x0;
+        let [raw_lo, raw_hi] = raw;
         // Sliced, not indexed: runs of one length let the bounds checks fall out
         // and the pair fold vectorise, as the adjacent-pair kernel's do.
-        let (f_lo, b_lo) = (&f[src0..src0 + len], &b[src0..src0 + len]);
+        let (f_lo, b_lo) = (&f[src0..src0 + len], b.chunk(src0, &mut raw_lo[..len]));
         if 2 * out_blk + 1 < n_in {
             let src1 = src0 + block;
-            let (f_hi, b_hi) = (&f[src1..src1 + len], &b[src1..src1 + len]);
+            let (f_hi, b_hi) = (&f[src1..src1 + len], b.chunk(src1, &mut raw_hi[..len]));
             fold_pairs_batched(stage, f_lo, f_hi, r);
             fold_pairs_batched(stage_b, b_lo, b_hi, r);
         } else {
@@ -813,13 +897,14 @@ fn fold_and_msg_blocks<T: RoundWitness>(
         let len = ROUND_CHUNK.min(block - x0);
         let stream = Stream::new();
         let mut stage = [[F192::ZERO; STAGE]; 4];
+        let mut raw = [[F192::ZERO; STAGE]; 2];
         let mut acc = (Acc8::ZERO, Acc8::ZERO);
         for s in (0..len).step_by(STAGE) {
             let n = STAGE.min(len - s);
             let [lo_f, lo_b, hi_f, hi_b] = &mut stage;
-            fold_block(&mut lo_f[..n], &mut lo_b[..n], 2 * i, x0 + s, &stream);
+            fold_block(&mut lo_f[..n], &mut lo_b[..n], &mut raw, 2 * i, x0 + s, &stream);
             let (u_0, u_2) = if 2 * i + 1 < n_out {
-                fold_block(&mut hi_f[..n], &mut hi_b[..n], 2 * i + 1, x0 + s, &stream);
+                fold_block(&mut hi_f[..n], &mut hi_b[..n], &mut raw, 2 * i + 1, x0 + s, &stream);
                 msg_terms_pair(&lo_f[..n], &hi_f[..n], &lo_b[..n], &hi_b[..n])
             } else if last {
                 // `ROUND_CHUNK`, `STAGE` and `block` are powers of two, so every
@@ -861,6 +946,8 @@ struct SumcheckProver<'a> {
     /// introduced since the last glue in as `combined_basis += lambda^tau *
     /// b_new`, `tau` counting from 1 (the running claim is `tau = 0`).
     combined_basis: Vec<F192>,
+    /// The round-0 basis when it is rebuilt rather than stored; the first lane fold consumes it.
+    generated: Option<GeneratedBasis<'a>>,
     /// The running claim and its quadratic; `h(0) + h(1) = t_r` fixes the linear coefficient.
     t_r: F192,
     quad: RoundQuad,
@@ -876,17 +963,25 @@ impl<'a> SumcheckProver<'a> {
     /// whole blocks rather than adjacent words.
     fn new(
         f: &'a [F64],
-        b1: Vec<F192>,
+        b1: InitialBasis<'a>,
         h1: F192,
         block: usize,
         initial_message: Option<SumcheckMessage>,
     ) -> (Self, SumcheckMessage) {
         let _span = tracing::info_span!("Sumcheck round", round = 0, log_size = f.len().ilog2()).entered();
         assert_eq!(f.len(), b1.len());
-        let msg = initial_message.unwrap_or_else(|| round_msg_blocks(f, &b1, block));
+        let (combined_basis, generated) = match b1 {
+            InitialBasis::Dense(b) => (b, None),
+            InitialBasis::Generated(g) => (Vec::new(), Some(g)),
+        };
+        let msg = initial_message.unwrap_or_else(|| {
+            assert!(generated.is_none(), "a generated basis comes with its first message");
+            round_msg_blocks(f, &combined_basis, block)
+        });
         let inst = Self {
             f: Witness::Base(f),
-            combined_basis: b1,
+            combined_basis,
+            generated,
             t_r: h1,
             quad: RoundQuad::from_msg(msg, h1),
             round: 0,
@@ -915,9 +1010,11 @@ impl<'a> SumcheckProver<'a> {
             Witness::Ext(f) => f.len().ilog2(),
         };
         let _span = tracing::info_span!("Sumcheck round", round = self.round, log_size).entered();
-        let (nf, nb, msg) = match &self.f {
-            Witness::Base(f) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
-            Witness::Ext(f) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
+        let (nf, nb, msg) = match (&self.f, self.generated.take()) {
+            (Witness::Base(f), Some(g)) => fold_and_msg_blocks(f, &g, r, block, last),
+            (Witness::Base(f), None) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
+            (Witness::Ext(f), None) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
+            (Witness::Ext(_), Some(_)) => unreachable!("the generated basis is consumed by the first fold"),
         };
         drop(std::mem::replace(&mut self.f, Witness::Ext(nf)));
         drop(std::mem::replace(&mut self.combined_basis, nb));
@@ -926,6 +1023,7 @@ impl<'a> SumcheckProver<'a> {
     }
 
     fn fold(&mut self, r: F192) -> SumcheckMessage {
+        assert!(self.generated.is_none(), "a generated basis is folded by a lane round");
         self.t_r = self.quad.eval(r);
         self.round += 1;
         let log_size = match &self.f {
@@ -1096,7 +1194,7 @@ pub fn recursive_prover_with_basis(
         config,
         log_n,
         witness,
-        b_initial,
+        InitialBasis::Dense(b_initial),
         target,
         l0_codeword,
         l0_tree,
@@ -1109,7 +1207,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     config: &ProverConfig,
     log_n: usize,
     witness: &[F64],
-    b_initial: Vec<F192>,
+    b_initial: InitialBasis<'_>,
     target: F192,
     l0_codeword: &[F64],
     l0_tree: &[Hash],

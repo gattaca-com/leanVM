@@ -67,13 +67,38 @@ fn default_topology() -> Topology {
 
 /// Performance-core count: `hw.perflevel0.logicalcpu` on Apple silicon (where
 /// `available_parallelism` counts the efficiency cores too, and those are handled
-/// separately), else the platform's parallelism.
+/// separately), else the platform's parallelism over the SMT width.
+///
+/// The prover is DRAM-bound once every core runs: a second SMT thread per core adds
+/// cache and bandwidth contention, not throughput. On a 16-core Zen 5 at 1,290
+/// signatures, 16 workers prove in 1.159 s where 32 take 1.234 s.
 fn perf_cores() -> usize {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if let Some(n) = sysctl_usize(c"hw.perflevel0.logicalcpu") {
         return n;
     }
-    std::thread::available_parallelism().map_or(1, |n| n.get())
+    let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (logical / smt_width()).max(1)
+}
+
+/// Hardware threads per core, from cpu0's sibling list (`0,16` or `0-1`); 1 when unknown.
+pub fn smt_width() -> usize {
+    #[cfg(target_os = "linux")]
+    if let Ok(list) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list") {
+        let width: usize = list
+            .trim()
+            .split(',')
+            .map(|part| match part.split_once('-') {
+                Some((lo, hi)) => match (lo.parse::<usize>(), hi.parse::<usize>()) {
+                    (Ok(lo), Ok(hi)) if hi >= lo => hi - lo + 1,
+                    _ => 1,
+                },
+                None => 1,
+            })
+            .sum();
+        return width.max(1);
+    }
+    1
 }
 
 /// Efficiency-core count on Apple silicon, else `0`.
