@@ -156,6 +156,37 @@ Flock BLAKE2s batch proving, 262,144 compressions (2^18 slots)
   (~2416.7 leanXMSS/s equivalent at 201 compressions/signature)
 ```
 
+### hashing, Haraka-512 over GF(2^8) coefficients
+
+The same batch prover with the constraint matrices over GF(2^8) instead of GF(2): an AES S-box is a field
+inverse, so it costs two degree-2 rows and eight committed bits, where its AND-gate circuit costs 32 of each.
+A Haraka-512 call (64 bytes in, 32 out, 640 S-boxes) commits 5,888 bits against a BLAKE2s compression's 16,384.
+The zerocheck, lincheck sumcheck, ring switch, PCS and verifier are shared with BLAKE2s (`flock::haraka`,
+`verifier::verify_flock_batch_haraka`); only round 1 and the fold at `z` read bytes rather than bits.
+
+```bash
+BENCH_REPEAT=3 BENCH_COOLDOWN=2 FLOCK_N_LOG=18 cargo bench -p flock --bench hash_batch_haraka
+```
+
+```
+Flock Haraka-512 batch proving, 262,144 calls (32,768 slots of 10)
+  witness-gen                     :     35.7 ms ± 2.1%   11.1%
+  commit                          :     46.4 ms ± 3.3%   14.4%
+  zerocheck                       :     89.6 ms ± 3.9%   27.8%
+  lincheck                        :     18.2 ms ± 7.4%    5.7%
+  pcs opening                     :    132.1 ms ± 3.9%   41.0%
+  other                           :      0.0 ms           0.0%
+  ------------------------------------------
+  prove TOTAL (witness excluded)  :    286.2 ms ± 2.9%   88.9%
+  verify (scalar, one thread)     :      5.4 ms
+  throughput                      :        915,823 calls/s ± 2.9%
+  (~4556.3 leanXMSS/s equivalent at 201 calls/signature)
+```
+
+On the same machine and run, `hash_batch` (BLAKE2s, 262,144 compressions) proves at 529,916 compressions/s:
+commit 91 ms, zerocheck 137 ms, lincheck 11 ms, opening 255 ms. On a c7i.4xlarge (Sapphire Rapids, 16 vCPU)
+the two are 578,667 calls/s against 276,445 compressions/s.
+
 ### Fibonacci
 
 ```bash

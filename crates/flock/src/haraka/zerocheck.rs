@@ -132,13 +132,14 @@ fn fold_at_z(c: &[u8], w: &[F192], r_eq: &[F192], n_slots: usize) -> ([Vec<F192>
         }
         (g1, gi)
     };
+    let fw = FoldWeights::new(w);
     let msg = parallel::map_reduce(
         n_slots,
         || (F192::ZERO, F192::ZERO),
         |slot| {
             // SAFETY: one task per slot, each chunk taken once.
             let (oa, ob, oc) = unsafe { (ac.get(slot), bc.get(slot), cc.get(slot)) };
-            fold_slot(c, w, slot, oa, ob, oc);
+            fold_slot(c, w, &fw, slot, oa, ob, oc);
             let (g1, gi) = message(oa, ob, oc);
             (eq_hi[slot] * g1, eq_hi[slot] * gi)
         },
@@ -147,8 +148,63 @@ fn fold_at_z(c: &[u8], w: &[F192], r_eq: &[F192], n_slots: usize) -> ([Vec<F192>
     ([am, bm, cm], msg)
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+struct FoldWeights {
+    k: &'static kernels::gfni::Consts,
+    wa: Box<[[u8; kernels::COORDS]; 64]>,
+    wb: Box<[[u8; kernels::COORDS]; 64]>,
+    wsum: [u8; kernels::COORDS],
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+impl FoldWeights {
+    fn new(w: &[F192]) -> Self {
+        use std::sync::OnceLock;
+        static CONSTS: OnceLock<kernels::gfni::Consts> = OnceLock::new();
+        let k = CONSTS.get_or_init(kernels::gfni::Consts::new);
+        let wa: Box<[[u8; kernels::COORDS]; 64]> = Box::new(std::array::from_fn(|s| k.basis.to_coords(w[s])));
+        let wb: Box<[[u8; kernels::COORDS]; 64]> = Box::new(std::array::from_fn(|s| wa[s ^ 1]));
+        let wsum = k.basis.to_coords(w.iter().fold(F192::ZERO, |acc, &x| acc + x));
+        FoldWeights { k, wa, wb, wsum }
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+)))]
+struct FoldWeights;
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+)))]
+impl FoldWeights {
+    fn new(_w: &[F192]) -> Self {
+        FoldWeights
+    }
+}
+
 /// One slot's three tables from its byte rows.
-fn fold_slot(c: &[u8], w: &[F192], slot: usize, oa: &mut [F192], ob: &mut [F192], oc: &mut [F192]) {
+fn fold_slot(c: &[u8], w: &[F192], fw: &FoldWeights, slot: usize, oa: &mut [F192], ob: &mut [F192], oc: &mut [F192]) {
     {
         #[cfg(all(
             target_arch = "x86_64",
@@ -158,13 +214,8 @@ fn fold_slot(c: &[u8], w: &[F192], slot: usize, oa: &mut [F192], ob: &mut [F192]
             target_feature = "gfni"
         ))]
         {
-            use std::sync::OnceLock;
-            static CONSTS: OnceLock<kernels::gfni::Consts> = OnceLock::new();
-            let k = CONSTS.get_or_init(kernels::gfni::Consts::new);
-            let wa: Box<[[u8; kernels::COORDS]; 64]> = Box::new(std::array::from_fn(|s| k.basis.to_coords(w[s])));
-            let wb: Box<[[u8; kernels::COORDS]; 64]> = Box::new(std::array::from_fn(|s| wa[s ^ 1]));
-            let wsum = k.basis.to_coords(w.iter().fold(F192::ZERO, |acc, &x| acc + x));
-            let (wa, wb, wsum) = (&wa, &wb, &wsum);
+            let FoldWeights { k, wa, wb, wsum } = fw;
+            let _ = w;
             for tile in 0..COLS_PER_SLOT / 64 {
                 let col0 = tile * 64;
                 let lin_mask = (0..64).fold(0u64, |m, j| if is_lin_col(col0 + j) { m | 1 << j } else { m });

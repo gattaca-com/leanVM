@@ -392,6 +392,9 @@ pub mod gfni {
         pub frob: __m512i,
         pub swap: __m512i,
         pub ones: __m512i,
+        /// Stage `s` of the 64×64 byte transpose swaps row bit `s` with column bit `s`: the two
+        /// two-source byte permutes of a vector pair.
+        pub tidx: [[__m512i; 2]; 6],
     }
 
     impl Consts {
@@ -399,12 +402,22 @@ pub mod gfni {
             // SAFETY: the target features are enabled at compile time.
             unsafe {
                 let swap: [u8; 64] = std::array::from_fn(|i| (i ^ 1) as u8);
+                let tidx: [[__m512i; 2]; 6] = std::array::from_fn(|st| {
+                    let bit = 1usize << st;
+                    let lo: [u8; 64] = std::array::from_fn(|x| if x & bit == 0 { x } else { 64 + (x ^ bit) } as u8);
+                    let hi: [u8; 64] = std::array::from_fn(|x| if x & bit == 0 { x | bit } else { 64 + x } as u8);
+                    [
+                        _mm512_loadu_si512(lo.as_ptr() as *const _),
+                        _mm512_loadu_si512(hi.as_ptr() as *const _),
+                    ]
+                });
                 Consts {
                     ntt: Ntt64::new(),
                     basis: Basis::new(),
                     frob: _mm512_set1_epi64(frobenius_matrix()),
                     swap: _mm512_loadu_si512(swap.as_ptr() as *const _),
                     ones: _mm512_set1_epi8(1),
+                    tidx,
                 }
             }
         }
@@ -440,6 +453,35 @@ pub mod gfni {
                 transpose8x8(&mut rows);
                 for (e, r) in rows.iter().enumerate() {
                     out[COORDS * e + 8 * k..COORDS * e + 8 * k + 8].copy_from_slice(&r.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    /// [`apply8_from_qwords`] writing the 8 elements straight to `out` (8 consecutive `F192`s).
+    ///
+    /// # Safety
+    ///
+    /// `out` must be valid for 8 `F192` writes, with the target features enabled.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+    #[inline]
+    pub unsafe fn apply8_into(blocks: &[[u64; COORDS]], t: &[u64; COORDS], out: *mut F192) {
+        unsafe {
+            let mut o = [_mm512_setzero_si512(); 3];
+            for i in 0..COORDS {
+                let q = _mm512_set1_epi64(t[i] as i64);
+                for (k, acc) in o.iter_mut().enumerate() {
+                    let m = _mm512_loadu_si512(blocks[i].as_ptr().add(8 * k) as *const _);
+                    *acc = _mm512_xor_si512(*acc, _mm512_gf2p8affine_epi64_epi8::<0>(q, m));
+                }
+            }
+            let out = out as *mut u64;
+            for (k, acc) in o.iter().enumerate() {
+                let mut rows = [0u64; 8];
+                _mm512_storeu_si512(rows.as_mut_ptr() as *mut _, *acc);
+                transpose8x8(&mut rows);
+                for (e, r) in rows.iter().enumerate() {
+                    out.add(3 * e + k).write_unaligned(*r);
                 }
             }
         }
@@ -565,6 +607,26 @@ pub mod gfni {
         *t = out;
     }
 
+    /// Transpose 64 rows of 64 bytes in registers: six stages, each exchanging one row-index bit with the
+    /// same column-index bit through a pair of two-source byte permutes.
+    ///
+    /// # Safety
+    ///
+    /// The AVX-512 and GFNI target features must be enabled, as they are when this module compiles.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+    pub unsafe fn transpose64_simd(k: &Consts, v: &mut [__m512i; 64]) {
+        for st in 0..6 {
+            let bit = 1usize << st;
+            let [lo, hi] = k.tidx[st];
+            for i0 in (0..64).filter(|i| i & bit == 0) {
+                let i1 = i0 | bit;
+                let (a, b) = (v[i0], v[i1]);
+                v[i0] = _mm512_permutex2var_epi8(a, lo, b);
+                v[i1] = _mm512_permutex2var_epi8(a, hi, b);
+            }
+        }
+    }
+
     /// Fold a tile of 64 columns at `z`: weights `wa[s][i]`, `wb[s][i]` are the coordinates of the
     /// `a` and `b` weights (`wb[s] = w[s ^ 1]`), `wsum` the coordinates of `Σ_s w_s` for the linear columns.
     /// Writes 64 `F192`s to each of `out_a`, `out_b`, `out_c` (`out_c[x] = Σ_s w_s φ8(c(s, x))`).
@@ -586,40 +648,40 @@ pub mod gfni {
         out_c: *mut F192,
     ) {
         unsafe {
-            let mut t = [[0u8; 64]; 64];
-            std::ptr::copy_nonoverlapping(c, t.as_mut_ptr() as *mut u8, 64 * 64);
-            transpose64(&mut t);
-            let rows: [__m512i; 64] = std::array::from_fn(|s| _mm512_loadu_si512(t[s].as_ptr() as *const _));
-            let mut raw = [[[0u8; 64]; COORDS]; 3];
+            let mut rows: [__m512i; 64] = std::array::from_fn(|s| _mm512_loadu_si512(c.add(64 * s) as *const _));
+            transpose64_simd(k, &mut rows);
+            let a_rows: [__m512i; 64] = std::array::from_fn(|s| _mm512_gf2p8affine_epi64_epi8::<0>(rows[s], k.frob));
+            let mut raw = [[[0u64; 8]; COORDS]; 3];
             for (t, raw_t) in raw.iter_mut().enumerate() {
-                let mut acc = [_mm512_setzero_si512(); COORDS];
-                for s in 0..64 {
-                    let v = if t == 0 {
-                        _mm512_gf2p8affine_epi64_epi8::<0>(rows[s], k.frob)
-                    } else {
-                        rows[s]
-                    };
-                    let w = if t == 1 { &wb[s] } else { &wa[s] };
-                    for i in 0..COORDS {
-                        acc[i] = _mm512_xor_si512(acc[i], _mm512_gf2p8mul_epi8(v, _mm512_set1_epi8(w[i] as i8)));
+                let (src, w): (&[__m512i; 64], &[[u8; COORDS]; 64]) = match t {
+                    0 => (&a_rows, wa),
+                    1 => (&rows, wb),
+                    _ => (&rows, wa),
+                };
+                for g in 0..COORDS / 8 {
+                    let mut acc = [_mm512_setzero_si512(); 8];
+                    for s in 0..64 {
+                        let v = src[s];
+                        let ws = &w[s];
+                        for (j, a) in acc.iter_mut().enumerate() {
+                            *a = _mm512_xor_si512(*a, _mm512_gf2p8mul_epi8(v, _mm512_set1_epi8(ws[8 * g + j] as i8)));
+                        }
                     }
-                }
-                if t == 1 {
-                    for (i, a) in acc.iter_mut().enumerate() {
-                        *a = _mm512_mask_mov_epi8(*a, lin_mask, _mm512_set1_epi8(wsum[i] as i8));
+                    for (j, a) in acc.iter().enumerate() {
+                        let i = 8 * g + j;
+                        let a = if t == 1 {
+                            _mm512_mask_mov_epi8(*a, lin_mask, _mm512_set1_epi8(wsum[i] as i8))
+                        } else {
+                            *a
+                        };
+                        _mm512_storeu_si512(raw_t[i].as_mut_ptr() as *mut _, a);
                     }
-                }
-                for i in 0..COORDS {
-                    _mm512_storeu_si512(raw_t[i].as_mut_ptr() as *mut _, acc[i]);
                 }
             }
             for (t, out) in [out_a, out_b, out_c].into_iter().enumerate() {
                 for g in 0..8 {
-                    let q: [u64; COORDS] =
-                        std::array::from_fn(|i| u64::from_le_bytes(raw[t][i][8 * g..8 * g + 8].try_into().unwrap()));
-                    let mut o = [0u8; 8 * COORDS];
-                    apply8_from_qwords(&k.basis.from_coords, &q, &mut o);
-                    std::ptr::copy_nonoverlapping(o.as_ptr(), out.add(8 * g) as *mut u8, 8 * COORDS);
+                    let q: [u64; COORDS] = std::array::from_fn(|i| raw[t][i][g]);
+                    apply8_into(&k.basis.from_coords, &q, out.add(8 * g));
                 }
             }
         }
