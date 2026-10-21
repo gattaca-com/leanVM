@@ -261,7 +261,7 @@ pub fn open_batch_mixed_whir_stacked(
         stack,
         initial_basis,
         target,
-        &prover_data.codeword,
+        prover_data.l0(),
         &prover_data.merkle_tree,
         Some(message),
         ps,

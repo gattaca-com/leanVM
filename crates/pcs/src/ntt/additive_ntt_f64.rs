@@ -13,6 +13,14 @@ use primitives::field::F64;
 use primitives::log2_strict_usize;
 use primitives::stream::Stream;
 
+/// Where an encode stopped writing its buffer back: the deep pass's layers, still to run on any row read.
+#[derive(Clone, Copy, Debug)]
+pub struct DeepRows {
+    log_d: usize,
+    num_ntts: usize,
+    deep_start: usize,
+}
+
 /// Table of the normalized subspace polynomials at the basis.
 ///
 /// - Row `i` holds `s_i(b_j)` for every basis element `b_j` with `j >= i`.
@@ -173,6 +181,48 @@ impl AdditiveNttF64 {
         self.transform(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows));
     }
 
+    /// [`Self::encode_interleaved_in_place_with`] without writing the deep pass back.
+    ///
+    /// - Each deep sub-block is finished in scratch and handed to `on_rows` from there.
+    /// - The buffer keeps what the gathered passes left, and [`DeepRows::rows`] finishes any row again.
+    /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
+    ///
+    /// A queried row costs one sub-block transform, against a write of the whole codeword saved.
+    pub fn encode_interleaved_in_place_without_deep(
+        &self,
+        data: &mut [F64],
+        num_ntts: usize,
+        log_inv_rate: usize,
+        on_rows: &RowSink<'_>,
+    ) -> Option<DeepRows> {
+        let msg = parallel::SendPtr(data.as_mut_ptr());
+        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
+    }
+
+    /// Codeword rows `positions` of a buffer left by [`Self::encode_interleaved_in_place_without_deep`].
+    pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
+        let DeepRows { log_d, num_ntts, deep_start } = *deep;
+        let log_sub = log_d - deep_start;
+        let sub_len = num_ntts << log_sub;
+        let mut subs: Vec<usize> = positions.iter().map(|&q| q >> log_sub).collect();
+        subs.sort_unstable();
+        subs.dedup();
+        let finished: Vec<Vec<F64>> = parallel::map_collect(subs.len(), |i| {
+            let sub_idx = subs[i];
+            let mut sub = data[sub_idx * sub_len..][..sub_len].to_vec();
+            self.run_layers(&mut sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx);
+            sub
+        });
+        positions
+            .iter()
+            .map(|&q| {
+                let sub = &finished[subs.binary_search(&(q >> log_sub)).expect("every queried sub-block is finished")];
+                let row = q & ((1 << log_sub) - 1);
+                sub[row * num_ntts..][..num_ntts].to_vec()
+            })
+            .collect()
+    }
+
     /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.
     ///
     /// - The result equals encoding in place.
@@ -243,6 +293,19 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         on_rows: Option<&RowSink<'_>>,
     ) {
+        self.transform_deferring_deep(data, num_ntts, start, msg, on_rows, false);
+    }
+
+    /// [`Self::transform`]; with `defer_deep`, the deep pass's results go only to `on_rows`, not back into the buffer.
+    fn transform_deferring_deep(
+        &self,
+        data: &mut [F64],
+        num_ntts: usize,
+        start: usize,
+        msg: Option<parallel::SendPtr<F64>>,
+        on_rows: Option<&RowSink<'_>>,
+        defer_deep: bool,
+    ) -> Option<DeepRows> {
         // The buffer is 2^log_d rows of `num_ntts` words.
         assert!(num_ntts > 0);
         assert_eq!(data.len() % num_ntts, 0);
@@ -331,6 +394,14 @@ impl AdditiveNttF64 {
                         sub.copy_from_slice(scratch);
                     }
                 }),
+                // The rows are hashed from scratch and the buffer keeps its pre-deep state.
+                None if defer_deep && deep_rows.is_some() => with_scratch(sub_len, |scratch| {
+                    scratch.copy_from_slice(sub);
+                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx);
+                    if let Some(f) = deep_rows {
+                        f(sub_idx << log_sub, scratch);
+                    }
+                }),
                 // The replicas are already in place: run the layers where they are.
                 None => {
                     self.run_layers(sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx);
@@ -347,6 +418,11 @@ impl AdditiveNttF64 {
             let log_rows = log_d - log_tasks.min(log_d);
             parallel::chunks_mut(data, num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
         }
+        (defer_deep && deep_rows.is_some() && msg.is_none()).then_some(DeepRows {
+            log_d,
+            num_ntts,
+            deep_start,
+        })
     }
 
     /// Run layers `layer..layer + g` in one sweep of the buffer, one row group at a time.
@@ -1316,6 +1392,38 @@ mod tests {
                         "lane {lane} pos {pos} at log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Without the deep writeback, the handed-over rows and the rows finished on demand
+    /// must equal the full encode's, wherever the plan splits off a deep pass.
+    #[test]
+    fn deferred_deep_rows_match_the_full_encode() {
+        let mut rng = Rng::new(0xDEE9);
+        for (log_d, lanes, log_inv_rate, split) in [(14usize, 51usize, 1usize, true), (14, 64, 2, true), (9, 8, 1, true), (4, 8, 4, false)] {
+            let ntt = AdditiveNttF64::standard(log_d);
+            let msg_len = (lanes << log_d) >> log_inv_rate;
+            let msg: Vec<F64> = (0..msg_len).map(|_| F64(rng.next_u64())).collect();
+            let mut want = vec![F64::ZERO; msg_len << log_inv_rate];
+            want[..msg_len].copy_from_slice(&msg);
+            ntt.encode_interleaved_in_place(&mut want, lanes, log_inv_rate);
+
+            let mut got = vec![F64::ZERO; msg_len << log_inv_rate];
+            got[..msg_len].copy_from_slice(&msg);
+            let handed = std::sync::Mutex::new(vec![F64::ZERO; got.len()]);
+            let deep = ntt.encode_interleaved_in_place_without_deep(&mut got, lanes, log_inv_rate, &|row, rows| {
+                handed.lock().unwrap()[row * lanes..][..rows.len()].copy_from_slice(rows)
+            });
+            assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, log_d={log_d}, lanes={lanes}");
+            assert_eq!(deep.is_some(), split, "plan, log_d={log_d}, lanes={lanes}");
+            let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+            let rows = match deep {
+                Some(deep) => ntt.finish_rows(&got, &deep, &positions),
+                None => positions.iter().map(|&q| got[q * lanes..][..lanes].to_vec()).collect(),
+            };
+            for (&q, row) in positions.iter().zip(&rows) {
+                assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_d={log_d}, lanes={lanes}");
             }
         }
     }

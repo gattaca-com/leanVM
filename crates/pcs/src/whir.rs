@@ -22,7 +22,7 @@
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
 use crate::merkle::{self, Hash};
-use crate::ntt::AdditiveNttF64;
+use crate::ntt::{AdditiveNttF64, DeepRows};
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use primitives::{
@@ -113,10 +113,53 @@ pub struct Commitment {
 
 /// Prover-side state retained after commit for the opening phase. The message
 /// itself is not stored; the caller retains it for opening.
+///
+/// With `deep` set, `codeword` holds the rows before the encode's deep layers,
+/// which [`ProverData::l0`] finishes for the rows a query opens.
 pub struct ProverData {
     pub codeword: Vec<F64>,
     pub merkle_tree: Vec<Hash>,
+    deep: Option<(AdditiveNttF64, DeepRows)>,
 }
+
+impl ProverData {
+    pub(crate) fn l0(&self) -> L0Codeword<'_> {
+        L0Codeword {
+            words: &self.codeword,
+            deep: self.deep.as_ref(),
+        }
+    }
+}
+
+/// The L0 codeword as the opening reads it: whole, or with its deep layers still to run.
+#[derive(Clone, Copy)]
+pub(crate) struct L0Codeword<'a> {
+    words: &'a [F64],
+    deep: Option<&'a (AdditiveNttF64, DeepRows)>,
+}
+
+impl L0Codeword<'_> {
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// The rows at `positions`, `n_lanes` words each.
+    fn rows(&self, positions: &[usize], n_lanes: usize) -> Vec<Vec<F64>> {
+        match self.deep {
+            Some((ntt, deep)) => ntt.finish_rows(self.words, deep, positions),
+            None => positions
+                .iter()
+                .map(|&q| self.words[q * n_lanes..(q + 1) * n_lanes].to_vec())
+                .collect(),
+        }
+    }
+}
+
+/// Pool size from which the L0 encode leaves its deep pass out of the codeword and an
+/// opening finishes the queried sub-blocks again: a DRAM write of the codeword saved
+/// against a transform per opened sub-block. 1,290 signatures on a 16-core Zen 5:
+/// 1 worker +2.5%, 2 +0.4%, 4 +0.5%, 8 -0.4%, 16 -1 to -4% (node -3.8%).
+const DEFER_DEEP_MIN_THREADS: usize = 8;
 
 /// Commit to the `F64` message of a `2^log_n`-word witness: the message is its
 /// leading `n_lanes` lane blocks of `2^(log_n - log_batch_size)` words each, one
@@ -155,17 +198,29 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
 
     // Leaves are hashed as the encode finishes each block of rows.
     let tree = merkle::MerkleBuilder::new(n_positions, n_lanes, 1usize << log_batch_size);
-    tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = n_lanes).in_scope(|| {
+    let deep = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = n_lanes).in_scope(|| {
         crate::ntt::transpose_lane_major(&mut codeword[..message.len()], message, n_lanes, log_rows);
         let ntt = AdditiveNttF64::standard(k_code);
-        ntt.encode_interleaved_in_place_with(&mut codeword, n_lanes, log_inv_rate, &|row, rows| {
-            tree.absorb(row, rows)
-        });
+        let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
+        if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
+            ntt.encode_interleaved_in_place_without_deep(&mut codeword, n_lanes, log_inv_rate, &on_rows)
+                .map(|rows| (ntt, rows))
+        } else {
+            ntt.encode_interleaved_in_place_with(&mut codeword, n_lanes, log_inv_rate, &on_rows);
+            None
+        }
     });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
     let root = *merkle_tree.last().expect("merkle tree non-empty");
 
-    (Commitment { root }, ProverData { codeword, merkle_tree })
+    (
+        Commitment { root },
+        ProverData {
+            codeword,
+            merkle_tree,
+            deep,
+        },
+    )
 }
 
 /// Codeword + Merkle tree for one deeper WHIR commitment level.
@@ -1253,7 +1308,10 @@ pub fn recursive_prover_with_basis(
         witness,
         InitialBasis::Dense(b_initial),
         target,
-        l0_codeword,
+        L0Codeword {
+            words: l0_codeword,
+            deep: None,
+        },
         l0_tree,
         None,
         ps,
@@ -1266,7 +1324,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     witness: &[F64],
     b_initial: InitialBasis,
     target: F192,
-    l0_codeword: &[F64],
+    l0_codeword: L0Codeword<'_>,
     l0_tree: &[Hash],
     initial_message: Option<SumcheckMessage>,
     ps: &mut ProverState,
@@ -1313,13 +1371,12 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     // block `n_lanes-1-t`, so a row IS the tail of the leaf image: the absent lanes
     // are the image's leading zeros (`MerkleBuilder` shares their hash prefix, and only
     // this tail rides the proof).
-    let l0_row = |q: usize| -> Vec<F64> { l0_codeword[q * n_lanes..(q + 1) * n_lanes].to_vec() };
     // The same row for the induce, which folds a lane-ASCENDING row against the
     // lane eq table: reversing the image puts block `b` at index `b` and the absent
     // lanes' zeros at the end, where they contribute nothing.
-    let l0_fold_row = |q: usize| -> Vec<F64> {
+    let l0_fold_row = |image: &[F64]| -> Vec<F64> {
         let mut row = vec![F64::ZERO; num_interleaved_0];
-        for (t, &word) in l0_codeword[q * n_lanes..(q + 1) * n_lanes].iter().enumerate() {
+        for (t, &word) in image.iter().enumerate() {
             row[n_lanes - 1 - t] = word;
         }
         row
@@ -1376,9 +1433,11 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     let weights_0 = powers(lambda_0, num_queries_0);
     let span = tracing::info_span!("Open", level = 0).entered();
     // Ordered (dup-possible) rows for the local induce math ...
-    let opened_rows_0: Vec<Vec<F64>> = queries_0.iter().map(|&q| l0_fold_row(q)).collect();
+    let images_0 = l0_codeword.rows(&queries_0, n_lanes);
+    let opened_rows_0: Vec<Vec<F64>> = images_0.iter().map(|image| l0_fold_row(image)).collect();
     // ... but the stored proof carries the sorted-unique rows + one octopus over
     // the sorted-unique positions (the verifier re-fans them to ordered).
+    let l0_row = |q: usize| -> Vec<F64> { images_0[queries_0.iter().position(|&p| p == q).expect("a queried row")].clone() };
     ps.hint_merkle(PrunedMerklePaths::prune(l0_tree, block_len_0, &queries_0, l0_row));
     drop(span);
 
