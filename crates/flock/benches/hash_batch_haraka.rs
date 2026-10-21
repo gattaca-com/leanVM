@@ -93,7 +93,7 @@ fn main() {
     });
     let proof = scalar_proof(&proof);
     let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|_final_pass| {
-        verifier::verify_flock_batch_haraka(&SEED[0], &SEED[1], ROWS_LOG + n_log, LOG_INV_RATE_0, &proof)
+        verifier::verify_flock_batch(&SEED[0], &SEED[1], ROWS_LOG + n_log, LOG_INV_RATE_0, &proof)
             .expect("Flock Haraka batch proof verifies");
     });
     if std::env::args().any(|arg| arg == "--json") {

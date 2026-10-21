@@ -75,7 +75,7 @@ fn whir_config(mu: usize, log_inv_rate: usize) -> std::sync::Arc<ProverConfig> {
 pub struct Committed {
     /// Codeword + Merkle tree retained for opening. Public so the single stacked
     /// WHIR opening (which also discharges flock's claim over
-    /// this same commitment, §hash_flock) can reuse it.
+    /// this same commitment, §haraka) can reuse it.
     pub prover_data: ProverData,
     /// `log2` of the witness length in F64 words.
     pub mu: usize,
@@ -125,7 +125,7 @@ pub fn commit(
 
 /// Open the committed witness: discharge the `points` (leanVM's bus / constraint /
 /// public-input claims, as block-sparse slot evaluations) AND flock's
-/// ring-switched BLAKE2s validity claim (`ring`) in ONE stacked WHIR.
+/// ring-switched Haraka validity claim (`ring`) in ONE stacked WHIR.
 /// The points become the opener's `point_claims`; the opening's Merkle data
 /// rides the transcript's phase list, not the scalar stream. The commitment root
 /// was already bound by [`commit`], and the point *values* either rode the

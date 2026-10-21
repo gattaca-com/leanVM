@@ -78,15 +78,12 @@ pub(crate) enum LOp {
         first: u32,
         dst: Off,
     },
-    /// `BLAKE2s`: the four 128-bit input chunks `ins` are addressed independently,
+    /// `Haraka`: the four 128-bit input chunks `ins` are addressed independently,
     /// one frame cell each. The 32-byte output occupies the two consecutive
-    /// 128-bit cells `c, c+1`; `md` is the cell holding the byte counter and the
-    /// two flags.
-    Blake2s {
+    /// 128-bit cells `c, c+1`.
+    Haraka {
         ins: [Off; 4],
-        cv: Off,
         c: Off,
-        md: Off,
     },
 }
 
@@ -138,8 +135,8 @@ pub(crate) struct JumpTables {
 
 /// A resolved run of consecutive cells ([`crate::lower::FnLower::cell_run`]): a
 /// frame (stack) run, used in place, or a heap slice (the buffer pointer's cell
-/// plus the first g-power offset), which a `blake2s` operand must bridge through
-/// the stack since `BLAKE2s` addresses only frame cells.
+/// plus the first g-power offset), which a `haraka` operand must bridge through
+/// the stack since `Haraka` addresses only frame cells.
 pub(crate) enum CellRun {
     Stack { base: Off, len: u32 },
     Heap { ptr: Off, lo: u32, len: u32 },

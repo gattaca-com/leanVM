@@ -151,7 +151,7 @@ def HeapBuf(n) -> _Elt:
 
 def StackBuf(n: int) -> _Elt:
     """Allocate `n` consecutive frame (stack) cells. A size-2 StackBuf holds a
-    256-bit value and is a valid `blake2s` operand."""
+    256-bit value and is a valid `haraka` operand."""
     _ = n
     return _Elt()
 
@@ -197,40 +197,18 @@ def hint_f192_limbs(dest, value) -> None:
     _ = dest, value
 
 
-def blake2s(
-    a,
-    b,
-    out,
-    *,
-    cv=None,
-    counter: Optional[int] = None,
-    final: Optional[int] = None,
-    last_node: int = 0,
-    md=None,
-) -> None:
-    """One standard BLAKE2s compression of the two 256-bit message operands
-    `a`, `b`, written into the 2-cell run `out` (write-once: if `out` was
-    already written, this asserts it equals the chaining value).
+def haraka(a, b, out) -> None:
+    """One Haraka-512 call on the two 256-bit message operands `a`, `b` (64
+    bytes), written into the 2-cell run `out` (write-once: if `out` was
+    already written, this asserts the digest equals it).
 
-    With no keywords this hashes exactly 64 bytes: the parameterized BLAKE2s-256
-    initial chaining value, byte counter 64, final-block flag set. That is
-    `blake2s(a || b)`, the form every Fiat-Shamir step and Merkle node uses.
+    That is `haraka512(a || b)`, the form every Fiat-Shamir step and Merkle
+    node uses. A longer message is the chain `primitives::hash::hash` runs:
+    `haraka(cv, block, next)` over 32-byte blocks from the zero chaining value,
+    closed by a `1` byte, zeros and the byte length ending the last block.
 
-    For a longer message, drive the blocks yourself. `counter` is the CUMULATIVE
-    byte count through this block (`64 * whole_blocks_before + bytes_in_this_block`)
-    and `final=1` marks the last block; `cv` carries the previous block's output
-    and requires one of `counter`, `final`, `last_node` or `md`. Setting any of
-    `counter`, `final` or `last_node` makes `final` default
-    to 0, so a single short block needs `counter=<len>, final=1`. Bytes past the
-    block's real length must be zero-filled by the program. `last_node` is
-    BLAKE2s's tree-mode `f1` and is 0 everywhere here.
+    An operand is a 2-cell `StackBuf`, a 2-cell slice of a larger buffer, or a
+    list `[lo, hi]` of two 128-bit values (addressed in place, no copies).
+    """
+    _ = (a, b, out)
 
-    `md` is the whole 128-bit metadata word as a value the program computed, for
-    a hash whose block count is only known at run time. It replaces `counter`,
-    `final` and `last_node` (giving both is an error), and it must not name a
-    cell of `out`.
-
-    Message, chaining-value, and output operands are size-2 StackBufs or
-    2-cell slices `buf[lo:hi]` of larger StackBufs or HeapBufs (heap inputs are
-    bridged through the stack, one DEREF per cell)."""
-    _ = a, b, out, cv, counter, final, last_node, md

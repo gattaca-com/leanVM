@@ -5,13 +5,13 @@
 //! rows and eight committed bits, against 32 AND gates for the same S-box over
 //! GF(2). A call commits 5,888 bits and 1,536 rows ([`circuit`]), in a block of `2^13` and `2^11`; the
 //! univariate-skip zerocheck, the lincheck's sumcheck, the ring switch and the
-//! PCS are shared with [`crate::hash`], so the transcript shape is BLAKE2s's
-//! with a rectangular block.
+//! PCS are the BLAKE2s ones, so the transcript shape is BLAKE2s's with a
+//! rectangular block.
 //!
 //! What this proves: every call's S-boxes are inverted correctly and its
 //! output bits are the truncated feed-forward of the final state. Inputs and
 //! outputs are free witness bits at fixed slots; binding them is the embedder's
-//! job, as for BLAKE2s.
+//! job.
 
 pub mod circuit;
 pub mod kernels;
@@ -24,12 +24,12 @@ pub use circuit::{CALL_BITS, CALLS_PER_SLOT, CONST_COL, K_LOG, ROWS_LOG, USEFUL_
 pub use primitive::{IN_LEN, OUT_LEN, haraka512};
 pub use witness::{Input, PADDING_INPUT, Witness, generate};
 
-use crate::hash::SliceClaim;
 use crate::lincheck::QuirkyPoint;
 use crate::zerocheck::K_SKIP;
 use fiat_shamir::transcript::ProverState;
 use pcs::pack::{LOG_PACKING, PACKING_WIDTH};
 use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen};
+use primitives::field::F192;
 
 /// Slots for `n_calls` calls: at least 8 (one lincheck stripe).
 pub fn min_n_log(n_calls: usize) -> usize {
@@ -40,6 +40,14 @@ pub fn min_n_log(n_calls: usize) -> usize {
 /// The variable count of the committed column for `n_calls` calls.
 pub fn qflock_kappa(n_calls: usize) -> usize {
     K_LOG + min_n_log(n_calls) - LOG_PACKING
+}
+
+/// What the reduction leaves: the 64 bit-slice values of `z` at `suffix_point`, which the ring switch
+/// binds to the commitment.
+#[derive(Clone, Debug)]
+pub struct SliceClaim {
+    pub suffix_point: Vec<F192>,
+    pub s_hat_v: Vec<F192>,
 }
 
 /// The zerocheck's output: the quirky point lincheck runs at.
@@ -342,7 +350,6 @@ mod tests {
         open_batch_mixed_whir_stacked(&mut ps, mu, q_flock, &prover_data, &config, &[], &ring);
         let proof = ps.into_proof();
         let proof = scalar_proof(&proof);
-        verifier::verify_flock_batch_haraka(&seed[0], &seed[1], ROWS_LOG + n_log, LOG_INV_RATE_0, &proof)
-            .expect("verifies");
+        verifier::verify_flock_batch(&seed[0], &seed[1], ROWS_LOG + n_log, LOG_INV_RATE_0, &proof).expect("verifies");
     }
 }

@@ -1,4 +1,4 @@
-//! Batched BLAKE2s throughput across the thread pool, 64-byte blocks to 32-byte digests.
+//! Batched Haraka-512 throughput across the thread pool, 64-byte inputs to 32-byte digests.
 //! The passes follow [`bench::Plan::from_env`] (`BENCH_REPEAT`, `BENCH_COOLDOWN`).
 //!
 //! ```text
@@ -16,7 +16,7 @@ fn main() {
         parallel::chunks_mut(&mut out, K * 32, |i, sub| {
             let d = &data[i * K * 64..i * K * 64 + sub.len() * 2];
             for _ in 0..ITERS {
-                primitives::hash::hash_many::<64>(d, sub);
+                primitives::hash::haraka512_many_dyn(d, sub);
                 std::hint::black_box(&mut *sub);
             }
         });

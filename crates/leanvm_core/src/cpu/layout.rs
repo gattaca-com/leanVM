@@ -15,11 +15,11 @@ pub const MEM_HI: usize = 1;
 pub const MEM_TOP: usize = 2;
 pub const MFCNT: usize = 3; // per-cell memory access count, g^{A[i]}
 pub const BFCNT: usize = 4; // per-pc bytecode execution count, g^{A[pc]}
-// flock's packed BLAKE2s witness `q_flock`, committed in the SAME stack as every
-// other column (single PCS). Size `2^(K_LOG+n_log-6)` F64 words, always ≥ 1
-// instance (a no-BLAKE2s program commits one full padding instance). It is the
-// SOLE copy of the input/output words: the VM's BLAKE2s value columns are
-// virtual and their memory-bus claims route to `q_flock` slots (§hash_flock), so
+// flock's packed Haraka witness `q_flock`, committed in the SAME stack as every
+// other column (single PCS). Size `2^(K_LOG+n_log-6)` F64 words, always ≥ 8
+// instances (a no-Haraka program commits padding instances). It is the
+// SOLE copy of the input/output words: the VM's Haraka value columns are
+// virtual and their memory-bus claims route to `q_flock` slots (§haraka), so
 // nothing duplicates them. flock's R1CS validity is discharged by the single
 // stacked WHIR opening over this commitment.
 pub const QFLOCK: usize = 5;
@@ -98,7 +98,7 @@ pub(crate) struct Witness {
     pub(crate) layout: Layout,
     pub(crate) log_mem: usize,
     /// Freed immediately after reduction, before the mixed PCS opening.
-    pub(crate) flock_reduction: crate::hash_flock::PreparedReductionWitness,
+    pub(crate) flock_reduction: crate::haraka::PreparedReductionWitness,
 }
 
 impl Witness {
@@ -150,21 +150,20 @@ pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     k[MEM_TOP] = Some((1, 0));
     k[MFCNT] = Some((1, 0));
     k[BFCNT] = Some((0, log_bytecode));
-    // q_flock is `2^(K_LOG + n_blocks_log - LOG_PACKING)` F64 words, always ≥ 1
-    // instance (a no-BLAKE2s program commits one padding instance), and tau_5 IS
-    // n_blocks_log, so this reproduces `qflock_kappa`.
-    k[QFLOCK] = Some((2 + tables::BLAKE2S_TABLE, flock::hash::K_LOG - ::pcs::LOG_PACKING));
+    // q_flock is `2^(K_LOG + n_calls_log - LOG_PACKING)` F64 words, and tau_5 IS
+    // n_calls_log, so this reproduces `qflock_kappa`.
+    k[QFLOCK] = Some((2 + tables::HARAKA_TABLE, flock::haraka::K_LOG - ::pcs::LOG_PACKING));
     for (t, table) in tables::tables().iter().enumerate() {
         let base = sch.base[t];
         k[base..base + table.n_committed_columns()].fill(Some((2 + t, 0)));
     }
-    // The BLAKE2s value columns are ALWAYS virtual: `q_flock` already holds those
+    // The Haraka value columns are ALWAYS virtual: `q_flock` already holds those
     // words at fixed packed slots, so committing them again is redundant. Their
     // memory-bus claims route directly to `q_flock` slot evaluations (`slot_claims`),
     // which both binds them to the proven witness AND removes the separate
     // value-binding sub-protocol.
-    let b3 = sch.base[tables::BLAKE2S_TABLE];
-    for &c in &tables::BLAKE2S_VALUE_COLS {
+    let b3 = sch.base[tables::HARAKA_TABLE];
+    for &c in &tables::HARAKA_VALUE_COLS {
         k[b3 + c] = None;
     }
     k
@@ -226,7 +225,7 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 8] {
             Op::Set { o, .. } => o,
             Op::Deref { o1, o2, o3, .. } => o1.max(o2).max(o3),
             Op::Jump { oc, od, of } => oc.max(od).max(of),
-            Op::Blake2s { ins, cv, out, md } => ins[0].max(ins[1]).max(ins[2]).max(ins[3]).max(cv).max(out).max(md),
+            Op::Haraka { ins, out } => ins[0].max(ins[1]).max(ins[2]).max(ins[3]).max(out),
         })
         .max()
         .unwrap_or(0) as usize;
@@ -239,7 +238,7 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 8] {
         Op::Set { .. } => OP_SET,
         Op::Deref { .. } => OP_DEREF,
         Op::Jump { .. } => OP_JUMP,
-        Op::Blake2s { .. } => OP_BLAKE2S,
+        Op::Haraka { .. } => OP_HARAKA,
     };
     let operands = |op: &Op| -> (F64, F64, F64) {
         match *op {
@@ -249,34 +248,27 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 8] {
             Op::Set { o, k } => (g_at(o), F64(k.c0), F64(k.c1)),
             Op::Deref { o1, o2, o3, .. } => (g_at(o1), g_at(o2), g_at(o3)),
             Op::Jump { oc, od, of } => (g_at(oc), g_at(od), g_at(of)),
-            // BLAKE2s's first three input-word offsets; the last two ride the
-            // fpc/ffp bytecode slots below.
-            Op::Blake2s { ins, .. } => (g_at(ins[0]), g_at(ins[1]), g_at(ins[2])),
+            // Haraka's first three input-word offsets; the last one and the output
+            // base ride the fpc/ffp bytecode slots below.
+            Op::Haraka { ins, .. } => (g_at(ins[0]), g_at(ins[1]), g_at(ins[2])),
         }
     };
     // The 4th/5th bytecode operand slots: the two DEREF store-mode flags, or
-    // BLAKE2s's remaining input word / chaining-value base (0 elsewhere).
+    // Haraka's remaining input word / output base (0 elsewhere).
     let fpc = |op: &Op| match op {
         Op::Deref { mode, .. } => mode.f_pc(),
-        Op::Blake2s { ins, .. } => g_at(ins[3]),
+        Op::Haraka { ins, .. } => g_at(ins[3]),
         Op::Set { k, .. } => F64(k.c2),
         _ => F64::ZERO,
     };
     let ffp = |op: &Op| match op {
         Op::Deref { mode, .. } => mode.f_fp(),
-        Op::Blake2s { cv, .. } => g_at(*cv),
+        Op::Haraka { out, .. } => g_at(*out),
         _ => F64::ZERO,
     };
-    // The 6th/7th bytecode operand slots: BLAKE2s's output base and its metadata
-    // cell (0 elsewhere).
-    let extra0 = |op: &Op| match op {
-        Op::Blake2s { out, .. } => g_at(*out),
-        _ => F64::ZERO,
-    };
-    let extra1 = |op: &Op| match op {
-        Op::Blake2s { md, .. } => g_at(*md),
-        _ => F64::ZERO,
-    };
+    // The 6th/7th bytecode operand slots, unused (0 everywhere).
+    let extra0 = |_: &Op| F64::ZERO;
+    let extra1 = |_: &Op| F64::ZERO;
     // The program is PUBLIC (not committed): eight public columns over the
     // program cube, embedded in the bytecode seed/finalize blocks below.
     let column = |f: &(dyn Fn(&Op) -> F64 + Sync)| parallel::map_collect(prog.len(), |i| f(&prog[i]));
@@ -421,13 +413,13 @@ pub fn layout(prog: &[Op], log_mem: usize, rows: [usize; tables::N_TABLES], pi: 
     }
 }
 
-/// Every table's log height: the least that holds its rows.
+/// Every table's log height: the least that holds its rows, at least its floor.
 pub(crate) fn table_logs(rows: [usize; tables::N_TABLES]) -> [usize; tables::N_TABLES] {
-    let taus = rows.map(crate::log2_ceil_usize);
+    let taus = std::array::from_fn(|t| crate::log2_ceil_usize(rows[t]).max(tables::TABLE_LOG_FLOORS[t]));
     debug_assert_eq!(
-        taus[tables::BLAKE2S_TABLE],
-        crate::hash_flock::n_blocks_log(rows[tables::BLAKE2S_TABLE].max(1)),
-        "the BLAKE2s table is flock's batch"
+        taus[tables::HARAKA_TABLE],
+        crate::haraka::n_calls_log(rows[tables::HARAKA_TABLE].max(1)),
+        "the Haraka table is flock's batch"
     );
     taus
 }
@@ -510,29 +502,23 @@ impl Program {
             parallel::fill(windows[MFCNT], |i| tr.mem_count[i]); // counts ended at g^{A[i]}
             parallel::fill(windows[BFCNT], |i| tr.bytecode_count[i]); // … at g^{A[pc]}
         });
-        // flock's packed BLAKE2s witness q_flock, ALWAYS committed in this same stack:
-        // built from the executed BLAKE2s rows in order (row j = flock instance j),
-        // padded to `2^n_blocks_log(max(count,1))` instances with flock's padding
+        // flock's packed Haraka witness q_flock, ALWAYS committed in this same stack:
+        // built from the executed Haraka rows in order (row j = flock instance j),
+        // padded to `2^n_calls_log(max(count,1))` instances with flock's padding
         // instance, which is what the table's padding rows hold.
         let flock_reduction = crate::stage!("Build q_flock", || {
-            // The rows carry only their access counts; the compression's input
-            // words are the nine cells they read, in the finished (write-once)
-            // memory image.
-            let blocks: Vec<_> = parallel::map_collect(tr.blake2s.len(), |i| {
-                let r = &tr.blake2s[i];
-                let a = tables::blake2s_addresses(&self.prog, r);
-                let chunk = |c0: u32, c1: u32| {
-                    let (w0, w1) = (exec.mem[c0 as usize], exec.mem[c1 as usize]);
-                    [F64(w0.c0), F64(w0.c1), F64(w1.c0), F64(w1.c1)]
-                };
-                crate::hash_flock::compression(
-                    chunk(a[0], a[1]),
-                    chunk(a[2], a[3]),
-                    chunk(a[4], a[4] + 1),
-                    exec.mem[a[6] as usize],
-                )
+            // The rows carry only their access counts; the call's input words are
+            // the four cells they read, in the finished (write-once) memory image.
+            let inputs: Vec<_> = parallel::map_collect(tr.haraka.len(), |i| {
+                let a = tables::haraka_addresses(&self.prog, &tr.haraka[i]);
+                crate::haraka::input([
+                    exec.mem[a[0] as usize],
+                    exec.mem[a[1] as usize],
+                    exec.mem[a[2] as usize],
+                    exec.mem[a[3] as usize],
+                ])
             });
-            crate::hash_flock::build_qflock_prepared(&blocks, windows[QFLOCK])
+            crate::haraka::build_qflock_prepared(&inputs, windows[QFLOCK])
         });
 
         // (`execute` already asserts the run halts at the sentinel (pc, fp) =

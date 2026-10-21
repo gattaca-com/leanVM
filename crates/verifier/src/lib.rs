@@ -24,19 +24,18 @@ mod whir;
 
 pub use bytecode::Bytecode;
 pub use field::{E, K};
-pub use flock::FlockClaims;
-pub use haraka::{HarakaClaims, haraka_row_values};
+pub use haraka::{HARAKA_K_LOG, HARAKA_ROWS_LOG, HarakaClaims, haraka_row_values};
 pub use layout::gpow;
 pub use merkle::{MerkleOpenings, MerklePath, PrunedMerklePaths};
 pub use transcript::Proof;
 
 use bus::{ColumnClaim, table_sumcheck, verify_bus_balance};
 use field::{ZERO, powers};
-use flock::{ring_switch, verify_flock};
+use flock::ring_switch;
 use hash::Digest;
 use layout::{
-    BLAKE2S_R1CS_LOG_SIZE, FLOCK_K_SKIP, MAX_STACKED_LOG, MEMORY_0, MEMORY_1, MEMORY_2, MIN_STACKED_LOG, N_TABLES,
-    OP_BLAKE2S, QFLOCK, build_layout,
+    FLOCK_K_SKIP, MAX_STACKED_LOG, MEMORY_0, MEMORY_1, MEMORY_2, MIN_STACKED_LOG, N_TABLES, OP_HARAKA, QFLOCK,
+    build_layout,
 };
 use multilinear::{dot, multilinear_eval};
 use transcript::Transcript;
@@ -154,7 +153,7 @@ pub struct Summary {
     pub log_inv_rate: usize,
     /// Where the bus reads the stacked bytecode. Its value there is the claim an aggregate defers.
     pub bytecode_point: Vec<E>,
-    pub flock: FlockClaims,
+    pub flock: HarakaClaims,
     /// The stream cursor just after flock's reduction, where the stacked opening's own scalars start.
     pub flock_stream_end: usize,
     /// One opening per query, in the order the walk read them.
@@ -173,42 +172,11 @@ pub fn replay_unchecked(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Pr
     walk(bytecode, public_input, proof, false)
 }
 
-/// Exposed for flock's benchmark: a batch of BLAKE2s compressions proved alone, the packed witness the whole committed stack.
+/// Exposed for flock's benchmark: a batch of Haraka-512 calls proved alone, the packed witness the whole committed
+/// stack. `log_rows` is `11 + n_log`, the committed column has `log_rows + 2 - 6` variables.
 ///
 /// The proof is the commitment root, flock's reduction, then the ring switch and its opening, as in an execution proof.
 pub fn verify_flock_batch(
-    fiat_shamir_iv: &[u8; 32],
-    public_input: &[u8; 32],
-    log_n: usize,
-    log_inv_rate: usize,
-    proof: &Proof,
-) -> Result<FlockClaims, VerifierError> {
-    let stack_log = log_n.checked_sub(FLOCK_K_SKIP).ok_or(VerifierError::CommittedSize)?;
-    require(
-        log_n >= BLAKE2S_R1CS_LOG_SIZE && (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&stack_log),
-        VerifierError::CommittedSize,
-    )?;
-    let mut transcript = Transcript::new(proof, Digest(*fiat_shamir_iv), Digest(*public_input), true);
-    let halves = transcript.next_scalars(2)?;
-    let root = Digest::from_halves(halves[0], halves[1])?;
-    let claims = verify_flock(log_n, &mut transcript)?;
-    let (target, weight) = ring_switch(claims.point(), &claims.s, &mut transcript);
-    let ringswitch: StackClaim = (Box::new(weight), target);
-    verify_stacked_opening(
-        &mut transcript,
-        root,
-        stack_log,
-        1 << stack_log,
-        log_inv_rate,
-        &[ringswitch],
-    )?;
-    transcript.finish()?;
-    Ok(claims)
-}
-
-/// [`verify_flock_batch`] for the Haraka-512 circuit: `log_rows` is `11 + n_log`, the committed column has
-/// `log_rows + 2 - 6` variables.
-pub fn verify_flock_batch_haraka(
     fiat_shamir_iv: &[u8; 32],
     public_input: &[u8; 32],
     log_rows: usize,
@@ -302,9 +270,9 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         });
     }
 
-    // 6] BLAKE2s validity via Flock
-    let flock_log_n = BLAKE2S_R1CS_LOG_SIZE + layout.table_log_heights[OP_BLAKE2S];
-    let flock = verify_flock(flock_log_n, &mut transcript)?;
+    // 6] Haraka validity via Flock
+    let flock_log_rows = HARAKA_ROWS_LOG + layout.table_log_heights[OP_HARAKA];
+    let flock = haraka::verify_flock_haraka(flock_log_rows, &mut transcript)?;
     let flock_stream_end = transcript.stream_offset();
 
     // 7] Ring-switching

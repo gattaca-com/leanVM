@@ -1,7 +1,7 @@
 //! Proof transport and Fiat-Shamir.
 
 use crate::field::{E, K, ZERO};
-use crate::hash::{Digest, blake2s_hash};
+use crate::hash::{Digest, haraka512};
 use crate::merkle::{MerkleOpenings, MerklePath};
 use crate::multilinear::{log2_strict, poly_eval};
 use crate::{VerifierError, require};
@@ -40,7 +40,7 @@ pub fn compress(left: [u64; 4], right: [u64; 4]) -> [u64; 4] {
     for (bytes, word) in data.as_chunks_mut().0.iter_mut().zip(left.into_iter().chain(right)) {
         *bytes = word.to_le_bytes();
     }
-    blake2s_hash(&data).words()
+    haraka512(&data).words()
 }
 
 pub struct Transcript<'a> {

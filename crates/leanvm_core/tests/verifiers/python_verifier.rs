@@ -5,7 +5,7 @@
 
 use lean_compiler::{compile, parse_with_replacements};
 use leanvm_core::cpu::{Program, Proof, Stats, prove, verify};
-use primitives::field::{F64, F192, g_pow};
+use primitives::field::{F192, g_pow};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -26,7 +26,7 @@ def mix(value, tag):
 def main():
     seed = [5, 7]
     digest = StackBuf(2)
-    blake2s(seed, seed, digest)
+    haraka(seed, seed, digest)
 
     chain = HeapBuf(LOOP_STEPS + 1)
     chain[1] = digest[0]
@@ -74,15 +74,8 @@ fn python_verify(directory: &Path, bytecode: &Path, public_input: &Path, stream:
 }
 
 fn public_input() -> [F192; 2] {
-    use leanvm_core::hash_flock::{FINAL_FLAG, IV, PINNED_T, compression, digest, metadata};
-
-    let seed = [F64(5), F64::ZERO, F64(7), F64::ZERO];
-    let metadata = metadata(PINNED_T, FINAL_FLAG, 0);
-    let digest = digest(&compression(seed, seed, IV, metadata));
-    let digest = [
-        F192::new(digest[0].0, digest[1].0, 0),
-        F192::new(digest[2].0, digest[3].0, 0),
-    ];
+    let seed = [F192::new(5, 0, 0), F192::new(7, 0, 0)];
+    let digest = leanvm_core::haraka::digest_cells(&leanvm_core::haraka::input([seed[0], seed[1], seed[0], seed[1]]));
     let mut value = digest[0];
     let mut index = F192::ONE;
     let generator = F192::from(g_pow(1));

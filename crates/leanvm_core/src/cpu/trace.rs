@@ -43,19 +43,14 @@ pub(crate) struct Jrow {
     pub(crate) bytecode_read: F64,
 }
 
-/// `BLAKE2s` row: the nine per-cell memory access counts of the four
-/// message-chunk cells, the chaining value's two cells, the output's two and the
-/// metadata cell. The addresses are `fp·g^{ins[i]}`, `fp·g^{cv}`, `fp·g^{out}`,
-/// `fp·g^{md}` and the successors of the middle two; the eighteen flock words are
-/// those cells' lanes.
-pub(crate) struct Brow {
+/// `Haraka` row: the six per-cell memory access counts of the four message-chunk
+/// cells and the output's two. The addresses are `fp·g^{ins[i]}`, `fp·g^{out}` and its
+/// successor; the twelve flock words are those cells' lanes.
+pub(crate) struct Hrow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
-    pub(crate) ra: [F64; 2],  // per-cell counts for the two a input cells
-    pub(crate) rb: [F64; 2],  // … the two b input cells
-    pub(crate) rcv: [F64; 2], // … the two cv input cells
-    pub(crate) rc: [F64; 2],  // … the two c output cells
-    pub(crate) rmd: F64,      // … and the metadata cell
+    pub(crate) r_in: [F64; 4],
+    pub(crate) r_out: [F64; 2],
     pub(crate) bytecode_read: F64,
 }
 
@@ -65,7 +60,7 @@ pub(crate) struct Trace {
     pub(crate) set: Vec<Srow>,
     pub(crate) deref: Vec<Drow>,
     pub(crate) jump: Vec<Jrow>,
-    pub(crate) blake2s: Vec<Brow>,
+    pub(crate) haraka: Vec<Hrow>,
     pub(crate) mem_count: Vec<F64>, // per-cell running access count g^{count}; final = g^{A[i]}
     pub(crate) bytecode_count: Vec<F64>, // per-pc running execution count g^{count}; final = g^{A[pc]}
 }
@@ -79,7 +74,7 @@ impl Trace {
             self.set.len(),
             self.deref.len(),
             self.jump.len(),
-            self.blake2s.len(),
+            self.haraka.len(),
         ]
     }
 }

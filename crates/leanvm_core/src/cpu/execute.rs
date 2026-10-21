@@ -67,7 +67,7 @@ pub enum Fault {
     NotInK { what: &'static str, value: F192 },
     /// A word that has to be an address or a count is not a g-power in its range.
     NotAGPower { what: &'static str, value: F64 },
-    /// A `BLAKE2s` operand outside the 128-bit embedding.
+    /// A `Haraka` operand outside the 128-bit embedding.
     NotCanonical { operand: &'static str, value: F192 },
     /// A `MUL` asked to solve `a·x = c` for `x` with `a = 0`.
     BackSolveThroughZero,
@@ -132,7 +132,7 @@ impl std::fmt::Display for Fault {
             Self::NotAGPower { what, value } => write!(f, "{what} is not a g-power in range (0x{:016x})", value.0),
             Self::NotCanonical { operand, value } => write!(
                 f,
-                "BLAKE2s {operand} cell is not a canonical 128-bit embedding: top limb 0x{:016x}",
+                "Haraka {operand} cell is not a canonical 128-bit embedding: top limb 0x{:016x}",
                 value.c2
             ),
             Self::BackSolveThroughZero => write!(f, "cannot back-solve MUL through a zero operand"),
@@ -251,7 +251,7 @@ impl Program {
         let mut set: Vec<Srow> = Vec::new();
         let mut deref: Vec<Drow> = Vec::new();
         let mut jump: Vec<Jrow> = Vec::new();
-        let mut blake2s: Vec<Brow> = Vec::new();
+        let mut haraka: Vec<Hrow> = Vec::new();
 
         // A cell that is not `Written` holds ZERO. A `DEREF` between two unwritten cells
         // links them, and a write to either reaches the other at once.
@@ -798,52 +798,33 @@ impl Program {
                         pc += 1;
                     }
                 }
-                Op::Blake2s { ins, cv, out, md } => {
+                Op::Haraka { ins, out } => {
                     // Four independently-addressed 128-bit message chunks, each a
-                    // single cell; the chaining value and the output each span two
-                    // consecutive cells; the metadata is one more cell.
-                    let (aa0, aa1, ab0, ab1) = (fp + ins[0], fp + ins[1], fp + ins[2], fp + ins[3]);
-                    let acv = fp + cv;
-                    let ac = fp + out;
-                    let amd = fp + md;
-                    let words = [aa0, aa1, ab0, ab1, acv, acv + 1, amd].map(|a| m.read(a));
-                    // Naming the operand and the line matters most for the metadata,
-                    // the one a guest builds with field arithmetic rather than reads.
+                    // single cell; the output spans two consecutive cells.
+                    let a_in = ins.map(|o| fp + o);
+                    let a_out = fp + out;
+                    let words = a_in.map(|a| m.read(a));
                     if let Some((i, &value)) = words.iter().enumerate().find(|(_, w)| w.c2 != 0) {
-                        const CELLS: [&str; 7] = ["m0", "m1", "m2", "m3", "cv0", "cv1", "md"];
+                        const CELLS: [&str; 4] = ["m0", "m1", "m2", "m3"];
                         return Err(fail(Fault::NotCanonical {
                             operand: CELLS[i],
                             value,
                         }));
                     }
-                    let va = [F64(words[0].c0), F64(words[0].c1), F64(words[1].c0), F64(words[1].c1)];
-                    let vb = [F64(words[2].c0), F64(words[2].c1), F64(words[3].c0), F64(words[3].c1)];
-                    let vcv = [F64(words[4].c0), F64(words[4].c1), F64(words[5].c0), F64(words[5].c1)];
-                    let metadata = words[6];
-                    // Compress the 64 message bytes to the 32-byte result, then
-                    // write it to c's two cells. No table constraint covers the
-                    // digest (the relation is proven by flock, §hash_flock); the
-                    // interpreter still computes the definite digest so the output
-                    // cells are consistent for any later read.
-                    let vc = blake2s_compress(va, vb, vcv, metadata);
-                    let outputs = [F192::new(vc[0].0, vc[1].0, 0), F192::new(vc[2].0, vc[3].0, 0)];
-                    m.put(ac, outputs[0])?;
-                    m.put(ac + 1, outputs[1])?;
-                    let ra = [m.bump_access_count(aa0), m.bump_access_count(aa1)];
-                    let rb = [m.bump_access_count(ab0), m.bump_access_count(ab1)];
-                    let rcv = [m.bump_access_count(acv), m.bump_access_count(acv + 1)];
-                    let rc = [m.bump_access_count(ac), m.bump_access_count(ac + 1)];
-                    // Last, matching the flush order, so an md cell aliasing another
-                    // operand still pairs each read with its own count.
-                    let rmd = m.bump_access_count(amd);
-                    blake2s.push(Brow {
+                    // Hash the 64 message bytes to the 32-byte digest, then write it to
+                    // out's two cells. No table constraint covers the digest (the relation
+                    // is proven by flock, §haraka); the interpreter still computes the
+                    // definite digest so the output cells are consistent for any later read.
+                    let outputs = crate::haraka::digest_cells(&crate::haraka::input(words));
+                    m.put(a_out, outputs[0])?;
+                    m.put(a_out + 1, outputs[1])?;
+                    let r_in = a_in.map(|a| m.bump_access_count(a));
+                    let r_out = [m.bump_access_count(a_out), m.bump_access_count(a_out + 1)];
+                    haraka.push(Hrow {
                         pc,
                         fp,
-                        ra,
-                        rb,
-                        rcv,
-                        rc,
-                        rmd,
+                        r_in,
+                        r_out,
                         bytecode_read,
                     });
                     pc += 1;
@@ -900,7 +881,7 @@ impl Program {
             set,
             deref,
             jump,
-            blake2s,
+            haraka,
             mem_count: m.count,
             bytecode_count,
         };

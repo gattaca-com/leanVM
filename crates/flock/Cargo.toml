@@ -20,9 +20,5 @@ bench.workspace = true
 verifier.workspace = true
 
 [[bench]]
-name = "hash_batch"
-harness = false
-
-[[bench]]
 name = "hash_batch_haraka"
 harness = false

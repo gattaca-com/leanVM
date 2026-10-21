@@ -13,7 +13,7 @@ def main():
     a[0] = 5
     a[1] = 7
     c = StackBuf(2)
-    blake2s(a, a, c)
+    haraka(a, a, c)
     p = 1
     p[1] = c[0]
     p[GEN] = c[1]
@@ -71,7 +71,7 @@ fn any_number_of_compressions_proves() {
     for n in [0usize, 1, 2, 3, 8] {
         let mut source = String::from("def main():\n    h0 = StackBuf(2)\n    h0[0] = 5\n    h0[1] = 7\n");
         for i in 0..n {
-            source += &format!("    h{} = StackBuf(2)\n    blake2s(h{i}, h{i}, h{})\n", i + 1, i + 1);
+            source += &format!("    h{} = StackBuf(2)\n    haraka(h{i}, h{i}, h{})\n", i + 1, i + 1);
         }
         source += &format!("    p = 1\n    p[1] = h{n}[0]\n    p[GEN] = h{n}[1]\n    return\n");
         let mut h = [F64(5), F64(0), F64(7), F64(0)];

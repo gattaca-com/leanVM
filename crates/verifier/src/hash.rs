@@ -1,94 +1,159 @@
-//! BLAKE2s and digests.
+//! Haraka-512 and digests.
 
 use crate::field::E;
 use crate::{VerifierError, require};
 
-pub const BLAKE2S_IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
-];
-/// The IV with the parameter block of an unkeyed 32-byte hash (fanout and depth 1) folded into word 0.
-pub const PARAM_IV: [u32; 8] = {
-    let mut iv = BLAKE2S_IV;
-    iv[0] ^= 0x0101_0020;
-    iv
-};
-#[rustfmt::skip]
-pub const BLAKE2S_SIGMA: [[usize; 16]; 10] = [
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
-    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
-    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
-    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
-    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
-    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
-    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
-    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
-];
-#[rustfmt::skip]
-pub const BLAKE2S_G_LANES: [[usize; 4]; 8] = [
-    [0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15],
-    [0, 5, 10, 15], [1, 6, 11, 12], [2, 7, 8, 13], [3, 4, 9, 14],
+const RC32: [[u32; 4]; 40] = [
+    [0x0684704c, 0xe620c00a, 0xb2c5fef0, 0x75817b9d],
+    [0x8b66b4e1, 0x88f3a06b, 0x640f6ba4, 0x2f08f717],
+    [0x3402de2d, 0x53f28498, 0xcf029d60, 0x9f029114],
+    [0x0ed6eae6, 0x2e7b4f08, 0xbbf3bcaf, 0xfd5b4f79],
+    [0xcbcfb0cb, 0x4872448b, 0x79eecd1c, 0xbe397044],
+    [0x7eeacdee, 0x6e9032b7, 0x8d5335ed, 0x2b8a057b],
+    [0x67c28f43, 0x5e2e7cd0, 0xe2412761, 0xda4fef1b],
+    [0x2924d9b0, 0xafcacc07, 0x675ffde2, 0x1fc70b3b],
+    [0xab4d63f1, 0xe6867fe9, 0xecdb8fca, 0xb9d465ee],
+    [0x1c30bf84, 0xd4b7cd64, 0x5b2a404f, 0xad037e33],
+    [0xb2cc0bb9, 0x941723bf, 0x69028b2e, 0x8df69800],
+    [0xfa0478a6, 0xde6f5572, 0x4aaa9ec8, 0x5c9d2d8a],
+    [0xdfb49f2b, 0x6b772a12, 0x0efa4f2e, 0x29129fd4],
+    [0x1ea10344, 0xf449a236, 0x32d611ae, 0xbb6a12ee],
+    [0xaf044988, 0x4b050084, 0x5f9600c9, 0x9ca8eca6],
+    [0x21025ed8, 0x9d199c4f, 0x78a2c7e3, 0x27e593ec],
+    [0xbf3aaaf8, 0xa759c9b7, 0xb9282ecd, 0x82d40173],
+    [0x6260700d, 0x6186b017, 0x37f2efd9, 0x10307d6b],
+    [0x5aca45c2, 0x21300443, 0x81c29153, 0xf6fc9ac6],
+    [0x9223973c, 0x226b68bb, 0x2caf92e8, 0x36d1943a],
+    [0xd3bf9238, 0x225886eb, 0x6cbab958, 0xe51071b4],
+    [0xdb863ce5, 0xaef0c677, 0x933dfddd, 0x24e1128d],
+    [0xbb606268, 0xffeba09c, 0x83e48de3, 0xcb2212b1],
+    [0x734bd3dc, 0xe2e4d19c, 0x2db91a4e, 0xc72bf77d],
+    [0x43bb47c3, 0x61301b43, 0x4b1415c4, 0x2cb3924e],
+    [0xdba775a8, 0xe707eff6, 0x03b231dd, 0x16eb6899],
+    [0x6df3614b, 0x3c755977, 0x8e5e2302, 0x7eca472c],
+    [0xcda75a17, 0xd6de7d77, 0x6d1be5b9, 0xb88617f9],
+    [0xec6b43f0, 0x6ba8e9aa, 0x9d6c069d, 0xa946ee5d],
+    [0xcb1e6950, 0xf957332b, 0xa2531159, 0x3bf327c1],
+    [0x2cee0c75, 0x00da619c, 0xe4ed0353, 0x600ed0d9],
+    [0xf0b1a5a1, 0x96e90cab, 0x80bbbabc, 0x63a4a350],
+    [0xae3db102, 0x5e962988, 0xab0dde30, 0x938dca39],
+    [0x17bb8f38, 0xd554a40b, 0x8814f3a8, 0x2e75b442],
+    [0x34bb8a5b, 0x5f427fd7, 0xaeb6b779, 0x360a16f6],
+    [0x26f65241, 0xcbe55438, 0x43ce5918, 0xffbaafde],
+    [0x4ce99a54, 0xb9f3026a, 0xa2ca9cf7, 0x839ec978],
+    [0xae51a51a, 0x1bdff7be, 0x40c06e28, 0x22901235],
+    [0xa0c1613c, 0xba7ed22b, 0xc173bc0f, 0x48a659cf],
+    [0x756acc03, 0x02288288, 0x4ad6bdfd, 0xe9c59da1],
 ];
 
-/// One round's eight gates.
-#[inline(always)]
-fn round(v: &mut [u32; 16], m: &[u32; 16], sigma: &[usize; 16]) {
-    for (gate, &[a, b, c, d]) in BLAKE2S_G_LANES.iter().enumerate() {
-        v[a] = v[a].wrapping_add(v[b]).wrapping_add(m[sigma[2 * gate]]);
-        v[d] = (v[d] ^ v[a]).rotate_right(16);
-        v[c] = v[c].wrapping_add(v[d]);
-        v[b] = (v[b] ^ v[c]).rotate_right(12);
-        v[a] = v[a].wrapping_add(v[b]).wrapping_add(m[sigma[2 * gate + 1]]);
-        v[d] = (v[d] ^ v[a]).rotate_right(8);
-        v[c] = v[c].wrapping_add(v[d]);
-        v[b] = (v[b] ^ v[c]).rotate_right(7);
+/// Byte `b` of round constant `i`, in state byte order.
+pub(crate) fn rc_byte(i: usize, b: usize) -> u8 {
+    (RC32[i][3 - b / 4] >> (8 * (b % 4))) as u8
+}
+
+/// `MIX[dst][d] = (src_state, src_dword)` of the dword mix between rounds.
+pub(crate) const MIX: [[(usize, usize); 4]; 4] = [
+    [(0, 3), (2, 3), (1, 3), (3, 3)],
+    [(2, 0), (0, 0), (3, 0), (1, 0)],
+    [(2, 1), (0, 1), (3, 1), (1, 1)],
+    [(0, 2), (2, 2), (1, 2), (3, 2)],
+];
+
+pub(crate) const MIX_COLUMNS: [[u8; 4]; 4] = [[2, 3, 1, 1], [1, 2, 3, 1], [1, 1, 2, 3], [3, 1, 1, 2]];
+
+/// Byte `i` of the truncated output comes from `(state, byte)` of the fed-forward state.
+pub(crate) const fn out_source(i: usize) -> (usize, usize) {
+    match i / 8 {
+        0 => (0, 8 + i % 8),
+        1 => (1, 8 + i % 8),
+        2 => (2, i % 8),
+        _ => (3, i % 8),
     }
 }
 
-fn compression(h: &mut [u32; 8], block: &[u8; 64], counter: u64, last: bool) {
-    let m: [u32; 16] = std::array::from_fn(|i| u32::from_le_bytes(block.as_chunks().0[i]));
-    let mut v = [0u32; 16];
-    v[..8].copy_from_slice(h);
-    v[8..].copy_from_slice(&BLAKE2S_IV);
-    v[12] ^= counter as u32;
-    v[13] ^= (counter >> 32) as u32;
-    if last {
-        v[14] = !v[14];
+fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        if b & 1 == 1 {
+            p ^= a;
+        }
+        let carry = a & 0x80;
+        a <<= 1;
+        if carry != 0 {
+            a ^= 0x1b;
+        }
+        b >>= 1;
     }
-    // Spelled out: a loop over the rounds is kept rolled, and its message indices loaded and bounds checked.
-    let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9] = &BLAKE2S_SIGMA;
-    round(&mut v, &m, s0);
-    round(&mut v, &m, s1);
-    round(&mut v, &m, s2);
-    round(&mut v, &m, s3);
-    round(&mut v, &m, s4);
-    round(&mut v, &m, s5);
-    round(&mut v, &m, s6);
-    round(&mut v, &m, s7);
-    round(&mut v, &m, s8);
-    round(&mut v, &m, s9);
-    for i in 0..8 {
-        h[i] ^= v[i] ^ v[i + 8];
-    }
+    p
 }
 
-/// Standard 32-byte unkeyed BLAKE2s-256 hash.
-pub fn blake2s_hash(data: &[u8]) -> Digest {
-    let mut h = PARAM_IV;
-    // The last block is the one compressed with the final flag, and is never empty unless the input is.
-    let last_start = data.len().saturating_sub(1) / 64 * 64;
-    for (index, block) in data[..last_start].as_chunks().0.iter().enumerate() {
-        compression(&mut h, block, 64 * (index as u64 + 1), false);
+fn sbox(x: u8) -> u8 {
+    let mut r = x;
+    if x != 0 {
+        for _ in 0..6 {
+            r = gf_mul(gf_mul(r, r), x);
+        }
+        r = gf_mul(r, r);
     }
-    let mut block = [0u8; 64];
-    block[..data.len() - last_start].copy_from_slice(&data[last_start..]);
-    compression(&mut h, &block, data.len() as u64, true);
-    let mut value = [0u8; 32];
-    for (bytes, word) in value.as_chunks_mut().0.iter_mut().zip(h) {
-        *bytes = word.to_le_bytes();
+    r ^ r.rotate_left(1) ^ r.rotate_left(2) ^ r.rotate_left(3) ^ r.rotate_left(4) ^ 0x63
+}
+
+/// One AES round on a column-major state: SubBytes, ShiftRows, MixColumns, then the round constant.
+fn aes_round(s: &[u8; 16], rc: usize) -> [u8; 16] {
+    let y: [u8; 16] = std::array::from_fn(|i| sbox(s[4 * ((i / 4 + i % 4) % 4) + i % 4]));
+    std::array::from_fn(|i| {
+        let (c, r) = (i / 4, i % 4);
+        (0..4).fold(rc_byte(rc, i), |acc, t| acc ^ gf_mul(MIX_COLUMNS[r][t], y[4 * c + t]))
+    })
+}
+
+/// Haraka-512 v2 of 64 bytes: the VM's hash opcode.
+pub fn haraka512(msg: &[u8; 64]) -> Digest {
+    let mut st: [[u8; 16]; 4] = std::array::from_fn(|b| msg[16 * b..16 * b + 16].try_into().unwrap());
+    for round in 0..5 {
+        for sub in 0..2 {
+            for blk in 0..4 {
+                st[blk] = aes_round(&st[blk], 4 * (2 * round + sub) + blk);
+            }
+        }
+        let old = st;
+        for (dst, row) in MIX.iter().enumerate() {
+            for (d, &(src_blk, src_d)) in row.iter().enumerate() {
+                st[dst][4 * d..4 * d + 4].copy_from_slice(&old[src_blk][4 * src_d..4 * src_d + 4]);
+            }
+        }
     }
-    Digest(value)
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        let (blk, b) = out_source(i);
+        *o = st[blk][b] ^ msg[16 * blk + b];
+    }
+    Digest(out)
+}
+
+/// The chain over 32-byte blocks from the zero chaining value, closed by a `1` byte, zeros, and the
+/// length as eight little-endian bytes ending a block.
+pub fn hash(data: &[u8]) -> Digest {
+    let mut cv = [0u8; 32];
+    let mut step = |block: &[u8; 32]| {
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&cv);
+        input[32..].copy_from_slice(block);
+        cv = haraka512(&input).0;
+    };
+    let (blocks, tail) = data.as_chunks::<32>();
+    for block in blocks {
+        step(block);
+    }
+    let mut last = [[0u8; 32]; 2];
+    last[0][..tail.len()].copy_from_slice(tail);
+    last[0][tail.len()] = 1;
+    let n = if tail.len() + 9 <= 32 { 1 } else { 2 };
+    last[n - 1][24..].copy_from_slice(&(data.len() as u64).to_le_bytes());
+    for block in &last[..n] {
+        step(block);
+    }
+    Digest(cv)
 }
 
 /// 256 bits
@@ -126,26 +191,10 @@ impl Digest {
 mod tests {
     use super::*;
 
-    /// Official unkeyed BLAKE2s-256 vectors: the digest of the bytes `00 01 .. n-1`, at lengths either side of every block boundary case.
-    const VECTORS: [(usize, &str); 6] = [
-        (0, "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9"),
-        (1, "e34d74dbaf4ff4c6abd871cc220451d2ea2648846c7757fbaac82fe51ad64bea"),
-        (63, "e57cb79487dd57902432b250733813bd96a84efce59f650fac26e6696aefafc3"),
-        (64, "56f34e8b96557e90c1f24b52d0c89d51086acf1b00f634cf1dde9233b8eaaa3e"),
-        (65, "1b53ee94aaf34e4b159d48de352c7f0661d0a40edff95a0b1639b4090e974472"),
-        (199, "1d4e5487ae3c740f2ba6e541ac91bc2bfcd2999c518d807b426748803a350fd4"),
-    ];
-
     #[test]
-    fn matches_official_vectors() {
-        for (n, want) in VECTORS {
-            let input: Vec<u8> = (0..n).map(|i| i as u8).collect();
-            let got: String = blake2s_hash(&input)
-                .0
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            assert_eq!(got, want, "{n} bytes");
-        }
+    fn matches_the_test_vector() {
+        let input: [u8; 64] = std::array::from_fn(|i| i as u8);
+        let got: String = haraka512(&input).0.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(got, "be7f723b4e80a99813b292287f306f625a6d57331cae5f34dd9277b0945be2aa");
     }
 }

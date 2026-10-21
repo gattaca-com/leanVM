@@ -1,12 +1,13 @@
 //! What the two schemes share: the tweakable hash
-//! `Th(P, A, M) = Truncate_n(BLAKE2s(P | A | M))`, its address and the address
+//! `Th(P, A, M) = Truncate_n(H(P | A | M))`, its address and the address
 //! types, so the recursion guest builds both schemes' addresses alike.
 //!
-//! The public parameter and the address are 16 bytes each, as every value hashed
-//! after them is: a chain step and a Merkle node are one compression, and a prover
+//! `H` is one Haraka-512 call when `P | A | M` fits its 64 bytes (zero-padded), the chain
+//! [`primitives::hash::hash`] otherwise. The public parameter and the address are 16 bytes each,
+//! as every value hashed after them is: a chain step and a Merkle node are one call, and a prover
 //! whose words are 16 bytes never has to cut a value in two.
 
-use primitives::hash::Hasher;
+use primitives::hash::{BLOCK_LEN, Hasher, IN_LEN, OUT_LEN, haraka512};
 
 /// `n`: hash value and Merkle node length, in bytes.
 pub const N: usize = 16;
@@ -63,21 +64,38 @@ pub fn address(tw: &Tweak) -> [u8; ADDRESS_LEN] {
     out
 }
 
-/// Compressions BLAKE2s spends on a hash input whose payload is `payload` bytes.
+/// Calls `H` spends on a hash input whose payload is `payload` bytes.
 pub const fn blocks(payload: usize) -> usize {
-    (PUBLIC_PARAM_LEN + ADDRESS_LEN + payload).div_ceil(64)
+    if payload <= BLOCK_LEN {
+        1
+    } else {
+        (PUBLIC_PARAM_LEN + ADDRESS_LEN + payload + 9).div_ceil(BLOCK_LEN)
+    }
 }
 
-/// A hasher that has absorbed `P | A`.
+/// A hasher that has absorbed `P | A`, for a payload longer than one call takes.
 pub fn hasher(pp: &PublicParam, tw: &Tweak) -> Hasher {
     let mut hasher = Hasher::new();
     hasher.update(pp).update(&address(tw));
     hasher
 }
 
+/// `H(P | A | M)` whole.
+fn image(pp: &PublicParam, tw: &Tweak, payload: &[u8]) -> [u8; OUT_LEN] {
+    if payload.len() <= BLOCK_LEN {
+        let mut input = [0u8; IN_LEN];
+        input[..PUBLIC_PARAM_LEN].copy_from_slice(pp);
+        input[PUBLIC_PARAM_LEN..PUBLIC_PARAM_LEN + ADDRESS_LEN].copy_from_slice(&address(tw));
+        input[BLOCK_LEN..BLOCK_LEN + payload.len()].copy_from_slice(payload);
+        haraka512(&input)
+    } else {
+        hasher(pp, tw).update(payload).finalize()
+    }
+}
+
 /// `Th` over a byte payload.
 pub fn th(pp: &PublicParam, tw: &Tweak, payload: &[u8]) -> Digest {
-    hasher(pp, tw).update(payload).finalize()[..N].try_into().unwrap()
+    image(pp, tw, payload)[..N].try_into().unwrap()
 }
 
 /// `Th` over a concatenation of digests: a Merkle node, a leaf, a few-time key.
@@ -87,7 +105,7 @@ pub fn th_digests(pp: &PublicParam, tw: &Tweak, values: &[Digest]) -> Digest {
 
 /// Two secrets for one hash: the two halves of the untruncated hash of the seed.
 pub fn th_pair(pp: &PublicParam, tw: &Tweak, seed: &[u8; 32]) -> [Digest; 2] {
-    let output = hasher(pp, tw).update(seed).finalize();
+    let output = image(pp, tw, seed);
     [output[..N].try_into().unwrap(), output[N..].try_into().unwrap()]
 }
 
@@ -113,7 +131,11 @@ mod tests {
         assert_eq!(address(&tw)[8..], [0; 8]);
         let pp: PublicParam = std::array::from_fn(|i| i as u8 + 1);
         let payload = [9u8; N];
-        let input = [&pp[..], &address(&tw), &payload].concat();
-        assert_eq!(th(&pp, &tw, &payload)[..], primitives::hash::hash(&input)[..N]);
+        let mut input = [0u8; 64];
+        input[..48].copy_from_slice(&[&pp[..], &address(&tw), &payload].concat());
+        assert_eq!(th(&pp, &tw, &payload)[..], haraka512(&input)[..N]);
+        let long = [9u8; 40];
+        let input = [&pp[..], &address(&tw), &long].concat();
+        assert_eq!(th(&pp, &tw, &long)[..], primitives::hash::hash(&input)[..N]);
     }
 }

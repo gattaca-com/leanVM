@@ -237,11 +237,11 @@ pub fn parse_with_replacements(src: &str, replacements: &BTreeMap<String, String
 const BUILTINS: &[&str] = &[
     "addr",
     "assert_in_k",
-    "blake2s",
     "const",
     "f192",
     "hint_decompose_bits",
     "hint_decompose_bits_exponent",
+    "haraka",
     "hint_f192_limbs",
     "hint_log2_ceil",
     "hint_witness",

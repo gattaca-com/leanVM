@@ -247,9 +247,9 @@ pub fn disassemble(prog: &[Op]) -> String {
             Op::Jump { oc, od, of } => {
                 format!("JUMP   if fp[{oc}]≠0: pc=fp[{od}], fp=fp[{of}]")
             }
-            Op::Blake2s { ins, cv, out, md } => {
+            Op::Haraka { ins, out } => {
                 format!(
-                    "BLAKE2S fp[{out}..]= compress(cv=fp[{cv}..], m=fp[{}],fp[{}],fp[{}],fp[{}], meta=fp[{md}])",
+                    "HARAKA fp[{out}..]= haraka512(fp[{}],fp[{}],fp[{}],fp[{}])",
                     ins[0], ins[1], ins[2], ins[3]
                 )
             }
@@ -322,11 +322,6 @@ fn resolve(op: &LOp, entry: &HashMap<String, u32>, sentinel: u32, pc0: u32, fram
             od: *od,
             of: *of,
         },
-        LOp::Blake2s { ins, cv, c, md } => Op::Blake2s {
-            ins: *ins,
-            cv: *cv,
-            out: *c,
-            md: *md,
-        },
+        LOp::Haraka { ins, c } => Op::Haraka { ins: *ins, out: *c },
     }
 }

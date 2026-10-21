@@ -16,7 +16,7 @@
 //! `eval_constraint` takes.
 
 use crate::colval::ColVal;
-use crate::cpu::{Brow, Drow, Jrow, Op, Srow, Trace};
+use crate::cpu::{Drow, Hrow, Jrow, Op, Srow, Trace};
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
 use primitives::field::{F64, F192, mul_by_g};
 
@@ -101,7 +101,7 @@ pub(crate) const OP_MUL: F64 = g_pow(1);
 pub(crate) const OP_SET: F64 = g_pow(2);
 pub(crate) const OP_DEREF: F64 = g_pow(3);
 pub(crate) const OP_JUMP: F64 = g_pow(4);
-pub(crate) const OP_BLAKE2S: F64 = g_pow(5);
+pub(crate) const OP_HARAKA: F64 = g_pow(5);
 
 // ---- flush builder -----------------------------------------------------------
 
@@ -368,7 +368,7 @@ pub trait Table: Sync {
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]);
 }
 
-/// The tables in fixed order `[XOR, MUL, SET, DEREF, JUMP, BLAKE2S]`, the
+/// The tables in fixed order `[XOR, MUL, SET, DEREF, JUMP, HARAKA]`, the
 /// order of `row_counts` / `taus` throughout `cpu`.
 pub const N_TABLES: usize = 6;
 
@@ -379,67 +379,45 @@ pub fn tables() -> [&'static dyn Table; N_TABLES] {
         &SetTable,
         &DerefTable,
         &JumpTable,
-        &Blake2sTable,
+        &HarakaTable,
     ]
 }
 
-/// Index of the BLAKE2s table in [`tables`].
-pub(crate) const BLAKE2S_TABLE: usize = 5;
+/// Index of the Haraka table in [`tables`].
+pub(crate) const HARAKA_TABLE: usize = 5;
 
-/// The seven base addresses a `BLAKE2s` row reads: the four message cells, the
-/// chaining-value base, the output base (each of those two spans that cell and
-/// its successor) and the metadata cell. Recovered from the instruction, not
-/// stored per row.
-pub(crate) fn blake2s_addresses(prog: &[Op], r: &Brow) -> [u32; 7] {
+/// The least log height of each table: the Haraka table is flock's batch, whose lincheck stripes eight calls.
+pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, 3];
+
+/// The five base addresses a `Haraka` row reads: the four message cells and the
+/// output base (which spans that cell and its successor). Recovered from the
+/// instruction, not stored per row.
+pub(crate) fn haraka_addresses(prog: &[Op], r: &Hrow) -> [u32; 5] {
     match prog[r.pc as usize] {
-        Op::Blake2s { ins, cv, out, md } => [
-            r.fp + ins[0],
-            r.fp + ins[1],
-            r.fp + ins[2],
-            r.fp + ins[3],
-            r.fp + cv,
-            r.fp + out,
-            r.fp + md,
-        ],
-        op => unreachable!("a BLAKE2s row's pc {} holds {op:?}", r.pc),
+        Op::Haraka { ins, out } => [r.fp + ins[0], r.fp + ins[1], r.fp + ins[2], r.fp + ins[3], r.fp + out],
+        op => unreachable!("a Haraka row's pc {} holds {op:?}", r.pc),
     }
 }
 
-/// BLAKE2s value-column LOCAL indices in canonical slot order
-/// `[a0..a3, b0..b3, c0..c3, cv0..cv3, md_lo, md_hi]` (matches
-/// `hash_flock::SLOTS`). These columns are
-/// VIRTUAL (never committed): `q_flock` already holds those words at fixed packed
-/// slots, so `cpu` routes their memory-bus evaluation claims straight to `q_flock`
-/// (`slot_claims`): the value the bus flushes IS the flock-proven word.
-pub const BLAKE2S_VALUE_COLS: [usize; 18] = [
-    blake2st::V_M0,
-    blake2st::V_M0 + 1,
-    blake2st::V_M0 + 2,
-    blake2st::V_M0 + 3,
-    blake2st::V_M2,
-    blake2st::V_M2 + 1,
-    blake2st::V_M2 + 2,
-    blake2st::V_M2 + 3,
-    blake2st::V_OUT0,
-    blake2st::V_OUT0 + 1,
-    blake2st::V_OUT0 + 2,
-    blake2st::V_OUT0 + 3,
-    blake2st::V_CV0,
-    blake2st::V_CV0 + 1,
-    blake2st::V_CV0 + 2,
-    blake2st::V_CV0 + 3,
-    blake2st::MD0,
-    blake2st::MD1,
+/// Haraka value-column LOCAL indices in canonical slot order `[m0.lo, m0.hi, .., m3.hi, out0.lo, ..,
+/// out1.hi]` (matches `haraka::SLOTS`). These columns are VIRTUAL (never committed): `q_flock` already
+/// holds those words at fixed packed slots, so `cpu` routes their memory-bus evaluation claims straight
+/// to `q_flock` (`slot_claims`): the value the bus flushes IS the flock-proven word.
+pub const HARAKA_VALUE_COLS: [usize; 12] = [
+    harakat::V_M0,
+    harakat::V_M0 + 1,
+    harakat::V_M0 + 2,
+    harakat::V_M0 + 3,
+    harakat::V_M0 + 4,
+    harakat::V_M0 + 5,
+    harakat::V_M0 + 6,
+    harakat::V_M0 + 7,
+    harakat::V_OUT0,
+    harakat::V_OUT0 + 1,
+    harakat::V_OUT0 + 2,
+    harakat::V_OUT0 + 3,
 ];
-// The eighteen value lanes are laid out contiguously (V_M0..V_M0+17), so they map
-// 1:1 onto `hash_flock::SLOTS`.
-const _: () = assert!(
-    blake2st::V_M2 == blake2st::V_M0 + 4
-        && blake2st::V_OUT0 == blake2st::V_M0 + 8
-        && blake2st::V_CV0 == blake2st::V_M0 + 12
-        && blake2st::MD0 == blake2st::V_M0 + 16
-        && blake2st::MD1 == blake2st::V_M0 + 17
-);
+const _: () = assert!(harakat::V_OUT0 == harakat::V_M0 + 8);
 
 // ---- XOR / MUL ---------------------------------------------------------------
 
@@ -829,151 +807,108 @@ impl Table for JumpTable {
     }
 }
 
-// ---- BLAKE2s ------------------------------------------------------------------
+// ---- Haraka ------------------------------------------------------------------
 
-/// `BLAKE2s` (“BLAKE2s” in `doc/leanvm/body/07-instruction-tables.tex`): one standard compression. The four 128-bit message
-/// chunks are addressed *independently* at `fp·o_i` (`o_i = g^{ins[i]}`), each a
-/// single cell, with no forced contiguity between chunks, so a caller hashing e.g.
-/// `(tweak, pp)` need not copy them into adjacent cells. The chaining value and the
-/// 32-byte output each occupy two consecutive cells, based at `fp·o_cv` and
-/// `fp·o_c`, and the metadata is one more cell at `fp·o_md`, so the row reads nine
-/// cells in all. No address is committed: each rides the bus as the product `fp·o_X`
-/// (§sec:m3). The compression relating output words to input words carries no
-/// table constraint either: it is proven by flock's R1CS validity via `q_flock`
-/// (§hash_flock), which leaves this table with no identity of its own.
+/// `Haraka` (“Haraka” in `doc/leanvm/body/07-instruction-tables.tex`): one Haraka-512 call. The four
+/// 128-bit message chunks are addressed *independently* at `fp·o_i` (`o_i = g^{ins[i]}`), each a single
+/// cell, with no forced contiguity between chunks, so a caller hashing e.g. `(tweak, pp)` need not copy
+/// them into adjacent cells. The 32-byte output occupies two consecutive cells based at `fp·o_out`, so
+/// the row reads six cells in all. No address is committed: each rides the bus as the product `fp·o_X`
+/// (§sec:m3). The call relating output words to input words carries no table constraint either: it is
+/// proven by flock's R1CS validity via `q_flock` (§haraka), which leaves this table with no identity of
+/// its own.
 ///
-/// A 128-bit chunk is two flock 64-bit words (lo, hi lanes), so the eighteen
-/// memory-borne flock words are eighteen value LANE columns over the nine cells.
-/// They are listed in `n_committed_columns` (they need a local index for the
-/// flushes and are filled from the trace for the bus), but `cpu` treats them as
-/// VIRTUAL (not committed) and routes their bus claims to `q_flock`, which already
-/// holds those words (see [`BLAKE2S_VALUE_COLS`]).
-struct Blake2sTable;
+/// A 128-bit chunk is two flock 64-bit words (lo, hi lanes), so the twelve memory-borne flock words are
+/// twelve value LANE columns over the six cells. They are listed in `n_committed_columns` (they need a
+/// local index for the flushes and are filled from the trace for the bus), but `cpu` treats them as
+/// VIRTUAL (not committed) and routes their bus claims to `q_flock`, which already holds those words
+/// (see [`HARAKA_VALUE_COLS`]).
+struct HarakaTable;
 
-pub(crate) mod blake2st {
+pub(crate) mod harakat {
     pub const PC: usize = 0;
     pub const FP: usize = 1;
     pub const O_M0: usize = 2; // operand g-powers (offsets) of the four message cells …
     pub const O_M1: usize = 3;
     pub const O_M2: usize = 4;
     pub const O_M3: usize = 5;
-    pub const O_CV: usize = 6; // … the chaining-value base …
-    pub const O_OUT: usize = 7; // … the output base …
-    pub const O_MD: usize = 8; // … and the metadata cell
-    // The eighteen flock lanes: a (lo, hi) pair for each of the nine cells,
-    // the four message cells first, then the output pair, the chaining-value
-    // pair, and last the metadata cell's counter and flag lanes.
-    pub const V_M0: usize = 9; // m0.lo, m0.hi, m1.lo, m1.hi
-    pub const V_M2: usize = 13; // m2.lo, m2.hi, m3.lo, m3.hi
-    pub const V_OUT0: usize = 17; // out0.lo, out0.hi, out1.lo, out1.hi
-    pub const V_CV0: usize = 21; // cv0.lo, cv0.hi, cv1.lo, cv1.hi
-    pub const MD0: usize = 25; // metadata: the counter lane …
-    pub const MD1: usize = 26; // … and the final ‖ last_node lane
-    pub const R_M0: usize = 27; // one read count per cell: the four message cells …
-    pub const R_M1: usize = 28;
-    pub const R_M2: usize = 29;
-    pub const R_M3: usize = 30;
-    pub const R_CV0: usize = 31; // … the two chaining-value cells …
-    pub const R_CV1: usize = 32;
-    pub const R_OUT0: usize = 33; // … the two output cells …
-    pub const R_OUT1: usize = 34;
-    pub const R_MD: usize = 35; // … and the metadata cell.
-    pub const RBC: usize = 36;
-    pub const N: usize = 37;
+    pub const O_OUT: usize = 6; // … and the output base
+    // The twelve flock lanes: a (lo, hi) pair for each of the six cells, the four message cells first.
+    pub const V_M0: usize = 7;
+    pub const V_OUT0: usize = 15;
+    pub const R_M0: usize = 19; // one read count per cell: the four message cells …
+    pub const R_M1: usize = 20;
+    pub const R_M2: usize = 21;
+    pub const R_M3: usize = 22;
+    pub const R_OUT0: usize = 23; // … and the two output cells.
+    pub const R_OUT1: usize = 24;
+    pub const RBC: usize = 25;
+    pub const N: usize = 26;
 }
 
-impl Table for Blake2sTable {
+impl Table for HarakaTable {
     fn n_committed_columns(&self) -> usize {
-        blake2st::N
+        harakat::N
     }
     fn count_columns(&self) -> &'static [usize] {
-        use blake2st::*;
-        &[R_M0, R_M1, R_M2, R_M3, R_CV0, R_CV1, R_OUT0, R_OUT1, R_MD, RBC]
+        use harakat::*;
+        &[R_M0, R_M1, R_M2, R_M3, R_OUT0, R_OUT1, RBC]
     }
     /// Zeros, but for the value columns: those are `q_flock`'s slots, and a padding
     /// row's instance is flock's padding instance.
     fn padding(&self) -> Vec<F64> {
-        let mut row = vec![F64::ZERO; blake2st::N];
-        for (&c, w) in BLAKE2S_VALUE_COLS.iter().zip(crate::hash_flock::padding_words()) {
+        let mut row = vec![F64::ZERO; harakat::N];
+        for (&c, w) in HARAKA_VALUE_COLS.iter().zip(crate::haraka::padding_words()) {
             row[c] = w;
         }
         row
     }
     fn flushes(&self, f: &mut FlushBuilder) {
-        use blake2st::*;
+        use harakat::*;
         f.state_step(PC, FP);
         f.bytecode(
             PC,
             RBC,
-            OP_BLAKE2S,
-            &[
-                Col(O_M0),
-                Col(O_M1),
-                Col(O_M2),
-                Col(O_M3),
-                Col(O_CV),
-                Col(O_OUT),
-                Col(O_MD),
-            ],
+            OP_HARAKA,
+            &[Col(O_M0), Col(O_M1), Col(O_M2), Col(O_M3), Col(O_OUT)],
         );
-        // Nine cell reads: four independent 128-bit message cells, the chaining
-        // value's two consecutive cells (ACV, g·ACV), the output's two
-        // consecutive cells (AC, g·AC), and the metadata cell. Each carries its
-        // chunk's two lanes with a literal-zero top limb (`memory_128`), so the
-        // canonical embedding is proof-enforced and the zero limbs are never
-        // committed. A consecutive cell is a free ×g on the product's g-power.
+        // Six cell reads: four independent 128-bit message cells and the output's two
+        // consecutive cells (AC, g·AC). Each carries its chunk's two lanes with a
+        // literal-zero top limb (`memory_128`), so the canonical embedding is
+        // proof-enforced and the zero limbs are never committed.
         f.memory_128(Prod(FP, O_M0, 0), R_M0, V_M0, V_M0 + 1);
         f.memory_128(Prod(FP, O_M1, 0), R_M1, V_M0 + 2, V_M0 + 3);
-        f.memory_128(Prod(FP, O_M2, 0), R_M2, V_M2, V_M2 + 1);
-        f.memory_128(Prod(FP, O_M3, 0), R_M3, V_M2 + 2, V_M2 + 3);
-        f.memory_128(Prod(FP, O_CV, 0), R_CV0, V_CV0, V_CV0 + 1);
-        f.memory_128(Prod(FP, O_CV, 1), R_CV1, V_CV0 + 2, V_CV0 + 3);
+        f.memory_128(Prod(FP, O_M2, 0), R_M2, V_M0 + 4, V_M0 + 5);
+        f.memory_128(Prod(FP, O_M3, 0), R_M3, V_M0 + 6, V_M0 + 7);
         f.memory_128(Prod(FP, O_OUT, 0), R_OUT0, V_OUT0, V_OUT0 + 1);
         f.memory_128(Prod(FP, O_OUT, 1), R_OUT1, V_OUT0 + 2, V_OUT0 + 3);
-        // The metadata rides the memory bus like every other operand: the read
-        // is what binds flock's counter and flag inputs, so a compile-time
-        // counter is pinned by the `SET` immediate that wrote the cell.
-        f.memory_128(Prod(FP, O_MD, 0), R_MD, MD0, MD1);
     }
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]) {
-        use blake2st::*;
-        let rows = &ctx.trace.blake2s;
-        let ad = |r: &Brow| blake2s_addresses(ctx.prog, r);
+        use harakat::*;
+        let rows = &ctx.trace.haraka;
+        let ad = |r: &Hrow| haraka_addresses(ctx.prog, r);
         ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
         ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // O_M0..O_MD are the seven base addresses' offsets, from the instruction decode.
         ctx.cols(out, rows, O_M0, |r| ad(r).map(|a| ctx.g_at(a - r.fp)));
-        // The eighteen memory-borne flock words are the nine cells' lo/hi lanes:
-        // the four message cells, then the cv pair, the output pair and the
-        // metadata. A cell's two lanes are one read, so each group of four takes two.
-        let word_pair = |c0: u32, c1: u32| {
-            let (w0, w1) = (ctx.mem[c0 as usize], ctx.mem[c1 as usize]);
-            [F64(w0.c0), F64(w0.c1), F64(w1.c0), F64(w1.c1)]
+        let lanes = |c: u32| {
+            let w = ctx.mem[c as usize];
+            [F64(w.c0), F64(w.c1)]
         };
         ctx.cols(out, rows, V_M0, |r| {
             let a = ad(r);
-            word_pair(a[0], a[1])
-        });
-        ctx.cols(out, rows, V_M2, |r| {
-            let a = ad(r);
-            word_pair(a[2], a[3])
+            let mut v = [F64::ZERO; 8];
+            for i in 0..4 {
+                v[2 * i..2 * i + 2].copy_from_slice(&lanes(a[i]));
+            }
+            v
         });
         ctx.cols(out, rows, V_OUT0, |r| {
             let a = ad(r);
-            word_pair(a[5], a[5] + 1)
-        });
-        ctx.cols(out, rows, V_CV0, |r| {
-            let a = ad(r);
-            word_pair(a[4], a[4] + 1)
-        });
-        ctx.cols(out, rows, MD0, |r| {
-            let md = ctx.mem[ad(r)[6] as usize];
-            [F64(md.c0), F64(md.c1)]
+            let (lo, hi) = (lanes(a[4]), lanes(a[4] + 1));
+            [lo[0], lo[1], hi[0], hi[1]]
         });
         ctx.cols(out, rows, R_M0, |r| {
-            [
-                r.ra[0], r.ra[1], r.rb[0], r.rb[1], r.rcv[0], r.rcv[1], r.rc[0], r.rc[1], r.rmd,
-            ]
+            [r.r_in[0], r.r_in[1], r.r_in[2], r.r_in[3], r.r_out[0], r.r_out[1]]
         });
         ctx.col(out, rows, RBC, |r| r.bytecode_read);
     }

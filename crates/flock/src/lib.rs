@@ -12,22 +12,13 @@
 //!   4. The PCS binds that family of slices ([`hash::SliceClaim`]) to the
 //!      commitment.
 //!
-//! [`hash`] is the one circuit: the BLAKE2s compression as a per-block R1CS,
-//! plus its witness generation and the leanVM-facing reduction entry points
-//! (`Blake2sSetup::{prove_reduction_precomputed, prove_zerocheck, prove_lincheck}`). Steps 2 to 4 above
-//! are circuit-agnostic: they take the block shape as plain numbers and reach
-//! the matrices only through [`lincheck::LincheckCircuit`], whose one live impl
-//! walks the circuit rather than reading any matrix.
-//!
-//! BLAKE2s is a 32-bit ARX round whose XORs and rotations are free over GF(2),
-//! so its only nonlinear constraints are the product bits of the modular ADDs.
-//! The private `gf2` module owns that part: the wire word and the two adder
-//! gadgets, forwards and transposed, kept separate because the fused
-//! three-operand adder's bit boundaries are the subtlest thing here.
+//! [`haraka`] is the one circuit: Haraka-512 as a per-call R1CS with GF(2^8)
+//! coefficients, plus its witness generation and the leanVM-facing reduction
+//! entry points (`HarakaSetup::{prove_zerocheck, prove_lincheck}`). Steps 2 to 4
+//! above are circuit-agnostic: they take the block shape as plain numbers.
 
-mod gf2;
 pub mod haraka;
-pub mod hash;
 pub mod lincheck;
-mod witness;
 pub mod zerocheck;
+
+pub use haraka::SliceClaim;

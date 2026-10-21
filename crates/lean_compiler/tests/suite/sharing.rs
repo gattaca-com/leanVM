@@ -195,12 +195,12 @@ def main():
     t[0] = x
     t[1] = z
     o1 = StackBuf(2)
-    blake2s(msg[0:2], msg[2:4], o1, cv=t, counter=64, final=1)
+    haraka(t, msg[0:2], o1)
     s = StackBuf(2)
     s[0] = x
     s[1] = w
     o2 = StackBuf(2)
-    blake2s(msg[0:2], msg[2:4], o2, cv=s, counter=64, final=1)
+    haraka(s, msg[0:2], o2)
     assert o1[0] != o2[0]
     p = 1
     p[1] = x
@@ -210,7 +210,7 @@ def main():
     let program = compile(&parse(src).expect("parse"));
     let want = [F192::from(g_pow(11)), F192::from(g_pow(22))];
     let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    verify(&program, &want, &proof).expect("each compression absorbs its own chaining value");
+    verify(&program, &want, &proof).expect("each call absorbs its own first half");
 }
 
 #[test]

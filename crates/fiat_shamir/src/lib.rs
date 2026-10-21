@@ -1,26 +1,22 @@
 // CREDIT: https://github.com/signalapp/libsignal/blob/main/rust/poksho/src/shosha256.rs, AGPL-3.0-only.
-//! Fiat-Shamir state and proof transport. The state is a domain-separated BLAKE2s chain whose 64-byte steps match the VM's hash opcode.
+//! Fiat-Shamir state and proof transport. The state is a domain-separated Haraka-512 chain whose 64-byte steps match the VM's hash opcode.
 
 pub mod merkle;
 pub mod transcript;
 
 use primitives::field::{F64, F192};
 
-/// `f(a, b) = BLAKE2s(a‖b)` on two 256-bit halves laid out little-endian into
-/// 64 bytes, *exactly* the VM's `Blake2s` opcode: 64 input bytes → 32-byte
+/// `f(a, b) = Haraka-512(a‖b)` on two 256-bit halves laid out little-endian into
+/// 64 bytes, *exactly* the VM's `Haraka` opcode: 64 input bytes → 32-byte
 /// digest, split back into four field words. THE primitive; the chain is a
-/// chain of these, so a zkDSL program replays it with one `blake2s(...)` per
+/// chain of these, so a zkDSL program replays it with one `haraka(...)` per
 /// step.
-///
-/// A 64-byte input is one compression, so this is `compress(PARAM_IV, m,
-/// t = 64, last = true)` and nothing about the byte-level padding rules can
-/// leak into the in-circuit version.
 pub fn compress(a: [F64; 4], b: [F64; 4]) -> [F64; 4] {
     let mut input = [0u8; 64];
     for (slot, w) in input.as_chunks_mut::<8>().0.iter_mut().zip(a.into_iter().chain(b)) {
         *slot = w.0.to_le_bytes();
     }
-    digest_words(&primitives::hash::hash(&input))
+    digest_words(&primitives::hash::haraka512(&input))
 }
 
 /// A 32-byte digest as the four little-endian words the chain runs in.
@@ -72,7 +68,7 @@ impl FiatShamirState {
         }
     }
 
-    /// Seed a protocol that has no public input of its own: `BLAKE2s(label)` is
+    /// Seed a protocol that has no public input of its own: the hash of `label` is
     /// the chaining value, which is all a domain separator has to be.
     pub fn from_label(label: &[u8]) -> Self {
         Self {
@@ -137,7 +133,7 @@ impl FiatShamirState {
                 n = n.wrapping_add(1);
             }
         } else {
-            const BATCH: usize = 2 * primitives::hash::LANES;
+            const BATCH: usize = 4 * primitives::hash::LANES;
             let mut template = [[0u8; 64]; BATCH];
             for input in &mut template {
                 for (slot, word) in input[..32].as_chunks_mut::<8>().0.iter_mut().zip(base) {
@@ -151,7 +147,7 @@ impl FiatShamirState {
                     input[32..40].copy_from_slice(&(first + i as u64).to_le_bytes());
                 }
                 let mut digests = [[0u8; 32]; BATCH];
-                primitives::hash::hash_many::<64>(inputs.as_flattened(), digests.as_flattened_mut());
+                primitives::hash::haraka512_many_dyn(inputs.as_flattened(), digests.as_flattened_mut());
                 digests
                     .iter()
                     .position(|d| u64::from_le_bytes(d[..8].try_into().unwrap()) & ((1u64 << bits) - 1) == 0)

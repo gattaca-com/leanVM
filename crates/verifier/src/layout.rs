@@ -2,7 +2,7 @@
 
 use crate::bytecode::Bytecode;
 use crate::field::{E, GEN, ONE, ZERO};
-use crate::hash::{PARAM_IV, blake2s_hash};
+use crate::hash::haraka512;
 use crate::multilinear::{Placement, log2_ceil, log2_strict, stack_offsets};
 use crate::{VerifierError, require};
 use std::collections::BTreeMap;
@@ -60,10 +60,8 @@ pub struct BusBlock {
     pub owner: usize,           // whose block it is, by opcode
 }
 
-pub const R1CS_DIGEST: [u8; 32] = [
-    0x53, 0x7a, 0xd2, 0x07, 0x90, 0x30, 0x8f, 0x8e, 0xb8, 0xc0, 0xe8, 0xbd, 0x3e, 0x6c, 0x58, 0xee, 0x64, 0x57, 0x33,
-    0x71, 0xe3, 0xd5, 0x3c, 0x30, 0x61, 0x3d, 0xd0, 0x4d, 0x87, 0xc0, 0xb7, 0xea,
-];
+/// Names the circuit in the Fiat-Shamir seed, independent of the instance count.
+pub const R1CS_LABEL: &[u8] = b"flock/haraka512/gf256-r1cs/v1";
 
 // The columns no instruction table owns. They come first in the global column numbering, the tables after.
 pub const NUM_GLOBAL_COLUMNS: usize = 6;
@@ -74,14 +72,12 @@ pub const MEMORY_FINAL_COUNTERS: usize = 3;
 pub const BYTECODE_FINAL_COUNTERS: usize = 4;
 pub const QFLOCK: usize = 5;
 
-pub const BLAKE2S_R1CS_LOG_SIZE: usize = 14;
 pub const K_BITS: usize = 64;
 pub const FLOCK_K_SKIP: usize = 6; // log2_ceil(K_BITS)
 const LOG_PACKING: usize = 6; // bits per committed K-element: log2_ceil(K_BITS)
 
-pub const FLOCK_NUM_LINCHECK_ROUNDS: usize = BLAKE2S_R1CS_LOG_SIZE - FLOCK_K_SKIP;
-const QFLOCK_SLOT_BITS: usize = BLAKE2S_R1CS_LOG_SIZE - LOG_PACKING;
-pub const BLAKE2S_CONSTANT_COLUMN: usize = 512;
+/// The low coordinates of a `q_flock` point that pick a word within a call: `2^7` words a call.
+pub const QFLOCK_SLOT_BITS: usize = crate::haraka::HARAKA_K_LOG - LOG_PACKING;
 
 pub const MAX_TABLE_LOG: usize = 32;
 pub const MIN_STACKED_LOG: usize = 15;
@@ -287,19 +283,17 @@ fn jump_constraints(columns: &[E]) -> Vec<E> {
     vec![flag + condition * inverse, condition * (flag + ONE)]
 }
 
-fn flushes_blake2s() -> Flushes {
-    let [pc, fp, cnt_bc] = cols(BLAKE2S_COLUMNS, ["pc", "fp", "cnt_bc"]);
-    let operands = cols(BLAKE2S_COLUMNS, ["o_0", "o_1", "o_2", "o_3", "o_v", "o_out", "o_md"]);
+fn flushes_haraka() -> Flushes {
+    let [pc, fp, cnt_bc] = cols(HARAKA_COLUMNS, ["pc", "fp", "cnt_bc"]);
+    let operands = cols(HARAKA_COLUMNS, ["o_0", "o_1", "o_2", "o_3", "o_out"]);
     let mut flushes = Flushes::default();
     flushes.state_step(pc, fp);
-    flushes.bytecode(pc, cnt_bc, OP_BLAKE2S, operands.map(|i| col(i, 0)).to_vec());
-    // The nine cells read, as (cell, operand, offset from it): four addressed message chunks, then
-    // the consecutive chaining-value and output pairs, then the metadata cell (the byte counter and
-    // the two flags). Each holds two q_flock limbs and a zero top.
+    flushes.bytecode(pc, cnt_bc, OP_HARAKA, operands.map(|i| col(i, 0)).to_vec());
+    // The six cells read, as (cell, operand, offset from it): four addressed input chunks, then the
+    // consecutive output pair. Each holds two q_flock limbs and a zero top.
     #[rustfmt::skip]
     let cells = [("m0", "o_0", 0), ("m1", "o_1", 0), ("m2", "o_2", 0), ("m3", "o_3", 0),
-                 ("cv0", "o_v", 0), ("cv1", "o_v", 1), ("out0", "o_out", 0), ("out1", "o_out", 1),
-                 ("md", "o_md", 0)];
+                 ("out0", "o_out", 0), ("out1", "o_out", 1)];
     for (cell, operand, exponent) in cells {
         let names = [
             operand,
@@ -307,7 +301,7 @@ fn flushes_blake2s() -> Flushes {
             &format!("{cell}_lo"),
             &format!("{cell}_hi"),
         ];
-        let [address, count, lo, hi] = cols(BLAKE2S_COLUMNS, names);
+        let [address, count, lo, hi] = cols(HARAKA_COLUMNS, names);
         flushes.memory_cols(prod(fp, address, exponent), count, &[lo, hi]);
     }
     flushes
@@ -318,8 +312,10 @@ pub const OP_MUL: usize = 1;
 pub const OP_SET: usize = 2;
 pub const OP_DEREF: usize = 3;
 pub const OP_JUMP: usize = 4;
-pub const OP_BLAKE2S: usize = 5;
+pub const OP_HARAKA: usize = 5;
 pub const N_TABLES: usize = 6;
+/// The least log height of each table: the Haraka table is flock's batch, whose lincheck stripes eight calls.
+pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, 3];
 
 #[rustfmt::skip]
 const ARITH_COLUMNS: &[&str] = &["pc", "fp", "o_a", "o_b", "o_c", "va_0", "va_1", "va_2", "vb_0", "vb_1", "vb_2", "cnt_a", "cnt_b", "cnt_c", "cnt_bc"];
@@ -329,30 +325,22 @@ const DEREF_COLUMNS: &[&str] = &["pc", "fp", "o1", "o2", "o3", "f_pc", "f_fp", "
 #[rustfmt::skip]
 const JUMP_COLUMNS: &[&str] = &["pc", "fp", "o_c", "o_d", "o_f", "v_cond", "v_pc", "v_fp", "cnt_c", "cnt_d", "cnt_f", "cnt_bc", "w", "b"];
 #[rustfmt::skip]
-const BLAKE2S_COLUMNS: &[&str] = &[
-    "pc", "fp", "o_0", "o_1", "o_2", "o_3", "o_v", "o_out", "o_md",
-    // These eighteen value limbs live in q_flock, not here: each is already a flock witness slot.
-    "m0_lo", "m0_hi", "m1_lo", "m1_hi", "m2_lo", "m2_hi", "m3_lo", "m3_hi",
-    "out0_lo", "out0_hi", "out1_lo", "out1_hi", "cv0_lo", "cv0_hi", "cv1_lo", "cv1_hi", "md_lo", "md_hi",
+const HARAKA_COLUMNS: &[&str] = &[
+    "pc", "fp", "o_0", "o_1", "o_2", "o_3", "o_out",
+    // These twelve value limbs live in q_flock, not here: each is already a flock witness slot.
+    "m0_lo", "m0_hi", "m1_lo", "m1_hi", "m2_lo", "m2_hi", "m3_lo", "m3_hi", "out0_lo", "out0_hi", "out1_lo", "out1_hi",
     // ...and the read counts, committed here like every other column.
-    "cnt_m0", "cnt_m1", "cnt_m2", "cnt_m3", "cnt_cv0", "cnt_cv1", "cnt_out0", "cnt_out1", "cnt_md", "cnt_bc",
+    "cnt_m0", "cnt_m1", "cnt_m2", "cnt_m3", "cnt_out0", "cnt_out1", "cnt_bc",
 ];
 
-/// Flock's padding instance, blake2s(0^64), in BLAKE2S_SLOTS order: the parameterized IV, the digest, then a zero
-/// message and the one-block final metadata (counter 64, f0 set).
-fn padding_instance() -> [u64; 20] {
-    let digest = blake2s_hash(&[0; 64]).words();
-    std::array::from_fn(|slot| match slot {
-        0..4 => PARAM_IV[2 * slot] as u64 | (PARAM_IV[2 * slot + 1] as u64) << 32,
-        4..8 => digest[slot - 4],
-        18 => 64,
-        19 => 0xFFFF_FFFF,
-        _ => 0,
-    })
+/// Flock's padding instance, the call on 64 zero bytes, in HARAKA_SLOTS order: the input, then the digest.
+fn padding_instance() -> [u64; 12] {
+    let digest = haraka512(&[0; 64]).words();
+    std::array::from_fn(|slot| if slot < 8 { 0 } else { digest[slot - 8] })
 }
 
 pub fn tables() -> Vec<Table> {
-    // A padding row is zero, but for BLAKE2s's value limbs: those are q_flock's slots, so they hold its padding instance.
+    // A padding row is zero, but for Haraka's value limbs: those are q_flock's slots, so they hold its padding instance.
     let instance = padding_instance();
     let table = |opcode, columns: &'static [&'static str], flushes, constraints| Table {
         opcode,
@@ -360,10 +348,10 @@ pub fn tables() -> Vec<Table> {
         padding: columns
             .iter()
             .map(|&name| {
-                let slot = BLAKE2S_SLOTS
+                let slot = HARAKA_SLOTS
                     .iter()
-                    .position(|&s| s == Some(name))
-                    .filter(|_| opcode == OP_BLAKE2S);
+                    .position(|&s| s == name)
+                    .filter(|_| opcode == OP_HARAKA);
                 E::new(slot.map_or(0, |s| instance[s]), 0, 0)
             })
             .collect(),
@@ -376,16 +364,14 @@ pub fn tables() -> Vec<Table> {
         table(OP_SET, SET_COLUMNS, flushes_set(), |_| vec![]),
         table(OP_DEREF, DEREF_COLUMNS, flushes_deref(), |_| vec![]),
         table(OP_JUMP, JUMP_COLUMNS, flushes_jump(), jump_constraints),
-        table(OP_BLAKE2S, BLAKE2S_COLUMNS, flushes_blake2s(), |_| vec![]),
+        table(OP_HARAKA, HARAKA_COLUMNS, flushes_haraka(), |_| vec![]),
     ]
 }
 
-// Where in the flock witness each embedded BLAKE2s limb live: one 64-bit slot per limb, the chaining value first, then the
-// digest, the message block and the metadata. Slots 8 and 9 are flock's constant wire and the padding up to its message base, which no memory cell carries.
+// Where in the flock witness each embedded limb lives: one 64-bit slot per limb, the input first, then the digest.
 #[rustfmt::skip]
-const BLAKE2S_SLOTS: [Option<&str>; 20] = [
-    Some("cv0_lo"), Some("cv0_hi"), Some("cv1_lo"), Some("cv1_hi"), Some("out0_lo"), Some("out0_hi"), Some("out1_lo"), Some("out1_hi"), None, None,
-    Some("m0_lo"), Some("m0_hi"), Some("m1_lo"), Some("m1_hi"), Some("m2_lo"), Some("m2_hi"), Some("m3_lo"), Some("m3_hi"), Some("md_lo"), Some("md_hi"),
+const HARAKA_SLOTS: [&str; 12] = [
+    "m0_lo", "m0_hi", "m1_lo", "m1_hi", "m2_lo", "m2_hi", "m3_lo", "m3_hi", "out0_lo", "out0_hi", "out1_lo", "out1_hi",
 ];
 
 const TABLE_WIDTHS: [usize; N_TABLES] = [
@@ -394,7 +380,7 @@ const TABLE_WIDTHS: [usize; N_TABLES] = [
     SET_COLUMNS.len(),
     DEREF_COLUMNS.len(),
     JUMP_COLUMNS.len(),
-    BLAKE2S_COLUMNS.len(),
+    HARAKA_COLUMNS.len(),
 ];
 pub const GLOBAL_COLUMN_BASES: [usize; N_TABLES] = {
     let mut bases = [NUM_GLOBAL_COLUMNS; N_TABLES];
@@ -420,8 +406,12 @@ pub fn build_layout<'a>(
     )?;
     let log_bytecode = log_bytecode - BUS_BITS;
     let log_memory = log_memory as usize;
-    // A table's height is the least power of two holding its rows.
-    let table_log_heights: Vec<usize> = table_rows.iter().map(|&rows| log2_ceil(rows)).collect();
+    // A table's height is the least power of two holding its rows, at least its floor.
+    let table_log_heights: Vec<usize> = table_rows
+        .iter()
+        .zip(TABLE_LOG_FLOORS)
+        .map(|(&rows, floor)| log2_ceil(rows).max(floor))
+        .collect();
 
     let tables = tables();
     let mut push = Vec::new();
@@ -440,7 +430,7 @@ pub fn build_layout<'a>(
     }
 
     // Every column's log size, in global order: the framework's, q_flock's, then each table's block.
-    let qflock_kappa = table_log_heights[OP_BLAKE2S] + QFLOCK_SLOT_BITS;
+    let qflock_kappa = table_log_heights[OP_HARAKA] + QFLOCK_SLOT_BITS;
     let mut kappas = vec![
         log_memory,
         log_memory,
@@ -453,16 +443,14 @@ pub fn build_layout<'a>(
         kappas.extend(vec![table_log_heights[table.opcode]; table.width()]);
     }
 
-    // A BLAKE2s value limb gets no block of its own: it is committed inside q_flock, whose slots
+    // A Haraka value limb gets no block of its own: it is committed inside q_flock, whose slots
     // interleave, so it sits at q_flock's offset behind its own slot's bits. Same width either way.
     let mut limbs = BTreeMap::new();
-    for (slot, name) in BLAKE2S_SLOTS.iter().enumerate() {
-        if let Some(name) = name {
-            limbs.insert(
-                GLOBAL_COLUMN_BASES[OP_BLAKE2S] + cols(BLAKE2S_COLUMNS, [name])[0],
-                slot as u64,
-            );
-        }
+    for (slot, name) in HARAKA_SLOTS.iter().enumerate() {
+        limbs.insert(
+            GLOBAL_COLUMN_BASES[OP_HARAKA] + cols(HARAKA_COLUMNS, [name])[0],
+            slot as u64,
+        );
     }
     let blocks: Vec<usize> = (0..kappas.len()).filter(|column| !limbs.contains_key(column)).collect();
     let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();

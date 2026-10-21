@@ -18,19 +18,19 @@ pub fn hash_to_scalars(hash: &Hash) -> [F192; 2] {
     ]
 }
 
-/// Hash one leaf with standard BLAKE2s-256.
+/// Hash one leaf: the chain over its bytes.
 #[inline]
 pub fn hash_leaf(data: &[u8]) -> Hash {
     primitives::hash::hash(data)
 }
 
-/// Hash two children into their parent.
+/// Hash two children into their parent: one call.
 #[inline]
 pub fn hash_pair(left: &Hash, right: &Hash) -> Hash {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(left);
     buf[32..].copy_from_slice(right);
-    primitives::hash::hash(&buf)
+    primitives::hash::haraka512(&buf)
 }
 
 /// Query positions with duplicates removed, ascending: the order a phase stores

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub use fiat_shamir::merkle::{Hash, hash_leaf, hash_pair};
 use parallel::SendPtr;
 use primitives::field::F64;
-use primitives::hash::{BATCH, BLOCK_LEN, OUT_LEN, hash_many, hash_many_dyn_from_state, zero_prefix_state};
+use primitives::hash::{BATCH, BLOCK_LEN, OUT_LEN, haraka512_many_dyn, hash_many_dyn_from_state, zero_prefix_state};
 use primitives::pretty_integer;
 
 /// Nodes one climb takes at most: 32 KiB of digests, which stay in L1.
@@ -38,7 +38,7 @@ const STAGE_TILE_BYTES: usize = 16 << 10;
 
 /// Merkle tree over `num_leaves` equal byte leaves.
 ///
-/// Every leaf is hashed as plain BLAKE2s-256 of its bytes.
+/// Every leaf is hashed as [`primitives::hash::hash`] of its bytes.
 #[tracing::instrument(
     name = "Hashing",
     skip_all,
@@ -202,7 +202,7 @@ impl Nodes {
         for j in level..level + height {
             // SAFETY: level `j` of the subtree is initialized, and level `j + 1` is ours to write.
             let (children, parents) = unsafe { (self.level_mut(j, first, n), self.level_mut(j + 1, first / 2, n / 2)) };
-            hash_many::<{ 2 * OUT_LEN }>(digests_as_bytes(children), digests_as_bytes(parents));
+            haraka512_many_dyn(digests_as_bytes(children), digests_as_bytes(parents));
             (first, n) = (first / 2, n / 2);
         }
     }
@@ -278,7 +278,7 @@ enum LeafHasher {
     /// Past the shared prefix, each row is its own whole-block image.
     Direct {
         row_bytes: usize,
-        state: [u32; 8],
+        state: [u8; OUT_LEN],
         t_offset: u64,
     },
     /// The rest of the padding does not fill a block, so rows are zero-extended in a tile first.
@@ -287,7 +287,7 @@ enum LeafHasher {
     Staged {
         row_bytes: usize,
         image: usize,
-        state: [u32; 8],
+        state: [u8; OUT_LEN],
         t_offset: u64,
     },
     /// Leaves of no whole block: one at a time, zero-extended to `leaf_bytes`.

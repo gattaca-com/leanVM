@@ -1,10 +1,10 @@
-//! leanXMSS over BLAKE2s: two layers of XMSS of height 16 over WOTS+C keys, as
+//! leanXMSS over Haraka-512: two layers of XMSS of height 16 over WOTS+C keys, as
 //! specified in the [leanXMSS specification]. Each leaf of the top tree signs the
 //! root of one bottom tree, whose `2^16` leaves sign messages, so a key signs at
 //! `2^32` leaf indices. A public key is 32 bytes, a signature 2404, and a
-//! verification 201 BLAKE2s compressions.
+//! verification 234 Haraka calls.
 //!
-//! `Th(P, A, M) = BLAKE2s(P | A | M)` truncated to 16 bytes, with the 16-byte
+//! `Th(P, A, M) = H(P | A | M)` truncated to 16 bytes, with the 16-byte
 //! address `A` of leanSPHINCS (the `hash` module).
 //!
 //! [leanXMSS specification]: https://github.com/leanEthereum/leanVM/releases/download/doc-latest/leanXMSS.pdf
@@ -73,7 +73,7 @@ pub const LAYER_SIG_SIZE: usize = RANDOMIZER_LEN + V * N + LAYER_HEIGHT * N;
 /// The leaf index, then the bottom layer's signature, then the top one's.
 pub const SIG_SIZE: usize = LEAF_INDEX_SIZE + 2 * LAYER_SIG_SIZE;
 
-/// BLAKE2s compressions of one verification: per layer the message digest, the
+/// Haraka calls of one verification: per layer the message digest, the
 /// chains, the one-time leaf and the path.
 pub const VERIFY_COMPRESSIONS: usize = blocks(RANDOMIZER_LEN + MESSAGE_LEN)
     + blocks(RANDOMIZER_LEN + N)
@@ -81,7 +81,7 @@ pub const VERIFY_COMPRESSIONS: usize = blocks(RANDOMIZER_LEN + MESSAGE_LEN)
 
 const _: () = assert!(V == 58 && TARGET_SUM < V * (CHAIN_LEN - 1));
 const _: () = assert!(PUB_KEY_SIZE == 32 && LAYER_SIG_SIZE == 1200 && SIG_SIZE == 2404);
-const _: () = assert!(VERIFY_COMPRESSIONS == 201);
+const _: () = assert!(VERIFY_COMPRESSIONS == 234);
 // A leaf index is the two layers' indices side by side.
 const _: () = assert!(LOG_LIFETIME == 8 * LEAF_INDEX_SIZE);
 
