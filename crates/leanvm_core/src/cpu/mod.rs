@@ -153,6 +153,8 @@ pub struct Program {
     /// which keeps the committed size a function of the announced sizes, so neither
     /// the verifier nor the guest needs a new parameter to certify. Prover-side only.
     pub min_log_committed: usize,
+    /// The largest memory and tables a run of this program or of a clone has reached.
+    pub(crate) run_sizes: std::sync::Arc<execute::RunSizes>,
 }
 
 /// The bytecode digest reinterprets the stacked table as bytes, which is its
@@ -181,6 +183,7 @@ impl Program {
             fn_ranges: Vec::new(),
             src_lines: Vec::new(),
             min_log_committed: 0,
+            run_sizes: Default::default(),
         }
     }
 
