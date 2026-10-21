@@ -741,57 +741,31 @@ fn initial_basis_pass(
     }
 }
 
-/// A lane fold's view of its basis: stored densely, or rebuilt one stage at a time.
+/// A lane-round weight that exists only as its fill and its fold.
 ///
-/// Rebuilding trades a fill per slot for a DRAM write and read of 24 bytes per slot,
-/// which wins wherever the fold is bandwidth bound.
-trait BasisChunks: Sync {
+/// Filling trades compute per slot for a DRAM write and read of 24 bytes per slot,
+/// which wins wherever the lane rounds are bandwidth bound.
+pub(crate) trait LaneWeight: Sync {
     fn len(&self) -> usize;
-    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192];
-}
 
-impl BasisChunks for Vec<F192> {
-    fn len(&self) -> usize {
-        self.as_slice().len()
-    }
+    /// Writes slots `start..start + dst.len()`, for `dst` one aligned [`INITIAL_BASIS_CHUNK`].
+    fn fill(&self, start: usize, dst: &mut [F192]);
 
-    #[inline]
-    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192] {
-        &self[start..start + scratch.len()]
-    }
-}
-
-/// A basis that exists only as its fill: `fill(start, dst)` writes slots `start..start + dst.len()`,
-/// for `dst` one aligned [`INITIAL_BASIS_CHUNK`].
-#[derive(Clone, Copy)]
-pub(crate) struct GeneratedBasis<'a> {
-    pub len: usize,
-    pub fill: &'a (dyn Fn(usize, &mut [F192]) + Sync),
-}
-
-impl BasisChunks for GeneratedBasis<'_> {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192] {
-        (self.fill)(start, scratch);
-        scratch
-    }
+    /// The weight after a lane round binds the lowest lane bit to `r`.
+    fn fold_lane(&self, r: F192) -> Box<dyn LaneWeight>;
 }
 
 /// The basis the sumcheck starts from.
-pub(crate) enum InitialBasis<'a> {
+pub(crate) enum InitialBasis {
     Dense(Vec<F192>),
-    Generated(GeneratedBasis<'a>),
+    Generated(Box<dyn LaneWeight>),
 }
 
-impl InitialBasis<'_> {
+impl InitialBasis {
     fn len(&self) -> usize {
         match self {
             InitialBasis::Dense(b) => b.len(),
-            InitialBasis::Generated(g) => g.len,
+            InitialBasis::Generated(g) => g.len(),
         }
     }
 }
@@ -832,9 +806,9 @@ const LANE_FOLD_STAGE: usize = 128;
 /// elements of the single output block rather than another pair of blocks. Which
 /// pairing comes next is what lets the message be built here, while the folded
 /// values are still in L1.
-fn fold_and_msg_blocks<T: RoundWitness, B: BasisChunks + ?Sized>(
+fn fold_and_msg_blocks<T: RoundWitness>(
     f: &[T],
-    b: &B,
+    b: &[F192],
     r: F192,
     block: usize,
     last: bool,
@@ -864,19 +838,17 @@ fn fold_and_msg_blocks<T: RoundWitness, B: BasisChunks + ?Sized>(
     const STAGE: usize = LANE_FOLD_STAGE;
     let fold_block = |stage: &mut [F192],
                       stage_b: &mut [F192],
-                      raw: &mut [[F192; STAGE]; 2],
                       out_blk: usize,
                       x0: usize,
                       stream: &Stream| {
         let len = stage.len();
         let src0 = 2 * out_blk * block + x0;
-        let [raw_lo, raw_hi] = raw;
         // Sliced, not indexed: runs of one length let the bounds checks fall out
         // and the pair fold vectorise, as the adjacent-pair kernel's do.
-        let (f_lo, b_lo) = (&f[src0..src0 + len], b.chunk(src0, &mut raw_lo[..len]));
+        let (f_lo, b_lo) = (&f[src0..src0 + len], &b[src0..src0 + len]);
         if 2 * out_blk + 1 < n_in {
             let src1 = src0 + block;
-            let (f_hi, b_hi) = (&f[src1..src1 + len], b.chunk(src1, &mut raw_hi[..len]));
+            let (f_hi, b_hi) = (&f[src1..src1 + len], &b[src1..src1 + len]);
             fold_pairs_batched(stage, f_lo, f_hi, r);
             fold_pairs_batched(stage_b, b_lo, b_hi, r);
         } else {
@@ -897,19 +869,100 @@ fn fold_and_msg_blocks<T: RoundWitness, B: BasisChunks + ?Sized>(
         let len = ROUND_CHUNK.min(block - x0);
         let stream = Stream::new();
         let mut stage = [[F192::ZERO; STAGE]; 4];
-        let mut raw = [[F192::ZERO; STAGE]; 2];
         let mut acc = (Acc8::ZERO, Acc8::ZERO);
         for s in (0..len).step_by(STAGE) {
             let n = STAGE.min(len - s);
             let [lo_f, lo_b, hi_f, hi_b] = &mut stage;
-            fold_block(&mut lo_f[..n], &mut lo_b[..n], &mut raw, 2 * i, x0 + s, &stream);
+            fold_block(&mut lo_f[..n], &mut lo_b[..n], 2 * i, x0 + s, &stream);
             let (u_0, u_2) = if 2 * i + 1 < n_out {
-                fold_block(&mut hi_f[..n], &mut hi_b[..n], &mut raw, 2 * i + 1, x0 + s, &stream);
+                fold_block(&mut hi_f[..n], &mut hi_b[..n], 2 * i + 1, x0 + s, &stream);
                 msg_terms_pair(&lo_f[..n], &hi_f[..n], &lo_b[..n], &hi_b[..n])
             } else if last {
                 // `ROUND_CHUNK`, `STAGE` and `block` are powers of two, so every
                 // slice has even length and starts even: no message pair
                 // straddles one.
+                let (u_0, u_2) = fold_msg_terms(&lo_f[..n], &lo_b[..n]);
+                (Acc8::from(u_0), Acc8::from(u_2))
+            } else {
+                msg_terms_lone(&lo_f[..n], &lo_b[..n])
+            };
+            acc.0 ^= u_0;
+            acc.1 ^= u_2;
+        }
+        acc
+    };
+    let (u_0, u_2) = accumulate_msg(n_out.div_ceil(2) * per, f.len() / 2, Acc8::ZERO, task);
+    (
+        nf,
+        nb,
+        SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        },
+    )
+}
+
+/// [`fold_and_msg_blocks`] against a weight that is never stored: the witness
+/// folds as there, and the folded weight `next` is filled straight into the stage
+/// the message reads. Only the last lane round stores it, for the rounds after.
+fn fold_and_msg_generated<T: RoundWitness>(
+    f: &[T],
+    next: &dyn LaneWeight,
+    r: F192,
+    block: usize,
+    last: bool,
+) -> (Vec<F192>, Vec<F192>, SumcheckMessage) {
+    assert!(block > 0 && f.len().is_multiple_of(block));
+    let n_in = f.len() / block;
+    let n_out = n_in.div_ceil(2);
+    assert_eq!(next.len(), n_out * block);
+    assert!(!last || n_out == 1);
+
+    // SAFETY: the loop below writes every slot of `nf`, and of `nb` when it is
+    // stored, one output element per input pair, before any is read.
+    let mut nf = unsafe { fold_out_buf(n_out * block) };
+    let mut nb = if last { unsafe { fold_out_buf(n_out * block) } } else { Vec::new() };
+    let nf_base = parallel::SendPtr(nf.as_mut_ptr());
+    let nb_base = parallel::SendPtr(nb.as_mut_ptr());
+
+    let per = block.div_ceil(ROUND_CHUNK);
+    const STAGE: usize = LANE_FOLD_STAGE;
+    let fold_block = |stage: &mut [F192], stage_b: &mut [F192], out_blk: usize, x0: usize, stream: &Stream| {
+        let len = stage.len();
+        let src0 = 2 * out_blk * block + x0;
+        let f_lo = &f[src0..src0 + len];
+        if 2 * out_blk + 1 < n_in {
+            let src1 = src0 + block;
+            fold_pairs_batched(stage, f_lo, &f[src1..src1 + len], r);
+        } else {
+            fold_lones_batched(stage, f_lo, r);
+        }
+        next.fill(out_blk * block + x0, stage_b);
+        // SAFETY: distinct (out_blk, x0) name disjoint in-bounds windows of `nf`
+        // and `nb`, which stay borrowed for the whole dispatch.
+        unsafe {
+            stream.copy(nf_base.slice(out_blk * block + x0, len), stage);
+            if last {
+                stream.copy(nb_base.slice(out_blk * block + x0, len), stage_b);
+            }
+        }
+    };
+
+    let task = |t: usize| -> (Acc8, Acc8) {
+        let (i, c) = (t / per, t % per);
+        let x0 = c * ROUND_CHUNK;
+        let len = ROUND_CHUNK.min(block - x0);
+        let stream = Stream::new();
+        let mut stage = [[F192::ZERO; STAGE]; 4];
+        let mut acc = (Acc8::ZERO, Acc8::ZERO);
+        for s in (0..len).step_by(STAGE) {
+            let n = STAGE.min(len - s);
+            let [lo_f, lo_b, hi_f, hi_b] = &mut stage;
+            fold_block(&mut lo_f[..n], &mut lo_b[..n], 2 * i, x0 + s, &stream);
+            let (u_0, u_2) = if 2 * i + 1 < n_out {
+                fold_block(&mut hi_f[..n], &mut hi_b[..n], 2 * i + 1, x0 + s, &stream);
+                msg_terms_pair(&lo_f[..n], &hi_f[..n], &lo_b[..n], &hi_b[..n])
+            } else if last {
                 let (u_0, u_2) = fold_msg_terms(&lo_f[..n], &lo_b[..n]);
                 (Acc8::from(u_0), Acc8::from(u_2))
             } else {
@@ -946,8 +999,8 @@ struct SumcheckProver<'a> {
     /// introduced since the last glue in as `combined_basis += lambda^tau *
     /// b_new`, `tau` counting from 1 (the running claim is `tau = 0`).
     combined_basis: Vec<F192>,
-    /// The round-0 basis when it is rebuilt rather than stored; the first lane fold consumes it.
-    generated: Option<GeneratedBasis<'a>>,
+    /// The lane-round weight while it is filled rather than stored; the last lane round stores it.
+    generated: Option<Box<dyn LaneWeight>>,
     /// The running claim and its quadratic; `h(0) + h(1) = t_r` fixes the linear coefficient.
     t_r: F192,
     quad: RoundQuad,
@@ -963,7 +1016,7 @@ impl<'a> SumcheckProver<'a> {
     /// whole blocks rather than adjacent words.
     fn new(
         f: &'a [F64],
-        b1: InitialBasis<'a>,
+        b1: InitialBasis,
         h1: F192,
         block: usize,
         initial_message: Option<SumcheckMessage>,
@@ -1010,12 +1063,16 @@ impl<'a> SumcheckProver<'a> {
             Witness::Ext(f) => f.len().ilog2(),
         };
         let _span = tracing::info_span!("Sumcheck round", round = self.round, log_size).entered();
-        let (nf, nb, msg) = match (&self.f, self.generated.take()) {
-            (Witness::Base(f), Some(g)) => fold_and_msg_blocks(f, &g, r, block, last),
+        let next = self.generated.take().map(|weight| weight.fold_lane(r));
+        let (nf, nb, msg) = match (&self.f, &next) {
+            (Witness::Base(f), Some(next)) => fold_and_msg_generated(f, &**next, r, block, last),
+            (Witness::Ext(f), Some(next)) => fold_and_msg_generated(f, &**next, r, block, last),
             (Witness::Base(f), None) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
             (Witness::Ext(f), None) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
-            (Witness::Ext(_), Some(_)) => unreachable!("the generated basis is consumed by the first fold"),
         };
+        if !last {
+            self.generated = next;
+        }
         drop(std::mem::replace(&mut self.f, Witness::Ext(nf)));
         drop(std::mem::replace(&mut self.combined_basis, nb));
         self.quad = RoundQuad::from_msg(msg, self.t_r);
@@ -1207,7 +1264,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     config: &ProverConfig,
     log_n: usize,
     witness: &[F64],
-    b_initial: InitialBasis<'_>,
+    b_initial: InitialBasis,
     target: F192,
     l0_codeword: &[F64],
     l0_tree: &[Hash],

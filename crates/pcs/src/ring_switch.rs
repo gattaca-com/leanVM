@@ -130,15 +130,8 @@ pub const COMPOSITION_SHIFTS: [usize; 6] = [32, 16, 8, 4, 2, 1];
 /// nonzero error lies in the kernel for EVERY coefficient choice and passes
 /// with probability one.
 pub fn build_coordinate_weights(challenges: &[F192; COMPOSITION_SHIFTS.len()]) -> Vec<F192> {
-    // b_w has only bit w set: bits 0..64 are K's power basis, and bits 64/128
-    // shift it by Y / Y^2.
-    let basis = |w: usize| match w / PACKING_WIDTH {
-        0 => F192::new(1u64 << (w % PACKING_WIDTH), 0, 0),
-        1 => F192::new(0, 1u64 << (w % PACKING_WIDTH), 0),
-        _ => F192::new(0, 0, 1u64 << (w % PACKING_WIDTH)),
-    };
     (0..DEGREE_E)
-        .map(|w| apply_composed_map(basis(w), challenges))
+        .map(|w| apply_composed_map(coordinate_basis(w), challenges))
         .collect()
 }
 
@@ -302,17 +295,30 @@ fn fold_one_slot_ext(elem: F192, tables: &FoldByteTable) -> F192 {
 
 /// Deferred, lambda-baked ring-switch output used by the stacked opener.
 ///
-/// Keeping the split eq factors and the tiny byte table avoids materializing
-/// one full `rs_eq_ind` vector per claim.  The table already contains the
-/// claim's batching scalar, so combining several claims needs only additions.
+/// Keeping the split eq factors and the folded map avoids materializing one full
+/// `rs_eq_ind` vector per claim. The map already contains the claim's batching
+/// scalar, so combining several claims needs only additions.
 pub(crate) struct DeferredRingSwitchOutput {
     pub(crate) batched_sumcheck_claim: F192,
+    pub(crate) weight: RingWeight,
+}
+
+/// `Phi(eq(point, y))` over a claim's suffix domain, for an F_2-linear `Phi` given by its
+/// value on every coordinate basis element of `E`.
+///
+/// A lane fold keeps this shape: binding coordinate `t` to `r` turns `Phi` into
+/// `v -> (1 + r)·Phi(v) + Phi(point[t]·v)` over the point without `t`, because
+/// `eq` factors per coordinate and `Phi` is additive.
+#[derive(Clone)]
+pub(crate) struct RingWeight {
+    weights: Vec<F192>,
+    point: Vec<F192>,
     eq_lo: Vec<F192>,
     eq_hi: Vec<F192>,
     #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
     table: Box<FoldByteTable>,
-    /// The scaled coordinate weights, one per bit of a product row (an F192 padded to
-    /// [`FOLD_ROW_BYTES`]), for the GFNI fold of 64 rows at a time.
+    /// The weights, one per bit of a product row (an F192 padded to [`FOLD_ROW_BYTES`]),
+    /// for the GFNI fold of 64 rows at a time.
     #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
     fold: BitFold,
 }
@@ -321,8 +327,108 @@ pub(crate) struct DeferredRingSwitchOutput {
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
 const FOLD_ROW_BYTES: usize = 32;
 
+/// The `w`-th `F_2`-coordinate basis element of `E`: bits 0..64 are K's power
+/// basis, and bits 64/128 shift it by Y / Y^2.
+fn coordinate_basis(w: usize) -> F192 {
+    match w / PACKING_WIDTH {
+        0 => F192::new(1u64 << (w % PACKING_WIDTH), 0, 0),
+        1 => F192::new(0, 1u64 << (w % PACKING_WIDTH), 0),
+        _ => F192::new(0, 0, 1u64 << (w % PACKING_WIDTH)),
+    }
+}
+
+impl RingWeight {
+    fn new(weights: Vec<F192>, point: Vec<F192>, eq_lo: Vec<F192>, eq_hi: Vec<F192>) -> Self {
+        assert_eq!(weights.len(), DEGREE_E);
+        debug_assert_eq!(eq_lo.len() * eq_hi.len(), 1 << point.len());
+        #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+        let fold = {
+            let mut padded = weights.clone();
+            padded.resize(8 * FOLD_ROW_BYTES, F192::ZERO);
+            BitFold::new(&padded)
+        };
+        Self {
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
+            table: build_fold_byte_table_ext(&weights),
+            #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+            fold,
+            weights,
+            point,
+            eq_lo,
+            eq_hi,
+        }
+    }
+
+    fn from_point(weights: Vec<F192>, point: Vec<F192>) -> Self {
+        let (eq_lo, eq_hi) = build_eq_split_ext(&point);
+        Self::new(weights, point, eq_lo, eq_hi)
+    }
+
+    pub(crate) fn vars(&self) -> usize {
+        self.point.len()
+    }
+
+    fn apply(&self, value: F192) -> F192 {
+        let mut acc = F192::ZERO;
+        for (limb, word) in [value.c0, value.c1, value.c2].into_iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                acc += self.weights[limb * PACKING_WIDTH + bits.trailing_zeros() as usize];
+                bits &= bits - 1;
+            }
+        }
+        acc
+    }
+
+    /// The weight with coordinate `t` bound to `r` by a lane fold: `(1 + r)·w(y, 0) + r·w(y, 1)`.
+    pub(crate) fn fold_coordinate(&self, t: usize, r: F192) -> Self {
+        let p_t = self.point[t];
+        let weights = (0..DEGREE_E)
+            .map(|w| (F192::ONE + r) * self.weights[w] + self.apply(p_t * coordinate_basis(w)))
+            .collect();
+        let mut point = self.point.clone();
+        point.remove(t);
+        Self::from_point(weights, point)
+    }
+
+    pub(crate) fn scaled(&self, scalar: F192) -> Self {
+        let weights = self.weights.iter().map(|&w| scalar * w).collect();
+        Self::new(weights, self.point.clone(), self.eq_lo.clone(), self.eq_hi.clone())
+    }
+
+    /// `out[j] += Phi(eq(point, start + j))`.
+    pub(crate) fn add_chunk(&self, start: usize, out: &mut [F192]) {
+        let block_len = self.eq_lo.len();
+        assert!(start + out.len() <= block_len * self.eq_hi.len());
+        let mut done = 0;
+        while done < out.len() {
+            let index = start + done;
+            let lo = index % block_len;
+            let len = (block_len - lo).min(out.len() - done);
+            let e_hi = self.eq_hi[index / block_len];
+            #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+            self.fold_products_gfni(&self.eq_lo[lo..lo + len], e_hi, &mut out[done..done + len]);
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
+            {
+                let (slots4, slots_r) = out[done..done + len].as_chunks_mut::<4>();
+                let (lo4, lo_r) = self.eq_lo[lo..lo + len].as_chunks::<4>();
+                for (slots, e_lo) in slots4.iter_mut().zip(lo4) {
+                    let products = mul4(*e_lo, [e_hi; 4]);
+                    for (slot, product) in slots.iter_mut().zip(products) {
+                        *slot += fold_one_slot_ext(product, &self.table);
+                    }
+                }
+                for (slot, &e_lo) in slots_r.iter_mut().zip(lo_r) {
+                    *slot += fold_one_slot_ext(e_lo * e_hi, &self.table);
+                }
+            }
+            done += len;
+        }
+    }
+}
+
 /// Finish a ring-switch claim without materializing its dense weight vector.
-/// The batching scalar is baked into both the target and the byte table.
+/// The batching scalar is baked into both the target and the map.
 pub(crate) fn prove_finish_deferred(
     state: RingSwitchProveState,
     coordinate_weights: &[F192],
@@ -331,20 +437,9 @@ pub(crate) fn prove_finish_deferred(
     let s_hat_u = transpose_s_hat(&state.s_hat_v);
     let sumcheck_claim = inner_product_base_ext(&s_hat_u, coordinate_weights);
     let scaled_weights: Vec<F192> = coordinate_weights.iter().map(|&x| lambda * x).collect();
-    #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-    let fold = {
-        let mut weights = scaled_weights;
-        weights.resize(8 * FOLD_ROW_BYTES, F192::ZERO);
-        BitFold::new(&weights)
-    };
     DeferredRingSwitchOutput {
         batched_sumcheck_claim: lambda * sumcheck_claim,
-        eq_lo: state.eq_lo,
-        eq_hi: state.eq_hi,
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
-        table: build_fold_byte_table_ext(&scaled_weights),
-        #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-        fold,
+        weight: RingWeight::new(scaled_weights, state.point, state.eq_lo, state.eq_hi),
     }
 }
 
@@ -352,39 +447,15 @@ pub(crate) fn prove_finish_deferred(
 /// basis, accumulating, so `out` arrives zeroed. No per-claim dense vector is
 /// allocated or read back. `start` is an offset into the basis, which lets a
 /// caller cover it one cache-resident window at a time.
+#[cfg(test)]
 pub(crate) fn combine_deferred_chunk(outputs: &[DeferredRingSwitchOutput], start: usize, out: &mut [F192]) {
     for claim in outputs {
-        let block_len = claim.eq_lo.len();
-        assert!(start + out.len() <= block_len * claim.eq_hi.len());
-        let mut done = 0;
-        while done < out.len() {
-            let index = start + done;
-            let lo = index % block_len;
-            let len = (block_len - lo).min(out.len() - done);
-            let e_hi = claim.eq_hi[index / block_len];
-            #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-            claim.fold_products_gfni(&claim.eq_lo[lo..lo + len], e_hi, &mut out[done..done + len]);
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
-            {
-                let (slots4, slots_r) = out[done..done + len].as_chunks_mut::<4>();
-                let (lo4, lo_r) = claim.eq_lo[lo..lo + len].as_chunks::<4>();
-                for (slots, e_lo) in slots4.iter_mut().zip(lo4) {
-                    let products = mul4(*e_lo, [e_hi; 4]);
-                    for (slot, product) in slots.iter_mut().zip(products) {
-                        *slot += fold_one_slot_ext(product, &claim.table);
-                    }
-                }
-                for (slot, &e_lo) in slots_r.iter_mut().zip(lo_r) {
-                    *slot += fold_one_slot_ext(e_lo * e_hi, &claim.table);
-                }
-            }
-            done += len;
-        }
+        claim.weight.add_chunk(start, out);
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-impl DeferredRingSwitchOutput {
+impl RingWeight {
     /// `out[j] += Phi(e_lo[j] * e_hi)`, 64 products at a time through the GFNI fold.
     #[inline]
     fn fold_products_gfni(&self, e_lo: &[F192], e_hi: F192, out: &mut [F192]) {
@@ -445,6 +516,7 @@ fn build_eq_split_ext(point: &[F192]) -> (Vec<F192>, Vec<F192>) {
 #[derive(Clone)]
 pub struct RingSwitchProveState {
     s_hat_v: Vec<F192>,
+    point: Vec<F192>,
     eq_lo: Vec<F192>,
     eq_hi: Vec<F192>,
 }
@@ -480,7 +552,12 @@ pub fn prove_prepare(
             fold_1b_rows(packed_witness, &full)
         }
     };
-    RingSwitchProveState { s_hat_v, eq_lo, eq_hi }
+    RingSwitchProveState {
+        s_hat_v,
+        point: suffix_point.to_vec(),
+        eq_lo,
+        eq_hi,
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +587,7 @@ mod tests {
                 let (eq_lo, eq_hi) = build_eq_split_ext(&point);
                 RingSwitchProveState {
                     s_hat_v: rng.ext_vec(PACKING_WIDTH),
+                    point: point.clone(),
                     eq_lo,
                     eq_hi,
                 }
