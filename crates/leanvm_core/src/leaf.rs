@@ -13,6 +13,7 @@ use crate::gkr;
 use crate::transcript::ProverState;
 use primitives::field::{Acc8, F64, F192, F192Unreduced, g_pow, index_mle, mul_base_splat8};
 use primitives::multilinear::{eq_eval, eq_table, mle_eval};
+use primitives::stream::Stream;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -305,10 +306,16 @@ pub fn build_leaves(
         if real.len() >= PAR_THRESHOLD {
             let (real8, real_r) = real.as_chunks_mut::<8>();
             const GROUPS: usize = 64;
+            // Staged in L1 and published with streaming stores: nothing reads a leaf until
+            // GKR, long after a vector this size is evicted, so an ordinary store's fetch
+            // of every line it overwrites would double the DRAM traffic of the write.
             parallel::chunks_mut(real8, GROUPS, |c, group| {
-                for (k, out) in group.iter_mut().enumerate() {
+                let n = group.len();
+                let mut stage = [[F192::ZERO; 8]; GROUPS];
+                for (k, out) in stage[..n].iter_mut().enumerate() {
                     rows8(8 * (c * GROUPS + k), out);
                 }
+                Stream::new().copy(group.as_flattened_mut(), stage[..n].as_flattened());
             });
             for (k, o) in real_r.iter_mut().enumerate() {
                 *o = row(8 * real8.len() + k);
@@ -320,7 +327,13 @@ pub fn build_leaves(
         }
         // A padding row's leaf is the identity, so it leaves the product alone.
         if padding.len() >= PAR_THRESHOLD {
-            parallel::fill(padding, |_| F192::ONE);
+            const ONES: [F192; 256] = [F192::ONE; 256];
+            parallel::chunks_mut(padding, 1 << 14, |_, chunk| {
+                let stream = Stream::new();
+                for part in chunk.chunks_mut(ONES.len()) {
+                    stream.copy(part, &ONES[..part.len()]);
+                }
+            });
         } else {
             padding.fill(F192::ONE);
         }
