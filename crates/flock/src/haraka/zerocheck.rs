@@ -120,9 +120,10 @@ fn fold_at_z(c: &[u8], w: &[F192], r_eq: &[F192], n_slots: usize) -> ([Vec<F192>
     let mut am = unsafe { primitives::uninit_vec::<F192>(n) };
     let mut bm = unsafe { primitives::uninit_vec::<F192>(n) };
     let mut cm = unsafe { primitives::uninit_vec::<F192>(n) };
-    let ac = parallel::Chunks::new(&mut am, COLS_PER_SLOT);
-    let bc = parallel::Chunks::new(&mut bm, COLS_PER_SLOT);
-    let cc = parallel::Chunks::new(&mut cm, COLS_PER_SLOT);
+    assert!(n_slots.is_multiple_of(SLOTS_PER_TASK));
+    let ac = parallel::Chunks::new(&mut am, TASK_COLS);
+    let bc = parallel::Chunks::new(&mut bm, TASK_COLS);
+    let cc = parallel::Chunks::new(&mut cm, TASK_COLS);
     let message = |oa: &[F192], ob: &[F192], oc: &[F192]| {
         let (mut g1, mut gi) = (F192::ZERO, F192::ZERO);
         for (p, &e) in eq_lo.iter().enumerate() {
@@ -134,14 +135,18 @@ fn fold_at_z(c: &[u8], w: &[F192], r_eq: &[F192], n_slots: usize) -> ([Vec<F192>
     };
     let fw = FoldWeights::new(w);
     let msg = parallel::map_reduce(
-        n_slots,
+        n_slots / SLOTS_PER_TASK,
         || (F192::ZERO, F192::ZERO),
-        |slot| {
-            // SAFETY: one task per slot, each chunk taken once.
-            let (oa, ob, oc) = unsafe { (ac.get(slot), bc.get(slot), cc.get(slot)) };
-            fold_slot(c, w, &fw, slot, oa, ob, oc);
-            let (g1, gi) = message(oa, ob, oc);
-            (eq_hi[slot] * g1, eq_hi[slot] * gi)
+        |task| {
+            // SAFETY: one task per chunk, each taken once.
+            let (oa, ob, oc) = unsafe { (ac.get(task), bc.get(task), cc.get(task)) };
+            fold_task(c, w, &fw, task * SLOTS_PER_TASK, oa, ob, oc);
+            (0..SLOTS_PER_TASK).fold((F192::ZERO, F192::ZERO), |acc, i| {
+                let r = i * COLS_PER_SLOT..(i + 1) * COLS_PER_SLOT;
+                let (g1, gi) = message(&oa[r.clone()], &ob[r.clone()], &oc[r]);
+                let e = eq_hi[task * SLOTS_PER_TASK + i];
+                (acc.0 + e * g1, acc.1 + e * gi)
+            })
         },
         |x, y| (x.0 + y.0, x.1 + y.1),
     );
@@ -203,8 +208,12 @@ impl FoldWeights {
     }
 }
 
-/// One slot's three tables from its byte rows.
-fn fold_slot(c: &[u8], w: &[F192], fw: &FoldWeights, slot: usize, oa: &mut [F192], ob: &mut [F192], oc: &mut [F192]) {
+/// Slots one fold task takes: a GFNI tile is 64 columns, so a block narrower than that shares a tile.
+const SLOTS_PER_TASK: usize = if COLS_PER_SLOT < 64 { 64 / COLS_PER_SLOT } else { 1 };
+const TASK_COLS: usize = SLOTS_PER_TASK * COLS_PER_SLOT;
+
+/// The three tables of `SLOTS_PER_TASK` consecutive slots from `slot0`, from their byte rows.
+fn fold_task(c: &[u8], w: &[F192], fw: &FoldWeights, slot0: usize, oa: &mut [F192], ob: &mut [F192], oc: &mut [F192]) {
     {
         #[cfg(all(
             target_arch = "x86_64",
@@ -216,14 +225,20 @@ fn fold_slot(c: &[u8], w: &[F192], fw: &FoldWeights, slot: usize, oa: &mut [F192
         {
             let FoldWeights { k, wa, wb, wsum } = fw;
             let _ = w;
-            for tile in 0..COLS_PER_SLOT / 64 {
+            for tile in 0..TASK_COLS / 64 {
                 let col0 = tile * 64;
-                let lin_mask = (0..64).fold(0u64, |m, j| if is_lin_col(col0 + j) { m | 1 << j } else { m });
-                // SAFETY: the target features are enabled at compile time; a tile is 64 whole columns of the slot.
+                let lin_mask = (0..64).fold(0u64, |m, j| {
+                    if is_lin_col((col0 + j) % COLS_PER_SLOT) {
+                        m | 1 << j
+                    } else {
+                        m
+                    }
+                });
+                // SAFETY: the target features are enabled at compile time; a tile is 64 whole columns of the task's slots.
                 unsafe {
                     kernels::gfni::fold_tile(
                         k,
-                        c.as_ptr().add((slot * COLS_PER_SLOT + col0) * COL_ROWS),
+                        c.as_ptr().add((slot0 * COLS_PER_SLOT + col0) * COL_ROWS),
                         lin_mask,
                         wa,
                         wb,
@@ -243,17 +258,29 @@ fn fold_slot(c: &[u8], w: &[F192], fw: &FoldWeights, slot: usize, oa: &mut [F192
             target_feature = "gfni"
         )))]
         {
-            kernels::fold_scalar(c, w, slot, USED_COLS, COLS_PER_SLOT, oa, ob);
-            for col in 0..COLS_PER_SLOT {
-                oc[col] = if col < USED_COLS {
-                    let x = slot * COLS_PER_SLOT + col;
-                    (0..64).fold(F192::ZERO, |acc, s| {
-                        let v = c[x * COL_ROWS + s];
-                        if v == 0 { acc } else { acc + w[s] * phi8_192(F8(v)) }
-                    })
-                } else {
-                    F192::ZERO
-                };
+            for i in 0..SLOTS_PER_TASK {
+                let slot = slot0 + i;
+                let r = i * COLS_PER_SLOT..(i + 1) * COLS_PER_SLOT;
+                kernels::fold_scalar(
+                    c,
+                    w,
+                    slot,
+                    USED_COLS,
+                    COLS_PER_SLOT,
+                    &mut oa[r.clone()],
+                    &mut ob[r.clone()],
+                );
+                for col in 0..COLS_PER_SLOT {
+                    oc[i * COLS_PER_SLOT + col] = if col < USED_COLS {
+                        let x = slot * COLS_PER_SLOT + col;
+                        (0..64).fold(F192::ZERO, |acc, s| {
+                            let v = c[x * COL_ROWS + s];
+                            if v == 0 { acc } else { acc + w[s] * phi8_192(F8(v)) }
+                        })
+                    } else {
+                        F192::ZERO
+                    };
+                }
             }
         }
     }

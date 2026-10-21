@@ -109,9 +109,8 @@ fn main() {
     let ms = |t: &Timing| format!("{:>8.1} ms{:<9}{}", t.mean() * 1e3, t.spread(), share(t.mean()));
     let named = witness.mean() + commit_stage.mean() + zerocheck.mean() + lincheck.mean() + open.mean();
     println!(
-        "\nFlock Haraka-512 batch proving, {} calls ({} slots of {CALLS_PER_SLOT})",
-        pretty_integer(n),
-        pretty_integer(1 << n_log)
+        "\nFlock Haraka-512 batch proving, {} calls (2^{n_log} blocks)",
+        pretty_integer(n)
     );
     println!("  witness-gen                     : {}", ms(&witness));
     println!("  commit                          : {}", ms(&commit_stage));

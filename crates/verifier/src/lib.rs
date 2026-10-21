@@ -206,7 +206,7 @@ pub fn verify_flock_batch(
     Ok(claims)
 }
 
-/// [`verify_flock_batch`] for the Haraka-512 circuit: `log_rows` is `14 + n_log`, the committed column has
+/// [`verify_flock_batch`] for the Haraka-512 circuit: `log_rows` is `11 + n_log`, the committed column has
 /// `log_rows + 2 - 6` variables.
 pub fn verify_flock_batch_haraka(
     fiat_shamir_iv: &[u8; 32],

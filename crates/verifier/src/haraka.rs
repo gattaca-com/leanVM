@@ -1,7 +1,7 @@
 //! Flock reduction for the Haraka-512 circuit (`flock::haraka`), then ring switching.
 //!
-//! The block is rectangular: `2^14` rows of GF(2^8)-coefficient constraints against `2^16` committed bits per
-//! slot. The zerocheck is the BLAKE2s one; the lincheck binds the ten high column bits and closes on the
+//! The block is rectangular: `2^11` rows of GF(2^8)-coefficient constraints against `2^13` committed bits per
+//! call. The zerocheck is the BLAKE2s one; the lincheck binds the ten high column bits and closes on the
 //! terminal identity `e_row^T (A + α B + α² C) w_col + α³ w_col[const]`, the three row values coming from one
 //! walk of Haraka's linear layers on bit-planes of the column weights.
 
@@ -12,11 +12,11 @@ use crate::multilinear::eq_kernel;
 use crate::transcript::{Transcript, sumcheck};
 use crate::{VerifierError, require};
 
-pub const HARAKA_ROWS_LOG: usize = 14;
-pub const HARAKA_K_LOG: usize = 16;
+pub const HARAKA_ROWS_LOG: usize = 11;
+pub const HARAKA_K_LOG: usize = 13;
 pub const HARAKA_ROW_INNER: usize = HARAKA_ROWS_LOG - 6;
 pub const HARAKA_LINCHECK_ROUNDS: usize = HARAKA_K_LOG - 6;
-const CALLS_PER_SLOT: usize = 10;
+const CALLS_PER_SLOT: usize = 1;
 const IN_LEN: usize = 64;
 const OUT_LEN: usize = 32;
 const SBOXES: usize = 640;

@@ -24,14 +24,15 @@
 //!   rows [1,280, 1,536) output bit i: out_i · 1 = z[512 + i]
 //! ```
 //!
-//! A slot holds [`CALLS_PER_SLOT`] calls then the constant wire at [`CONST_COL`].
+//! A block is one call then the constant wire at [`CONST_COL`]: `2^13` bits against `2^11` rows, so a VM
+//! row's value claims reach their words at a power-of-two stride.
 
 use super::primitive::*;
 use primitives::field::F8;
 
-pub const CALLS_PER_SLOT: usize = 10;
-pub const K_LOG: usize = 16;
-pub const ROWS_LOG: usize = 14;
+pub const CALLS_PER_SLOT: usize = 1;
+pub const K_LOG: usize = 13;
+pub const ROWS_LOG: usize = 11;
 pub const K: usize = 1 << K_LOG;
 pub const ROWS_PER_SLOT: usize = 1 << ROWS_LOG;
 pub const IN_BITS: usize = 8 * IN_LEN;

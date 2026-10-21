@@ -3,7 +3,7 @@
 //! The AES S-box is a field inverse, so with GF(2^8) coefficients in the
 //! constraint matrices each of the 640 S-boxes of a call costs two degree-2
 //! rows and eight committed bits, against 32 AND gates for the same S-box over
-//! GF(2). A call commits 5,888 bits and 1,536 rows ([`circuit`]); the
+//! GF(2). A call commits 5,888 bits and 1,536 rows ([`circuit`]), in a block of `2^13` and `2^11`; the
 //! univariate-skip zerocheck, the lincheck's sumcheck, the ring switch and the
 //! PCS are shared with [`crate::hash`], so the transcript shape is BLAKE2s's
 //! with a rectangular block.
@@ -166,10 +166,10 @@ mod tests {
 
     #[test]
     fn witness_satisfies_the_circuit() {
-        let setup = HarakaSetup::new(3 * CALLS_PER_SLOT + 1);
-        let w = setup.generate_witness(&inputs(3 * CALLS_PER_SLOT + 1, 5));
+        let setup = HarakaSetup::new(31);
+        let w = setup.generate_witness(&inputs(31, 5));
         let sq = |v: u8| (F8(v) * F8(v)).0;
-        for slot in [0, 3, 7] {
+        for slot in [0, 3, 30] {
             let zf = |col: usize| witness::z_bit(&w, slot, col);
             for (r, (ra, (rb, rc))) in setup
                 .mats
@@ -268,17 +268,31 @@ mod tests {
         let wts: Vec<F192> = (0..64)
             .map(|_| F192::new(rng.next_u64(), rng.next_u64(), rng.next_u64()))
             .collect();
-        let mut ra = vec![F192::ZERO; COLS_PER_SLOT];
-        let mut rb = vec![F192::ZERO; COLS_PER_SLOT];
-        kernels::fold_scalar(&w.c, &wts, 0, USED_COLS, COLS_PER_SLOT, &mut ra, &mut rb);
+        let mut ra = vec![F192::ZERO; 64];
+        let mut rb = vec![F192::ZERO; 64];
+        for slot in 0..64 / COLS_PER_SLOT {
+            let r = slot * COLS_PER_SLOT..(slot + 1) * COLS_PER_SLOT;
+            kernels::fold_scalar(
+                &w.c,
+                &wts,
+                slot,
+                USED_COLS,
+                COLS_PER_SLOT,
+                &mut ra[r.clone()],
+                &mut rb[r],
+            );
+        }
         let wa: Box<[[u8; kernels::COORDS]; 64]> = Box::new(std::array::from_fn(|s| k.basis.to_coords(wts[s])));
         let wb: Box<[[u8; kernels::COORDS]; 64]> = Box::new(std::array::from_fn(|s| wa[s ^ 1]));
         let wsum = k.basis.to_coords(wts.iter().fold(F192::ZERO, |acc, &x| acc + x));
         let mut ga = vec![F192::ZERO; 64];
         let mut gb = vec![F192::ZERO; 64];
         let mut gc = vec![F192::ZERO; 64];
-        for tile in 0..COLS_PER_SLOT / 64 {
-            let lin_mask = (0..64).fold(0u64, |mm, j| if is_lin_col(64 * tile + j) { mm | 1 << j } else { mm });
+        for tile in 0..1 {
+            let lin_mask = (0..64).fold(
+                0u64,
+                |mm, j| if is_lin_col(j % COLS_PER_SLOT) { mm | 1 << j } else { mm },
+            );
             unsafe {
                 fold_tile(
                     &k,
@@ -310,7 +324,7 @@ mod tests {
         use pcs::stack_open::open_batch_mixed_whir_stacked;
         use pcs::whir::{INITIAL_FOLDING_FACTOR, LOG_INV_RATE_0, commit, config_for_rate};
         use primitives::field::F64;
-        let n = 25 * CALLS_PER_SLOT + 3;
+        let n = 300;
         let setup = HarakaSetup::new(n);
         let n_log = setup.n_log();
         let mu = setup.m_bits() - LOG_PACKING;
