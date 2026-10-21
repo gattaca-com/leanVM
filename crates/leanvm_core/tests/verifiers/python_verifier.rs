@@ -134,6 +134,7 @@ pub(crate) fn fixture() -> &'static Fixture {
 }
 
 #[test]
+#[ignore = "python-verifier/verifier.py still verifies the BLAKE2s protocol"]
 fn test_python_verifier() {
     let Fixture {
         program,

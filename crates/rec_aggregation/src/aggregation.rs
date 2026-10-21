@@ -25,7 +25,7 @@
 //! size, and here the inner bytecode is this one. Its digest does not need a
 //! fixed point, riding the statement instead of the code.
 //!
-//! Three fixed polynomials (the stacked bytecode and flock's `A0`/`B0`) are too
+//! Four fixed polynomials (the stacked bytecode and flock's `A0`/`B0`/`C0`) are too
 //! big to evaluate in-circuit, so each node exports one deferred claim on each
 //! and batches its children's carried claims with the fresh ones its
 //! verifications raise (`doc/leanvm/main.tex` §Deferred evaluation claims). Only
@@ -84,30 +84,6 @@ pub const MAX_KEYS: usize = 1 << 16;
 /// Maximum number of LeanDA roots in one statement, including inherited and direct roots.
 pub const MAX_DA_ROOTS: usize = 16;
 const _: () = assert!(MAX_DA_ROOTS < MAX_KEYS);
-
-/// Blocks the guest absorbs per loop frame when it hashes a declared list, and so
-/// how many share one byte-counter base (`doc/leanvm` §Byte counters for a hash of
-/// runtime length). Larger amortizes the base's bit decomposition over more blocks
-/// and costs bytecode in the tail's dispatch arms; the split it induces is what
-/// [`signers_split`] hands the guest.
-const SIGNERS_WINDOW: usize = 32;
-// The counter split is a bit split: a window's base is `64·SIGNERS_WINDOW·q`, which
-// has to be a power of two for its bits to sit clear of the window's own offsets.
-const _: () = assert!(SIGNERS_WINDOW.is_power_of_two());
-
-/// The window bound the guest range-checks its hinted window count against. A
-/// range check takes a COUNT (`assert log(x) < k` bounds the exponent by `k`), so
-/// this has to cover the most windows a list can hold, which a bit width would not:
-/// under the bound every list still hashes, so the mistake shows up only past it.
-const SIGNERS_MAX_WINDOWS: usize = MAX_KEYS / SIGNERS_WINDOW;
-// A list is one block a claim, so at most MAX_KEYS blocks, of which the last is
-// absorbed apart.
-const _: () = assert!((MAX_KEYS - 1) / SIGNERS_WINDOW < SIGNERS_MAX_WINDOWS);
-// The guest decomposes a count into SIGNERS_COUNT_BITS bits and shifts the result
-// left to make a byte counter, so a count has to fit and the shift must not reduce.
-const SIGNERS_COUNT_BITS: u32 = MAX_KEYS.ilog2();
-const _: () = assert!(MAX_KEYS.is_power_of_two());
-const _: () = assert!(SIGNERS_COUNT_BITS + 6 + SIGNERS_WINDOW.ilog2() <= 64);
 
 // The guest bakes a bytecode claim's width from `N_TUPLE_BITS` while `bytecode_vars`
 // reads it off the stacked table, which is `N_BYTECODE_SELECTORS` wide. Two constants
@@ -178,8 +154,7 @@ fn pack_state(state: [F64; 4]) -> [F192; 2] {
     ]
 }
 
-/// Pack a 32-byte Merkle node as the same canonical 128+128 cell pair used by
-/// the VM's sole BLAKE2s representation.
+/// Pack a 32-byte digest as the canonical 128+128 cell pair the VM carries it in.
 fn pack_hash_state(hash: &[u8; 32]) -> [F192; 2] {
     let word_at = |offset: usize| u64::from_le_bytes(hash[offset..offset + 8].try_into().unwrap());
     [
@@ -194,9 +169,9 @@ fn pack_16_bytes(bytes: &[u8]) -> F192 {
     F192::new(word_at(0), word_at(8), 0)
 }
 
-/// A run of canonical 128-bit cells as the byte string BLAKE2s hashes: each cell
-/// is its two low limbs, little-endian, which is the order the VM's compression
-/// reads a memory cell in.
+/// A run of canonical 128-bit cells as the byte string the hash takes: each cell
+/// is its two low limbs, little-endian, which is the order the VM's call reads a
+/// memory cell in.
 fn cell_bytes(cells: impl IntoIterator<Item = F192>) -> Vec<u8> {
     let mut bytes = Vec::new();
     for cell in cells {
@@ -206,21 +181,10 @@ fn cell_bytes(cells: impl IntoIterator<Item = F192>) -> Vec<u8> {
     bytes
 }
 
-/// How the guest splits a list's `n - 1` non-final blocks: whole windows, then the
-/// tail. Its own product identity and range check pin both, so this only has to
-/// agree with them (`claim_list_digest` in the guest). A list is never empty
-/// here: both claim lists are guarded at the call, since the guest hashes an empty
-/// one without a split at all.
-fn signers_split(blocks: usize) -> Vec<F192> {
-    assert!(blocks > 0, "an empty list has no window split");
-    let leading = blocks - 1;
-    vec![count(leading / SIGNERS_WINDOW), count(leading % SIGNERS_WINDOW)]
-}
-
-/// One scheme's declared claims under plain BLAKE2s: one 64-byte block per claim,
-/// its pubkey then the message it signed, so the hashed string is exactly `64n` bytes
-/// and an empty list hashes the empty string. The guest computes this same digest a
-/// window of blocks at a time (`claim_list_digest`).
+/// One scheme's declared claims under the plain hash: 64 bytes per claim, its pubkey
+/// then the message it signed, so the hashed string is exactly `64n` bytes and an
+/// empty list hashes the empty string. The guest computes this same digest two
+/// calls a claim (`claim_list_digest`).
 fn claim_list_digest(claims: impl IntoIterator<Item = [F192; 4]>) -> [F192; 2] {
     pack_hash_state(&primitives::hash::hash(&cell_bytes(claims.into_iter().flatten())))
 }
@@ -244,23 +208,19 @@ fn lean_sphincs_claim_cells((pk, message): &LeanSphincsClaim) -> [F192; 4] {
     claim_cells(&pk.flatten(), message)
 }
 
-/// The signer-set digest: plain BLAKE2s of the leanXMSS list's digest then the leanSPHINCS
-/// list's, one 64-byte block (`main` in the guest). Each list digest binds its own
-/// length through BLAKE2s's byte counter, so the pair binds both lists whole.
+/// The signer-set digest: one call over the leanXMSS list's digest then the leanSPHINCS
+/// list's (`main` in the guest). Each list digest binds its own length through the
+/// chain's length block, so the pair binds both lists whole.
 fn signers_hash(xmss_signers: &[LeanXmssClaim], lean_sphincs_signers: &[LeanSphincsClaim]) -> [F192; 2] {
     let xmss = claim_list_digest(xmss_signers.iter().map(lean_xmss_claim_cells));
     let lean_sphincs = claim_list_digest(lean_sphincs_signers.iter().map(lean_sphincs_claim_cells));
-    pack_hash_state(&primitives::hash::hash(&cell_bytes([
-        xmss[0],
-        xmss[1],
-        lean_sphincs[0],
-        lean_sphincs[1],
-    ])))
+    let bytes = cell_bytes([xmss[0], xmss[1], lean_sphincs[0], lean_sphincs[1]]);
+    pack_hash_state(&primitives::hash::haraka512(bytes[..].try_into().unwrap()))
 }
 
-/// The claims on the three fixed polynomials that a node defers rather than
+/// The claims on the four fixed polynomials that a node defers rather than
 /// evaluating in-circuit: one point and value on the stacked bytecode, one point
-/// and two values on flock's `A0`/`B0` (`doc/leanvm/main.tex` §Deferred
+/// and three values on flock's `A0`/`B0`/`C0` (`doc/leanvm/main.tex` §Deferred
 /// evaluation claims).
 ///
 /// Only the points are transmitted; the values are derived from them on receipt,
@@ -273,20 +233,21 @@ pub struct DeferredClaim {
     matrix_point: Vec<F192>,
     matrix_a_value: F192,
     matrix_b_value: F192,
+    matrix_c_value: F192,
 }
+
+/// The matrix point's length: the row coordinates, then the column coordinates.
+const MAT_VARS: usize = flock::haraka::ROWS_LOG + flock::haraka::K_LOG;
 
 impl DeferredClaim {
     /// What a leaf defers: the all-zeros point on each polynomial, where the
     /// value is just the table's first entry.
     fn leaf() -> Self {
-        Self::recompute(
-            vec![F192::ZERO; bytecode_vars()],
-            vec![F192::ZERO; 2 * flock::hash::K_LOG],
-        )
-        .expect("the all-zeros point has the right shape")
+        Self::recompute(vec![F192::ZERO; bytecode_vars()], vec![F192::ZERO; MAT_VARS])
+            .expect("the all-zeros point has the right shape")
     }
 
-    /// Evaluate the three fixed polynomials at `bytecode_point` / `matrix_point`, on the prover's field kernels and thread pool.
+    /// Evaluate the four fixed polynomials at `bytecode_point` / `matrix_point`, on the prover's field kernels and thread pool.
     fn recompute(bytecode_point: Vec<F192>, matrix_point: Vec<F192>) -> Result<Self, AggregateVerifyError> {
         let bytecode_at = |point: &[F192]| {
             let _span = tracing::info_span!("bytecode mle").entered();
@@ -294,10 +255,10 @@ impl DeferredClaim {
         };
         let matrices_at = |point: &[F192]| {
             let _span = tracing::info_span!("matrix walk").entered();
-            let (row, column) = point.split_at(flock::hash::K_LOG);
+            let (row, column) = point.split_at(flock::haraka::ROWS_LOG);
             let eq_r = pcs::whir::build_eq_table_ext(row);
             let eq_c = pcs::whir::build_eq_table_ext(column);
-            flock::hash::bilinear_walk_pair(&eq_r, &eq_c)
+            flock::haraka::circuit::SlotMatrices::shared().bilinear(&eq_r, &eq_c)
         };
         Self::evaluate(bytecode_point, matrix_point, bytecode_at, matrices_at)
     }
@@ -312,8 +273,9 @@ impl DeferredClaim {
         };
         let matrices_at = |point: &[F192]| {
             let _span = tracing::info_span!("matrix walk").entered();
-            let (a, b) = verifier::deferred::matrix_values(&scalars(point)).expect("the point's length was checked");
-            (from_scalar(a), from_scalar(b))
+            verifier::deferred::matrix_values(&scalars(point))
+                .expect("the point's length was checked")
+                .map(from_scalar)
         };
         Self::evaluate(bytecode_point, matrix_point, bytecode_at, matrices_at)
     }
@@ -322,9 +284,9 @@ impl DeferredClaim {
         bytecode_point: Vec<F192>,
         matrix_point: Vec<F192>,
         bytecode_at: impl FnOnce(&[F192]) -> F192,
-        matrices_at: impl FnOnce(&[F192]) -> (F192, F192),
+        matrices_at: impl FnOnce(&[F192]) -> [F192; 3],
     ) -> Result<Self, AggregateVerifyError> {
-        if bytecode_point.len() != bytecode_vars() || matrix_point.len() != 2 * flock::hash::K_LOG {
+        if bytecode_point.len() != bytecode_vars() || matrix_point.len() != MAT_VARS {
             return Err(AggregateVerifyError::MalformedClaim);
         }
         // Every leaf defers the all-zeros point, where the bytecode polynomial is
@@ -338,13 +300,14 @@ impl DeferredClaim {
         } else {
             bytecode_at(&bytecode_point)
         };
-        let (matrix_a_value, matrix_b_value) = matrices_at(&matrix_point);
+        let [matrix_a_value, matrix_b_value, matrix_c_value] = matrices_at(&matrix_point);
         Ok(Self {
             bytecode_point,
             bytecode_value,
             matrix_point,
             matrix_a_value,
             matrix_b_value,
+            matrix_c_value,
         })
     }
 
@@ -355,6 +318,7 @@ impl DeferredClaim {
         cells.extend_from_slice(&self.matrix_point);
         cells.push(self.matrix_a_value);
         cells.push(self.matrix_b_value);
+        cells.push(self.matrix_c_value);
         cells
     }
 }
@@ -364,11 +328,9 @@ impl DeferredClaim {
 /// the DA root-list digest. Fed to the guest as `STMT_HEADER`, so the two cannot drift.
 const STATEMENT_HEADER: usize = 6;
 
-/// A plain BLAKE2s over a lane stream, zero-filled to a whole 64-byte block:
-/// what the guest gets by streaming four 128-bit cells a block.
+/// The plain hash over a lane stream: what the guest gets by streaming two 128-bit cells a block.
 fn lane_hash(lanes: impl Iterator<Item = u64>) -> [F192; 2] {
-    let mut bytes: Vec<u8> = lanes.flat_map(u64::to_le_bytes).collect();
-    bytes.resize(bytes.len().next_multiple_of(64), 0);
+    let bytes: Vec<u8> = lanes.flat_map(u64::to_le_bytes).collect();
     pack_hash_state(&primitives::hash::hash(&bytes))
 }
 
@@ -378,10 +340,10 @@ fn lane_hash(lanes: impl Iterator<Item = u64>) -> [F192; 2] {
 /// each child's claims, bound by the signer-set digest,
 /// onto its parent's lists.
 ///
-/// Fixed-length preimage, so a plain BLAKE2s, with no domain tag of its own: the
+/// Fixed-length preimage, so a plain hash, with no domain tag of its own: the
 /// header leads with the environment digest, which binds this bytecode and
 /// flock's R1CS and so already separates the preimage from every other use of
-/// BLAKE2s here. The header is hashed as the canonical cells it already is (two
+/// the hash here. The header is hashed as the canonical cells it already is (two
 /// lanes each, whence the assert, the guest being unable to hash a third), then
 /// all three lanes of each deferred cell.
 fn statement_digest(signers_hash: [F192; 2], da_digest: [u8; 32], defer: &DeferredClaim) -> [F192; 2] {
@@ -646,7 +608,7 @@ impl EthereumProof {
         &self.da_roots
     }
 
-    /// BLAKE2s of the concatenated `(root, vector hash)` pairs, or of empty input.
+    /// The hash of the concatenated `(root, vector hash)` pairs, or of empty input.
     /// Each vector hash is derived from its root outside the SNARK.
     /// This digest is bound into the public statement.
     pub fn da_commitments_digest(&self) -> [u8; 32] {
@@ -717,7 +679,7 @@ impl EthereumProof {
         } = claims;
         let (da_roots, bytecode_point, matrix_point, proof) = core;
         // Cheap rejections first. `recompute_scalar` below is a pass over the whole stacked
-        // bytecode plus a walk of the BLAKE2s circuit, on points a peer chose, so
+        // bytecode plus a walk of the Haraka circuit, on points a peer chose, so
         // anything decidable without it has to be decided before it.
         check_signer_set(&xmss_signers, &lean_sphincs_signers)?;
         check_da_roots(&da_roots)?;
@@ -1009,7 +971,6 @@ fn aggregate_deferred_claims(
     let child_count = subproofs.len();
     assert_eq!(child_count, carried_claims.len(), "one carried claim per child");
     let kbcv = bytecode_vars();
-    let klog = flock::hash::K_LOG;
 
     let mut transcript = FiatShamirState::from_label(RECURSION_AGG_LABEL);
     transcript.observe(count(child_count));
@@ -1116,49 +1077,54 @@ fn aggregate_deferred_claims(
 
     drop(_span);
     let _span = tracing::info_span!("Matrix batch").entered();
+    let (rlog, clog) = (flock::haraka::ROWS_LOG, flock::haraka::K_LOG);
+    let mats = flock::haraka::circuit::SlotMatrices::shared();
     // One group per claim: the row weights, the column weights, and the
     // coefficient each matrix enters with. Downstream is shape-blind.
     let mut us: Vec<Vec<F192>> = Vec::with_capacity(2 * child_count);
     let mut ws: Vec<Vec<F192>> = Vec::with_capacity(2 * child_count);
-    let mut ga: Vec<F192> = Vec::with_capacity(2 * child_count);
-    let mut gb: Vec<F192> = Vec::with_capacity(2 * child_count);
+    let mut gs: [Vec<F192>; 3] = std::array::from_fn(|_| Vec::with_capacity(2 * child_count));
     let mut mrun = F192::ZERO;
     for (subproof, carried) in subproofs.iter().zip(carried_claims) {
-        let (gf, cga, cgb) = (transcript.sample(), transcript.sample(), transcript.sample());
+        let gf = transcript.sample();
+        let cg: [F192; 3] = std::array::from_fn(|_| transcript.sample());
         us.push(flock::lincheck::build_quirky_eq_table(
             subproof.skip_point,
             &subproof.zerocheck_row_point,
             6,
         ));
         ws.push(
-            (0..1usize << klog)
+            (0..1usize << clog)
                 .map(|col| {
                     let mut w = subproof.lincheck_terminal_values[col & 63];
                     for (j, &rj) in subproof.lincheck_round_point.iter().enumerate() {
-                        let bit = (col >> (klog - 1 - j)) & 1;
+                        let bit = (col >> (clog - 1 - j)) & 1;
                         w *= if bit == 1 { rj } else { F192::ONE + rj };
                     }
                     w
                 })
                 .collect(),
         );
-        ga.push(gf);
-        gb.push(gf * subproof.matrix_a_coefficient);
-        us.push(pcs::whir::build_eq_table_ext(&carried.matrix_point[..klog]));
-        ws.push(pcs::whir::build_eq_table_ext(&carried.matrix_point[klog..]));
-        ga.push(cga);
-        gb.push(cgb);
-        mrun += gf * subproof.matrix_claim + cga * carried.matrix_a_value + cgb * carried.matrix_b_value;
+        let alpha = subproof.matrix_a_coefficient;
+        gs[0].push(gf);
+        gs[1].push(gf * alpha);
+        gs[2].push(gf * alpha * alpha);
+        us.push(pcs::whir::build_eq_table_ext(&carried.matrix_point[..rlog]));
+        ws.push(pcs::whir::build_eq_table_ext(&carried.matrix_point[rlog..]));
+        for (g, &c) in gs.iter_mut().zip(&cg) {
+            g.push(c);
+        }
+        mrun += gf * subproof.matrix_claim
+            + cg[0] * carried.matrix_a_value
+            + cg[1] * carried.matrix_b_value
+            + cg[2] * carried.matrix_c_value;
     }
     let _cols = tracing::info_span!("Contract columns").entered();
-    // One forward walk of the circuit per claim yields that claim's two row
-    // tables `(A_0 w, B_0 w)` directly, in O(circuit): no matrix, and no pass
-    // over the ~89M nonzeros. A before B, the order `ga`/`gb` index.
-    let mut ms: Vec<Vec<F192>> = Vec::with_capacity(2 * ws.len());
+    // One pass over the circuit's matrices per claim yields that claim's three row
+    // tables `(A_0 w, B_0 w, C_0 w)`, in the order `gs` indexes.
+    let mut ms: Vec<Vec<F192>> = Vec::with_capacity(3 * ws.len());
     for w in &ws {
-        let (ra, rb) = flock::hash::row_values_walk(w);
-        ms.push(ra);
-        ms.push(rb);
+        ms.extend(mats.row_values(w));
     }
     drop(_cols);
     // sanity: every carried claim really is the bilinear form over the matrices.
@@ -1172,23 +1138,21 @@ fn aggregate_deferred_claims(
                 .fold(F192::ZERO, |a, x| a + x)
         };
         assert_eq!(
-            (form(&ms[2 * t]), form(&ms[2 * t + 1])),
-            (carried.matrix_a_value, carried.matrix_b_value),
+            [form(&ms[3 * t]), form(&ms[3 * t + 1]), form(&ms[3 * t + 2])],
+            [carried.matrix_a_value, carried.matrix_b_value, carried.matrix_c_value],
             "carried matrix claim"
         );
     }
     let mut mscr = Vec::new();
     let mut r_row = Vec::new();
     let _rounds = tracing::info_span!("Row rounds").entered();
-    for _ in 0..klog {
-        let pairs: Vec<(&[F192], &[F192], F192)> = (0..2 * child_count)
-            .flat_map(|t| {
-                [
-                    (&us[t][..], &ms[2 * t][..], ga[t]),
-                    (&us[t][..], &ms[2 * t + 1][..], gb[t]),
-                ]
-            })
-            .collect();
+    for _ in 0..rlog {
+        let mut pairs: Vec<(&[F192], &[F192], F192)> = Vec::with_capacity(6 * child_count);
+        for t in 0..2 * child_count {
+            for (k, g) in gs.iter().enumerate() {
+                pairs.push((&us[t][..], &ms[3 * t + k][..], g[t]));
+            }
+        }
         let msg = round_msg(&pairs);
         let r = absorb_round(&mut transcript, &mut mscr, &mut r_row, &mut mrun, msg);
         for u in us.iter_mut() {
@@ -1201,46 +1165,46 @@ fn aggregate_deferred_claims(
     drop(_rounds);
     let eq_rstar = pcs::whir::build_eq_table_ext(&r_row);
     let _rows = tracing::info_span!("Contract rows").entered();
-    // `A_0ᵀ eq` and `B_0ᵀ eq` are the column marginals, which the circuit walks
-    // backwards (`gf2`'s `back_*`) in O(circuit).
-    let (mut acol, mut bcol) = flock::hash::marginal_walk_pair(&eq_rstar);
+    // `A_0ᵀ eq`, `B_0ᵀ eq` and `C_0ᵀ eq` are the column marginals.
+    let mut cols = mats.column_marginals(&eq_rstar);
     drop(_rows);
-    let mut wa = vec![F192::ZERO; 1 << klog];
-    let mut wb = vec![F192::ZERO; 1 << klog];
+    let mut wk: [Vec<F192>; 3] = std::array::from_fn(|_| vec![F192::ZERO; 1 << clog]);
     for t in 0..2 * child_count {
-        let (sa, sb) = (ga[t] * us[t][0], gb[t] * us[t][0]);
-        for j in 0..1 << klog {
-            wa[j] += sa * ws[t][j];
-            wb[j] += sb * ws[t][j];
+        for k in 0..3 {
+            let scale = gs[k][t] * us[t][0];
+            for j in 0..1 << clog {
+                wk[k][j] += scale * ws[t][j];
+            }
         }
     }
     let mut r_col = Vec::new();
-    for _ in 0..klog {
-        let pairs: Vec<(&[F192], &[F192], F192)> = vec![(&acol, &wa, F192::ONE), (&bcol, &wb, F192::ONE)];
+    for _ in 0..clog {
+        let pairs: Vec<(&[F192], &[F192], F192)> =
+            cols.iter().zip(&wk).map(|(c, w)| (&c[..], &w[..], F192::ONE)).collect();
         let msg = round_msg(&pairs);
         let r = absorb_round(&mut transcript, &mut mscr, &mut r_col, &mut mrun, msg);
-        for tb in [&mut acol, &mut bcol, &mut wa, &mut wb] {
+        for tb in cols.iter_mut().chain(wk.iter_mut()) {
             fold_lsb(tb, r);
         }
     }
-    let (v_a, v_b) = (acol[0], bcol[0]);
+    let [v_a, v_b, v_c] = [cols[0][0], cols[1][0], cols[2][0]];
     // A fresh matrix claim is the bilinear form exactly when its child's lincheck closes, which the replay did
     // not check. A false one leaves this honest sumcheck off by its error.
-    if mrun != v_a * wa[0] + v_b * wb[0] {
+    if mrun != v_a * wk[0][0] + v_b * wk[1][0] + v_c * wk[2][0] {
         return Err(AggregateVerifyError::Snark(
             verifier::VerifierError::FlockLincheckTerminal,
         ));
     }
-    // The guest reaches the same two weights by a succinct formula rather than by
+    // The guest reaches the same three weights by a succinct formula rather than by
     // folding these tables, and nothing else compares the two: the aggregation
     // layer has no other implementation the way the snark's verifier does. So this runs
     // unconditionally (it is O(n) against a 2^28 sumcheck), and it compares the
-    // weights COMPONENT-WISE. Checking only the combination `v_a·wa + v_b·wb`
-    // would let two correlated errors through.
+    // weights COMPONENT-WISE. Checking only the combination would let correlated
+    // errors through.
     {
         let eqr = pcs::whir::build_eq_table_ext(&r_row[..6]);
         let eqc = pcs::whir::build_eq_table_ext(&r_col[..6]);
-        let (mut wam, mut wbm) = (F192::ZERO, F192::ZERO);
+        let mut wm = [F192::ZERO; 3];
         for (t, (subproof, carried)) in subproofs.iter().zip(carried_claims).enumerate() {
             let lam = primitives::multilinear::lagrange_weights_naive(6, subproof.skip_point);
             let mut urow: F192 = (0..64).map(|i| lam[i] * eqr[i]).fold(F192::ZERO, |a, x| a + x);
@@ -1251,19 +1215,21 @@ fn aggregate_deferred_claims(
                 .map(|i| subproof.lincheck_terminal_values[i] * eqc[i])
                 .fold(F192::ZERO, |a, x| a + x);
             for (j, &rj) in subproof.lincheck_round_point.iter().enumerate() {
-                wcol *= F192::ONE + rj + r_col[klog - 1 - j];
+                wcol *= F192::ONE + rj + r_col[clog - 1 - j];
             }
             let fresh = urow * wcol;
             let mut plain = F192::ONE;
             for (k, &p) in carried.matrix_point.iter().enumerate() {
-                let r = if k < klog { r_row[k] } else { r_col[k - klog] };
+                let r = if k < rlog { r_row[k] } else { r_col[k - rlog] };
                 plain *= F192::ONE + p + r;
             }
-            wam += ga[2 * t] * fresh + ga[2 * t + 1] * plain;
-            wbm += gb[2 * t] * fresh + gb[2 * t + 1] * plain;
+            for k in 0..3 {
+                wm[k] += gs[k][2 * t] * fresh + gs[k][2 * t + 1] * plain;
+            }
         }
-        assert_eq!(wa[0], wam, "guest row-weight formula for A0");
-        assert_eq!(wb[0], wbm, "guest row-weight formula for B0");
+        for k in 0..3 {
+            assert_eq!(wk[k][0], wm[k], "guest row-weight formula for matrix {k}");
+        }
     }
 
     drop(_span);
@@ -1271,7 +1237,7 @@ fn aggregate_deferred_claims(
         ("bc_sumcheck_msgs", bscr),
         ("mat_sumcheck_msgs", mscr),
         ("bc_star_hint", vec![v_bc]),
-        ("mat_stars_hint", vec![v_a, v_b]),
+        ("mat_stars_hint", vec![v_a, v_b, v_c]),
     ];
     Ok((
         hints,
@@ -1281,6 +1247,7 @@ fn aggregate_deferred_claims(
             matrix_point: r_row.iter().chain(&r_col).copied().collect(),
             matrix_a_value: v_a,
             matrix_b_value: v_b,
+            matrix_c_value: v_c,
         },
     ))
 }
@@ -1315,10 +1282,10 @@ fn merkle_cap_depth(queries: usize, depth: usize) -> usize {
     (queries.next_power_of_two().ilog2() as usize).min(depth)
 }
 
-/// The BLAKE2s table's virtual value columns, in `hash_flock::SLOTS` order.
-fn blake2s_value_columns() -> Vec<usize> {
+/// The Haraka table's virtual value columns, in `haraka::SLOTS` order.
+fn haraka_value_columns() -> Vec<usize> {
     let base = leanvm_core::cpu::schema().base[5];
-    leanvm_core::tables::BLAKE2S_VALUE_COLS
+    leanvm_core::tables::HARAKA_VALUE_COLS
         .iter()
         .map(|&c| base + c)
         .collect()
@@ -1389,7 +1356,7 @@ fn push_coord_terms(c: &Coord, base: usize, terms: &mut Vec<Term>) {
 /// claim descriptors follow this order.
 fn walk_claims(layout: &leanvm_core::cpu::Layout, kbc: usize, mut visit: impl FnMut(ClaimSite)) {
     let sides: [&[Block]; 3] = [&layout.push, &layout.pull, &layout.count];
-    let valcols = blake2s_value_columns();
+    let valcols = haraka_value_columns();
     // Only the framework blocks raise claims: a table's coords are settled inside
     // the table sumcheck.
     let is_framework: Vec<bool> = leanvm_core::cpu::block_kappa_sources(kbc)
@@ -1475,7 +1442,8 @@ fn gen_verify(
 
     let taus = layout.taus;
     // Flock replay data, all named struct fields.
-    let lcrounds = flock::hash::K_LOG - 6;
+    let lcrounds = flock::haraka::K_LOG - 6;
+    let row_inner = flock::haraka::ROWS_LOG - 6;
     let flock = &summary.flock;
     let zcf = [from_scalar(flock.v_a), from_scalar(flock.v_b)];
     let zc_z = from_scalar(flock.z_skip);
@@ -1496,8 +1464,8 @@ fn gen_verify(
     let lcz = scalars(&flock.s);
 
     // matpart = the deferred weighted matrix evaluation: the lincheck running
-    // claim minus (= plus, char 2) the const-pin and c-claim contributions,
-    // which every verifier weighs by α³ and α².
+    // claim minus (= plus, char 2) the const-pin contribution, which every
+    // verifier weighs by α³.
     let lc_sq = lc_alpha.square();
     let lc_beta = lc_sq * lc_alpha;
     let mut lrun = zcf[0] + lc_alpha * zcf[1] + lc_sq * from_scalar(flock.v_c) + lc_beta;
@@ -1507,21 +1475,11 @@ fn gen_verify(
     }
     let mut pinw = lc_beta;
     for (j, &rv) in lrr.iter().enumerate() {
-        let bit = (flock::hash::Z_CONST_POS >> (flock::hash::K_LOG - 1 - j)) & 1;
+        let bit = (flock::haraka::CONST_COL >> (flock::haraka::K_LOG - 1 - j)) & 1;
         pinw *= if bit == 1 { rv } else { F192::ONE + rv };
     }
-    pinw *= lcz[flock::hash::Z_CONST_POS % 64];
-    // The c term: eq(ρ_in, ρ'_in) times the φ8-Lagrange combination of the 64
-    // slices, ρ'_in being the lincheck challenges read back in coordinate order.
-    let mut c_point_eq = F192::ONE;
-    for (t, &rin) in zchi[..lcrounds].iter().enumerate() {
-        c_point_eq *= F192::ONE + rin + lrr[lcrounds - 1 - t];
-    }
-    let c_slice_value = primitives::multilinear::lagrange_weights_naive(6, zc_z)
-        .iter()
-        .zip(&lcz)
-        .fold(F192::ZERO, |acc, (&w, &s)| acc + w * s);
-    let matpart = lrun + pinw + lc_sq * c_point_eq * c_slice_value;
+    pinw *= lcz[flock::haraka::CONST_COL % 64];
+    let matpart = lrun + pinw;
 
     // ---- hints ----
     // The program's whole share of a bytecode leaf: ONE value, the stacked
@@ -1621,7 +1579,7 @@ fn gen_verify(
         bytecode_value,
         matrix_a_coefficient: lc_alpha,
         skip_point: zc_z,
-        zerocheck_row_point: zchi[..lcrounds].to_vec(),
+        zerocheck_row_point: zchi[..row_inner].to_vec(),
         lincheck_round_point: lrr,
         lincheck_terminal_values: lcz,
         matrix_claim: matpart,
@@ -2078,9 +2036,6 @@ pub fn aggregate_with_stats(
         .map(lean_sphincs_claim_cells)
         .collect();
     for cells in [&lean_xmss_cells, &lean_sphincs_cells] {
-        if !cells.is_empty() {
-            hints.push("signers_split", signers_split(cells.len()));
-        }
         for claim in cells {
             hints.push("claims", claim.to_vec());
         }
@@ -2114,9 +2069,6 @@ pub fn aggregate_with_stats(
             vec![count(child.xmss_signers.len()), count(child.lean_sphincs_signers.len())],
         );
         for offsets in [&cover.xmss.children[i], &cover.lean_sphincs.children[i]] {
-            if !offsets.is_empty() {
-                hints.push("signers_split", signers_split(offsets.len()));
-            }
             for &offset in offsets {
                 hints.push("child_claim_index", vec![count(offset)]);
             }
@@ -2137,7 +2089,12 @@ pub fn aggregate_with_stats(
         let leaf = DeferredClaim::leaf();
         hints.push(
             "leaf_defer",
-            vec![leaf.bytecode_value, leaf.matrix_a_value, leaf.matrix_b_value],
+            vec![
+                leaf.bytecode_value,
+                leaf.matrix_a_value,
+                leaf.matrix_b_value,
+                leaf.matrix_c_value,
+            ],
         );
         leaf
     } else {
@@ -2295,7 +2252,8 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     let stand_in = vec![leanvm_core::cpu::Op::Xor { a: 0, b: 0, c: 0 }; 1 << kbc];
     let layout = leanvm_core::cpu::layout(&stand_in, 20, [1 << 10; N_TABLES], [F192::ZERO, F192::ZERO]);
     let sides: [&[Block]; 3] = [&layout.push, &layout.pull, &layout.count];
-    let lcrounds = flock::hash::K_LOG - 6;
+    let lcrounds = flock::haraka::K_LOG - 6;
+    let row_inner = flock::haraka::ROWS_LOG - 6;
 
     // ---- flattened block/coord descriptors (structural) ----
     let mut sblk = vec![0usize];
@@ -2361,7 +2319,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     let ncl = nclaims + evtot + 3; // bus + constraint + the three PI memory-limb claims
 
     // ---- claim descriptor buffer ids (structural) ----
-    let valcols = blake2s_value_columns();
+    let valcols = haraka_value_columns();
     let col_sources_pm = leanvm_core::cpu::col_kappa_sources(kbc);
     let mut compact_col_pm = vec![usize::MAX; col_sources_pm.len()];
     let mut n_committed = 0usize;
@@ -2394,7 +2352,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
                     compact_col_pm[column]
                 },
                 qflock_slot: if is_virtual {
-                    leanvm_core::hash_flock::SLOTS[valcols.iter().position(|&v| v == column).unwrap()]
+                    leanvm_core::haraka::SLOTS[valcols.iter().position(|&v| v == column).unwrap()]
                 } else {
                     0
                 },
@@ -2485,6 +2443,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("INDEX_MLE_FACTORS", literals(&idxc));
     ps("N_CLAIMS", ncl.to_string());
     ps("N_TABLES", N_TABLES.to_string());
+    ps("FLOORS", literals(leanvm_core::tables::TABLE_LOG_FLOORS));
     // The table sumcheck's xi layout, from the native verifier's own numbers:
     // a disjoint range of identities per table, then THREE powers shared by every
     // table, one per bus side. Sharing is what lets the target be derived from the
@@ -2543,11 +2502,13 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
         f192_literal(primitives::multilinear::window_denominator(64)),
     );
     ps("LINCHECK_ROUNDS", lcrounds.to_string());
-    ps("PIN_COLUMN", flock::hash::Z_CONST_POS.to_string());
-    ps("K_LOG", flock::hash::K_LOG.to_string());
-    // The q_flock Strided-claim slot stride is K_LOG - LOG_PACKING (= 8), so the
+    ps("ROW_INNER", row_inner.to_string());
+    ps("PIN_COLUMN", flock::haraka::CONST_COL.to_string());
+    ps("ROWS_LOG", flock::haraka::ROWS_LOG.to_string());
+    ps("COL_LOG", flock::haraka::K_LOG.to_string());
+    // The q_flock Strided-claim slot stride is K_LOG - LOG_PACKING (= 7), so the
     // qflock point-claim slot must use THIS, not LOG2_FIELD_BITS.
-    ps("SLOT_STRIDE_LOG", leanvm_core::hash_flock::SLOT_STRIDE_LOG.to_string());
+    ps("SLOT_STRIDE_LOG", leanvm_core::haraka::SLOT_STRIDE_LOG.to_string());
 
     // ---- LIG candidate tables (fixed [minm, maxm] range; open_stacked config) ----
     let oshape = |m: usize, log_inv_rate: usize| {
@@ -2564,13 +2525,13 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
         assert!(
             cni.iter().enumerate().all(|(lv, &n)| {
                 let (bytes, whole_blocks) = if lv == 0 {
-                    (8 * n, n % 8 == 0)
+                    (8 * n, n % 4 == 0)
                 } else {
-                    (24 * n, (3 * n) % 8 == 0)
+                    (24 * n, (3 * n) % 4 == 0)
                 };
                 bytes <= 1024 && whole_blocks
             }),
-            "recursive WHIR guest supports whole-block Merkle rows of at most one 1024-byte BLAKE2s chunk"
+            "recursive WHIR guest supports whole-block Merkle rows of at most 1024 bytes"
         );
         let psum = |f: &dyn Fn(usize) -> usize| -> Vec<usize> {
             let mut offsets = Vec::with_capacity(cn);
@@ -2722,7 +2683,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
         ps("LIG_QUERIES", flat(&|c| c.queries.clone()));
         ps("LIG_FOLDS", flat(&|c| c.folds.clone()));
         ps("LIG_INTERLEAVE", flat(&|c| c.interleaving.clone()));
-        // 64-byte BLAKE2s blocks per leaf row: level 0's committed rows are
+        // 32-byte chain blocks per leaf row: level 0's committed rows are
         // base-field F64 (8 bytes/lane); deeper levels are native F192
         // (24 bytes/word, received as three embedded K limbs each). Rows are
         // whole blocks only (asserted at candidate construction).
@@ -2732,7 +2693,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
                 c.interleaving
                     .iter()
                     .enumerate()
-                    .map(|(level, &n)| if level == 0 { n / 8 } else { 3 * n / 8 })
+                    .map(|(level, &n)| if level == 0 { n / 4 } else { 3 * n / 4 })
                     .collect()
             }),
         );
@@ -2778,7 +2739,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     );
     ps("CLAIM_POINT_BUF", literals(claims.iter().map(|c| c.buffer)));
     ps("CLAIM_COMMITTED_COL", literals(claims.iter().map(|c| c.column)));
-    let slot_stride_log = leanvm_core::hash_flock::SLOT_STRIDE_LOG;
+    let slot_stride_log = leanvm_core::haraka::SLOT_STRIDE_LOG;
     let cpqbits: Vec<usize> = claims
         .iter()
         .flat_map(|c| (0..slot_stride_log).map(move |k| (c.qflock_slot >> k) & 1))
@@ -2789,13 +2750,16 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("BYTECODE_LOG", kbc.to_string());
     // The stacked bytecode: nbcv/2 encoding columns per side, aligned with the bus
     // tuple, so their slots span the fingerprint's own bits. The defer region is
-    // 2*kbc points + sel bits + 2 reduced + alpha + z_skip + 2*lcrounds rounds
-    // + 64 z_partial + 1 matpart.
+    // kbc points + sel bits + 1 reduced + alpha + z_skip + row_inner zerocheck rounds
+    // + lcrounds lincheck rounds + 64 z_partial + 1 matpart.
     let bc_cols = nbcv / 2;
     let log2_bc_cols = leanvm_core::leaf::N_TUPLE_BITS;
     ps("BYTECODE_COLS", bc_cols.to_string());
     ps("LOG2_BYTECODE_COLS", log2_bc_cols.to_string());
-    ps("DEFER_SIZE", (kbc + log2_bc_cols + 2 * lcrounds + 68).to_string());
+    ps(
+        "DEFER_SIZE",
+        (kbc + log2_bc_cols + row_inner + lcrounds + 68).to_string(),
+    );
     ps("BYTECODE_VARS", (kbc + log2_bc_cols).to_string());
     let agg_state = pack_state(FiatShamirState::from_label(RECURSION_AGG_LABEL).state());
     ps("AGG_SEED_0", dsl_u128(agg_state[0]).to_string());
@@ -2812,39 +2776,14 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("DA_PAD_CELL_1", f192_literal(pad_cell[1]));
     ps("DA_PAD_ROW_0", f192_literal(pad_row[0]));
     ps("DA_PAD_ROW_1", f192_literal(pad_row[1]));
-    let defer_cells = kbc + log2_bc_cols + 1 + 2 * flock::hash::K_LOG + 2;
+    let defer_cells = kbc + log2_bc_cols + 1 + MAT_VARS + 3;
     ps("STMT_HEADER", STATEMENT_HEADER.to_string());
     let (off, pairs) = (STATEMENT_HEADER, defer_cells.div_ceil(2));
-    let blocks = (off + 3 * pairs).div_ceil(4);
-    ps("STMT_ODD", (defer_cells % 2).to_string());
     ps("STMT_PAIRS", pairs.to_string());
-    ps("STMT_PAD_CELLS", (4 * blocks - off - 3 * pairs).to_string());
-    ps("STMT_BLOCKS", blocks.to_string());
-    // A list is at most MAX_KEYS blocks (one a claim is the widest it gets), so it
-    // holds fewer than that many windows; a declared count is below MAX_KEYS, hence
-    // decomposes into that many bits. The first two bound a range check, which takes
-    // a COUNT, the third a bit decomposition.
-    ps("SIGNERS_WINDOW", SIGNERS_WINDOW.to_string());
-    ps("SIGNERS_WINDOW_LOG", SIGNERS_WINDOW.ilog2().to_string());
-    ps("SIGNERS_MAX_WINDOWS", SIGNERS_MAX_WINDOWS.to_string());
-    ps("SIGNERS_COUNT_BITS", SIGNERS_COUNT_BITS.to_string());
-    ps(
-        "BLAKE2S_IV_0",
-        dsl_u128(leanvm_core::hash_flock::IV_CELLS[0]).to_string(),
-    );
-    ps(
-        "BLAKE2S_IV_1",
-        dsl_u128(leanvm_core::hash_flock::IV_CELLS[1]).to_string(),
-    );
-    ps(
-        "MD_FINAL",
-        dsl_u128(leanvm_core::hash_flock::metadata(
-            0,
-            leanvm_core::hash_flock::FINAL_FLAG,
-            0,
-        ))
-        .to_string(),
-    );
+    ps("STMT_CELLS", (off + 3 * pairs).to_string());
+    ps("MAT_VARS", MAT_VARS.to_string());
+    // A declared count is below MAX_KEYS, hence decomposes into that many bits.
+    ps("SIGNERS_COUNT_BITS", MAX_KEYS.ilog2().to_string());
 
     // Both schemes' WOTS+C: the chain length, the digit sums of a dispatched group,
     // and the hash types they share, as the address lane holds them.
@@ -3331,15 +3270,11 @@ def main():
         }
     }
 
-    /// The right leaf holds more claims than one absorb window of its list hash
-    /// (`SIGNERS_WINDOW` blocks of one claim), so both that leaf and the parent
-    /// rebuilding it run the window loop and then a non-empty tail, while the left
-    /// leaf's list is a tail alone. Under a window everywhere, the loop would never
-    /// execute and neither would the byte counter's base.
+    /// The right leaf holds many more claims than the left one.
     #[test]
     fn aggregate_two_to_one() {
         leanvm_core::init_prover();
-        let big = 2 * SIGNERS_WINDOW + 6;
+        let big = 70;
         let signers = get_signers(SMALL_LEAF_SIZE + big);
         let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
         let right = prove_leaf(&signers[SMALL_LEAF_SIZE..]);
@@ -3672,8 +3607,12 @@ def main():
     # Adjacent signature slots must stay outside the DA writer's range.
     cover[1] = 1
     a, b, v0, v1 = cover_da_root(roots, cover * GEN, n_slots, GEN)
+    st = StackBuf(2)
+    haraka([0, 0], [a, b], st)
+    mid = StackBuf(2)
+    haraka(st, [v0, v1], mid)
     digest = StackBuf(2)
-    blake2s([a, b], [v0, v1], digest)
+    haraka(mid, [PAD_CELL, Y_TOWER * 64], digest)
     public = GEN ** 0
     assert public[1] == digest[0]
     assert public[GEN] == digest[1]
@@ -3711,7 +3650,7 @@ def main():
         let source = include_str!("../guests/lean_ethereum.py");
         let (helpers, _) = source.split_once("\ndef main():").unwrap();
         let source = format!(
-            "{helpers}\ndef main():\n    _, squares = exponent_tables()\n    a, b, v0, v1 = da_verify(squares)\n    digest = StackBuf(2)\n    blake2s([a, b], [v0, v1], digest)\n    public = GEN ** 0\n    assert public[1] == digest[0]\n    assert public[GEN] == digest[1]\n    return\n"
+            "{helpers}\ndef main():\n    _, squares = exponent_tables()\n    a, b, v0, v1 = da_verify(squares)\n    st = StackBuf(2)\n    haraka([0, 0], [a, b], st)\n    mid = StackBuf(2)\n    haraka(st, [v0, v1], mid)\n    digest = StackBuf(2)\n    haraka(mid, [PAD_CELL, Y_TOWER * 64], digest)\n    public = GEN ** 0\n    assert public[1] == digest[0]\n    assert public[GEN] == digest[1]\n    return\n"
         );
         let guest = compile(&parse_with_replacements(&source, &placeholder_map(20)).unwrap());
         let n_rows = 3usize;
@@ -4067,16 +4006,24 @@ def main():
     /// statement.
     #[test]
     fn leaf_claim_matches_the_general_path() {
-        let klog = flock::hash::K_LOG;
+        let rlog = flock::haraka::ROWS_LOG;
         let leaf = DeferredClaim::leaf();
         let general = {
             let bytecode_value = mle_eval_par(stacked_bytecode(), &leaf.bytecode_point);
-            let eq_r = pcs::whir::build_eq_table_ext(&leaf.matrix_point[..klog]);
-            let eq_c = pcs::whir::build_eq_table_ext(&leaf.matrix_point[klog..]);
-            let (matrix_a_value, matrix_b_value) = flock::hash::bilinear_walk_pair(&eq_r, &eq_c);
-            (bytecode_value, matrix_a_value, matrix_b_value)
+            let eq_r = pcs::whir::build_eq_table_ext(&leaf.matrix_point[..rlog]);
+            let eq_c = pcs::whir::build_eq_table_ext(&leaf.matrix_point[rlog..]);
+            let [a, b, c] = flock::haraka::circuit::SlotMatrices::shared().bilinear(&eq_r, &eq_c);
+            (bytecode_value, a, b, c)
         };
-        assert_eq!((leaf.bytecode_value, leaf.matrix_a_value, leaf.matrix_b_value), general);
+        assert_eq!(
+            (
+                leaf.bytecode_value,
+                leaf.matrix_a_value,
+                leaf.matrix_b_value,
+                leaf.matrix_c_value
+            ),
+            general
+        );
     }
 
     /// The scalar verifier's deferred values are the prover's, away from the leaf shortcut.
@@ -4087,7 +4034,7 @@ def main():
             let limbs = (0..len).map(|_| rand::Rng::random::<(u64, u64, u64)>(&mut rng));
             limbs.map(|(c0, c1, c2)| F192::new(c0, c1, c2)).collect()
         };
-        let (bytecode_point, matrix_point) = (point(bytecode_vars()), point(2 * flock::hash::K_LOG));
+        let (bytecode_point, matrix_point) = (point(bytecode_vars()), point(MAT_VARS));
         assert_eq!(
             DeferredClaim::recompute_scalar(bytecode_point.clone(), matrix_point.clone()),
             DeferredClaim::recompute(bytecode_point, matrix_point)
@@ -4162,52 +4109,5 @@ def main():
             aggregate(&[], vec![], raw, &[], None, LOG_INV_RATE).err(),
             Some(AggregationError::MalformedRawSignature)
         );
-    }
-
-    /// Every `BLAKE2s` the guest itself runs reads a metadata cell an earlier
-    /// instruction of its own function wrote: a `SET` for a compile-time counter,
-    /// an `XOR` for a window's base plus its offset. An unwritten cell is
-    /// prover-chosen (write-once memory constrains only what something writes), so
-    /// a compression whose metadata nothing writes would hand the prover that
-    /// hash's byte counter and both flags, and every guest digest rests on those
-    /// being the ones the scheme specifies.
-    ///
-    /// This is a scan by pc, not a dominance check: a writer sitting in a branch
-    /// nobody took would satisfy it. What makes naming such a cell impossible is
-    /// `FnLower::scoped` reverting the constant pool at every join, and the
-    /// `blake2s_default_iv_*` tests are what guard that, by proving both paths.
-    #[test]
-    fn every_guest_blake2s_metadata_cell_is_written_first() {
-        use leanvm_core::cpu::{DerefMode, Op};
-
-        // Which frame cell an instruction writes, if any. A `DEREF` in cell mode is
-        // bidirectional under write-once, so its local operand counts as a write.
-        let written = |op: &Op| match *op {
-            Op::Set { o, .. } => vec![o],
-            Op::Xor { c, .. } | Op::Mul { c, .. } => vec![c],
-            Op::Deref { o3, mode, .. } => {
-                if mode == DerefMode::Cell {
-                    vec![o3]
-                } else {
-                    vec![]
-                }
-            }
-            Op::Blake2s { out, .. } => vec![out, out + 1],
-            Op::Jump { .. } => vec![],
-        };
-        let program = unified_guest();
-        let mut unwritten = Vec::new();
-        for (name, entry, len) in &program.fn_ranges {
-            let range = *entry as usize..(*entry + *len) as usize;
-            for pc in range.clone() {
-                let Op::Blake2s { md, .. } = program.prog[pc] else {
-                    continue;
-                };
-                if !program.prog[range.start..pc].iter().any(|op| written(op).contains(&md)) {
-                    unwritten.push(format!("{name} pc {pc} md fp[{md}]"));
-                }
-            }
-        }
-        assert!(unwritten.is_empty(), "metadata cell never written: {unwritten:?}");
     }
 }

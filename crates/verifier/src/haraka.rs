@@ -77,10 +77,10 @@ fn value_sq(p: &Byte) -> E {
     (0..8).fold(ZERO, |acc, j| acc + squared_basis(j) * p[j])
 }
 
-/// `A w`, `B w` and `C w` over one slot's rows by one forward walk of the ten calls.
+/// `A w`, `B w` and `C w` over the block's `2^HARAKA_ROWS_LOG` rows (the unused tail zero) by one forward walk of the call.
 pub fn haraka_row_values(w: &[E]) -> [Vec<E>; 3] {
     let constant = w[HARAKA_CONSTANT_COLUMN];
-    let n_rows = CALLS_PER_SLOT * CALL_ROWS;
+    let n_rows = 1 << HARAKA_ROWS_LOG;
     let mut a = vec![ZERO; n_rows];
     let mut b = vec![ZERO; n_rows];
     let mut c = vec![ZERO; n_rows];

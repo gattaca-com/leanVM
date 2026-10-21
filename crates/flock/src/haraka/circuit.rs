@@ -242,3 +242,63 @@ impl SlotMatrices {
         m
     }
 }
+
+/// `φ8` of each byte, the coefficient an entry carries in `F192`.
+fn phi_table() -> &'static [primitives::field::F192; 256] {
+    use primitives::field::{F192, phi8_192};
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[F192; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|g| phi8_192(F8(g as u8))))
+}
+
+impl SlotMatrices {
+    /// The one slot's matrices, built once.
+    pub fn shared() -> &'static Self {
+        use std::sync::OnceLock;
+        static MATS: OnceLock<SlotMatrices> = OnceLock::new();
+        MATS.get_or_init(Self::build)
+    }
+
+    /// `(A w, B w, C w)` over the slot's `2^ROWS_LOG` rows, `w` over its `2^K_LOG` columns.
+    pub fn row_values(&self, w: &[primitives::field::F192]) -> [Vec<primitives::field::F192>; 3] {
+        use primitives::field::F192;
+        assert_eq!(w.len(), K);
+        let phi = phi_table();
+        [&self.a, &self.b, &self.c].map(|m| {
+            let mut out = vec![F192::ZERO; ROWS_PER_SLOT];
+            for (row, entries) in m.iter().enumerate() {
+                out[row] = entries
+                    .iter()
+                    .fold(F192::ZERO, |acc, &(col, g)| acc + phi[g as usize] * w[col as usize]);
+            }
+            out
+        })
+    }
+
+    /// `(Aᵀ u, Bᵀ u, Cᵀ u)` over the slot's columns, `u` over its rows.
+    pub fn column_marginals(&self, u: &[primitives::field::F192]) -> [Vec<primitives::field::F192>; 3] {
+        use primitives::field::F192;
+        assert_eq!(u.len(), ROWS_PER_SLOT);
+        let phi = phi_table();
+        [&self.a, &self.b, &self.c].map(|m| {
+            let mut out = vec![F192::ZERO; K];
+            for (row, entries) in m.iter().enumerate() {
+                for &(col, g) in entries {
+                    out[col as usize] += phi[g as usize] * u[row];
+                }
+            }
+            out
+        })
+    }
+
+    /// `(uᵀ A w, uᵀ B w, uᵀ C w)`.
+    pub fn bilinear(
+        &self,
+        u: &[primitives::field::F192],
+        w: &[primitives::field::F192],
+    ) -> [primitives::field::F192; 3] {
+        use primitives::field::F192;
+        self.row_values(w)
+            .map(|rows| rows.iter().zip(u).fold(F192::ZERO, |acc, (&r, &e)| acc + r * e))
+    }
+}

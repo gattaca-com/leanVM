@@ -9,7 +9,7 @@
 //!      on `(â, b̂, ĉ)`.
 //!   3. [`lincheck`] reduces those to the `2^k_skip` bit-slice values of `z` at
 //!      one point, against the per-block matrices.
-//!   4. The PCS binds that family of slices ([`hash::SliceClaim`]) to the
+//!   4. The PCS binds that family of slices ([`haraka::SliceClaim`]) to the
 //!      commitment.
 //!
 //! [`haraka`] is the one circuit: Haraka-512 as a per-call R1CS with GF(2^8)

@@ -51,17 +51,11 @@ pub fn wots_leaf_hash(pp: &PublicParam, layer: usize, e: u32, ends: &[Digest; V]
 /// The digest key `e` on `layer` signs: `Th(P, A, M | R)`, `M` the message at the
 /// bottom and the bottom root at the top.
 pub fn message_digest(pp: &PublicParam, layer: usize, e: u32, randomizer: &Randomizer, message: &[u8]) -> Digest {
-    digest_prefix(pp, layer, e, message).hash(randomizer)[..N]
-        .try_into()
-        .unwrap()
-}
-
-/// `P | A | M`, which fills the bottom digest's first block, so a randomizer trial
-/// compresses only the block holding `R`.
-fn digest_prefix(pp: &PublicParam, layer: usize, e: u32, message: &[u8]) -> primitives::hash::Prefix {
-    let mut prefix = hasher(pp, &tweak(TWEAK_MSG, layer_hi(layer, 0), e));
-    prefix.update(message);
-    prefix.prefix()
+    th(
+        pp,
+        &tweak(TWEAK_MSG, layer_hi(layer, 0), e),
+        &[message, randomizer].concat(),
+    )
 }
 
 /// The digest's first `v` digits, if it is a codeword.
@@ -93,11 +87,7 @@ pub fn wots_sign(
         u128::from_le_bytes(hasher.finalize()[..RANDOMIZER_LEN].try_into().unwrap())
     };
     let trial = |c: u64| base.wrapping_add(u128::from(c)).to_le_bytes();
-    let prefix = digest_prefix(pp, layer, e, message);
-    let admits = |c: u64| {
-        let digest = prefix.hash(&trial(c));
-        codeword(&digest[..N].try_into().unwrap()).is_some()
-    };
+    let admits = |c: u64| codeword(&message_digest(pp, layer, e, &trial(c), message)).is_some();
     let c = (0..MAX_RANDOMIZER_TRIALS)
         .step_by(GRIND_BATCH as usize)
         .find_map(|start| {

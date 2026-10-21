@@ -7,7 +7,7 @@
 //! The final commitment is `H(root_row, root_col)`.
 
 use fiat_shamir::merkle::{Hash, hash_pair};
-use primitives::hash::{OUT_LEN, hash, hash_many_dyn};
+use primitives::hash::{OUT_LEN, haraka512_many_dyn, hash, hash_many_dyn};
 
 use crate::{CELL_SYMBOLS, CELLS_PER_ROW, CODEWORD_SYMBOLS, PAYLOAD_CELLS, encode_rows, row_count};
 
@@ -133,11 +133,7 @@ fn tree_from_leaves(mut tree: Vec<Hash>) -> Vec<Hash> {
     let (mut base, mut width) = (0, n);
     while width > 1 {
         let (read, write) = tree.split_at_mut(base + width);
-        hash_many_dyn(
-            read[base..].as_flattened(),
-            2 * OUT_LEN,
-            write[..width / 2].as_flattened_mut(),
-        );
+        haraka512_many_dyn(read[base..].as_flattened(), write[..width / 2].as_flattened_mut());
         base += width;
         width /= 2;
     }

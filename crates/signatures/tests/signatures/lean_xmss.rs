@@ -32,11 +32,11 @@ fn known_answer() {
     let signature = sign(&sk, &message, 0xA5C3_7E19).unwrap();
     assert_eq!(
         hex(&pk.as_ssz_bytes()),
-        "b60df5557dd72654da9b26eb5aee454fbb8b8839d80d6d0ab29a4226fc2c910f"
+        "29ac26856bbf10dd753dddd20c1cd23665e7d8fc5f2270f1f6dd7b25abd5b8d6"
     );
     assert_eq!(
         hex(&primitives::hash::hash(&signature.as_ssz_bytes())),
-        "76fe28fc5609099765d1289f0a75b397d8698e9abfe74d3f83bf01118e2db831"
+        "19a4765d8d29bcdaddf6cafeac5cc64bace2f68149b1b60b2d8445116e385120"
     );
 }
 
@@ -146,7 +146,7 @@ fn ssz_rejects_wrong_lengths() {
     LeanXmssSignature::from_ssz_bytes(&[0xcd; SIGNATURE_SSZ_LEN]).unwrap();
 }
 
-/// The address layout is leanSPHINCS's, and `Th` is BLAKE2s of `P | A | M`.
+/// The address layout is leanSPHINCS's, and `Th` is one Haraka call over `P | A | M`, zero-padded.
 #[test]
 fn address_layout() {
     let tw = tweak(TWEAK_NODE, layer_hi(1, 0x12), 0x89abcdef).step(5);
@@ -154,8 +154,9 @@ fn address_layout() {
     assert_eq!(address(&tw)[8..], [0; 8]);
     let pp: PublicParam = std::array::from_fn(|i| i as u8 + 1);
     let payload = [9u8; N];
-    let input = [&pp[..], &address(&tw), &payload].concat();
-    assert_eq!(th(&pp, &tw, &payload)[..], primitives::hash::hash(&input)[..N]);
+    let mut input = [0u8; 64];
+    input[..48].copy_from_slice(&[&pp[..], &address(&tw), &payload].concat());
+    assert_eq!(th(&pp, &tw, &payload)[..], primitives::hash::haraka512(&input)[..N]);
 }
 
 /// Detect changes to the encoding predicate through its grinding cost.
