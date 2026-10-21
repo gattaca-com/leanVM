@@ -60,13 +60,29 @@ pub type RowSink<'a> = dyn Fn(usize, &[F64]) + Sync + 'a;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF64 {
     evals: Vec<Vec<F64>>,
+    /// Per eval row, the subset sums of `row[1..]` over each byte of a block index:
+    /// a twiddle of a block below `2^24` is three loads and two XORs.
+    tables: Vec<Box<[[F64; 256]; 3]>>,
 }
 
 impl AdditiveNttF64 {
     fn new(basis: &[F64]) -> Self {
-        Self {
-            evals: generate_evals_from_subspace(basis),
-        }
+        let evals = generate_evals_from_subspace(basis);
+        let tables = evals
+            .iter()
+            .map(|row| {
+                let basis = &row[1..];
+                let mut t = Box::new([[F64::ZERO; 256]; 3]);
+                for (k, part) in t.iter_mut().enumerate() {
+                    let sub = &basis[(8 * k).min(basis.len())..(8 * k + 8).min(basis.len())];
+                    for (x, slot) in part.iter_mut().enumerate() {
+                        *slot = span_get(sub, x);
+                    }
+                }
+                t
+            })
+            .collect();
+        Self { evals, tables }
     }
 
     /// Standard NTT with basis `{1, x, …, x^(dim-1)}`. Requires `dim ≤ 63` so
@@ -86,9 +102,15 @@ impl AdditiveNttF64 {
     ///
     /// - It is `s_i(sum_j bit_j(block) * b_(i+1+j))`, with `i = L - layer - 1` on a `2^L`-point domain.
     /// - The normalized `s_i` is F_2-linear, so this is a subset sum of row `i` of the table.
+    #[inline]
     pub fn twiddle(&self, layer: usize, block: usize) -> F64 {
-        let v = &self.evals[self.log_domain_size() - layer - 1];
-        span_get(&v[1..], block)
+        let row = self.log_domain_size() - layer - 1;
+        if block < 1 << 24 {
+            let t = &self.tables[row];
+            t[0][block & 255] + t[1][(block >> 8) & 255] + t[2][(block >> 16) & 255]
+        } else {
+            span_get(&self.evals[row][1..], block)
+        }
     }
 
     /// The seven twiddles a radix-8 group needs, breadth-first: layer `layer`,
@@ -99,19 +121,11 @@ impl AdditiveNttF64 {
     /// one scan of the three basis rows replaces seven.
     pub(crate) fn twiddles_radix8(&self, layer: usize, block: usize) -> [F64; 7] {
         let l = self.log_domain_size();
-        let (v0, v1, v2) = (
-            &self.evals[l - layer - 1],
-            &self.evals[l - layer - 2],
-            &self.evals[l - layer - 3],
-        );
-        let (mut t0, mut a, mut c) = (F64::ZERO, F64::ZERO, F64::ZERO);
-        for j in 0..layer {
-            if (block >> j) & 1 == 1 {
-                t0 += v0[1 + j];
-                a += v1[2 + j];
-                c += v2[3 + j];
-            }
-        }
+        let (v1, v2) = (&self.evals[l - layer - 2], &self.evals[l - layer - 3]);
+        // `a` and `c` are the deeper layers' twiddles of this block's first sub-block.
+        let t0 = self.twiddle(layer, block);
+        let a = self.twiddle(layer + 1, 2 * block);
+        let c = self.twiddle(layer + 2, 4 * block);
         let (d, e0, e1) = (v1[1], v2[1], v2[2]);
         [t0, a, a + d, c, c + e0, c + e1, c + e0 + e1]
     }
