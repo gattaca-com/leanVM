@@ -64,7 +64,7 @@
 //! `Phi`'s challenges.
 
 use fiat_shamir::transcript::ProverState;
-use primitives::field::{F64, F192};
+use primitives::field::{F64, F192, mul4};
 
 use super::pack::PACKING_WIDTH;
 use super::tensor_algebra::{DEGREE_E, transpose_s_hat};
@@ -335,7 +335,15 @@ pub(crate) fn combine_deferred_chunk(outputs: &[DeferredRingSwitchOutput], start
             let lo = index % block_len;
             let len = (block_len - lo).min(out.len() - done);
             let e_hi = claim.eq_hi[index / block_len];
-            for (slot, &e_lo) in out[done..done + len].iter_mut().zip(&claim.eq_lo[lo..lo + len]) {
+            let (slots4, slots_r) = out[done..done + len].as_chunks_mut::<4>();
+            let (lo4, lo_r) = claim.eq_lo[lo..lo + len].as_chunks::<4>();
+            for (slots, e_lo) in slots4.iter_mut().zip(lo4) {
+                let products = mul4(*e_lo, [e_hi; 4]);
+                for (slot, product) in slots.iter_mut().zip(products) {
+                    *slot += fold_one_slot_ext(product, &claim.table);
+                }
+            }
+            for (slot, &e_lo) in slots_r.iter_mut().zip(lo_r) {
                 *slot += fold_one_slot_ext(e_lo * e_hi, &claim.table);
             }
             done += len;
