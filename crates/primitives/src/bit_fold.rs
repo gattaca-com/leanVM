@@ -11,9 +11,9 @@
 //! - Portable: a 256-entry subset-sum table per byte, one lookup per byte.
 //! - GFNI: an 8x8 bit matrix per (input byte, output byte), applied to 64 rows by one instruction.
 
-use primitives::field::F192;
+use crate::field::F192;
 
-use crate::zerocheck::univariate_skip::build_eq;
+use crate::multilinear::eq_table as build_eq;
 
 /// Rows folded per call.
 pub const BLOCK: usize = 64;
@@ -101,7 +101,7 @@ fn lookup_tables(weights: &[F192]) -> Vec<[F192; 256]> {
             let mut sums = [F192::ZERO; 256];
             // Each entry adds its lowest set bit's weight to an entry already built.
             for v in 1..256usize {
-                let low = v.isolate_lowest_one();
+                let low = v & v.wrapping_neg();
                 sums[v] = sums[v ^ low] + w[low.trailing_zeros() as usize];
             }
             sums
@@ -181,7 +181,7 @@ mod portable {
     target_feature = "avx512bw",
     target_feature = "avx512vbmi"
 ))]
-pub(crate) mod gfni {
+pub mod gfni {
     //! The GFNI fold of 64 rows at a time.
     //!
     //! ```text
@@ -200,7 +200,7 @@ pub(crate) mod gfni {
     use super::{BLOCK, F192};
 
     /// Bytes of an F192.
-    pub(crate) const OUT_BYTES: usize = 24;
+    pub const OUT_BYTES: usize = 24;
 
     /// One butterfly stage: registers `z` and `z | zbit` exchange bytes through two permutes.
     #[derive(Clone, Copy, Debug)]
@@ -261,7 +261,7 @@ pub(crate) mod gfni {
     /// Store 24 registers of output bytes, register `o` holding byte `o` of 64 values, as those 64 values.
     #[inline]
     #[target_feature(enable = "avx512f", enable = "avx512vbmi")]
-    pub(crate) fn store_f192(acc: &[__m512i; OUT_BYTES], out: &mut [F192; BLOCK]) {
+    pub fn store_f192(acc: &[__m512i; OUT_BYTES], out: &mut [F192; BLOCK]) {
         // Per coefficient, eight registers of output bytes become eight registers of qwords.
         let [mut c0, mut c1, mut c2]: [[__m512i; 8]; 3] =
             std::array::from_fn(|i| std::array::from_fn(|o| acc[8 * i + o]));
@@ -338,7 +338,7 @@ pub(crate) mod gfni {
     /// ```
     #[inline]
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "gfni")]
-    pub(crate) fn weight_matrices(w: &[F192; 8]) -> [u64; OUT_BYTES] {
+    pub fn weight_matrices(w: &[F192; 8]) -> [u64; OUT_BYTES] {
         let src = w.as_ptr().cast::<u8>();
         // SAFETY: eight weights are 192 bytes, exactly three registers.
         let v: [__m512i; 3] = std::array::from_fn(|i| unsafe { _mm512_loadu_si512(src.add(64 * i).cast()) });
@@ -450,7 +450,7 @@ pub(crate) mod gfni {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use primitives::test_rng::Rng;
+    use crate::test_rng::Rng;
 
     /// Every row width, full and short blocks, against the byte-table fold.
     #[test]
