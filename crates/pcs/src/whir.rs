@@ -26,7 +26,10 @@ use crate::ntt::AdditiveNttF64;
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use primitives::{
-    field::{F64, F192, F192Unreduced, Weights8, dot_base, mul4, mul_base8, mul_unreduced4, powers},
+    field::{
+        Acc8, F64, F192, F192Unreduced, dot8, fold_lones8_base, fold_lones8_ext, fold_pairs8_base, fold_pairs8_ext,
+        msg_lone8_ext, msg_terms8_ext, powers,
+    },
     stream::Stream,
 };
 
@@ -318,11 +321,11 @@ trait RoundWitness: Copy + Sync + std::ops::Add<Output = Self> {
 }
 
 impl RoundWitness for F64 {
-    type Acc = F192Unreduced;
-    const ZERO_ACC: Self::Acc = F192Unreduced::ZERO;
+    type Acc = Acc8;
+    const ZERO_ACC: Self::Acc = Acc8::ZERO;
     #[inline]
     fn mul_basis_unreduced(self, b: F192) -> Self::Acc {
-        b.mul_base_unreduced(self)
+        Acc8::from(b.mul_base_unreduced(self))
     }
     #[inline]
     fn reduce(acc: Self::Acc) -> F192 {
@@ -338,36 +341,30 @@ impl RoundWitness for F64 {
     }
     #[inline]
     fn fold_pairs8(x0: &[Self; 8], x1: &[Self; 8], r: F192) -> [F192; 8] {
-        let p = mul_base8(r, std::array::from_fn(|j| x0[j] + x1[j]));
-        std::array::from_fn(|j| F192::from(x0[j]) + p[j])
+        fold_pairs8_base(x0, x1, r)
     }
     #[inline]
     fn fold_lones8(x0: &[Self; 8], r: F192) -> [F192; 8] {
-        let p = mul_base8(r, *x0);
-        std::array::from_fn(|j| F192::from(x0[j]) + p[j])
+        fold_lones8_base(x0, r)
     }
     #[inline]
     fn msg_terms8(x0: &[Self; 8], x1: &[Self; 8], y0: &[F192; 8], y1: &[F192; 8]) -> (Self::Acc, Self::Acc) {
-        let w0 = Weights8::new(y0);
-        let w2 = Weights8::new(&std::array::from_fn(|j| y0[j] + y1[j]));
+        let ys: [F192; 8] = std::array::from_fn(|j| y0[j] + y1[j]);
         let k2: [F64; 8] = std::array::from_fn(|j| x0[j] + x1[j]);
-        (
-            dot_base(std::slice::from_ref(&w0), x0),
-            dot_base(std::slice::from_ref(&w2), &k2),
-        )
+        (dot8(y0, x0), dot8(&ys, &k2))
     }
     #[inline]
     fn msg_lone8(x0: &[Self; 8], y0: &[F192; 8]) -> Self::Acc {
-        dot_base(std::slice::from_ref(&Weights8::new(y0)), x0)
+        dot8(y0, x0)
     }
 }
 
 impl RoundWitness for F192 {
-    type Acc = F192Unreduced;
-    const ZERO_ACC: Self::Acc = F192Unreduced::ZERO;
+    type Acc = Acc8;
+    const ZERO_ACC: Self::Acc = Acc8::ZERO;
     #[inline]
     fn mul_basis_unreduced(self, b: F192) -> Self::Acc {
-        self.mul_unreduced(b)
+        Acc8::from(self.mul_unreduced(b))
     }
     #[inline]
     fn reduce(acc: Self::Acc) -> F192 {
@@ -383,52 +380,19 @@ impl RoundWitness for F192 {
     }
     #[inline]
     fn fold_pairs8(x0: &[Self; 8], x1: &[Self; 8], r: F192) -> [F192; 8] {
-        let s: [F192; 8] = std::array::from_fn(|j| x0[j] + x1[j]);
-        let lo = mul4([s[0], s[1], s[2], s[3]], [r; 4]);
-        let hi = mul4([s[4], s[5], s[6], s[7]], [r; 4]);
-        std::array::from_fn(|j| x0[j] + if j < 4 { lo[j] } else { hi[j - 4] })
+        fold_pairs8_ext(x0, x1, r)
     }
     #[inline]
     fn fold_lones8(x0: &[Self; 8], r: F192) -> [F192; 8] {
-        let lo = mul4([x0[0], x0[1], x0[2], x0[3]], [r; 4]);
-        let hi = mul4([x0[4], x0[5], x0[6], x0[7]], [r; 4]);
-        std::array::from_fn(|j| x0[j] + if j < 4 { lo[j] } else { hi[j - 4] })
+        fold_lones8_ext(x0, r)
     }
     #[inline]
     fn msg_terms8(x0: &[Self; 8], x1: &[Self; 8], y0: &[F192; 8], y1: &[F192; 8]) -> (Self::Acc, Self::Acc) {
-        let xs: [F192; 8] = std::array::from_fn(|j| x0[j] + x1[j]);
-        let ys: [F192; 8] = std::array::from_fn(|j| y0[j] + y1[j]);
-        let mut u_0 = F192Unreduced::ZERO;
-        let mut u_2 = F192Unreduced::ZERO;
-        for h in [0, 4] {
-            let p0 = mul_unreduced4(
-                [x0[h], x0[h + 1], x0[h + 2], x0[h + 3]],
-                [y0[h], y0[h + 1], y0[h + 2], y0[h + 3]],
-            );
-            let p2 = mul_unreduced4(
-                [xs[h], xs[h + 1], xs[h + 2], xs[h + 3]],
-                [ys[h], ys[h + 1], ys[h + 2], ys[h + 3]],
-            );
-            for j in 0..4 {
-                u_0 ^= p0[j];
-                u_2 ^= p2[j];
-            }
-        }
-        (u_0, u_2)
+        msg_terms8_ext(x0, x1, y0, y1)
     }
     #[inline]
     fn msg_lone8(x0: &[Self; 8], y0: &[F192; 8]) -> Self::Acc {
-        let mut u = F192Unreduced::ZERO;
-        for h in [0, 4] {
-            let p = mul_unreduced4(
-                [x0[h], x0[h + 1], x0[h + 2], x0[h + 3]],
-                [y0[h], y0[h + 1], y0[h + 2], y0[h + 3]],
-            );
-            for j in 0..4 {
-                u ^= p[j];
-            }
-        }
-        u
+        msg_lone8_ext(x0, y0)
     }
 }
 
@@ -747,7 +711,7 @@ pub(crate) fn build_initial_basis(
         unsafe { stream.copy(dst.slice(lo, len), &b0[..len]) };
         message
     };
-    let (u_0, u_2) = accumulate_msg(n_blocks.div_ceil(2) * per, f.len() / 2, F192Unreduced::ZERO, task);
+    let (u_0, u_2) = accumulate_msg(n_blocks.div_ceil(2) * per, f.len() / 2, Acc8::ZERO, task);
     (
         basis,
         SumcheckMessage {
@@ -843,13 +807,13 @@ fn fold_and_msg_blocks<T: RoundWitness>(
         }
     };
 
-    let task = |t: usize| -> (F192Unreduced, F192Unreduced) {
+    let task = |t: usize| -> (Acc8, Acc8) {
         let (i, c) = (t / per, t % per);
         let x0 = c * ROUND_CHUNK;
         let len = ROUND_CHUNK.min(block - x0);
         let stream = Stream::new();
         let mut stage = [[F192::ZERO; STAGE]; 4];
-        let mut acc = (F192Unreduced::ZERO, F192Unreduced::ZERO);
+        let mut acc = (Acc8::ZERO, Acc8::ZERO);
         for s in (0..len).step_by(STAGE) {
             let n = STAGE.min(len - s);
             let [lo_f, lo_b, hi_f, hi_b] = &mut stage;
@@ -861,7 +825,8 @@ fn fold_and_msg_blocks<T: RoundWitness>(
                 // `ROUND_CHUNK`, `STAGE` and `block` are powers of two, so every
                 // slice has even length and starts even: no message pair
                 // straddles one.
-                fold_msg_terms(&lo_f[..n], &lo_b[..n])
+                let (u_0, u_2) = fold_msg_terms(&lo_f[..n], &lo_b[..n]);
+                (Acc8::from(u_0), Acc8::from(u_2))
             } else {
                 msg_terms_lone(&lo_f[..n], &lo_b[..n])
             };
@@ -870,7 +835,7 @@ fn fold_and_msg_blocks<T: RoundWitness>(
         }
         acc
     };
-    let (u_0, u_2) = accumulate_msg(n_out.div_ceil(2) * per, f.len() / 2, F192Unreduced::ZERO, task);
+    let (u_0, u_2) = accumulate_msg(n_out.div_ceil(2) * per, f.len() / 2, Acc8::ZERO, task);
     (
         nf,
         nb,

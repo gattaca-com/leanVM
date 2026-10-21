@@ -67,6 +67,8 @@ use fiat_shamir::transcript::ProverState;
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
 use primitives::bit_fold::{BLOCK, BitFold};
 use primitives::field::{F64, F192, mul4};
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+use primitives::field::xor_into8;
 
 use super::pack::PACKING_WIDTH;
 use super::tensor_algebra::{DEGREE_E, transpose_s_hat};
@@ -404,7 +406,11 @@ impl DeferredRingSwitchOutput {
             // SAFETY: `[u64; 4]` and `[u8; 32]` have the same size, and every bit pattern is a valid byte row.
             let bytes: &[[u8; FOLD_ROW_BYTES]; BLOCK] = unsafe { &*rows.as_ptr().cast() };
             self.fold.fold_block(&bytes[..n], &mut folded);
-            for (o, f) in out.iter_mut().zip(&folded) {
+            let (out8, out_r) = out.as_chunks_mut::<8>();
+            for (o, f) in out8.iter_mut().zip(folded.as_chunks::<8>().0) {
+                xor_into8(o, f);
+            }
+            for (o, f) in out_r.iter_mut().zip(&folded[8 * out8.len()..]) {
                 *o += *f;
             }
         }

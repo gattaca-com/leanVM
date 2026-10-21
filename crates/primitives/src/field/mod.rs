@@ -15,11 +15,16 @@ pub mod neon;
 
 pub mod gf2_64;
 pub mod gf2_64x3;
+pub mod f192x8;
 pub mod gf2_8;
 pub mod phi8_tower;
 
 pub use gf2_8::F8;
 pub use gf2_64::F64;
+pub use f192x8::{
+    Acc8, dot8, fold_lones8_base, fold_lones8_ext, fold_pairs8_base, fold_pairs8_ext, msg_lone8_ext, msg_terms8_ext,
+    mul_base_splat8, xor_into8,
+};
 pub use gf2_64x3::{F192, F192Unreduced, Weights8, dot_base, mul_base8, mul_unreduced4, mul2, mul4};
 pub use phi8_tower::{PHI_8_TABLE_192, phi8_192};
 
