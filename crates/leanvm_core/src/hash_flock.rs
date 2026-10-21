@@ -32,7 +32,7 @@
 
 use crate::transcript::ProverState;
 use ::pcs::pack::LOG_PACKING;
-use flock::hash::{Blake2sSetup, Compression, K_LOG, blake2s_compress, generate_witness_with_ab_packed_and_lincheck};
+use flock::hash::{Blake2sSetup, Compression, K_LOG, blake2s_compress, generate_witness_into_z};
 use primitives::field::{F64, F192};
 use primitives::stream::Stream;
 
@@ -50,7 +50,6 @@ pub const PINNED_T: u64 = flock::hash::PINNED_T;
 /// constraint proving so reduction needs no second witness pass.
 pub(crate) struct PreparedReductionWitness {
     n_blocks: usize,
-    z_packed: Vec<u64>,
     a_packed: Vec<u64>,
     b_packed: Vec<u64>,
     z_lincheck: Vec<u8>,
@@ -61,9 +60,10 @@ impl PreparedReductionWitness {
         self.n_blocks
     }
 
-    pub(crate) fn prove(&self, ps: &mut ProverState) -> SliceClaim {
+    /// `q_flock` is the committed window, which holds the packed `z` words themselves.
+    pub(crate) fn prove(&self, q_flock: &[F64], ps: &mut ProverState) -> SliceClaim {
         Blake2sSetup::new(self.n_blocks).prove_reduction_precomputed(
-            &self.z_packed,
+            packed_words(q_flock),
             &self.a_packed,
             &self.b_packed,
             &self.z_lincheck,
@@ -198,13 +198,10 @@ pub fn padding_words() -> [F64; 18] {
 /// Lift flock's packed witness (64 bits per word, bit `i` at position `i`) into
 /// the committed `F64` column: word for word, which is exactly `pcs::pack`'s
 /// LSB-first convention on the same bit string.
-fn flatten_packed_into(packed: &[u64], out: &mut [F64]) {
-    assert_eq!(out.len(), packed.len(), "q_flock's window is the wrong size");
-    // Write directly into the committed window and publish it with streaming stores.
-    // SAFETY: `F64` is `repr(transparent)` over `u64`, so the two slices are the
-    // same bytes.
-    let words: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), out.len()) };
-    parallel::chunks_mut_zip(words, packed, 1 << 14, |_, dst, src| Stream::new().copy(dst, src));
+/// `q_flock`'s words as flock's packed `z`: the same bytes.
+fn packed_words(q_flock: &[F64]) -> &[u64] {
+    // SAFETY: `F64` is `repr(transparent)` over `u64`.
+    unsafe { std::slice::from_raw_parts(q_flock.as_ptr().cast(), q_flock.len()) }
 }
 
 /// Build the committed `q_flock` column (flock's packed witness) for `blocks`, padded
@@ -215,12 +212,12 @@ fn flatten_packed_into(packed: &[u64], out: &mut [F64]) {
 /// padding).
 pub(crate) fn build_qflock_prepared(blocks: &[Compression], q_flock: &mut [F64]) -> PreparedReductionWitness {
     let n_blocks = blocks.len().max(1);
-    let (z_packed, a_packed, b_packed, z_lincheck) =
-        generate_witness_with_ab_packed_and_lincheck(blocks, n_blocks_log(n_blocks));
-    flatten_packed_into(&z_packed, q_flock);
+    // The packed `z` is generated straight into the committed window: its words are `q_flock`.
+    // SAFETY: `F64` is `repr(transparent)` over `u64`, so the two slices are the same bytes.
+    let words: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(q_flock.as_mut_ptr().cast(), q_flock.len()) };
+    let (a_packed, b_packed, z_lincheck) = generate_witness_into_z(blocks, n_blocks_log(n_blocks), words);
     PreparedReductionWitness {
         n_blocks,
-        z_packed,
         a_packed,
         b_packed,
         z_lincheck,
