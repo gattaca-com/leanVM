@@ -19,7 +19,7 @@ const PHI_BASIS: [u64; 8] = [
 ];
 
 /// `PHI[value]`: the F2-linear image of the byte `value` in the PHI basis.
-fn phi(value: usize) -> E {
+pub(crate) fn phi(value: usize) -> E {
     let bits = (0..8).filter(|bit| value >> bit & 1 == 1);
     E::new(bits.fold(0, |acc, bit| acc ^ PHI_BASIS[bit]), 0, 0)
 }
@@ -52,7 +52,7 @@ fn window_denominator(count: usize) -> E {
 }
 
 /// The barycentric weights of `PHI[:count]` at `point`, by prefix and suffix numerator products.
-fn lagrange_weights(count: usize, point: E) -> Vec<E> {
+pub(crate) fn lagrange_weights(count: usize, point: E) -> Vec<E> {
     let differences: Vec<E> = (0..count).map(|node| point + phi(node)).collect();
     let mut prefix = vec![ONE; count + 1];
     let mut suffix = vec![ONE; count + 1];
@@ -68,17 +68,20 @@ fn lagrange_interpolate(count: usize, values: &[E], point: E) -> E {
     dot(&lagrange_weights(count, point), values)
 }
 
-struct ZerocheckResult {
-    z_skip: E,
-    chi: Vec<E>,
-    v_a: E,
-    v_b: E,
-    v_c: E,
+pub(crate) struct ZerocheckResult {
+    pub(crate) z_skip: E,
+    pub(crate) chi: Vec<E>,
+    pub(crate) v_a: E,
+    pub(crate) v_b: E,
+    pub(crate) v_c: E,
 }
 
 /// The zerocheck: one univariate skip round, then nflock quadratic ones.
 /// C rides those rounds with AB, so all three claims come out at one point.
-fn verify_flock_zerocheck(log_n: usize, transcript: &mut Transcript) -> Result<ZerocheckResult, VerifierError> {
+pub(crate) fn verify_flock_zerocheck(
+    log_n: usize,
+    transcript: &mut Transcript,
+) -> Result<ZerocheckResult, VerifierError> {
     // The point r: seven fixed coordinates, the rest sampled.
     let mut r: Vec<Option<E>> = fixed_challenges().map(Some).into();
     let sampled = transcript.samples(log_n - FLOCK_K_SKIP - N_FIXED_CHALLENGES);

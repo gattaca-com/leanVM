@@ -14,6 +14,7 @@ pub mod da;
 pub mod deferred;
 mod field;
 mod flock;
+mod haraka;
 mod hash;
 mod layout;
 mod merkle;
@@ -24,6 +25,7 @@ mod whir;
 pub use bytecode::Bytecode;
 pub use field::{E, K};
 pub use flock::FlockClaims;
+pub use haraka::{HarakaClaims, haraka_row_values};
 pub use layout::gpow;
 pub use merkle::{MerkleOpenings, MerklePath, PrunedMerklePaths};
 pub use transcript::Proof;
@@ -191,6 +193,40 @@ pub fn verify_flock_batch(
     let root = Digest::from_halves(halves[0], halves[1])?;
     let claims = verify_flock(log_n, &mut transcript)?;
     let (target, weight) = ring_switch(claims.point(), &claims.s, &mut transcript);
+    let ringswitch: StackClaim = (Box::new(weight), target);
+    verify_stacked_opening(
+        &mut transcript,
+        root,
+        stack_log,
+        1 << stack_log,
+        log_inv_rate,
+        &[ringswitch],
+    )?;
+    transcript.finish()?;
+    Ok(claims)
+}
+
+/// [`verify_flock_batch`] for the Haraka-512 circuit: `log_rows` is `14 + n_log`, the committed column has
+/// `log_rows + 2 - 6` variables.
+pub fn verify_flock_batch_haraka(
+    fiat_shamir_iv: &[u8; 32],
+    public_input: &[u8; 32],
+    log_rows: usize,
+    log_inv_rate: usize,
+    proof: &Proof,
+) -> Result<HarakaClaims, VerifierError> {
+    let stack_log = (log_rows + haraka::HARAKA_K_LOG - haraka::HARAKA_ROWS_LOG)
+        .checked_sub(FLOCK_K_SKIP)
+        .ok_or(VerifierError::CommittedSize)?;
+    require(
+        (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&stack_log),
+        VerifierError::CommittedSize,
+    )?;
+    let mut transcript = Transcript::new(proof, Digest(*fiat_shamir_iv), Digest(*public_input), true);
+    let halves = transcript.next_scalars(2)?;
+    let root = Digest::from_halves(halves[0], halves[1])?;
+    let claims = haraka::verify_flock_haraka(log_rows, &mut transcript)?;
+    let (target, weight) = flock::ring_switch(claims.point(), &claims.s, &mut transcript);
     let ringswitch: StackClaim = (Box::new(weight), target);
     verify_stacked_opening(
         &mut transcript,

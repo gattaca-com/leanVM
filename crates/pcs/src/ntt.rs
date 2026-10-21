@@ -125,6 +125,10 @@ impl AdditiveNttGf8 {
         }
     }
 
+    /// Level-`d` block `j`'s twiddle sits at `2^d - 1 + j`.
+    pub fn twiddles(&self) -> &[F8] {
+        &self.twiddles
+    }
     pub fn k(&self) -> usize {
         self.k
     }

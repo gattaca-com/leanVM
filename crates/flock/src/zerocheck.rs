@@ -54,7 +54,7 @@ const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dimensions
 const PAIR_PASSES: usize = if bit_fold::GFNI { 2 } else { 0 };
 
 /// Build the equality coordinates that remain after the univariate skip.
-fn equality_tail(m: usize, mut sample_vec: impl FnMut(usize) -> Vec<F192>) -> Vec<F192> {
+pub(crate) fn equality_tail(m: usize, mut sample_vec: impl FnMut(usize) -> Vec<F192>) -> Vec<F192> {
     let outer = sample_vec(m - K_SKIP - N_INNER);
     small_challenges()
         .into_iter()
@@ -106,7 +106,7 @@ pub struct ZerocheckClaim {
 /// `(1 + r_eq)·G(0) + r_eq·G(1) = claim` fixes the constant coefficient. At
 /// `r_eq = 1` it leaves `G(0)` free, so the caller passes it: only the table
 /// rounds can meet that, the earlier ones running on fixed challenges.
-fn send_round(
+pub(crate) fn send_round(
     ps: &mut ProverState,
     claim: F192,
     r_eq: F192,

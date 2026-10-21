@@ -26,6 +26,7 @@
 //! three-operand adder's bit boundaries are the subtlest thing here.
 
 mod gf2;
+pub mod haraka;
 pub mod hash;
 pub mod lincheck;
 mod witness;

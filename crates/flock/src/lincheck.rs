@@ -702,7 +702,7 @@ fn partial_fold_packed_z_gfni(
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
 /// the dense path on honestly-padded witnesses).
-fn partial_fold_packed_z_best(
+pub(crate) fn partial_fold_packed_z_best(
     z_packed: &[u8],
     m: usize,
     k_log: usize,
@@ -842,7 +842,7 @@ const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 12;
 /// One round of product-sumcheck on `(c, z)`: compute `(q(1), q(∞))` =
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
-fn sumcheck_round_eval_par(c: &[F192], z: &[F192]) -> (F192, F192) {
+pub(crate) fn sumcheck_round_eval_par(c: &[F192], z: &[F192]) -> (F192, F192) {
     let half = c.len() / 2;
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
@@ -870,7 +870,7 @@ fn sumcheck_round_eval_par(c: &[F192], z: &[F192]) -> (F192, F192) {
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
 /// r·(v[i+half] + v[i])` for `i ∈ [0, half)`, then truncate to `half`. In-place.
-fn sumcheck_bind_top_in_place_par(v: &mut Vec<F192>, r: F192) {
+pub(crate) fn sumcheck_bind_top_in_place_par(v: &mut Vec<F192>, r: F192) {
     let half = v.len() / 2;
     if half < SUMCHECK_PAR_THRESHOLD {
         for i in 0..half {
@@ -914,7 +914,7 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F192>, r: F192) {
 /// well-defined next round; the caller guarantees this by only fusing when a
 /// later round exists). The returned message is bit-identical to
 /// `sumcheck_round_eval_par` run on the bound tables.
-fn sumcheck_bind_both_and_eval_next(comb: &mut Vec<F192>, z: &mut Vec<F192>, r: F192) -> (F192, F192) {
+pub(crate) fn sumcheck_bind_both_and_eval_next(comb: &mut Vec<F192>, z: &mut Vec<F192>, r: F192) -> (F192, F192) {
     let len = comb.len();
     debug_assert_eq!(z.len(), len);
     let half = len / 2;
