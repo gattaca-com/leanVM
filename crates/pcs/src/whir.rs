@@ -22,7 +22,7 @@
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
 use crate::merkle::{self, Hash};
-use crate::ntt::AdditiveNttF64;
+use crate::ntt::{AdditiveNttF64, DeepRows};
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use primitives::{
@@ -113,10 +113,53 @@ pub struct Commitment {
 
 /// Prover-side state retained after commit for the opening phase. The message
 /// itself is not stored; the caller retains it for opening.
+///
+/// With `deep` set, `codeword` holds the rows before the encode's deep layers,
+/// which [`ProverData::l0`] finishes for the rows a query opens.
 pub struct ProverData {
     pub codeword: Vec<F64>,
     pub merkle_tree: Vec<Hash>,
+    deep: Option<(AdditiveNttF64, DeepRows)>,
 }
+
+impl ProverData {
+    pub(crate) fn l0(&self) -> L0Codeword<'_> {
+        L0Codeword {
+            words: &self.codeword,
+            deep: self.deep.as_ref(),
+        }
+    }
+}
+
+/// The L0 codeword as the opening reads it: whole, or with its deep layers still to run.
+#[derive(Clone, Copy)]
+pub(crate) struct L0Codeword<'a> {
+    words: &'a [F64],
+    deep: Option<&'a (AdditiveNttF64, DeepRows)>,
+}
+
+impl L0Codeword<'_> {
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// The rows at `positions`, `n_lanes` words each.
+    fn rows(&self, positions: &[usize], n_lanes: usize) -> Vec<Vec<F64>> {
+        match self.deep {
+            Some((ntt, deep)) => ntt.finish_rows(self.words, deep, positions),
+            None => positions
+                .iter()
+                .map(|&q| self.words[q * n_lanes..(q + 1) * n_lanes].to_vec())
+                .collect(),
+        }
+    }
+}
+
+/// Pool size from which the L0 encode leaves its deep pass out of the codeword and an
+/// opening finishes the queried sub-blocks again: a DRAM write of the codeword saved
+/// against a transform per opened sub-block. 1,290 signatures on a 16-core Zen 5:
+/// 1 worker +2.5%, 2 +0.4%, 4 +0.5%, 8 -0.4%, 16 -1 to -4% (node -3.8%).
+const DEFER_DEEP_MIN_THREADS: usize = 8;
 
 /// Commit to the `F64` message of a `2^log_n`-word witness: the message is its
 /// leading `n_lanes` lane blocks of `2^(log_n - log_batch_size)` words each, one
@@ -155,34 +198,59 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
 
     // Leaves are hashed as the encode finishes each block of rows.
     let tree = merkle::MerkleBuilder::new(n_positions, n_lanes, 1usize << log_batch_size);
-    tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = n_lanes).in_scope(|| {
+    let deep = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = n_lanes).in_scope(|| {
         crate::ntt::transpose_lane_major(&mut codeword[..message.len()], message, n_lanes, log_rows);
         let ntt = AdditiveNttF64::standard(k_code);
-        ntt.encode_interleaved_in_place_with(&mut codeword, n_lanes, log_inv_rate, &|row, rows| {
-            tree.absorb(row, rows)
-        });
+        let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
+        if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
+            ntt.encode_interleaved_in_place_without_deep(&mut codeword, n_lanes, log_inv_rate, &on_rows)
+                .map(|rows| (ntt, rows))
+        } else {
+            ntt.encode_interleaved_in_place_with(&mut codeword, n_lanes, log_inv_rate, &on_rows);
+            None
+        }
     });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
     let root = *merkle_tree.last().expect("merkle tree non-empty");
 
-    (Commitment { root }, ProverData { codeword, merkle_tree })
+    (
+        Commitment { root },
+        ProverData {
+            codeword,
+            merkle_tree,
+            deep,
+        },
+    )
 }
 
 /// Codeword + Merkle tree for one deeper WHIR commitment level.
 /// `mat[pos * num_interleaved + lane]`; each row (one `pos` across all lanes)
 /// is one Merkle leaf of `num_interleaved * 16` bytes.
+///
+/// With `deep` set, `mat` holds the rows before the encode's deep layers, which
+/// [`LigeroWitness::opened_words`] finishes for the rows a query opens.
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F192>,
     pub tree: Vec<Hash>,
     pub block_len: usize,
     pub num_interleaved: usize,
+    deep: Option<(AdditiveNttF64, DeepRows)>,
 }
 
 impl LigeroWitness {
-    #[inline]
-    pub fn row(&self, pos: usize) -> &[F192] {
-        let start = pos * self.num_interleaved;
-        &self.mat[start..start + self.num_interleaved]
+    /// The rows at `positions`, each as the K words its Merkle leaf is hashed from.
+    fn opened_words(&self, positions: &[usize]) -> Vec<Vec<F64>> {
+        match &self.deep {
+            Some((ntt, deep)) => {
+                // SAFETY: an E element is laid out as three K words, so the view covers exactly `mat`.
+                let words = unsafe { std::slice::from_raw_parts(self.mat.as_ptr().cast::<F64>(), 3 * self.mat.len()) };
+                ntt.finish_rows(words, deep, positions)
+            }
+            None => positions
+                .iter()
+                .map(|&q| ext_row_words(&self.mat[q * self.num_interleaved..(q + 1) * self.num_interleaved]))
+                .collect(),
+        }
     }
 
     #[inline]
@@ -218,16 +286,21 @@ pub(crate) fn ligero_commit_ext(
     // One leaf per row, its F192s as K words: hashed as the encode finishes each block.
     let row_words = 3 * num_interleaved;
     let builder = merkle::MerkleBuilder::new(block_len, row_words, row_words);
-    tracing::info_span!(
+    let deep = tracing::info_span!(
         "NTT",
         kind = "extension encode",
         log_domain = log_block_len,
         lanes = num_interleaved
     )
     .in_scope(|| {
-        encode_interleaved_ext(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &|row, rows| {
-            builder.absorb(row, rows)
-        })
+        let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
+        if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
+            encode_interleaved_ext_without_deep(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows)
+                .map(|rows| (ntt.clone(), rows))
+        } else {
+            encode_interleaved_ext(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows);
+            None
+        }
     });
     let tree = tracing::info_span!("Merkle").in_scope(|| builder.finish());
 
@@ -236,6 +309,7 @@ pub(crate) fn ligero_commit_ext(
         tree,
         block_len,
         num_interleaved,
+        deep,
     }
 }
 
@@ -741,57 +815,31 @@ fn initial_basis_pass(
     }
 }
 
-/// A lane fold's view of its basis: stored densely, or rebuilt one stage at a time.
+/// A lane-round weight that exists only as its fill and its fold.
 ///
-/// Rebuilding trades a fill per slot for a DRAM write and read of 24 bytes per slot,
-/// which wins wherever the fold is bandwidth bound.
-trait BasisChunks: Sync {
+/// Filling trades compute per slot for a DRAM write and read of 24 bytes per slot,
+/// which wins wherever the lane rounds are bandwidth bound.
+pub(crate) trait LaneWeight: Sync {
     fn len(&self) -> usize;
-    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192];
-}
 
-impl BasisChunks for Vec<F192> {
-    fn len(&self) -> usize {
-        self.as_slice().len()
-    }
+    /// Writes slots `start..start + dst.len()`, for `dst` one aligned [`INITIAL_BASIS_CHUNK`].
+    fn fill(&self, start: usize, dst: &mut [F192]);
 
-    #[inline]
-    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192] {
-        &self[start..start + scratch.len()]
-    }
-}
-
-/// A basis that exists only as its fill: `fill(start, dst)` writes slots `start..start + dst.len()`,
-/// for `dst` one aligned [`INITIAL_BASIS_CHUNK`].
-#[derive(Clone, Copy)]
-pub(crate) struct GeneratedBasis<'a> {
-    pub len: usize,
-    pub fill: &'a (dyn Fn(usize, &mut [F192]) + Sync),
-}
-
-impl BasisChunks for GeneratedBasis<'_> {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    fn chunk<'s>(&'s self, start: usize, scratch: &'s mut [F192]) -> &'s [F192] {
-        (self.fill)(start, scratch);
-        scratch
-    }
+    /// The weight after a lane round binds the lowest lane bit to `r`.
+    fn fold_lane(&self, r: F192) -> Box<dyn LaneWeight>;
 }
 
 /// The basis the sumcheck starts from.
-pub(crate) enum InitialBasis<'a> {
+pub(crate) enum InitialBasis {
     Dense(Vec<F192>),
-    Generated(GeneratedBasis<'a>),
+    Generated(Box<dyn LaneWeight>),
 }
 
-impl InitialBasis<'_> {
+impl InitialBasis {
     fn len(&self) -> usize {
         match self {
             InitialBasis::Dense(b) => b.len(),
-            InitialBasis::Generated(g) => g.len,
+            InitialBasis::Generated(g) => g.len(),
         }
     }
 }
@@ -832,9 +880,9 @@ const LANE_FOLD_STAGE: usize = 128;
 /// elements of the single output block rather than another pair of blocks. Which
 /// pairing comes next is what lets the message be built here, while the folded
 /// values are still in L1.
-fn fold_and_msg_blocks<T: RoundWitness, B: BasisChunks + ?Sized>(
+fn fold_and_msg_blocks<T: RoundWitness>(
     f: &[T],
-    b: &B,
+    b: &[F192],
     r: F192,
     block: usize,
     last: bool,
@@ -864,19 +912,17 @@ fn fold_and_msg_blocks<T: RoundWitness, B: BasisChunks + ?Sized>(
     const STAGE: usize = LANE_FOLD_STAGE;
     let fold_block = |stage: &mut [F192],
                       stage_b: &mut [F192],
-                      raw: &mut [[F192; STAGE]; 2],
                       out_blk: usize,
                       x0: usize,
                       stream: &Stream| {
         let len = stage.len();
         let src0 = 2 * out_blk * block + x0;
-        let [raw_lo, raw_hi] = raw;
         // Sliced, not indexed: runs of one length let the bounds checks fall out
         // and the pair fold vectorise, as the adjacent-pair kernel's do.
-        let (f_lo, b_lo) = (&f[src0..src0 + len], b.chunk(src0, &mut raw_lo[..len]));
+        let (f_lo, b_lo) = (&f[src0..src0 + len], &b[src0..src0 + len]);
         if 2 * out_blk + 1 < n_in {
             let src1 = src0 + block;
-            let (f_hi, b_hi) = (&f[src1..src1 + len], b.chunk(src1, &mut raw_hi[..len]));
+            let (f_hi, b_hi) = (&f[src1..src1 + len], &b[src1..src1 + len]);
             fold_pairs_batched(stage, f_lo, f_hi, r);
             fold_pairs_batched(stage_b, b_lo, b_hi, r);
         } else {
@@ -897,19 +943,100 @@ fn fold_and_msg_blocks<T: RoundWitness, B: BasisChunks + ?Sized>(
         let len = ROUND_CHUNK.min(block - x0);
         let stream = Stream::new();
         let mut stage = [[F192::ZERO; STAGE]; 4];
-        let mut raw = [[F192::ZERO; STAGE]; 2];
         let mut acc = (Acc8::ZERO, Acc8::ZERO);
         for s in (0..len).step_by(STAGE) {
             let n = STAGE.min(len - s);
             let [lo_f, lo_b, hi_f, hi_b] = &mut stage;
-            fold_block(&mut lo_f[..n], &mut lo_b[..n], &mut raw, 2 * i, x0 + s, &stream);
+            fold_block(&mut lo_f[..n], &mut lo_b[..n], 2 * i, x0 + s, &stream);
             let (u_0, u_2) = if 2 * i + 1 < n_out {
-                fold_block(&mut hi_f[..n], &mut hi_b[..n], &mut raw, 2 * i + 1, x0 + s, &stream);
+                fold_block(&mut hi_f[..n], &mut hi_b[..n], 2 * i + 1, x0 + s, &stream);
                 msg_terms_pair(&lo_f[..n], &hi_f[..n], &lo_b[..n], &hi_b[..n])
             } else if last {
                 // `ROUND_CHUNK`, `STAGE` and `block` are powers of two, so every
                 // slice has even length and starts even: no message pair
                 // straddles one.
+                let (u_0, u_2) = fold_msg_terms(&lo_f[..n], &lo_b[..n]);
+                (Acc8::from(u_0), Acc8::from(u_2))
+            } else {
+                msg_terms_lone(&lo_f[..n], &lo_b[..n])
+            };
+            acc.0 ^= u_0;
+            acc.1 ^= u_2;
+        }
+        acc
+    };
+    let (u_0, u_2) = accumulate_msg(n_out.div_ceil(2) * per, f.len() / 2, Acc8::ZERO, task);
+    (
+        nf,
+        nb,
+        SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        },
+    )
+}
+
+/// [`fold_and_msg_blocks`] against a weight that is never stored: the witness
+/// folds as there, and the folded weight `next` is filled straight into the stage
+/// the message reads. Only the last lane round stores it, for the rounds after.
+fn fold_and_msg_generated<T: RoundWitness>(
+    f: &[T],
+    next: &dyn LaneWeight,
+    r: F192,
+    block: usize,
+    last: bool,
+) -> (Vec<F192>, Vec<F192>, SumcheckMessage) {
+    assert!(block > 0 && f.len().is_multiple_of(block));
+    let n_in = f.len() / block;
+    let n_out = n_in.div_ceil(2);
+    assert_eq!(next.len(), n_out * block);
+    assert!(!last || n_out == 1);
+
+    // SAFETY: the loop below writes every slot of `nf`, and of `nb` when it is
+    // stored, one output element per input pair, before any is read.
+    let mut nf = unsafe { fold_out_buf(n_out * block) };
+    let mut nb = if last { unsafe { fold_out_buf(n_out * block) } } else { Vec::new() };
+    let nf_base = parallel::SendPtr(nf.as_mut_ptr());
+    let nb_base = parallel::SendPtr(nb.as_mut_ptr());
+
+    let per = block.div_ceil(ROUND_CHUNK);
+    const STAGE: usize = LANE_FOLD_STAGE;
+    let fold_block = |stage: &mut [F192], stage_b: &mut [F192], out_blk: usize, x0: usize, stream: &Stream| {
+        let len = stage.len();
+        let src0 = 2 * out_blk * block + x0;
+        let f_lo = &f[src0..src0 + len];
+        if 2 * out_blk + 1 < n_in {
+            let src1 = src0 + block;
+            fold_pairs_batched(stage, f_lo, &f[src1..src1 + len], r);
+        } else {
+            fold_lones_batched(stage, f_lo, r);
+        }
+        next.fill(out_blk * block + x0, stage_b);
+        // SAFETY: distinct (out_blk, x0) name disjoint in-bounds windows of `nf`
+        // and `nb`, which stay borrowed for the whole dispatch.
+        unsafe {
+            stream.copy(nf_base.slice(out_blk * block + x0, len), stage);
+            if last {
+                stream.copy(nb_base.slice(out_blk * block + x0, len), stage_b);
+            }
+        }
+    };
+
+    let task = |t: usize| -> (Acc8, Acc8) {
+        let (i, c) = (t / per, t % per);
+        let x0 = c * ROUND_CHUNK;
+        let len = ROUND_CHUNK.min(block - x0);
+        let stream = Stream::new();
+        let mut stage = [[F192::ZERO; STAGE]; 4];
+        let mut acc = (Acc8::ZERO, Acc8::ZERO);
+        for s in (0..len).step_by(STAGE) {
+            let n = STAGE.min(len - s);
+            let [lo_f, lo_b, hi_f, hi_b] = &mut stage;
+            fold_block(&mut lo_f[..n], &mut lo_b[..n], 2 * i, x0 + s, &stream);
+            let (u_0, u_2) = if 2 * i + 1 < n_out {
+                fold_block(&mut hi_f[..n], &mut hi_b[..n], 2 * i + 1, x0 + s, &stream);
+                msg_terms_pair(&lo_f[..n], &hi_f[..n], &lo_b[..n], &hi_b[..n])
+            } else if last {
                 let (u_0, u_2) = fold_msg_terms(&lo_f[..n], &lo_b[..n]);
                 (Acc8::from(u_0), Acc8::from(u_2))
             } else {
@@ -946,8 +1073,8 @@ struct SumcheckProver<'a> {
     /// introduced since the last glue in as `combined_basis += lambda^tau *
     /// b_new`, `tau` counting from 1 (the running claim is `tau = 0`).
     combined_basis: Vec<F192>,
-    /// The round-0 basis when it is rebuilt rather than stored; the first lane fold consumes it.
-    generated: Option<GeneratedBasis<'a>>,
+    /// The lane-round weight while it is filled rather than stored; the last lane round stores it.
+    generated: Option<Box<dyn LaneWeight>>,
     /// The running claim and its quadratic; `h(0) + h(1) = t_r` fixes the linear coefficient.
     t_r: F192,
     quad: RoundQuad,
@@ -963,7 +1090,7 @@ impl<'a> SumcheckProver<'a> {
     /// whole blocks rather than adjacent words.
     fn new(
         f: &'a [F64],
-        b1: InitialBasis<'a>,
+        b1: InitialBasis,
         h1: F192,
         block: usize,
         initial_message: Option<SumcheckMessage>,
@@ -1010,12 +1137,16 @@ impl<'a> SumcheckProver<'a> {
             Witness::Ext(f) => f.len().ilog2(),
         };
         let _span = tracing::info_span!("Sumcheck round", round = self.round, log_size).entered();
-        let (nf, nb, msg) = match (&self.f, self.generated.take()) {
-            (Witness::Base(f), Some(g)) => fold_and_msg_blocks(f, &g, r, block, last),
+        let next = self.generated.take().map(|weight| weight.fold_lane(r));
+        let (nf, nb, msg) = match (&self.f, &next) {
+            (Witness::Base(f), Some(next)) => fold_and_msg_generated(f, &**next, r, block, last),
+            (Witness::Ext(f), Some(next)) => fold_and_msg_generated(f, &**next, r, block, last),
             (Witness::Base(f), None) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
             (Witness::Ext(f), None) => fold_and_msg_blocks(f, &self.combined_basis, r, block, last),
-            (Witness::Ext(_), Some(_)) => unreachable!("the generated basis is consumed by the first fold"),
         };
+        if !last {
+            self.generated = next;
+        }
         drop(std::mem::replace(&mut self.f, Witness::Ext(nf)));
         drop(std::mem::replace(&mut self.combined_basis, nb));
         self.quad = RoundQuad::from_msg(msg, self.t_r);
@@ -1161,6 +1292,16 @@ fn ext_row_words(row: &[F192]) -> Vec<F64> {
     row.iter().flat_map(|v| [F64(v.c0), F64(v.c1), F64(v.c2)]).collect()
 }
 
+/// The `E` row behind the `F64` words of its Merkle leaf.
+fn ext_row(words: &[F64]) -> Vec<F192> {
+    words.chunks_exact(3).map(|w| F192::new(w[0].0, w[1].0, w[2].0)).collect()
+}
+
+/// The opened row at a queried position, for the Merkle pruning: `rows[i]` is the row at `queries[i]`.
+fn opened_row<'a>(queries: &'a [usize], rows: &'a [Vec<F64>]) -> impl Fn(usize) -> Vec<F64> + 'a {
+    move |q| rows[queries.iter().position(|&p| p == q).expect("a queried row")].clone()
+}
+
 /// Prove `Σ_x witness(x) · b_initial(x) = target` against the L0 commitment
 /// produced by [`commit`] (with `log_batch_size = config.initial_k` and
 /// `log_inv_rate = config.log_inv_rates[0]`).
@@ -1196,7 +1337,10 @@ pub fn recursive_prover_with_basis(
         witness,
         InitialBasis::Dense(b_initial),
         target,
-        l0_codeword,
+        L0Codeword {
+            words: l0_codeword,
+            deep: None,
+        },
         l0_tree,
         None,
         ps,
@@ -1207,9 +1351,9 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     config: &ProverConfig,
     log_n: usize,
     witness: &[F64],
-    b_initial: InitialBasis<'_>,
+    b_initial: InitialBasis,
     target: F192,
-    l0_codeword: &[F64],
+    l0_codeword: L0Codeword<'_>,
     l0_tree: &[Hash],
     initial_message: Option<SumcheckMessage>,
     ps: &mut ProverState,
@@ -1256,13 +1400,12 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     // block `n_lanes-1-t`, so a row IS the tail of the leaf image: the absent lanes
     // are the image's leading zeros (`MerkleBuilder` shares their hash prefix, and only
     // this tail rides the proof).
-    let l0_row = |q: usize| -> Vec<F64> { l0_codeword[q * n_lanes..(q + 1) * n_lanes].to_vec() };
     // The same row for the induce, which folds a lane-ASCENDING row against the
     // lane eq table: reversing the image puts block `b` at index `b` and the absent
     // lanes' zeros at the end, where they contribute nothing.
-    let l0_fold_row = |q: usize| -> Vec<F64> {
+    let l0_fold_row = |image: &[F64]| -> Vec<F64> {
         let mut row = vec![F64::ZERO; num_interleaved_0];
-        for (t, &word) in l0_codeword[q * n_lanes..(q + 1) * n_lanes].iter().enumerate() {
+        for (t, &word) in image.iter().enumerate() {
             row[n_lanes - 1 - t] = word;
         }
         row
@@ -1319,10 +1462,11 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     let weights_0 = powers(lambda_0, num_queries_0);
     let span = tracing::info_span!("Open", level = 0).entered();
     // Ordered (dup-possible) rows for the local induce math ...
-    let opened_rows_0: Vec<Vec<F64>> = queries_0.iter().map(|&q| l0_fold_row(q)).collect();
+    let images_0 = l0_codeword.rows(&queries_0, n_lanes);
+    let opened_rows_0: Vec<Vec<F64>> = images_0.iter().map(|image| l0_fold_row(image)).collect();
     // ... but the stored proof carries the sorted-unique rows + one octopus over
     // the sorted-unique positions (the verifier re-fans them to ordered).
-    ps.hint_merkle(PrunedMerklePaths::prune(l0_tree, block_len_0, &queries_0, l0_row));
+    ps.hint_merkle(PrunedMerklePaths::prune(l0_tree, block_len_0, &queries_0, opened_row(&queries_0, &images_0)));
     drop(span);
 
     // Induce basis_0 from the L0 opens. L0 dominates the induce phase, where
@@ -1376,17 +1520,18 @@ pub(crate) fn recursive_prover_with_prepared_basis(
             let span = tracing::info_span!("Final level").entered();
             // Final level: stored (sorted-unique) only, no local induce; the
             // verifier fans these to ordered for its last-level induce.
+            let words_last = wtns_prev.opened_words(&queries_last);
             ps.hint_merkle(PrunedMerklePaths::prune(
                 &wtns_prev.tree,
                 wtns_prev.block_len,
                 &queries_last,
-                |q| ext_row_words(wtns_prev.row(q)),
+                opened_row(&queries_last, &words_last),
             ));
             // Tie the last commitment into the running claim through the same
             // intro/glue step as every other level, then finish the remaining
             // sumcheck rounds. This closes on one weight evaluation instead of
             // a sweep over the residual cube.
-            let rows_last: Vec<Vec<F192>> = queries_last.iter().map(|&q| wtns_prev.row(q).to_vec()).collect();
+            let rows_last: Vec<Vec<F192>> = words_last.iter().map(|words| ext_row(words)).collect();
             let enforced_sum_last = induce_sumcheck_enforced_sum(&rows_last, &level_rs, &queries_last, &weights_last);
             let n_res = sc_prover.f_ext().len().trailing_zeros() as usize;
             let basis_last = induce_sumcheck_evaluate_at_residual(
@@ -1440,12 +1585,13 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         let weights_i = powers(lambda_i, num_queries_i);
         let span = tracing::info_span!("Open", level = i + 1).entered();
         // Ordered rows for the local induce; sorted-unique rows + octopus stored.
-        let opened_rows_i: Vec<Vec<F192>> = queries_i.iter().map(|&q| wtns_prev.row(q).to_vec()).collect();
+        let words_i = wtns_prev.opened_words(&queries_i);
+        let opened_rows_i: Vec<Vec<F192>> = words_i.iter().map(|words| ext_row(words)).collect();
         ps.hint_merkle(PrunedMerklePaths::prune(
             &wtns_prev.tree,
             wtns_prev.block_len,
             &queries_i,
-            |q| ext_row_words(wtns_prev.row(q)),
+            opened_row(&queries_i, &words_i),
         ));
         drop(span);
 

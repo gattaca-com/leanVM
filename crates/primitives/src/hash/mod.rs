@@ -89,14 +89,27 @@ pub const PARAM_IV: [u32; 8] = {
 /// The last-node flag stays zero: nothing here uses the tree mode.
 #[inline]
 pub fn compress(h: &mut [u32; 8], m: &[u32; 16], t: u64, last: bool) {
+    *h = compress_with_flags(h, m, t, if last { u32::MAX } else { 0 }, 0);
+}
+
+/// The BLAKE2s compression with both finalization flags free: the chaining value after block `m`.
+#[inline]
+pub fn compress_with_flags(h: &[u32; 8], m: &[u32; 16], t: u64, f0: u32, f1: u32) -> [u32; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl"))]
+    return x86::compress_rows(h, m, t, f0, f1);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vl")))]
+    return compress_scalar(h, m, t, f0, f1);
+}
+
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512vl", not(test)), allow(dead_code))]
+fn compress_scalar(h: &[u32; 8], m: &[u32; 16], t: u64, f0: u32, f1: u32) -> [u32; 8] {
     let mut v = [0u32; 16];
     v[..8].copy_from_slice(h);
     v[8..].copy_from_slice(&IV);
     v[12] ^= t as u32;
     v[13] ^= (t >> 32) as u32;
-    if last {
-        v[14] = !v[14];
-    }
+    v[14] ^= f0;
+    v[15] ^= f1;
     for round in &SIGMA {
         for (g, &[a, b, c, d]) in G_LANES.iter().enumerate() {
             let (mx, my) = (m[round[2 * g]], m[round[2 * g + 1]]);
@@ -110,9 +123,7 @@ pub fn compress(h: &mut [u32; 8], m: &[u32; 16], t: u64, last: bool) {
             v[b] = (v[b] ^ v[c]).rotate_right(7);
         }
     }
-    for i in 0..8 {
-        h[i] ^= v[i] ^ v[i + 8];
-    }
+    std::array::from_fn(|i| h[i] ^ v[i] ^ v[i + 8])
 }
 
 /// Read a 64-byte block as 16 little-endian words.
@@ -389,6 +400,24 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| ((i * 7 + 3) & 0xff) as u8).collect()
+    }
+
+    #[test]
+    fn compression_matches_scalar() {
+        let mut x = 0x9E37_79B9u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for _ in 0..1000 {
+            let h: [u32; 8] = std::array::from_fn(|_| next());
+            let m: [u32; 16] = std::array::from_fn(|_| next());
+            let t = u64::from(next()) << 32 | u64::from(next());
+            let (f0, f1) = (next(), next());
+            assert_eq!(compress_with_flags(&h, &m, t, f0, f1), compress_scalar(&h, &m, t, f0, f1));
+        }
     }
 
     #[test]

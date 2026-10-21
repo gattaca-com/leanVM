@@ -21,7 +21,7 @@
 //!
 //! Every butterfly acts on each coefficient alone, so the encode runs as the base transform over `3n` lanes.
 
-use crate::ntt::{AdditiveNttF64, RowSink};
+use crate::ntt::{AdditiveNttF64, DeepRows, RowSink};
 use primitives::field::{F64, F192};
 
 // An E element is exactly three K words, with no padding, so the two views line up.
@@ -46,19 +46,36 @@ pub(crate) fn encode_interleaved_ext(
     log_inv_rate: usize,
     on_rows: &RowSink<'_>,
 ) {
+    let (mat, msg) = k_words(mat, msg, num_ntts);
+    ntt.encode_interleaved_with(mat, msg, 3 * num_ntts, log_inv_rate, on_rows);
+}
+
+/// [`encode_interleaved_ext`] without writing the deep pass back: see
+/// [`AdditiveNttF64::encode_interleaved_without_deep`]. Rows come back as K words.
+pub(crate) fn encode_interleaved_ext_without_deep(
+    ntt: &AdditiveNttF64,
+    mat: &mut [F192],
+    msg: &[F192],
+    num_ntts: usize,
+    log_inv_rate: usize,
+    on_rows: &RowSink<'_>,
+) -> Option<DeepRows> {
+    let (mat, msg) = k_words(mat, msg, num_ntts);
+    ntt.encode_interleaved_without_deep(mat, msg, 3 * num_ntts, log_inv_rate, on_rows)
+}
+
+/// Both buffers as K words: each row of n E lanes becomes 3n K lanes.
+fn k_words<'a>(mat: &'a mut [F192], msg: &'a [F192], num_ntts: usize) -> (&'a mut [F64], &'a [F64]) {
     assert!(num_ntts.is_power_of_two());
-    // View both buffers as K words: each row of n E lanes becomes 3n K lanes.
-    //
     // SAFETY:
     // - An E element is laid out as three K words, and a K element as one word.
     // - So each view covers exactly the same memory as the slice it came from.
-    let (mat, msg) = unsafe {
+    unsafe {
         (
             std::slice::from_raw_parts_mut(mat.as_mut_ptr().cast::<F64>(), 3 * mat.len()),
             std::slice::from_raw_parts(msg.as_ptr().cast::<F64>(), 3 * msg.len()),
         )
-    };
-    ntt.encode_interleaved_with(mat, msg, 3 * num_ntts, log_inv_rate, on_rows);
+    }
 }
 
 #[cfg(test)]

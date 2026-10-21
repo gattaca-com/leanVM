@@ -187,18 +187,6 @@ fn g_slot(g: usize, off: usize) -> usize {
 // Reference BLAKE2s compression, the witness oracle.
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn g_fn(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
-    v[d] = (v[d] ^ v[a]).rotate_right(16);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(12);
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
-    v[d] = (v[d] ^ v[a]).rotate_right(8);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(7);
-}
-
 /// The 16-word working state a compression starts from: the chaining value,
 /// the first four IV words, and the last four IV words XOR'd with the counter
 /// and the finalization flags.
@@ -216,14 +204,7 @@ fn initial_state(h: &[u32; 8], t: u64, f0: u32, f1: u32) -> [u32; 16] {
 /// BLAKE2s compression function (RFC 7693 §3.2). Returns the new chaining
 /// value `h'[i] = h[i] ^ v[i] ^ v[i+8]`.
 pub fn blake2s_compress(h: &[u32; 8], m: &[u32; 16], t: u64, f0: u32, f1: u32) -> [u32; 8] {
-    let mut v = initial_state(h, t, f0, f1);
-    for r in 0..N_ROUNDS {
-        for g in 0..N_G_PER_ROUND {
-            let [la, lb, lc, ld] = G_LANES[g];
-            g_fn(&mut v, la, lb, lc, ld, m[SIGMA[r][2 * g]], m[SIGMA[r][2 * g + 1]]);
-        }
-    }
-    std::array::from_fn(|i| h[i] ^ v[i] ^ v[i + 8])
+    primitives::hash::compress_with_flags(h, m, t, f0, f1)
 }
 
 /// One BLAKE2s compression input: `(h, m, t, f0, f1)`.

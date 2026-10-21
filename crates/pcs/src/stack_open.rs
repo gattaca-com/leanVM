@@ -53,12 +53,12 @@ use primitives::field::{F64, F192, powers};
 
 use super::ring_switch;
 use super::whir::{
-    GeneratedBasis, InitialBasis, ProverConfig, ProverData, build_initial_basis, initial_basis_message,
+    InitialBasis, LaneWeight, ProverConfig, ProverData, build_initial_basis, initial_basis_message,
 };
 
-/// Pool size from which the first lane fold refills the basis instead of reading it back.
-/// Measured on a 16-core Zen 5 at 1,290 signatures: 2 workers +5%, 4 workers -1%, 32 workers -6%.
-const REFILL_BASIS_MIN_THREADS: usize = 8;
+/// Pool size from which the lane rounds fill the weight instead of storing it.
+/// Measured on a 16-core Zen 5 at 1,290 signatures: 1 worker +4.9%, 2 workers +0.3%, 4 workers -4.3%, 8 workers -5.4%.
+const FILL_WEIGHT_MIN_THREADS: usize = 4;
 
 mod basis;
 
@@ -237,20 +237,18 @@ pub fn open_batch_mixed_whir_stacked(
 
     // The lifted weight is filled chunk by chunk from the ring-switch outputs and the point
     // claims while round 0's message reads it. Below a DRAM-saturating pool it is stored
-    // for the first lane fold; from there the fold fills it again, because a fill is cheaper
-    // than writing and reading back 24 bytes a slot once DRAM is the bottleneck.
+    // for the first lane fold. From there every lane round folds the weight symbolically and
+    // fills its output, because a fill is cheaper than writing and reading back 24 bytes a
+    // slot once DRAM is the bottleneck.
     let lane_block = 1usize << (log_n - config.initial_k);
-    let weight = basis::StackWeight::new(stack.len(), lane_block, point_claims, lambdas_pd, ring, &rs_outputs);
-    let fill = |start: usize, dst: &mut [F192]| weight.fill(start, dst);
+    let rings = rs_outputs.into_iter().map(|output| output.weight).collect();
+    let weight = basis::StackWeight::new(stack.len(), lane_block, point_claims, lambdas_pd, ring, rings);
     let (initial_basis, message) = tracing::info_span!("Basis").in_scope(|| {
-        if parallel::num_threads() >= REFILL_BASIS_MIN_THREADS {
-            let generated = GeneratedBasis {
-                len: stack.len(),
-                fill: &fill,
-            };
-            (InitialBasis::Generated(generated), initial_basis_message(stack, lane_block, &fill))
+        if parallel::num_threads() >= FILL_WEIGHT_MIN_THREADS {
+            let message = initial_basis_message(stack, lane_block, &|start, dst| weight.fill(start, dst));
+            (InitialBasis::Generated(Box::new(weight)), message)
         } else {
-            let (dense, message) = build_initial_basis(stack, lane_block, fill);
+            let (dense, message) = build_initial_basis(stack, lane_block, |start, dst| weight.fill(start, dst));
             (InitialBasis::Dense(dense), message)
         }
     });
@@ -263,7 +261,7 @@ pub fn open_batch_mixed_whir_stacked(
         stack,
         initial_basis,
         target,
-        &prover_data.codeword,
+        prover_data.l0(),
         &prover_data.merkle_tree,
         Some(message),
         ps,
@@ -278,6 +276,85 @@ pub fn open_batch_mixed_whir_stacked(
 mod tests {
     use super::*;
     use primitives::test_rng::Rng;
+
+    /// Every lane round's symbolic weight must equal the dense weight folded pair by pair,
+    /// across claims inside one lane, claims spanning lanes, strides above the lane bit, and
+    /// the q_flock ring both spanning lanes and selected by lane bits.
+    #[test]
+    fn folded_weight_matches_the_folded_dense_weight() {
+        use crate::whir::{INITIAL_BASIS_CHUNK, LaneWeight};
+        let mut rng = Rng::new(0xF01D);
+        for (lane_vars, lanes, qflock_vars) in [(6usize, 1usize, 6usize), (6, 3, 7), (8, 13, 10), (8, 13, 8), (10, 37, 12)] {
+            let lane_block = 1usize << lane_vars;
+            let stack: Vec<F64> = (0..lanes * lane_block).map(|_| F64(rng.next_u64())).collect();
+            let qflock_len = 1usize << qflock_vars;
+            let offset = if stack.len() >= 2 * qflock_len { qflock_len } else { 0 };
+            let ring = RingSwitchOpen {
+                offset,
+                qflock_vars,
+                claims: (0..2)
+                    .map(|_| RingSwitchClaim {
+                        suffix_point: rng.ext_vec(qflock_vars),
+                        s_hat_v: None,
+                    })
+                    .collect(),
+            };
+            let coordinates = rng.ext_vec(192);
+            let rings = ring
+                .claims
+                .iter()
+                .map(|claim| {
+                    let state =
+                        ring_switch::prove_prepare(&stack[offset..offset + qflock_len], &claim.suffix_point, None);
+                    ring_switch::prove_finish_deferred(state, &coordinates, rng.ext()).weight
+                })
+                .collect();
+            let last_lane = (lanes - 1) * lane_block;
+            let mut claims: Vec<_> = [(offset, qflock_vars), (last_lane, lane_vars), (8, 3), (0, 0), (last_lane + 4, 2)]
+                .into_iter()
+                .map(|(offset, vars)| StackClaim::Point {
+                    offset,
+                    low_point: rng.ext_vec(vars),
+                    value: rng.ext(),
+                })
+                .collect();
+            for stride_log in [0, 1, 3, qflock_vars - 1, qflock_vars] {
+                claims.push(StackClaim::Strided {
+                    offset,
+                    slot: (1 << stride_log) - 1,
+                    stride_log,
+                    point: rng.ext_vec(qflock_vars - stride_log),
+                    value: rng.ext(),
+                });
+            }
+            let lambdas = rng.ext_vec(claims.len());
+            let chunk = lane_block.min(INITIAL_BASIS_CHUNK);
+            let dense = |weight: &dyn LaneWeight| {
+                let mut out = vec![F192::ZERO; weight.len()];
+                for (i, dst) in out.chunks_mut(chunk).enumerate() {
+                    weight.fill(i * chunk, dst);
+                }
+                out
+            };
+            let mut weight: Box<dyn LaneWeight> =
+                Box::new(basis::StackWeight::new(stack.len(), lane_block, &claims, &lambdas, &ring, rings));
+            let mut expected = dense(&*weight);
+            for round in 0..6 {
+                let r = rng.ext();
+                let n_in = expected.len() / lane_block;
+                expected = (0..n_in.div_ceil(2) * lane_block)
+                    .map(|i| {
+                        let (lane, x) = (i / lane_block, i % lane_block);
+                        let lo = expected[2 * lane * lane_block + x];
+                        let hi = expected.get((2 * lane + 1) * lane_block + x).copied().unwrap_or(F192::ZERO);
+                        lo + r * (lo + hi)
+                    })
+                    .collect();
+                weight = weight.fold_lane(r);
+                assert_eq!(dense(&*weight), expected, "lane_vars={lane_vars}, lanes={lanes}, round={round}");
+            }
+        }
+    }
 
     #[test]
     fn fused_basis_matches_dense_weights() {

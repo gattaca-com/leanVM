@@ -2,6 +2,7 @@
 //! the final memory image and the per-opcode [`Trace`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::hints::MAX_CELLS;
 use super::*;
@@ -146,6 +147,39 @@ impl std::fmt::Display for Fault {
 
 /// A memory word interpreted as a K-valued address: valid only when both
 /// extension limbs are zero (every g-power is a K-element).
+/// Sizes earlier runs reached, so a run allocates its memory and trace tables once.
+///
+/// A vector that grows by doubling copies everything it holds at each step. In the
+/// interpreter that copying was 14% of the serial run (1,290 signatures).
+#[derive(Default)]
+pub(crate) struct RunSizes {
+    cells: AtomicUsize,
+    rows: [AtomicUsize; crate::tables::N_TABLES],
+}
+
+impl RunSizes {
+    fn record(&self, cells: usize, rows: [usize; crate::tables::N_TABLES]) {
+        self.cells.fetch_max(cells, Ordering::Relaxed);
+        for (seen, n) in self.rows.iter().zip(rows) {
+            seen.fetch_max(n, Ordering::Relaxed);
+        }
+    }
+
+    fn cells(&self) -> usize {
+        self.cells.load(Ordering::Relaxed)
+    }
+
+    fn rows<T>(&self, table: usize) -> Vec<T> {
+        Vec::with_capacity(self.rows[table].load(Ordering::Relaxed))
+    }
+}
+
+fn filled<T: Clone>(capacity: usize, len: usize, value: T) -> Vec<T> {
+    let mut v = Vec::with_capacity(capacity);
+    v.resize(len, value);
+    v
+}
+
 fn as_addr(v: F192) -> Option<F64> {
     (v.c1 == 0 && v.c2 == 0).then_some(F64(v.c0))
 }
@@ -155,32 +189,36 @@ fn in_k(what: &'static str, v: F192) -> Result<F64, Fault> {
     as_addr(v).ok_or(Fault::NotInK { what, value: v })
 }
 
-fn pop_witness<'a>(
-    witness: &'a HashMap<String, Vec<Vec<F192>>>,
-    positions: &mut HashMap<&'a str, usize>,
+/// One named witness stream and the next entry a `hint_witness` pops from it.
+struct WitnessStream<'a> {
     name: &'a str,
-    len: u32,
-) -> Result<&'a [F192], Fault> {
-    let entries = witness
-        .get(name)
-        .ok_or_else(|| Fault::Witness(format!("no witness stream `{name}` (Program::set_witness)")))?;
-    let position = positions.entry(name).or_default();
-    let entry = entries.get(*position).ok_or_else(|| {
-        Fault::Witness(format!(
-            "witness stream `{name}` exhausted (needs entry {}, has {})",
-            *position + 1,
-            entries.len()
-        ))
-    })?;
-    if entry.len() != len as usize {
-        return Err(Fault::Witness(format!(
-            "witness `{name}` entry {} holds {} values, the destination {len}",
-            *position,
-            entry.len()
-        )));
+    entries: Option<&'a Vec<Vec<F192>>>,
+    position: usize,
+}
+
+impl<'a> WitnessStream<'a> {
+    fn pop(&mut self, len: u32) -> Result<&'a [F192], Fault> {
+        let name = self.name;
+        let entries = self
+            .entries
+            .ok_or_else(|| Fault::Witness(format!("no witness stream `{name}` (Program::set_witness)")))?;
+        let entry = entries.get(self.position).ok_or_else(|| {
+            Fault::Witness(format!(
+                "witness stream `{name}` exhausted (needs entry {}, has {})",
+                self.position + 1,
+                entries.len()
+            ))
+        })?;
+        if entry.len() != len as usize {
+            return Err(Fault::Witness(format!(
+                "witness `{name}` entry {} holds {} values, the destination {len}",
+                self.position,
+                entry.len()
+            )));
+        }
+        self.position += 1;
+        Ok(entry)
     }
-    *position += 1;
-    Ok(entry)
 }
 
 impl Program {
@@ -204,10 +242,11 @@ impl Program {
         // Dense write-once data memory (read path stays a vector for speed), the
         // per-cell access count (g^{count}, default g^0 = 1), and each cell's state.
         let n0 = self.main_frame.max(2) as usize;
+        let reserved = self.run_sizes.cells().max(n0);
         let mut m = Mem {
-            cells: vec![F192::ZERO; n0],
-            state: vec![State::Unwritten; n0],
-            count: vec![F64::ONE; n0],
+            cells: filled(reserved, n0, F192::ZERO),
+            state: filled(reserved, n0, State::Unwritten),
+            count: filled(reserved, n0, F64::ONE),
             links: HashMap::new(),
             unwritten_reads: Vec::new(),
             program: self,
@@ -239,19 +278,40 @@ impl Program {
         let mut prof: Option<Vec<u64>> = std::env::var("DBG_PROF").is_ok().then(|| vec![0u64; self.prog.len()]);
 
         // Per-stream cursor into the named witness data (`hint_witness` pops
-        // sequentially).
-        let mut witness_positions: HashMap<&str, usize> = HashMap::new();
+        // sequentially). Each witness hint resolves its stream once, here, so a pop
+        // indexes `streams` rather than hashing the stream's name twice.
+        let mut streams: Vec<WitnessStream<'_>> = Vec::new();
+        let stream_of: Vec<Vec<usize>> = hint_lists
+            .iter()
+            .map(|hs| {
+                hs.iter()
+                    .map(|h| match h {
+                        RHint::WitnessStack { name, .. } | RHint::WitnessHeap { name, .. } => {
+                            streams.iter().position(|s| s.name == name).unwrap_or_else(|| {
+                                streams.push(WitnessStream {
+                                    name,
+                                    entries: self.witness.get(name.as_str()),
+                                    position: 0,
+                                });
+                                streams.len() - 1
+                            })
+                        }
+                        _ => usize::MAX,
+                    })
+                    .collect()
+            })
+            .collect();
         // Baby-step table for `hint_decompose_bits_exponent`, built on first use.
         let mut dlog_cache: Option<(GPow, F64)> = None;
 
         // Per-opcode trace rows, accumulated during the walk and assembled into the
         // `Trace` once the run finishes (alongside the final count columns).
-        let mut xor: Vec<Xrow> = Vec::new();
-        let mut mul: Vec<Xrow> = Vec::new();
-        let mut set: Vec<Srow> = Vec::new();
-        let mut deref: Vec<Drow> = Vec::new();
-        let mut jump: Vec<Jrow> = Vec::new();
-        let mut blake2s: Vec<Brow> = Vec::new();
+        let mut xor: Vec<Xrow> = self.run_sizes.rows(0);
+        let mut mul: Vec<Xrow> = self.run_sizes.rows(1);
+        let mut set: Vec<Srow> = self.run_sizes.rows(2);
+        let mut deref: Vec<Drow> = self.run_sizes.rows(3);
+        let mut jump: Vec<Jrow> = self.run_sizes.rows(4);
+        let mut blake2s: Vec<Brow> = self.run_sizes.rows(5);
 
         // A cell that is not `Written` holds ZERO. A `DEREF` between two unwritten cells
         // links them, and a write to either reaches the other at once.
@@ -449,8 +509,8 @@ impl Program {
 
             // Apply the hints scheduled before this instruction.
             if hint_at[pc as usize] != 0 {
-                let hs = hint_lists[hint_at[pc as usize] as usize - 1];
-                for h in hs {
+                let list = hint_at[pc as usize] as usize - 1;
+                for (h, &stream) in hint_lists[list].iter().zip(&stream_of[list]) {
                     m.dbg_hint = Some(match h {
                         RHint::FrameAddress { .. } => "FrameAddress",
                         RHint::AllocFrames { .. } => "AllocFrames",
@@ -550,17 +610,17 @@ impl Program {
                                 eprintln!("[print] {label} = <unwritten>");
                             }
                         }
-                        RHint::WitnessStack { name, base, len } => {
+                        RHint::WitnessStack { base, len, .. } => {
                             let values =
-                                pop_witness(&self.witness, &mut witness_positions, name, *len).map_err(fail)?;
+                                streams[stream].pop(*len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
                                 m.put(fp + base + k as u32, value)?;
                             }
                         }
-                        RHint::WitnessHeap { name, ptr, lo, len } => {
+                        RHint::WitnessHeap { ptr, lo, len, .. } => {
                             let b = heap_base(&m, &mut g, fp + ptr, "hint_witness heap pointer").map_err(fail)?;
                             let values =
-                                pop_witness(&self.witness, &mut witness_positions, name, *len).map_err(fail)?;
+                                streams[stream].pop(*len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
                                 m.put(b + lo + k as u32, value)?;
                             }
@@ -918,6 +978,7 @@ impl Program {
         assert!(cells <= 1 << MAX_LOG_MEM, "data memory exceeds 2^{MAX_LOG_MEM} cells");
         m.cells.resize(cells, F192::ZERO);
         trace.mem_count.resize(cells, F64::ONE);
+        self.run_sizes.record(cells, trace.row_counts());
         Ok(Execution {
             mem: m.cells,
             cycles: steps,
