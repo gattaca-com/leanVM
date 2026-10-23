@@ -25,6 +25,7 @@
 //! commitment only shrinks the level-0 symbols to 8 bytes; every random
 //! ingredient is sampled from `E` with the same error terms as before.
 
+use flux_profiler::timed;
 use crate::transcript::ProverState;
 use primitives::field::F64;
 
@@ -91,6 +92,7 @@ pub struct Committed {
 /// ([`crate::witness::StackShape::committed_len`]); the zero tail past them is
 /// neither encoded nor hashed, and the resulting commitment is the same one the
 /// full `2^μ` witness would have produced.
+#[timed]
 pub fn commit(
     ps: &mut ProverState,
     witness: &[F64],
@@ -134,6 +136,7 @@ pub fn commit(
 ///
 /// There is no plain (non-ring-switch) path: the witness ALWAYS carries a `q_flock`
 /// sub-block (≥ 1 padding instance, §cpu), so every opening is stacked.
+#[timed]
 pub fn open(ps: &mut ProverState, c: &Committed, q: &[F64], points: &[SlotClaim], ring: &RingSwitchOpen) {
     let lane_block = 1usize << (c.mu - LOG_BATCH);
     assert_eq!(q.len() % lane_block, 0, "witness must be whole committed lanes");

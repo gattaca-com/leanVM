@@ -2,6 +2,7 @@
 //! the flush/count blocks the verifier reconstructs from the program + announced
 //! sizes and public input. Plus the prover-side witness build.
 
+use flux_profiler::timed;
 use super::*;
 
 // ---- column schema -----------------------------------------------------------
@@ -276,6 +277,7 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 8] {
 ///
 /// This is the multilinear an outermost verifier is handed in place of a
 /// structured program, and what the transcript seed binds ([`super::fs_seed`]).
+#[timed]
 pub fn bytecode_table(prog: &[Op]) -> Vec<F64> {
     let coords = bytecode_columns(prog)
         .map(|c| Coord::Public(std::sync::Arc::new(c)))
@@ -289,6 +291,7 @@ pub fn bytecode_table(prog: &[Op]) -> Vec<F64> {
 /// reference columns only by INDEX and the program only through its public columns, so
 /// this needs no committed witness: both prover and verifier reconstruct exactly the
 /// same structure.
+#[timed]
 pub fn layout(prog: &[Op], log_mem: usize, rows: [usize; tables::N_TABLES], pi: [F192; 2]) -> Layout {
     let taus = table_logs(rows);
     let bytecode_size = prog.len();
@@ -403,6 +406,7 @@ pub(crate) fn table_logs(rows: [usize; tables::N_TABLES]) -> [usize; tables::N_T
 }
 
 impl Program {
+    #[timed]
     pub(crate) fn build(&self, exec: &Execution) -> Witness {
         assert!(self.prog.len().is_power_of_two());
         assert!(exec.mem.len().is_power_of_two());

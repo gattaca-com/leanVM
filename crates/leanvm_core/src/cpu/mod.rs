@@ -8,6 +8,7 @@
 //! whose relation is discharged by flock (see [`crate::hash_flock`]). All
 //! Challenges and transcript scalars live in the same tower E.
 
+use flux_profiler::timed;
 use std::collections::HashMap;
 
 use crate::colval::ColVal;
@@ -537,6 +538,7 @@ impl Stats {
 /// selects the PCS rate and is announced in the Fiat-Shamir transcript before
 /// the commitment.
 #[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
+#[timed]
 pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
@@ -650,6 +652,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
 /// the bus's framework claims, then the zerocheck's per-table column claims, then
 /// the three public-input limb claims, each located in its committed slot. Every
 /// verifier assembles the same list in the same order.
+#[timed]
 fn finish_claims(
     l: &Layout,
     bus_claims: Vec<ColumnClaim>,

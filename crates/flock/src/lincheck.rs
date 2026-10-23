@@ -87,6 +87,7 @@
 //!   `byte_idx` and apply it across all `i_inner` with one lookup + one XOR
 //!   per byte.
 
+use flux_profiler::timed;
 use fiat_shamir::transcript::ProverState;
 use pcs::ring_switch::inner_product_ext;
 use primitives::field::F192;
@@ -185,6 +186,7 @@ pub struct LincheckClaim {
 /// `i_inner`. Used as the cross-check oracle for the production
 /// `partial_fold_packed_z_triple`.
 #[cfg(test)]
+#[timed]
 pub fn partial_fold_packed_z(z_packed: &[u8], m: usize, k_log: usize, eq_outer: &[F192]) -> Vec<F192> {
     let n_log = m - k_log;
     let k = 1usize << k_log;
@@ -702,6 +704,7 @@ fn partial_fold_packed_z_gfni(
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
 /// the dense path on honestly-padded witnesses).
+#[timed]
 fn partial_fold_packed_z_best(
     z_packed: &[u8],
     m: usize,
@@ -816,6 +819,7 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
 /// index (matches z_packed's stripe layout / zerocheck's LSB-first
 /// univariate-skip variable ordering). The `k_log − k_skip` multilinear
 /// inner-rest dims occupy the next bits.
+#[timed]
 pub fn build_quirky_eq_table(z_skip: F192, x_inner_rest: &[F192], k_skip: usize) -> Vec<F192> {
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
     let eq_rest = build_eq(x_inner_rest);
@@ -914,6 +918,7 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F192>, r: F192) {
 /// well-defined next round; the caller guarantees this by only fusing when a
 /// later round exists). The returned message is bit-identical to
 /// `sumcheck_round_eval_par` run on the bound tables.
+#[timed]
 fn sumcheck_bind_both_and_eval_next(comb: &mut Vec<F192>, z: &mut Vec<F192>, r: F192) -> (F192, F192) {
     let len = comb.len();
     debug_assert_eq!(z.len(), len);
@@ -993,6 +998,7 @@ fn sumcheck_bind_both_and_eval_next(comb: &mut Vec<F192>, z: &mut Vec<F192>, r: 
 /// The lincheck prover. Its claim retains the transmitted post-sumcheck
 /// `z_partial`, which is exactly the AB claim's 64-entry ring-switch `s_hat_v`.
 /// The opening reuses it without a second witness scan or transmission.
+#[timed]
 pub fn prove_padded_capture_s_hat_v(
     z_packed: &[u8],
     m: usize,

@@ -20,6 +20,7 @@
 //!
 //! Above the blocks, the last block to finish a unit of nodes climbs it, so no pass waits on a barrier.
 
+use flux_profiler::timed;
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -47,6 +48,7 @@ const STAGE_TILE_BYTES: usize = 16 << 10;
         leaf_size = %pretty_integer(data.len().checked_div(num_leaves).unwrap_or(0))
     )
 )]
+#[timed]
 pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
     assert!(num_leaves > 0, "num_leaves must be power of 2");
     assert_eq!(
@@ -91,6 +93,7 @@ impl MerkleBuilder {
     /// # Panics
     ///
     /// Panics unless the block is aligned, sized like every other, and new.
+    #[timed]
     pub fn absorb(&self, first_leaf: usize, rows: &[F64]) {
         self.absorb_bytes(first_leaf, words_as_bytes(rows));
     }
@@ -149,6 +152,7 @@ impl MerkleBuilder {
     /// # Panics
     ///
     /// Panics unless every leaf was absorbed.
+    #[timed]
     pub fn finish(self) -> Vec<Hash> {
         assert!(self.progress.all_claimed(), "every leaf absorbed");
         // SAFETY: every block was absorbed once, and the last arrivals climbed every level above.

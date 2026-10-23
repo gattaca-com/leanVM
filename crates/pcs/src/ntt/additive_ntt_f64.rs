@@ -7,6 +7,7 @@
 //! - The E-valued encodes of deeper WHIR levels reuse it, one F64 lane per F192 coefficient.
 //! - Large transforms are bound by memory bandwidth, so the driver minimizes sweeps of the buffer.
 
+use flux_profiler::timed;
 use std::cell::RefCell;
 
 use primitives::field::F64;
@@ -148,6 +149,7 @@ impl AdditiveNttF64 {
     /// - Each row is handed over exactly once.
     /// - Blocks are aligned, and all of one power-of-two size.
     /// - A block is handed over while its rows are still in cache.
+    #[timed]
     pub fn encode_interleaved_in_place_with(
         &self,
         data: &mut [F64],
@@ -168,6 +170,7 @@ impl AdditiveNttF64 {
     /// # Panics
     ///
     /// Panics unless the codeword is exactly `2^r` messages long.
+    #[timed]
     pub fn encode_interleaved_with(
         &self,
         data: &mut [F64],
@@ -368,6 +371,7 @@ impl AdditiveNttF64 {
     /// - Every block's rows come from the message.
     /// - One task takes one residue across all blocks, block 0 last.
     #[allow(clippy::too_many_arguments)]
+    #[timed]
     fn gathered_pass(
         &self,
         data: &mut [F64],
@@ -521,6 +525,7 @@ impl AdditiveNttF64 {
     }
 
     /// Recover novel-basis coefficients from evaluations with a scalar inverse NTT.
+    #[timed]
     pub fn inverse_transform(&self, data: &mut [F64]) {
         let log_d = log2_strict_usize(data.len());
         assert!(log_d <= self.log_domain_size());
@@ -645,6 +650,7 @@ fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
 /// - Each lane adds a contiguous burst of words to an L1-resident tile.
 /// - The finished tile goes out as one contiguous run.
 /// - That keeps an n-way gather at a `2^rows_log` stride near memory bandwidth.
+#[timed]
 pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, log_rows: usize) {
     let rows = 1usize << log_rows;
     assert!(n_lanes > 0, "a commitment needs at least one lane");

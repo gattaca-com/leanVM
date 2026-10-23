@@ -48,6 +48,7 @@
 //! sumcheck's xi ranges do, so every claim carries a distinct power (the
 //! batching step of `thm:rbr`).
 
+use flux_profiler::timed;
 use fiat_shamir::transcript::ProverState;
 use primitives::field::{F64, F192, powers};
 
@@ -158,6 +159,7 @@ fn claim_range(claim: &StackClaim) -> (usize, usize) {
 /// exactly the weight's zero region. `config.initial_k` / `config.log_inv_rates[0]`
 /// must match the commit's `log_batch_size` / `log_inv_rate` (enforced by shape
 /// asserts inside the WHIR prover).
+#[timed]
 pub fn open_batch_mixed_whir_stacked(
     ps: &mut ProverState,
     log_n: usize,

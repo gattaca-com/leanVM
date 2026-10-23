@@ -7,6 +7,7 @@
 //! dense per-query expansion, its succinct residual evaluator, and the sparse
 //! transposed-NTT fast path with the dispatch between them.
 
+use flux_profiler::timed;
 use crate::ntt::AdditiveNttF64;
 use crate::whir::build_eq_table_ext;
 use primitives::field::{F64, F192};
@@ -107,6 +108,7 @@ fn invert_sks(sks_vks: &[F64]) -> Vec<F64> {
 /// expands straight into the worker's accumulator, so each query touches the
 /// accumulator once instead of writing a full-size table and adding it back.
 /// Addition in E is XOR, so reassociating across workers is bit-exact.
+#[timed]
 pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     log_msg_cols: usize,
     sks_vks: &[F64],
@@ -185,6 +187,7 @@ pub(crate) fn induce_sumcheck_poly<T: RowElem>(
 ///   `enforced_sum = Σ_i w_i · <opened_rows[i], eq(v_challenges, ·)>`
 /// Cheap: O(num_queries x num_interleaved). The prover needs it for its last
 /// level, whose induced basis it never materializes.
+#[timed]
 pub(crate) fn induce_sumcheck_enforced_sum<T: RowElem>(
     opened_rows: &[Vec<T>],
     v_challenges: &[F192],
@@ -209,6 +212,7 @@ pub(crate) fn induce_sumcheck_enforced_sum<T: RowElem>(
 /// through the char-2 factor. `ris_for_basis` is the fixed residual prefix
 /// (length `log_msg_cols - yr_log_n`); returns evaluations at the `2^yr_log_n`
 /// points `ris_for_basis ++ y_bits`.
+#[timed]
 pub(crate) fn induce_sumcheck_evaluate_at_residual(
     log_msg_cols: usize,
     sks_vks: &[F64],

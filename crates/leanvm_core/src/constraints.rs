@@ -32,6 +32,7 @@
 //! verifier certifies that maximum with one hinted `g`-power (§recursion), so there
 //! are no rounds in which no table has joined.
 
+use flux_profiler::timed;
 use crate::PAR_THRESHOLD;
 use crate::colval::ColVal;
 use crate::transcript::ProverState;
@@ -136,6 +137,7 @@ fn round_polynomial([endpoint, quadratic]: [F192; 2], zeta: F192, claim: F192, w
 /// sumcheck over `max τ_t` variables. `cols[t]` holds table `t`'s involved columns
 /// (`2^{τ_t}` values each, folded in place). Returns the per-table claims, in input
 /// order, on the nested points `ρ[..τ_t]`.
+#[timed]
 pub fn prove(
     airs: &[Air<'_>],
     cols: &[Vec<&[F64]>],

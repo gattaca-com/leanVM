@@ -1,6 +1,7 @@
 //! The write-once execution interpreter: run the compiled program to produce
 //! the final memory image and the per-opcode [`Trace`].
 
+use flux_profiler::timed;
 use std::collections::HashMap;
 
 use super::hints::MAX_CELLS;
@@ -266,6 +267,7 @@ impl Program {
     /// input seeds the first two memory cells `m[0], m[1]` (§sec:e2e-pi).
     /// Compilation yields the `Program`; executing it (here) and proving it are
     /// separate later phases.
+    #[timed]
     pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
         use super::hints::{BitsDest, GPow, RHint};
 

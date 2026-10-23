@@ -18,6 +18,7 @@
 //! puts all three claims at ONE point and leaves lincheck a single family of
 //! bit slices for ring switching (doc/leanvm Annex C).
 
+use flux_profiler::timed;
 use fiat_shamir::transcript::ProverState;
 use primitives::field::{F8, F192};
 
@@ -125,6 +126,7 @@ fn send_round(
 
 /// THE zerocheck prover entry: proves `a·b ⊕ c = 0` over the padded cube,
 /// leaving `(â, b̂, ĉ)` claimed at one point for lincheck to batch.
+#[timed]
 pub fn prove_packed_padded(
     a_packed: &[u8],
     b_packed: &[u8],
