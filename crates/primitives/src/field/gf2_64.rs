@@ -122,6 +122,20 @@ impl MulAssign for F64 {
     }
 }
 
+/// `out[i] = x[i] * y[i]`, with all three slices of one length: eight at a time through
+/// [`super::mul_f64x8`].
+pub fn mul_slices(out: &mut [F64], x: &[F64], y: &[F64]) {
+    assert!(out.len() == x.len() && out.len() == y.len());
+    let (out8, out_tail) = out.as_chunks_mut::<8>();
+    let ((x8, x_tail), (y8, y_tail)) = (x.as_chunks::<8>(), y.as_chunks::<8>());
+    for ((o, a), b) in out8.iter_mut().zip(x8).zip(y8) {
+        *o = super::mul_f64x8(a, b);
+    }
+    for ((o, &a), &b) in out_tail.iter_mut().zip(x_tail).zip(y_tail) {
+        *o = a * b;
+    }
+}
+
 /// The carry-less product of two 64-bit polynomials, as a 128-bit polynomial.
 #[inline]
 pub fn mul_wide(a: u64, b: u64) -> u128 {
@@ -407,6 +421,24 @@ mod tests {
             // The bit spread is the carry-less square, and squaring is the self-product.
             assert_eq!(square_wide(a), software::clmul(a, a));
             assert_eq!(F64(a).square(), F64(reference_mul(a, a)));
+        }
+    }
+
+    #[test]
+    fn mul_slices_matches_the_scalar_product() {
+        let mut rng = Rng::new(2);
+        // Lengths around the vector width, with the corners in the operands' top nibbles.
+        for len in [0, 1, 7, 8, 9, 23, 64] {
+            let mut word = || match rng.next_u8() % 4 {
+                0 => F64(CORNERS[rng.next_u8() as usize % CORNERS.len()]),
+                _ => F64(rng.next_u64()),
+            };
+            let x: Vec<F64> = (0..len).map(|_| word()).collect();
+            let y: Vec<F64> = (0..len).map(|_| word()).collect();
+            let mut out = vec![F64::ZERO; len];
+            mul_slices(&mut out, &x, &y);
+            let want: Vec<F64> = x.iter().zip(&y).map(|(&a, &b)| F64(reference_mul(a.0, b.0))).collect();
+            assert_eq!(out, want);
         }
     }
 

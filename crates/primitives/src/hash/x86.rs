@@ -274,3 +274,58 @@ impl Lanes32 for Avx512 {
         }
     }
 }
+
+/// One compression with the state held as four rows of four words.
+///
+/// The four column G steps run as one vector step, then the diagonal ones after a lane rotation.
+/// A lone compression has no second input to fill lanes with, so this is its only parallelism.
+#[cfg(target_feature = "avx512vl")]
+#[inline]
+pub(super) fn compress_rows(h: &[u32; 8], m: &[u32; 16], t: u64, f0: u32, f1: u32) -> [u32; 8] {
+    use super::{IV, SIGMA};
+
+    #[inline(always)]
+    fn g(a: &mut __m128i, b: &mut __m128i, c: &mut __m128i, d: &mut __m128i, mx: __m128i, my: __m128i) {
+        // SAFETY: the module is compiled only with AVX-512VL enabled.
+        unsafe {
+            *a = _mm_add_epi32(_mm_add_epi32(*a, *b), mx);
+            *d = _mm_ror_epi32::<16>(_mm_xor_si128(*d, *a));
+            *c = _mm_add_epi32(*c, *d);
+            *b = _mm_ror_epi32::<12>(_mm_xor_si128(*b, *c));
+            *a = _mm_add_epi32(_mm_add_epi32(*a, *b), my);
+            *d = _mm_ror_epi32::<8>(_mm_xor_si128(*d, *a));
+            *c = _mm_add_epi32(*c, *d);
+            *b = _mm_ror_epi32::<7>(_mm_xor_si128(*b, *c));
+        }
+    }
+
+    let words = |s: &[usize; 16], k: usize| {
+        // SAFETY: plain register construction, no memory access.
+        unsafe { _mm_setr_epi32(m[s[k]] as i32, m[s[k + 2]] as i32, m[s[k + 4]] as i32, m[s[k + 6]] as i32) }
+    };
+    // SAFETY: the loads read 16 bytes inside `h` and `IV`, unaligned loads allowed.
+    unsafe {
+        let mut a = _mm_loadu_si128(h.as_ptr().cast());
+        let mut b = _mm_loadu_si128(h.as_ptr().add(4).cast());
+        let mut c = _mm_loadu_si128(IV.as_ptr().cast());
+        let flags = _mm_setr_epi32(t as i32, (t >> 32) as i32, f0 as i32, f1 as i32);
+        let mut d = _mm_xor_si128(_mm_loadu_si128(IV.as_ptr().add(4).cast()), flags);
+        for s in &SIGMA {
+            g(&mut a, &mut b, &mut c, &mut d, words(s, 0), words(s, 1));
+            // Diagonals into columns: row r turns left by r lanes.
+            b = _mm_shuffle_epi32::<0b00_11_10_01>(b);
+            c = _mm_shuffle_epi32::<0b01_00_11_10>(c);
+            d = _mm_shuffle_epi32::<0b10_01_00_11>(d);
+            g(&mut a, &mut b, &mut c, &mut d, words(s, 8), words(s, 9));
+            b = _mm_shuffle_epi32::<0b10_01_00_11>(b);
+            c = _mm_shuffle_epi32::<0b01_00_11_10>(c);
+            d = _mm_shuffle_epi32::<0b00_11_10_01>(d);
+        }
+        let lo = _mm_xor_si128(_mm_loadu_si128(h.as_ptr().cast()), _mm_xor_si128(a, c));
+        let hi = _mm_xor_si128(_mm_loadu_si128(h.as_ptr().add(4).cast()), _mm_xor_si128(b, d));
+        let mut out = [0u32; 8];
+        _mm_storeu_si128(out.as_mut_ptr().cast(), lo);
+        _mm_storeu_si128(out.as_mut_ptr().add(4).cast(), hi);
+        out
+    }
+}

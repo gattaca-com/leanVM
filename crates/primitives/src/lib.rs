@@ -1,6 +1,7 @@
 //! Shared primitives: field kernels, bit transposes, multilinear helpers, and
 //! small integer utilities.
 
+pub mod bit_fold;
 pub mod bits;
 pub mod field;
 pub mod hash;
