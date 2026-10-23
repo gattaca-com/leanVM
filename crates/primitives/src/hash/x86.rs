@@ -178,6 +178,8 @@ impl Lanes32 for Avx512 {
     /// ```text
     ///     digest 4L + c    lane L of s[c], then lane L of s[4 + c]
     /// ```
+    ///
+    /// One `vpermt2q` joins the halves of two digests, 4 apart, and two 256-bit stores write them.
     #[inline(always)]
     unsafe fn store_digests(h: &[Self; 8], out: *mut u8) {
         unsafe {
@@ -193,29 +195,19 @@ impl Lanes32 for Avx512 {
                 s[4 * a + 2] = _mm512_unpacklo_epi64(hi01, hi23);
                 s[4 * a + 3] = _mm512_unpackhi_epi64(hi01, hi23);
             }
-            macro_rules! lane {
-                ($l:expr, $c:expr) => {{
-                    let p = out.add((4 * $l + $c) * OUT_LEN);
-                    _mm_storeu_si128(p.cast(), _mm512_extracti32x4_epi32::<$l>(s[$c]));
-                    _mm_storeu_si128(p.add(16).cast(), _mm512_extracti32x4_epi32::<$l>(s[4 + $c]));
-                }};
+            // Quadwords 0..8 are `s[c]`, 8..16 are `s[4 + c]`: pick lanes 2p and 2p + 1 of both, interleaved.
+            let idx = [
+                _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0),
+                _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4),
+            ];
+            for c in 0..4 {
+                for (p, &i) in idx.iter().enumerate() {
+                    let v = _mm512_permutex2var_epi64(s[c], i, s[4 + c]);
+                    let d = out.add((8 * p + c) * OUT_LEN);
+                    _mm256_storeu_si256(d.cast(), _mm512_castsi512_si256(v));
+                    _mm256_storeu_si256(d.add(4 * OUT_LEN).cast(), _mm512_extracti64x4_epi64::<1>(v));
+                }
             }
-            lane!(0, 0);
-            lane!(0, 1);
-            lane!(0, 2);
-            lane!(0, 3);
-            lane!(1, 0);
-            lane!(1, 1);
-            lane!(1, 2);
-            lane!(1, 3);
-            lane!(2, 0);
-            lane!(2, 1);
-            lane!(2, 2);
-            lane!(2, 3);
-            lane!(3, 0);
-            lane!(3, 1);
-            lane!(3, 2);
-            lane!(3, 3);
         }
     }
 
