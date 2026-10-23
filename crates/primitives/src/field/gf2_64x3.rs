@@ -364,7 +364,7 @@ impl F192Unreduced {
 
     /// Build from three 128-bit coefficients.
     #[inline]
-    pub(crate) fn from_wide(coeffs: [u128; 3]) -> Self {
+    fn from_wide(coeffs: [u128; 3]) -> Self {
         Self {
             coeffs: coeffs.map(|c| [c as u64, (c >> 64) as u64]),
         }

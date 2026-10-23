@@ -18,8 +18,6 @@ pub mod gf2_64x3;
 pub mod f192x8;
 pub mod gf2_8;
 pub mod phi8_tower;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-pub mod x8;
 
 pub use gf2_8::F8;
 pub use gf2_64::{F64, mul_slices};

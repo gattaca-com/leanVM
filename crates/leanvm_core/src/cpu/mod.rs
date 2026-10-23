@@ -11,7 +11,6 @@
 use flux_profiler::timed;
 use std::collections::HashMap;
 
-use crate::colval::ColVal;
 use crate::constraints;
 use crate::leaf::{self, Block, ColumnClaim, Coord};
 use crate::pcs;
@@ -21,7 +20,7 @@ use crate::tables::{
 };
 use crate::transcript::ProverState;
 use crate::witness;
-use primitives::field::{F64, F192, g_pow};
+use primitives::field::{F64, F192, F192Unreduced, g_pow};
 
 mod execute;
 pub mod hints;
@@ -345,96 +344,17 @@ fn airs(
             // One form, not three: the batch adds the three sides' evaluations
             // anyway, and summing them here is a setup cost against a dot product
             // and a product list per row per node.
-            let bus = RowForm::new(&leaf::BusForm::sum((0..3).map(|s| forms[s][t].scaled(form_pows[s]))));
-            let bus_k = bus.clone();
+            let bus = leaf::BusForm::sum((0..3).map(|s| forms[s][t].scaled(form_pows[s])));
             constraints::Air {
                 tau,
                 n_constraints: table.n_constraints(),
                 eval: Box::new(move |p, vals, quadratic| {
-                    let air = <F192 as ColVal>::lift(table.eval_constraint(p, vals, quadratic));
-                    <F192 as ColVal>::reduce(air ^ bus.eval_unreduced(vals, quadratic))
-                }),
-                // The same expression over K columns: the identity's K-only products
-                // stay 64-bit and the bus form becomes a mixed dot product.
-                eval_k: Box::new(move |p, vals, quadratic| {
-                    let air = <F64 as ColVal>::lift(table.eval_constraint_k(p, vals, quadratic));
-                    <F64 as ColVal>::reduce(air ^ bus_k.eval_unreduced(vals, quadratic))
+                    let air = F192Unreduced::from(table.eval_constraint(p, vals, quadratic));
+                    (air ^ bus.eval_unreduced(vals, quadratic)).reduce()
                 }),
             }
         })
         .collect()
-}
-
-/// A table's bus form as the batch evaluates it on every row of every round: its
-/// nonzero coefficients, and its products grouped by a column they share,
-/// `Σ_a v_a·(Σ_b c_ab·v_b)`, so a column that several products share multiplies
-/// once rather than once per product. The arithmetic is exact, so the value is the form's.
-#[derive(Clone)]
-struct RowForm {
-    linear: Vec<(usize, F192)>,
-    constant: F192,
-    groups: Vec<(usize, Vec<(usize, F192)>)>,
-}
-
-impl RowForm {
-    fn new(form: &leaf::BusForm) -> Self {
-        let n = form.coeffs.len();
-        let linear = (0..n)
-            .filter(|&i| !form.coeffs[i].is_zero())
-            .map(|i| (i, form.coeffs[i]))
-            .collect();
-        let mut prods = form.prods.clone();
-        let mut groups: Vec<(usize, Vec<(usize, F192)>)> = Vec::new();
-        // Greedily factor out the column the most remaining products share.
-        while !prods.is_empty() {
-            let mut shared = vec![0usize; n];
-            for &(a, b, _) in &prods {
-                shared[a] += 1;
-                if b != a {
-                    shared[b] += 1;
-                }
-            }
-            let col = (0..n)
-                .max_by_key(|&c| (shared[c], std::cmp::Reverse(c)))
-                .expect("a column");
-            let (with, rest): (Vec<_>, Vec<_>) = prods.into_iter().partition(|&(a, b, _)| a == col || b == col);
-            groups.push((
-                col,
-                with.into_iter()
-                    .map(|(a, b, c)| (if a == col { b } else { a }, c))
-                    .collect(),
-            ));
-            prods = rest;
-        }
-        Self {
-            linear,
-            constant: form.constant,
-            groups,
-        }
-    }
-
-    /// The form at one row, unreduced, or only its degree-two terms when `quadratic`.
-    #[inline(always)]
-    fn eval_unreduced<T: ColVal>(&self, vals: &[T], quadratic: bool) -> T::Unreduced {
-        let mut acc = if quadratic {
-            T::lift(F192::ZERO)
-        } else {
-            self.linear
-                .iter()
-                .fold(T::lift(self.constant), |acc, &(i, c)| acc ^ vals[i].mul_e_unreduced(c))
-        };
-        for (a, terms) in &self.groups {
-            if let [(b, c)] = terms[..] {
-                acc ^= (vals[*a] * vals[b]).mul_e_unreduced(c);
-                continue;
-            }
-            let inner = terms
-                .iter()
-                .fold(T::lift(F192::ZERO), |acc, &(b, c)| acc ^ vals[b].mul_e_unreduced(c));
-            acc ^= vals[*a].mul_e_unreduced(T::reduce(inner));
-        }
-        acc
-    }
 }
 
 /// Each table's claimed sum: its identities vanish, so what its summand comes to
@@ -606,6 +526,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
                 xi,
                 &bus.point,
                 &sigma,
+                &bus.blocks,
                 &mut ps,
             )
         });

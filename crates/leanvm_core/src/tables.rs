@@ -11,50 +11,37 @@
 //! the `DEREF` store, the `JUMP` successors are each written out as the degree-2
 //! bus coordinate that carries them (§sec:m3), which leaves `JUMP`'s is-nonzero
 //! indicator as the one identity any table still has. Every identity is `K`-valued,
-//! so a relation on machine words is written out lane by lane; after the round a
-//! table joins the batch its columns are `E`-valued, which is what
-//! `eval_constraint` takes.
+//! so a relation on machine words is written out lane by lane. `eval_constraint`
+//! reads the columns as `E`-valued, which embeds `K`.
 
-use crate::colval::ColVal;
 use crate::cpu::{Brow, Drow, Jrow, Memory, Op, Rows, Srow, Trace};
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
 use primitives::field::{F64, F192, mul_by_g};
 
 // ---- the identities ----------------------------------------------------------
 //
-// Each is written ONCE, generic over the column type: `F64` in the round a table
-// joins the batch, `F192` afterwards (see [`ColVal`]). Products of two `K`
-// columns stay 64-bit and an `η`-power multiplies through `mul_e`.
-//
 // EVERY identity is `K`-valued, like the columns it reads and like the bus
 // coordinates (§sec:air). A relation between machine WORDS is therefore written out
 // lane by lane, with the tower multiplication unrolled by hand ([`TOWER_LANES`]),
-// rather than assembled into one `E` equation. A table's identity slice is then a
-// mixed dot product against its `η`-range: in the round a table joins the batch (the
-// batch's largest) that is one 64-bit product per identity plus three PMULL for its
-// `η`-power, with ONE reduction for the whole slice ([`ColVal::dot`]). One `E`-valued
-// identity would instead cost a full `E×E` product against its `η`-power, plus a
-// reduction of its own, and the lanes it bundles are the same lane polynomials
-// either way.
+// rather than assembled into one `E` equation.
 
 /// The tower product `x·y` in `E = K[y]/(y³+y+1)` as three lane sums: lane `i` is
 /// `Σ x_j·y_k` over `TOWER_LANES[i]`. The five partial sums of §sec:tab-mul fold
-/// into `c0 = p0+p3`, `c1 = p1+p3+p4`, `c2 = p2+p4`; written once here because both
-/// `MUL`'s result coordinate ([`arith_result`]) and `JUMP`'s inverse identity need
-/// the same unrolling.
+/// into `c0 = p0+p3`, `c1 = p1+p3+p4`, `c2 = p2+p4`. `MUL`'s result coordinate
+/// ([`arith_result`]) is built from it.
 const TOWER_LANES: [&[(usize, usize)]; 3] = [
     &[(0, 0), (1, 2), (2, 1)],
     &[(0, 1), (1, 0), (1, 2), (2, 1), (2, 2)],
     &[(0, 2), (1, 1), (2, 0), (2, 2)],
 ];
 
-/// One lane of the tower product, in the columns' own field. Only the test that
+/// One lane of the tower product, over `K`. Only the test that
 /// checks [`TOWER_LANES`] against the field needs it: `MUL`'s result rides the bus
 /// as a coordinate ([`arith_result`]), and `JUMP`'s condition is `K`-valued, so no
 /// identity assembles a tower product any more.
 #[cfg(test)]
-fn tower_lane<T: ColVal>(lane: usize, x: [T; 3], y: [T; 3]) -> T {
-    TOWER_LANES[lane].iter().fold(T::ZERO, |acc, &(j, k)| acc + x[j] * y[k])
+fn tower_lane(lane: usize, x: [F64; 3], y: [F64; 3]) -> F64 {
+    TOWER_LANES[lane].iter().fold(F64::ZERO, |acc, &(j, k)| acc + x[j] * y[k])
 }
 
 /// `JUMP`'s two identities: `b = cond·w` and `cond·(b+1) = 0` (§sec:tab-jump).
@@ -67,14 +54,14 @@ fn tower_lane<T: ColVal>(lane: usize, x: [T; 3], y: [T; 3]) -> T {
 /// The condition is `K`-valued, so both identities are single-lane. Its memory
 /// flush carries literal zeros above the low limb (`memory_k`), so a word outside
 /// `K` cannot balance the bus; the interpreter rejects one outright.
-fn jump_identity<T: ColVal>(pows: &[F192], cols: &[T], quadratic: bool) -> F192 {
+fn jump_identity(pows: &[F192], cols: &[F192], quadratic: bool) -> F192 {
     use jump::*;
     let (b, b1) = if quadratic {
-        (T::ZERO, cols[B])
+        (F192::ZERO, cols[B])
     } else {
-        (cols[B], cols[B] + T::ONE)
+        (cols[B], cols[B] + F192::ONE)
     };
-    T::dot(pows, &[b + cols[V_COND] * cols[W], cols[V_COND] * b1], F192::ZERO)
+    pows[0] * (b + cols[V_COND] * cols[W]) + pows[1] * (cols[V_COND] * b1)
 }
 
 // ---- shared bus vocabulary ---------------------------------------------------
@@ -364,13 +351,6 @@ pub trait Table: Sync {
     /// The default is the constraint-free case; a table that declares constraints
     /// and forgets to evaluate them trips the assert instead of dropping them.
     fn eval_constraint(&self, pows: &[F192], _cols: &[F192], _quadratic: bool) -> F192 {
-        assert!(pows.is_empty(), "a table with constraints must evaluate them");
-        F192::ZERO
-    }
-    /// The same identity over `K`-valued columns, for the round a table joins the
-    /// batch, before its columns have been folded into `E` (§sec:air). Both entry
-    /// points delegate to one generic definition per table, so they cannot drift.
-    fn eval_constraint_k(&self, pows: &[F192], _cols: &[F64], _quadratic: bool) -> F192 {
         assert!(pows.is_empty(), "a table with constraints must evaluate them");
         F192::ZERO
     }
@@ -760,9 +740,6 @@ impl Table for JumpTable {
     fn eval_constraint(&self, pows: &[F192], cols: &[F192], quadratic: bool) -> F192 {
         jump_identity(pows, cols, quadratic)
     }
-    fn eval_constraint_k(&self, pows: &[F192], cols: &[F64], quadratic: bool) -> F192 {
-        jump_identity(pows, cols, quadratic)
-    }
     fn flushes(&self, f: &mut FlushBuilder) {
         use jump::*;
         // The successor state is DERIVED: `b·d + (b+1)·g·pc` and `b·f + (b+1)·fp`,
@@ -1030,6 +1007,7 @@ mod tests {
             row[jump::V_COND] = cond;
             row[jump::W] = w;
             row[jump::B] = if cond.is_zero() { F64::ZERO } else { F64::ONE };
+            let row: Vec<F192> = row.into_iter().map(F192::from).collect();
             assert_eq!(jump_identity(&pows, &row, false), F192::ZERO, "cond = {cond:?}");
         }
     }
