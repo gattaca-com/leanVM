@@ -413,7 +413,6 @@ impl Program {
         // The trace was emitted in the same walk as the memory image (no re-walk).
         let tr = &exec.trace;
         let cells = exec.mem.len();
-        let bytecode_size = self.prog.len();
         let log_mem = crate::log2_strict_usize(cells);
 
         let sch = schema();

@@ -704,6 +704,7 @@ fn butterfly_interleaved_fused_3layer(block: &mut [F64], t: &[F64; 7], eighth: u
 #[inline(always)]
 fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
     // Inlined into the sweep: a call would pass the vectors through memory.
+    #[allow(clippy::redundant_closure)] // the closure carries the inline attribute
     fused_lanes_avx512(
         rows,
         t,

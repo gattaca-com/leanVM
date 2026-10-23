@@ -69,14 +69,6 @@ pub(crate) struct Cell {
     state: State,
 }
 
-impl Cell {
-    pub(crate) const UNWRITTEN: Self = Self {
-        word: F192::ZERO,
-        count: 0,
-        state: State::Unwritten,
-    };
-}
-
 /// The write-once data memory: `len` cells, a power of two, in pages, so that the
 /// image grows without moving what it holds. Cells past the last page are unwritten
 /// and never accessed.

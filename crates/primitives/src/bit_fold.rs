@@ -344,6 +344,10 @@ pub mod gfni {
     }
 
     /// Store 24 registers of output bytes, register `o` holding byte `o` of 64 values, as those 64 values.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must have the target features this function enables.
     #[inline]
     #[target_feature(enable = "avx512f", enable = "avx512vbmi")]
     pub fn store_f192(acc: &[__m512i; OUT_BYTES], out: &mut [F192; BLOCK]) {
@@ -414,6 +418,10 @@ pub mod gfni {
     ///     1. gather     qword o  =  byte o of w_7, ..., w_0        (a byte transpose)
     ///     2. transpose  each qword as an 8x8 bit matrix           (an affine against the reversed identity)
     /// ```
+    ///
+    /// # Safety
+    ///
+    /// The CPU must have the target features this function enables.
     #[inline]
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "gfni")]
     pub fn weight_matrices(w: &[F192; 8]) -> [u64; OUT_BYTES] {
