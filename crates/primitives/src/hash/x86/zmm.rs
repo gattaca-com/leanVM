@@ -4,7 +4,7 @@
 //!
 //! One 16-lane group then waits on its own G chains, and most vector pipes idle.
 //!
-//! Two groups in lockstep double the independent work, and fill the whole register file:
+//! Two groups double the independent work, and fill the whole register file:
 //!
 //! ```text
 //!     zmm0  .. zmm15    group A's state
@@ -14,6 +14,20 @@
 //! Nothing else fits, so every update is in place and message words stay in memory.
 //!
 //! The compiler spills at this pressure, hence assembly.
+//!
+//! # Schedule
+//!
+//! One G is a chain of 12 dependent ops, and a group runs four G's per half round.
+//!
+//! Group B runs five slots behind group A, so the two groups are never on the same step.
+//!
+//! A slot is the steps that issue together, and `period!` lists the 14 slots of one half round.
+//!
+//! The second message add sits late, off the dependency chain.
+//!
+//! Lockstep, with both groups on the same step, measured slower.
+//!
+//! Rotating by 16 or 8 with `vpshufb` instead of `vprord` also measured slower.
 
 use crate::hash::IV;
 
@@ -38,52 +52,88 @@ macro_rules! ror {
     };
 }
 
-/// Independent G functions, emitted one step at a time across all of them.
+/// One step of the G function, for each `(a, b, c, d, m, x, y)` of one half round and group.
 ///
-/// Each step is then a run of independent instructions.
+/// The tuple holds the four state rows, the message base and the two message words.
+#[rustfmt::skip]
+macro_rules! step {
+    (mx  $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(addm!($a, $m, $x),)*) };
+    (my  $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(addm!($a, $m, $y),)*) };
+    (ab  $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(rr!("vpaddd", $a, $b),)*) };
+    (cd  $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(rr!("vpaddd", $c, $d),)*) };
+    (xda $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(rr!("vpxord", $d, $a),)*) };
+    (xbc $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(rr!("vpxord", $b, $c),)*) };
+    (d16 $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(ror!($d, 16),)*) };
+    (d8  $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(ror!($d, 8),)*) };
+    (b12 $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(ror!($b, 12),)*) };
+    (b7  $(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => { concat!($(ror!($b, 7),)*) };
+}
+
+/// One step of group `$grp` (`A` or `B`) for the half round `$spec`.
 ///
-/// The second message add is hoisted early, off the dependency chain.
-macro_rules! g {
-    ($(($a:literal, $b:literal, $c:literal, $d:literal, $m:literal, $x:literal, $y:literal))*) => {
+/// A spec is `[cols s0 .. s7]` or `[diag s8 .. s15]`: the half round and its message schedule.
+///
+/// `[none]` is no half round, so the step is empty.
+#[rustfmt::skip]
+macro_rules! at {
+    ($step:ident, $grp:ident, [none]) => { "" };
+    ($step:ident, A, [cols $s0:literal $s1:literal $s2:literal $s3:literal $s4:literal $s5:literal $s6:literal $s7:literal]) => {
+        step!($step (0, 4, 8, 12, "{ma}", $s0, $s1) (1, 5, 9, 13, "{ma}", $s2, $s3) (2, 6, 10, 14, "{ma}", $s4, $s5) (3, 7, 11, 15, "{ma}", $s6, $s7))
+    };
+    ($step:ident, B, [cols $s0:literal $s1:literal $s2:literal $s3:literal $s4:literal $s5:literal $s6:literal $s7:literal]) => {
+        step!($step (16, 20, 24, 28, "{mb}", $s0, $s1) (17, 21, 25, 29, "{mb}", $s2, $s3) (18, 22, 26, 30, "{mb}", $s4, $s5) (19, 23, 27, 31, "{mb}", $s6, $s7))
+    };
+    ($step:ident, A, [diag $s0:literal $s1:literal $s2:literal $s3:literal $s4:literal $s5:literal $s6:literal $s7:literal]) => {
+        step!($step (0, 5, 10, 15, "{ma}", $s0, $s1) (1, 6, 11, 12, "{ma}", $s2, $s3) (2, 7, 8, 13, "{ma}", $s4, $s5) (3, 4, 9, 14, "{ma}", $s6, $s7))
+    };
+    ($step:ident, B, [diag $s0:literal $s1:literal $s2:literal $s3:literal $s4:literal $s5:literal $s6:literal $s7:literal]) => {
+        step!($step (16, 21, 26, 31, "{mb}", $s0, $s1) (17, 22, 27, 28, "{mb}", $s2, $s3) (18, 23, 24, 29, "{mb}", $s4, $s5) (19, 20, 25, 30, "{mb}", $s6, $s7))
+    };
+}
+
+/// One period of 14 slots: group A on half round `$cur`, group B five slots behind.
+///
+/// Group B's steps from the first slots of the period still belong to the half round `$prev`.
+///
+/// Within a slot, group A goes first.
+#[rustfmt::skip]
+macro_rules! period {
+    ($cur:tt, $prev:tt) => {
         concat!(
-            $(addm!($a, $m, $x),)*
-            $(rr!("vpaddd", $a, $b),)*
-            $(rr!("vpxord", $d, $a),)*
-            $(addm!($a, $m, $y),)*
-            $(ror!($d, 16),)*
-            $(rr!("vpaddd", $c, $d),)*
-            $(rr!("vpxord", $b, $c),)*
-            $(ror!($b, 12),)*
-            $(rr!("vpaddd", $a, $b),)*
-            $(rr!("vpxord", $d, $a),)*
-            $(ror!($d, 8),)*
-            $(rr!("vpaddd", $c, $d),)*
-            $(rr!("vpxord", $b, $c),)*
-            $(ror!($b, 7),)*
+            // slot 0
+            at!(mx, A, $cur),
+            // slot 1
+            at!(ab, A, $cur), at!(xda, B, $prev), at!(d8, B, $prev),
+            // slots 2 and 3
+            at!(cd, B, $prev), at!(xbc, B, $prev),
+            // slot 4
+            at!(xda, A, $cur), at!(d16, A, $cur), at!(b7, B, $prev),
+            // slot 5
+            at!(cd, A, $cur), at!(mx, B, $cur),
+            // slot 6
+            at!(ab, B, $cur),
+            // slot 7
+            at!(my, A, $cur),
+            // slot 8
+            at!(xbc, A, $cur), at!(b12, A, $cur), at!(ab, A, $cur),
+            // slot 9
+            at!(xda, B, $cur), at!(d16, B, $cur),
+            // slot 10
+            at!(xda, A, $cur), at!(d8, A, $cur), at!(cd, B, $cur),
+            // slot 11
+            at!(cd, A, $cur),
+            // slot 12
+            at!(xbc, A, $cur), at!(my, B, $cur),
+            // slot 13
+            at!(b7, A, $cur), at!(xbc, B, $cur), at!(b12, B, $cur), at!(ab, B, $cur),
         )
     };
 }
 
-/// One round of both groups: columns, then diagonals.
-#[rustfmt::skip]
-macro_rules! round {
-    ([$s0:literal, $s1:literal, $s2:literal, $s3:literal, $s4:literal, $s5:literal, $s6:literal, $s7:literal,
-      $s8:literal, $s9:literal, $s10:literal, $s11:literal, $s12:literal, $s13:literal, $s14:literal, $s15:literal]) => {
-        concat!(
-            g!(
-                (0, 4, 8, 12, "{ma}", $s0, $s1)       (1, 5, 9, 13, "{ma}", $s2, $s3)
-                (2, 6, 10, 14, "{ma}", $s4, $s5)      (3, 7, 11, 15, "{ma}", $s6, $s7)
-                (16, 20, 24, 28, "{mb}", $s0, $s1)    (17, 21, 25, 29, "{mb}", $s2, $s3)
-                (18, 22, 26, 30, "{mb}", $s4, $s5)    (19, 23, 27, 31, "{mb}", $s6, $s7)
-            ),
-            g!(
-                (0, 5, 10, 15, "{ma}", $s8, $s9)      (1, 6, 11, 12, "{ma}", $s10, $s11)
-                (2, 7, 8, 13, "{ma}", $s12, $s13)     (3, 4, 9, 14, "{ma}", $s14, $s15)
-                (16, 21, 26, 31, "{mb}", $s8, $s9)    (17, 22, 27, 28, "{mb}", $s10, $s11)
-                (18, 23, 24, 29, "{mb}", $s12, $s13)  (19, 20, 25, 30, "{mb}", $s14, $s15)
-            ),
-        )
-    };
+/// The periods of half rounds `$cur, ..`, then group B's last slots.
+macro_rules! chain {
+    ($prev:tt;) => { period!([none], $prev) };
+    ($prev:tt; $cur:tt $($rest:tt)*) => { concat!(period!($cur, $prev), chain!($cur; $($rest)*)) };
 }
 
 /// Load `v[i] = h[i]` and broadcast `v[8 + i]` from `src`, for both groups.
@@ -145,17 +195,19 @@ pub(super) unsafe fn compress_x2(h: *mut u32, ma: *const u32, mb: *const u32, t:
                 6 22 14 30 "{f:e}",
                 7 23 15 31 "dword ptr [{iv} + 28]"
             ),
-            // The ten rounds (RFC 7693 message schedule), both groups in lockstep.
-            round!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
-            round!([14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3]),
-            round!([11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4]),
-            round!([7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8]),
-            round!([9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13]),
-            round!([2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9]),
-            round!([12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11]),
-            round!([13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10]),
-            round!([6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5]),
-            round!([10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0]),
+            // The ten rounds (RFC 7693 message schedule), as 20 half rounds.
+            chain!([none];
+                [cols 0 1 2 3 4 5 6 7] [diag 8 9 10 11 12 13 14 15]
+                [cols 14 10 4 8 9 15 13 6] [diag 1 12 0 2 11 7 5 3]
+                [cols 11 8 12 0 5 2 15 13] [diag 10 14 3 6 7 1 9 4]
+                [cols 7 9 3 1 13 12 11 14] [diag 2 6 5 10 4 0 15 8]
+                [cols 9 0 5 7 2 4 10 15] [diag 14 1 11 12 6 8 3 13]
+                [cols 2 12 6 10 0 11 8 3] [diag 4 13 7 5 15 14 1 9]
+                [cols 12 5 1 15 14 13 4 10] [diag 0 7 6 3 9 2 8 11]
+                [cols 13 11 7 14 12 1 3 9] [diag 5 0 15 4 8 6 2 10]
+                [cols 6 15 14 9 11 3 0 8] [diag 12 2 13 7 1 4 10 5]
+                [cols 10 2 8 4 7 6 1 5] [diag 15 11 9 14 3 12 13 0]
+            ),
             // h[i] ^= v[i] ^ v[i + 8], written back in place.
             feed_forward!(
                 0 16 8 24, 1 17 9 25, 2 18 10 26, 3 19 11 27, 4 20 12 28, 5 21 13 29, 6 22 14 30, 7 23 15 31
