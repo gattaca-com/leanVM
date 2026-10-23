@@ -17,6 +17,7 @@
 use crate::cpu::{Brow, Drow, Jrow, Memory, Op, Rows, Srow, Trace};
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
 use primitives::field::{F64, F192, mul_by_g};
+use primitives::stream::Stream;
 
 // ---- the identities ----------------------------------------------------------
 //
@@ -231,12 +232,6 @@ impl<'a> FillCtx<'a> {
         }
     }
 
-    /// Write local column `at`: `f` over the trace rows, then its padding value to the
-    /// end of the window.
-    fn col<R: Sync>(&self, out: &mut [ColumnOut], rows: &Rows<R>, at: usize, f: impl Fn(&R) -> F64 + Sync) {
-        self.cols(out, rows, at, |r| [f(r)]);
-    }
-
     /// Write the `N` local columns at `at..at + N` from one closure per row.
     /// Columns fed by the same read fill together: the three lanes of a 192-bit
     /// memory word are one random access, and splitting them across `N` passes
@@ -261,38 +256,15 @@ impl<'a> FillCtx<'a> {
         f: impl Fn(usize) -> [F64; N] + Sync,
     ) {
         let n = self.height;
-        let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| {
+        for k in 0..N {
             assert_eq!(out[at + k].len(), n, "column {} has the wrong window length", at + k);
             self.written
                 .fetch_or(1 << (at + k), std::sync::atomic::Ordering::Relaxed);
-            parallel::SendPtr(out[at + k].as_mut_ptr())
-        });
+        }
         assert!(n_rows <= n, "a table's rows must fit its cube");
         let padding: [F64; N] = std::array::from_fn(|k| self.padding[at + k]);
-        // A cache line of rows is gathered column by column, then streamed out: the
-        // stack is read by a later pass, so its lines need not be fetched.
-        const LINE: usize = 8;
-        parallel::for_each_chunk(n.div_ceil(LINE), |first, end| {
-            let stream = primitives::stream::Stream::new();
-            for b in first..end {
-                let start = b * LINE;
-                let len = LINE.min(n - start);
-                let mut buf = [[F64::ZERO; LINE]; N];
-                for j in 0..len {
-                    let i = start + j;
-                    let v = if i < n_rows { f(i) } else { padding };
-                    for k in 0..N {
-                        buf[k][j] = v[k];
-                    }
-                }
-                for (p, column) in dst.iter().zip(&buf) {
-                    // SAFETY: block `b` writes rows `start..start + len` of each of the
-                    // `N` windows, in bounds and disjoint from every other block's, and
-                    // the dispatch blocks until every write is finished.
-                    unsafe { stream.copy_uninit(p.add(start), &column[..len]) };
-                }
-            }
-        });
+        let windows: &mut [ColumnOut; N] = (&mut out[at..at + N]).try_into().unwrap();
+        fill_columns(windows, n_rows, padding, f);
     }
 
     /// The three `K`-lanes of the 192-bit word in memory cell `addr`.
@@ -300,6 +272,51 @@ impl<'a> FillCtx<'a> {
         let w = self.mem.word(addr as usize);
         [F64(w.c0), F64(w.c1), F64(w.c2)]
     }
+}
+
+/// Rows a streamed fill gathers per column before publishing them: whole cache lines.
+const FILL_ROWS: usize = 64;
+/// Rows one task of a streamed fill covers.
+const FILL_TASK: usize = 1 << 12;
+
+/// Write `f(i)` to row `i` of the `N` windows for `i < n_rows`, then `padding` to the end of each.
+/// Rows are gathered into line-sized runs per column and streamed out: the windows are the stacked
+/// witness, which nothing reads until the commit, so a fetch of a line before its write is wasted.
+/// The windows are equal and a power of two long.
+pub(crate) fn fill_columns<const N: usize>(
+    windows: &mut [ColumnOut; N],
+    n_rows: usize,
+    padding: [F64; N],
+    f: impl Fn(usize) -> [F64; N] + Sync,
+) {
+    let n = windows[0].len();
+    assert!(n.is_power_of_two() && windows.iter().all(|w| w.len() == n));
+    assert!(n_rows <= n);
+    let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| parallel::SendPtr(windows[k].as_mut_ptr()));
+    let (task, run) = (n.min(FILL_TASK), n.min(FILL_ROWS));
+    parallel::for_each(n / task, |t| {
+        let stream = Stream::new();
+        let padded: [[F64; FILL_ROWS]; N] = std::array::from_fn(|k| [padding[k]; FILL_ROWS]);
+        let mut gathered = [[F64::ZERO; FILL_ROWS]; N];
+        for base in (t * task..(t + 1) * task).step_by(run) {
+            let run_rows = if base >= n_rows {
+                &padded
+            } else {
+                for j in 0..run {
+                    let row = if base + j < n_rows { f(base + j) } else { padding };
+                    for k in 0..N {
+                        gathered[k][j] = row[k];
+                    }
+                }
+                &gathered
+            };
+            for k in 0..N {
+                // SAFETY: tasks cover disjoint rows, so each window slot is written once, in bounds,
+                // and the dispatch returns after every task's stream has fenced.
+                unsafe { stream.copy_uninit(dst[k].0.add(base), &run_rows[k][..run]) };
+            }
+        }
+    });
 }
 
 /// Fill one table's columns and check that every window was written. The stack is
@@ -358,8 +375,8 @@ pub trait Table: Sync {
     fn flushes(&self, f: &mut FlushBuilder);
     /// Fill this table's columns from the trace: `out[i]` is local column `i`'s
     /// window, already at its padded length. Every window must be written in full;
-    /// use `FillCtx::col` / `FillCtx::cols`, which append the column's pad value
-    /// past the last trace row and record the coverage `fill_table` checks.
+    /// use `FillCtx::cols`, which appends the columns' pad values
+    /// past the last trace row and records the coverage `fill_table` checks.
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]);
 }
 
@@ -511,14 +528,13 @@ impl Table for Arith {
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]) {
         use arith::*;
         let rows = if self.is_xor { &ctx.trace.xor } else { &ctx.trace.mul };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // The offsets and both operand words come out of ONE bytecode decode: split
-        // across passes, the row's instruction is fetched once per pass.
-        ctx.cols(out, rows, OA, |r| {
+        // One pass: the row's instruction is decoded once, and every column is written from it.
+        ctx.cols(out, rows, PC, |r| {
             let (a, b, c) = ctx.ternary_operands(r.pc);
             let (va, vb) = (ctx.limbs(r.fp + a), ctx.limbs(r.fp + b));
             [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
                 ctx.g_at(a),
                 ctx.g_at(b),
                 ctx.g_at(c),
@@ -528,10 +544,12 @@ impl Table for Arith {
                 vb[0],
                 vb[1],
                 vb[2],
+                ctx.g_at(r.ra),
+                ctx.g_at(r.rb),
+                ctx.g_at(r.rc),
+                ctx.g_at(r.bytecode_read),
             ]
         });
-        ctx.cols(out, rows, RA, |r| [r.ra, r.rb, r.rc].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -582,15 +600,19 @@ impl Table for SetTable {
             Op::Set { o, k } => (o, k),
             op => unreachable!("a SET row's pc {} holds {op:?}", r.pc),
         };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        ctx.col(out, rows, O, |r| ctx.g_at(imm(r).0));
-        ctx.cols(out, rows, K_LO, |r| {
-            let k = imm(r).1;
-            [F64(k.c0), F64(k.c1), F64(k.c2)]
+        ctx.cols(out, rows, PC, |r| {
+            let (o, k) = imm(r);
+            [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
+                ctx.g_at(o),
+                F64(k.c0),
+                F64(k.c1),
+                F64(k.c2),
+                ctx.g_at(r.r),
+                ctx.g_at(r.bytecode_read),
+            ]
         });
-        ctx.col(out, rows, R, |r| ctx.g_at(r.r));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -665,8 +687,6 @@ impl Table for DerefTable {
             Op::Deref { o1, o2, o3, mode } => (o1, o2, o3, mode),
             op => unreachable!("a DEREF row's pc {} holds {op:?}", r.pc),
         };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
         debug_assert!(
             rows.iter().all(|r| {
                 let p = ctx.mem.word((r.fp + ins(r).0) as usize);
@@ -674,12 +694,14 @@ impl Table for DerefTable {
             }),
             "deref pointer must be K-valued"
         );
-        // The three offsets, the two mode flags, the pointer lane and the local
-        // word all follow from ONE bytecode decode.
-        ctx.cols(out, rows, O1, |r| {
+        // One pass: the offsets, the two mode flags, the pointer lane and the local
+        // word all follow from one bytecode decode.
+        ctx.cols(out, rows, PC, |r| {
             let (o1, o2, o3, mode) = ins(r);
             let v3 = ctx.limbs(r.fp + o3);
             [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
                 ctx.g_at(o1),
                 ctx.g_at(o2),
                 ctx.g_at(o3),
@@ -689,10 +711,12 @@ impl Table for DerefTable {
                 v3[0],
                 v3[1],
                 v3[2],
+                ctx.g_at(r.r1),
+                ctx.g_at(r.r2),
+                ctx.g_at(r.r3),
+                ctx.g_at(r.bytecode_read),
             ]
         });
-        ctx.cols(out, rows, R1, |r| [r.r1, r.r2, r.r3].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -770,23 +794,6 @@ impl Table for JumpTable {
         };
         let cell = |r: &Jrow, o: u32| ctx.mem.word((r.fp + o) as usize);
         let cond = |r: &Jrow| cell(r, ins(r).0);
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // The three offsets and the three cells they name come out of ONE decode.
-        // Those cells are K-valued on every row, taken or not (`cpu::execute`
-        // rejects anything else), so each is one lane and the memory flush carries
-        // literal zeros above it.
-        ctx.cols(out, rows, OC, |r| {
-            let (oc, od, of) = ins(r);
-            [
-                ctx.g_at(oc),
-                ctx.g_at(od),
-                ctx.g_at(of),
-                F64(cell(r, oc).c0),
-                F64(cell(r, od).c0),
-                F64(cell(r, of).c0),
-            ]
-        });
         // The is-nonzero witness `w = c⁻¹` (0 where c = 0) for every row, in one
         // batched Montgomery inversion. `prefix[i]` is the
         // running product of the nonzero conditions before row `i`, so `acc` ends
@@ -815,9 +822,30 @@ impl Table for JumpTable {
             }
             (w, b)
         };
-        ctx.cols_at(out, rows.len(), W, |i| [F64(w[i].c0), b[i]]);
-        ctx.cols(out, rows, RC, |r| [r.rc, r.rd, r.rf].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        // One pass. The three offsets and the three cells they name come out of one decode.
+        // Those cells are K-valued on every row, taken or not (`cpu::execute` rejects
+        // anything else), so each is one lane and the memory flush carries literal zeros
+        // above it.
+        ctx.cols_at(out, rows.len(), PC, |i| {
+            let r = rows.get(i);
+            let (oc, od, of) = ins(r);
+            [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
+                ctx.g_at(oc),
+                ctx.g_at(od),
+                ctx.g_at(of),
+                F64(cell(r, oc).c0),
+                F64(cell(r, od).c0),
+                F64(cell(r, of).c0),
+                ctx.g_at(r.rc),
+                ctx.g_at(r.rd),
+                ctx.g_at(r.rf),
+                ctx.g_at(r.bytecode_read),
+                F64(w[i].c0),
+                b[i],
+            ]
+        });
     }
 }
 
@@ -931,10 +959,6 @@ impl Table for Blake2sTable {
         use blake2st::*;
         let rows = &ctx.trace.blake2s;
         let ad = |r: &Brow| blake2s_addresses(ctx.prog, r);
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // O_M0..O_MD are the seven base addresses' offsets, from the instruction decode.
-        ctx.cols(out, rows, O_M0, |r| ad(r).map(|a| ctx.g_at(a - r.fp)));
         // The eighteen memory-borne flock words are the nine cells' lo/hi lanes:
         // the four message cells, then the cv pair, the output pair and the
         // metadata. A cell's two lanes are one read, so each group of four takes two.
@@ -942,33 +966,29 @@ impl Table for Blake2sTable {
             let (w0, w1) = (ctx.mem.word(c0 as usize), ctx.mem.word(c1 as usize));
             [F64(w0.c0), F64(w0.c1), F64(w1.c0), F64(w1.c1)]
         };
-        ctx.cols(out, rows, V_M0, |r| {
+        ctx.cols(out, rows, PC, |r| {
             let a = ad(r);
-            word_pair(a[0], a[1])
+            let md = ctx.mem.word(a[6] as usize);
+            let mut row = [F64::ZERO; N];
+            row[PC] = ctx.g_at(r.pc);
+            row[FP] = ctx.g_at(r.fp);
+            // O_M0..O_MD are the seven base addresses' offsets, from the instruction decode.
+            for (k, address) in a.into_iter().enumerate() {
+                row[O_M0 + k] = ctx.g_at(address - r.fp);
+            }
+            row[V_M0..V_M0 + 4].copy_from_slice(&word_pair(a[0], a[1]));
+            row[V_M2..V_M2 + 4].copy_from_slice(&word_pair(a[2], a[3]));
+            row[V_OUT0..V_OUT0 + 4].copy_from_slice(&word_pair(a[5], a[5] + 1));
+            row[V_CV0..V_CV0 + 4].copy_from_slice(&word_pair(a[4], a[4] + 1));
+            row[MD0] = F64(md.c0);
+            row[MD1] = F64(md.c1);
+            for (k, count) in [r.ra, r.rb, r.rcv, r.rc].into_iter().flatten().enumerate() {
+                row[R_M0 + k] = ctx.g_at(count);
+            }
+            row[R_MD] = ctx.g_at(r.rmd);
+            row[RBC] = ctx.g_at(r.bytecode_read);
+            row
         });
-        ctx.cols(out, rows, V_M2, |r| {
-            let a = ad(r);
-            word_pair(a[2], a[3])
-        });
-        ctx.cols(out, rows, V_OUT0, |r| {
-            let a = ad(r);
-            word_pair(a[5], a[5] + 1)
-        });
-        ctx.cols(out, rows, V_CV0, |r| {
-            let a = ad(r);
-            word_pair(a[4], a[4] + 1)
-        });
-        ctx.cols(out, rows, MD0, |r| {
-            let md = ctx.mem.word(ad(r)[6] as usize);
-            [F64(md.c0), F64(md.c1)]
-        });
-        ctx.cols(out, rows, R_M0, |r| {
-            [
-                r.ra[0], r.ra[1], r.rb[0], r.rb[1], r.rcv[0], r.rcv[1], r.rc[0], r.rc[1], r.rmd,
-            ]
-            .map(|k| ctx.g_at(k))
-        });
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 

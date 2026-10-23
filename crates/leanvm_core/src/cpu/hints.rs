@@ -3,6 +3,8 @@
 //! table + reverse index the hint interpreter grows on demand.
 
 use primitives::field::F64;
+use std::ops::{Deref, DerefMut};
+use std::sync::Mutex;
 
 /// Frame-relative offset operand (matches the compiler's `ir::Off`).
 pub type Off = u32;
@@ -40,6 +42,8 @@ pub struct GPow {
     index: Vec<u32>,
     /// Set once a lookup missed: every exponent is announced from then on.
     dense: bool,
+    /// Every exponent below this is announced.
+    announced: usize,
 }
 
 impl GPow {
@@ -51,10 +55,16 @@ impl GPow {
         g.grow_to(upto);
         g.index = vec![0; (2 * (upto + 1)).next_power_of_two().max(1 << 13)];
         g.noted.reserve((upto + 1).next_power_of_two());
-        for k in 0..=upto {
-            g.note(k);
-        }
+        g.seed(upto);
         g
+    }
+
+    /// Announce every exponent up to `upto`.
+    fn seed(&mut self, upto: usize) {
+        for k in self.announced..=upto {
+            self.note(k);
+        }
+        self.announced = self.announced.max(upto + 1);
     }
 
     /// `g^k`. Panics past the grown range, which is the honest outcome: every
@@ -64,15 +74,9 @@ impl GPow {
         self.pow[k]
     }
 
-    /// One past the largest index the forward table covers.
-    #[inline(always)]
-    pub fn covered(&self) -> usize {
-        self.pow.len()
-    }
-
     /// The forward table, `g^0` to `g^{covered - 1}`.
-    pub(crate) fn into_powers(self) -> Vec<F64> {
-        self.pow
+    pub(crate) fn powers(&self) -> &[F64] {
+        &self.pow
     }
 
     /// Extend the forward table to cover index `upto`.
@@ -132,8 +136,10 @@ impl GPow {
         self.lookup(x)
     }
 
+    /// The exponent of `x` if announced, without the dense retry: all of a table
+    /// built by [`Self::new`].
     #[inline]
-    fn lookup(&self, x: F64) -> Option<u32> {
+    pub fn lookup(&self, x: F64) -> Option<u32> {
         let mask = self.index.len() - 1;
         let mut i = slot_of(x.0, mask);
         loop {
@@ -161,6 +167,46 @@ impl GPow {
             index[i] = k + 1;
         }
         self.index = index;
+    }
+}
+
+/// The table a run leaves for the next. It is a function of the exponent alone, and
+/// announcing more only widens the index, so a run starts from what the last one
+/// announced instead of announcing every pc again.
+static KEPT: Mutex<Option<GPow>> = Mutex::new(None);
+
+/// A [`GPow`] taken from [`KEPT`], put back when dropped. A run that finds none
+/// (another holds it) builds its own.
+pub(crate) struct Kept(GPow);
+
+impl Kept {
+    /// The kept table with every exponent up to `seed` announced.
+    pub(crate) fn take(seed: usize) -> Self {
+        let mut g = match KEPT.lock().unwrap().take() {
+            Some(g) => g,
+            None => return Self(GPow::new(seed)),
+        };
+        g.seed(seed);
+        Self(g)
+    }
+}
+
+impl Deref for Kept {
+    type Target = GPow;
+    fn deref(&self) -> &GPow {
+        &self.0
+    }
+}
+
+impl DerefMut for Kept {
+    fn deref_mut(&mut self) -> &mut GPow {
+        &mut self.0
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        *KEPT.lock().unwrap() = Some(std::mem::take(&mut self.0));
     }
 }
 
