@@ -525,6 +525,51 @@ mod tests {
         }
     }
 
+    /// The node's Merkle trees alone, hashed from one L2-resident block of rows reused for every
+    /// block, as the encode hands over rows it just wrote. Shapes are `(log leaves, row words, leaf words)`:
+    /// L0, then the four extension levels. `MERKLE_REPS` sets the passes.
+    #[test]
+    #[ignore]
+    fn merkle_shapes_report() {
+        let reps = std::env::var("MERKLE_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5usize);
+        let log_block = 7;
+        let rows: Vec<F64> = (0..48usize << log_block)
+            .map(|i| F64((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1))
+            .collect();
+        let mut total = 0.0;
+        for (name, log_leaves, row_words, leaf_words) in [
+            ("L0", 21usize, 48usize, 64usize),
+            ("L1", 20, 48, 48),
+            ("L2", 19, 48, 48),
+            ("L3", 18, 48, 48),
+            ("L4", 17, 48, 48),
+        ] {
+            let build = || {
+                let builder = MerkleBuilder::new(1 << log_leaves, row_words, leaf_words);
+                for b in 0..1usize << (log_leaves - log_block) {
+                    builder.absorb(b << log_block, &rows);
+                }
+                std::hint::black_box(builder.finish());
+            };
+            build();
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                build();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let compressions = (1usize << log_leaves) * (row_words * 8 / BLOCK_LEN + 1);
+            total += ms;
+            println!(
+                "{name}: {ms:.2} ms, {:.3} ns per compression",
+                ms * 1e6 / compressions as f64
+            );
+        }
+        println!("all: {total:.2} ms");
+    }
+
     #[test]
     #[should_panic(expected = "every leaf absorbed")]
     fn a_missing_block_is_rejected() {
