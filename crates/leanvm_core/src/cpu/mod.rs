@@ -124,6 +124,9 @@ pub struct Program {
     /// `prog`: always set by [`Program::assemble`] from the bytecode, so a
     /// `Program` cannot carry a hash inconsistent with its own `prog`.
     pub(crate) bytecode_hash: [u8; 32],
+    /// The public bytecode columns [`layout::layout`] puts in the seed and finalize
+    /// blocks, built once at assembly. Same trust as `bytecode_hash`.
+    pub(crate) bytecode_cols: layout::BytecodeColumns,
     /// Prover-side frame/buffer allocation hints (keyed by global pc) and the
     /// size of `main`'s frame: the nondeterminism [`Program::execute`] needs to
     /// run the program. Public verification ([`verify`]) ignores them.
@@ -165,8 +168,9 @@ impl Program {
     /// from `prog`. The single funnel for construction, so the digest is always
     /// consistent with the bytecode.
     pub fn assemble(prog: Vec<Op>, hints: HashMap<u32, Vec<hints::RHint>>, main_frame: u32) -> Self {
+        let bytecode_cols = layout::bytecode_columns(&prog);
         let bytecode_hash = {
-            let table = layout::bytecode_table(&prog);
+            let table = layout::stacked_columns(&bytecode_cols);
             // SAFETY: F64 is #[repr(transparent)] over u64, so the slice's byte image is
             // exactly the concatenation of its `to_le_bytes` on little-endian targets.
             let bytes: &[u8] =
@@ -176,6 +180,7 @@ impl Program {
         Self {
             prog,
             bytecode_hash,
+            bytecode_cols,
             hints,
             main_frame,
             witness: HashMap::new(),
@@ -183,6 +188,11 @@ impl Program {
             src_lines: Vec::new(),
             min_log_committed: 0,
         }
+    }
+
+    /// The public bytecode columns, for [`layout::layout`].
+    pub fn bytecode_cols(&self) -> &layout::BytecodeColumns {
+        &self.bytecode_cols
     }
 
     /// Where `pc` came from: `"verify_sub (line 2204)"` when the compiler left a
@@ -662,7 +672,7 @@ pub fn verify(program: &Program, public_input: &[F192; 2], proof: &Proof) -> Res
     if public_input.iter().any(|half| half.c2 != 0) || !program.prog.len().is_power_of_two() {
         return Err(CpuError::PublicInput);
     }
-    let table: Vec<u64> = layout::bytecode_table(&program.prog)
+    let table: Vec<u64> = layout::stacked_columns(&program.bytecode_cols)
         .iter()
         .map(|word| word.0)
         .collect();

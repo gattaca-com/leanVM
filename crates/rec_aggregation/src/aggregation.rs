@@ -45,12 +45,13 @@ use std::ops::Range;
 use lean_compiler::{compile, parse_with_replacements};
 use lean_da::{BLOB_SYMBOLS, CELL_SYMBOLS, CELLS_PER_ROW, CODEWORD_SYMBOLS};
 pub use lean_da::{DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS};
+use leanvm_core::constraints::{BLOCK, BLOCK_VARS, partial_evals};
 use leanvm_core::cpu::{Program, ProveError, from_scalar, prove, public_input_bytes, scalar_proof, to_scalar};
 use leanvm_core::leaf::{Block, Coord};
 use leanvm_core::tables::N_TABLES;
 use leanvm_core::transcript::FiatShamirState;
-use primitives::field::{F64, F192, G, g_pow};
-use primitives::multilinear::mle_eval_par;
+use primitives::field::{F64, F192, F192Unreduced, G, Weights8, dot_base, g_pow};
+use primitives::multilinear::{eq_table, mle_eval_par};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use signatures::{lean_sphincs, lean_xmss};
 
@@ -299,7 +300,7 @@ impl DeferredClaim {
     fn recompute(bytecode_point: Vec<F192>, matrix_point: Vec<F192>) -> Result<Self, AggregateVerifyError> {
         let bytecode_at = |point: &[F192]| {
             let _span = tracing::info_span!("bytecode mle").entered();
-            mle_eval_par(stacked_bytecode(), point)
+            bytecode_mle(point)
         };
         let matrices_at = |point: &[F192]| {
             let _span = tracing::info_span!("matrix walk").entered();
@@ -822,66 +823,39 @@ fn bytecode_window() -> Range<usize> {
         .clone()
 }
 
-/// One round message against a K-valued table: `bt` is the bytecode itself, so
-/// the products are base-by-extension.
-fn round_msg_base(bytecode: &[F64], weights: &[F192]) -> (F192, F192) {
-    let half = bytecode.len() / 2;
-    let term = |i: usize| {
-        let (bytecode_0, bytecode_1) = (bytecode[2 * i], bytecode[2 * i + 1]);
-        let (weight_0, weight_1) = (weights[2 * i], weights[2 * i + 1]);
-        (
-            weight_1.mul_base(bytecode_1),
-            (weight_0 + weight_1).mul_base(bytecode_0 + bytecode_1),
-        )
-    };
-    if half >= PAR_MIN {
-        parallel::fold_reduce(
-            half,
-            || (F192::ZERO, F192::ZERO),
-            |acc: &mut (F192, F192), i| {
-                let (x, y) = term(i);
-                acc.0 += x;
-                acc.1 += y;
-            },
-            |a: (F192, F192), b: (F192, F192)| (a.0 + b.0, a.1 + b.1),
-        )
-    } else {
-        (0..half).fold((F192::ZERO, F192::ZERO), |acc, i| {
-            let (x, y) = term(i);
-            (acc.0 + x, acc.1 + y)
-        })
-    }
-}
-
-/// The first fold of a K-valued table, which is where it becomes extension-valued.
-fn fold_lsb_base(table: &[F64], challenge: F192) -> Vec<F192> {
-    parallel::map_collect(table.len() / 2, |i| {
-        let (left, right) = (table[2 * i], table[2 * i + 1]);
-        F192::from(left) + challenge.mul_base(left + right)
-    })
+/// The stacked bytecode polynomial at `point`, summed over the populated slot window only.
+fn bytecode_mle(point: &[F192]) -> F192 {
+    let table = stacked_bytecode();
+    let kbc = bytecode_vars() - leanvm_core::leaf::N_BYTECODE_SELECTORS;
+    bytecode_window()
+        .map(|slot| slot_eq(point, kbc, slot) * mle_eval_par(&table[slot << kbc..(slot + 1) << kbc], &point[..kbc]))
+        .fold(F192::ZERO, |acc, value| acc + value)
 }
 
 /// `Σ_t γ_t · eq(points[t], (r_row, ·))` over the stacking slots, once the row
 /// variables are bound. A closed form, so the row rounds never have to carry the
 /// slot half of a `2^kbcv` weight table.
 fn slot_weights(points: &[Vec<F192>], lambdas: &[F192], r_row: &[F192], kbc: usize) -> Vec<F192> {
-    let slots = leanvm_core::leaf::N_BYTECODE_SELECTORS;
-    let mut weights = vec![F192::ZERO; 1 << slots];
+    let mut weights = vec![F192::ZERO; 1 << leanvm_core::leaf::N_BYTECODE_SELECTORS];
     for (point, &lambda) in points.iter().zip(lambdas) {
         let row_weight: F192 = (0..kbc).fold(lambda, |acc, k| acc * (F192::ONE + point[k] + r_row[k]));
         for (slot, weight) in weights.iter_mut().enumerate() {
-            let slot_weight = (0..slots).fold(row_weight, |acc, bit| {
-                let coordinate = point[kbc + bit];
-                acc * if (slot >> bit) & 1 == 1 {
-                    coordinate
-                } else {
-                    F192::ONE + coordinate
-                }
-            });
-            *weight += slot_weight;
+            *weight += row_weight * slot_eq(point, kbc, slot);
         }
     }
     weights
+}
+
+/// `eq(point[kbc..], slot)`: the claim's weight on one stacking slot.
+fn slot_eq(point: &[F192], kbc: usize, slot: usize) -> F192 {
+    (0..leanvm_core::leaf::N_BYTECODE_SELECTORS).fold(F192::ONE, |acc, bit| {
+        let coordinate = point[kbc + bit];
+        acc * if (slot >> bit) & 1 == 1 {
+            coordinate
+        } else {
+            F192::ONE + coordinate
+        }
+    })
 }
 
 /// Variables of a bytecode claim's point: the log row count plus the stacking
@@ -964,41 +938,6 @@ fn absorb_round(
     let c1 = g0 + g1 + gi;
     *claim = (gi * challenge + c1) * challenge + g0;
     challenge
-}
-
-/// `Σ_t γ_t · eq(points[t], ·)`, over the `active` window of `2^vars` entries.
-///
-/// Each point splits in half; the halves' eq tables are small and serial, and
-/// the full table is their outer product, one fused multiply-add per entry,
-/// parallel over the high index. Materializing a `2^vars` eq table per claim and
-/// summing them is the same arithmetic done twice, serially.
-fn weighted_eq_table(points: &[Vec<F192>], lambdas: &[F192], vars: usize, active: Range<usize>) -> Vec<F192> {
-    let lo_vars = vars / 2;
-    let lo_len = 1usize << lo_vars;
-    debug_assert!(active.start.is_multiple_of(lo_len) && active.end.is_multiple_of(lo_len));
-    // `build_eq_table_ext` is LSB-first, so the low variables index the low bits
-    // and entry `hi * lo_len + lo` is `eq_lo[lo] * eq_hi[hi]`.
-    let halves: Vec<(Vec<F192>, Vec<F192>)> = points
-        .iter()
-        .zip(lambdas)
-        .map(|(point, &lambda)| {
-            let low = pcs::whir::build_eq_table_ext(&point[..lo_vars]);
-            let mut high = pcs::whir::build_eq_table_ext(&point[lo_vars..]);
-            high.iter_mut().for_each(|weight| *weight *= lambda);
-            (low, high)
-        })
-        .collect();
-    let mut weights = vec![F192::ZERO; active.len()];
-    let first = active.start / lo_len;
-    parallel::chunks_mut(&mut weights, lo_len, |high_index, chunk| {
-        for (low, high) in &halves {
-            let scale = high[first + high_index];
-            for (output, &low_weight) in chunk.iter_mut().zip(low) {
-                *output += scale * low_weight;
-            }
-        }
-    });
-    weights
 }
 
 /// Mirror the guest's `aggregate_claims` transcript and prove the two batching
@@ -1087,25 +1026,57 @@ fn aggregate_deferred_claims(
     let n_slots = 1 << leanvm_core::leaf::N_BYTECODE_SELECTORS;
     let slot_window = bytecode_window();
     let kbc = kbcv - leanvm_core::leaf::N_BYTECODE_SELECTORS;
-    let mut wt = weighted_eq_table(
-        &points,
-        &gbc,
-        kbcv,
-        (slot_window.start << kbc)..(slot_window.end << kbc),
-    );
-    // Round zero runs against the K-valued table itself: the bytecode never needs
-    // to exist as `2^kbcv` extension elements (three times the memory traffic),
-    // and base-by-extension is cheaper than extension-by-extension. Every later
-    // round is extension-valued anyway.
-    let bc = &stacked_bytecode()[(slot_window.start << kbc)..(slot_window.end << kbc)];
-    let mut bt = {
-        let msg = round_msg_base(bc, &wt);
+    assert!(kbc >= BLOCK_VARS, "the bytecode has fewer rows than a block");
+    let columns: Vec<&[F64]> = stacked_bytecode()[(slot_window.start << kbc)..(slot_window.end << kbc)]
+        .chunks(1 << kbc)
+        .collect();
+    let eq_hi: Vec<Vec<F192>> = points.iter().map(|point| eq_table(&point[BLOCK_VARS..kbc])).collect();
+    // Rows `(high, low)` with `low` the first `BLOCK_VARS` variables, which the first rounds bind. Per claim,
+    // the weight splits into a factor on each of slot, high and low rows, so those rounds run on the
+    // slot and high rows summed out: `G_t(low) = Σ_slot eq(slot) Σ_high eq(high) · column_slot(high, low)`.
+    let mut sums: Vec<Vec<F192>> = points
+        .iter()
+        .zip(&eq_hi)
+        .map(|(point, eq_hi)| {
+            let per_slot = partial_evals(&columns, eq_hi);
+            let weights: Vec<F192> = slot_window.clone().map(|slot| slot_eq(point, kbc, slot)).collect();
+            (0..BLOCK)
+                .map(|low| {
+                    (0..columns.len())
+                        .fold(F192Unreduced::ZERO, |acc, s| {
+                            acc ^ weights[s].mul_unreduced(per_slot[s * BLOCK + low])
+                        })
+                        .reduce()
+                })
+                .collect()
+        })
+        .collect();
+    let mut eq_lo: Vec<Vec<F192>> = points.iter().map(|point| eq_table(&point[..BLOCK_VARS])).collect();
+    for _ in 0..BLOCK_VARS {
+        let pairs: Vec<(&[F192], &[F192], F192)> = (0..points.len())
+            .map(|t| (&sums[t][..], &eq_lo[t][..], gbc[t]))
+            .collect();
+        let msg = round_msg(&pairs);
         let r = absorb_round(&mut transcript, &mut bscr, &mut r_bc, &mut brun, msg);
-        let folded = fold_lsb_base(bc, r);
-        fold_lsb(&mut wt, r);
-        folded
-    };
-    for _ in 1..kbc {
+        sums.iter_mut().chain(&mut eq_lo).for_each(|table| fold_lsb(table, r));
+    }
+    // The high rows: every column against the low challenges, then a sumcheck over (slot, high) pairs
+    // whose weight is the claims' weight on the high rows, scaled by what the low rows left.
+    let n_hi = 1usize << (kbc - BLOCK_VARS);
+    let low_eq: Vec<Weights8> = eq_table(&r_bc).as_chunks::<8>().0.iter().map(Weights8::new).collect();
+    let mut bt = parallel::map_collect(columns.len() * n_hi, |i| {
+        dot_base(&low_eq, &columns[i / n_hi][(i % n_hi) * BLOCK..][..BLOCK]).reduce()
+    });
+    let mut wt = vec![F192::ZERO; bt.len()];
+    parallel::chunks_mut(&mut wt, n_hi, |s, weights| {
+        for (t, point) in points.iter().enumerate() {
+            let scale = gbc[t] * eq_lo[t][0] * slot_eq(point, kbc, slot_window.start + s);
+            for (weight, &eq) in weights.iter_mut().zip(&eq_hi[t]) {
+                *weight += scale * eq;
+            }
+        }
+    });
+    for _ in BLOCK_VARS..kbc {
         let msg = round_msg(&[(&bt, &wt, F192::ONE)]);
         let r = absorb_round(&mut transcript, &mut bscr, &mut r_bc, &mut brun, msg);
         fold_lsb(&mut bt, r);
@@ -1143,16 +1114,12 @@ fn aggregate_deferred_claims(
             &subproof.zerocheck_row_point,
             6,
         ));
+        // The round point binds the column's top bits, its first challenge the topmost.
+        let high: Vec<F192> = subproof.lincheck_round_point.iter().rev().copied().collect();
+        let high = pcs::whir::build_eq_table_ext(&high);
         ws.push(
             (0..1usize << klog)
-                .map(|col| {
-                    let mut w = subproof.lincheck_terminal_values[col & 63];
-                    for (j, &rj) in subproof.lincheck_round_point.iter().enumerate() {
-                        let bit = (col >> (klog - 1 - j)) & 1;
-                        w *= if bit == 1 { rj } else { F192::ONE + rj };
-                    }
-                    w
-                })
+                .map(|col| subproof.lincheck_terminal_values[col & 63] * high[col >> 6])
                 .collect(),
         );
         ga.push(gf);
@@ -1461,7 +1428,7 @@ fn gen_verify(
     summary: verifier::Summary,
 ) -> Result<(SubHints, DeferredSubproof), AggregationError> {
     let layout = leanvm_core::cpu::layout(
-        &program.prog,
+        program.bytecode_cols(),
         summary.log_memory,
         std::array::from_fn(|t| summary.table_rows[t] as usize),
         public_input,
@@ -1542,7 +1509,7 @@ fn gen_verify(
     // polynomial at (ζ_lo, α⃗), the slot coordinates of the claim's own point being
     // the fingerprint challenges (§sec:e2e-bc). The summary carries the point
     // only, so this is the prover's own evaluation, `program` being the guest.
-    let bytecode_value = mle_eval_par(stacked_bytecode(), &bytecode_point);
+    let bytecode_value = bytecode_mle(&bytecode_point);
     let bcv = vec![bytecode_value];
 
     // ---- per-sub HINT data (the placeholder map is built once, elsewhere) ----
@@ -2351,6 +2318,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     // Only block and coordinate structure is used here; dummy instructions and
     // table sizes let us derive it before the guest's bytecode exists.
     let stand_in = vec![leanvm_core::cpu::Op::Xor { a: 0, b: 0, c: 0 }; 1 << kbc];
+    let stand_in = leanvm_core::cpu::bytecode_columns(&stand_in);
     let layout = leanvm_core::cpu::layout(&stand_in, 20, [1 << 10; N_TABLES], [F192::ZERO, F192::ZERO]);
     let sides: [&[Block]; 3] = [&layout.push, &layout.pull, &layout.count];
     let lcrounds = flock::hash::K_LOG - 6;
@@ -4153,6 +4121,15 @@ def main():
         )
         .expect("round trip");
         without.verify().expect("a caller-supplied signer set verifies");
+    }
+
+    /// The window sum must equal the evaluation over the whole stacked table.
+    #[test]
+    fn bytecode_mle_matches_the_full_table() {
+        let point: Vec<F192> = (0..bytecode_vars() as u64)
+            .map(|i| F192::new(0x9e37_79b9 * (i + 1), 0x85eb_ca6b ^ i, i + 7))
+            .collect();
+        assert_eq!(bytecode_mle(&point), mle_eval_par(stacked_bytecode(), &point));
     }
 
     /// The all-zeros fast path in `DeferredClaim::recompute` must agree with the

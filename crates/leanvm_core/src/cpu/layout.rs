@@ -215,11 +215,14 @@ pub(crate) fn committed_log(log_mem: usize, log_bytecode: usize, taus: [usize; t
         .mu
 }
 
+/// The eight public bytecode columns, shared by the seed and finalize blocks.
+pub type BytecodeColumns = [std::sync::Arc<Vec<F64>>; 8];
+
 /// The eight PUBLIC bytecode columns over the program cube, in bytecode-slot
 /// order: the opcode, then seven operand/immediate slots. The program is not
 /// committed, so these ride the seed/finalize blocks as `Coord::Public` and
 /// stack into the polynomial [`bytecode_table`] returns.
-pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 8] {
+pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
     let max_op = prog
         .iter()
         .map(|op| match *op {
@@ -268,7 +271,7 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 8] {
             unsafe { column.add(i).write(value) };
         }
     });
-    columns
+    columns.map(std::sync::Arc::new)
 }
 
 /// The stacked bytecode polynomial: the eight columns at their bus tuple
@@ -279,10 +282,13 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 8] {
 /// structured program, and what the transcript seed binds ([`super::fs_seed`]).
 #[timed]
 pub fn bytecode_table(prog: &[Op]) -> Vec<F64> {
-    let coords = bytecode_columns(prog)
-        .map(|c| Coord::Public(std::sync::Arc::new(c)))
-        .into();
-    let block = Block::full(crate::log2_strict_usize(prog.len()), coords);
+    stacked_columns(&bytecode_columns(prog))
+}
+
+/// [`bytecode_table`] over columns [`bytecode_columns`] already built.
+pub(crate) fn stacked_columns(cols: &BytecodeColumns) -> Vec<F64> {
+    let coords = cols.each_ref().map(|c| Coord::Public(c.clone())).into();
+    let block = Block::full(crate::log2_strict_usize(cols[0].len()), coords);
     crate::leaf::stacked_bytecode_table(std::slice::from_ref(&block))
 }
 
@@ -292,9 +298,9 @@ pub fn bytecode_table(prog: &[Op]) -> Vec<F64> {
 /// this needs no committed witness: both prover and verifier reconstruct exactly the
 /// same structure.
 #[timed]
-pub fn layout(prog: &[Op], log_mem: usize, rows: [usize; tables::N_TABLES], pi: [F192; 2]) -> Layout {
+pub fn layout(prog_cols: &BytecodeColumns, log_mem: usize, rows: [usize; tables::N_TABLES], pi: [F192; 2]) -> Layout {
     let taus = table_logs(rows);
-    let bytecode_size = prog.len();
+    let bytecode_size = prog_cols[0].len();
     let log_bytecode = crate::log2_strict_usize(bytecode_size);
 
     // Derived boundary: the run starts at (pc,fp) = (0,0) and, by convention, the
@@ -303,12 +309,6 @@ pub fn layout(prog: &[Op], log_mem: usize, rows: [usize; tables::N_TABLES], pi: 
     let final_pc = (bytecode_size - 1) as u32;
 
     let one = F64::ONE;
-    // The bytecode columns map operand *offsets* (small, ≤ frame size) to
-    // g-powers (not memory addresses), so precompute only up to the largest
-    // operand, an O(1) lookup each, rather than over the whole 2^log_mem memory.
-    // Shared between the seed and finalize blocks: at kbc = 19 a copy is tens of
-    // megabytes per column.
-    let prog_cols: [std::sync::Arc<Vec<F64>>; 8] = bytecode_columns(prog).map(std::sync::Arc::new);
 
     // ---- bus blocks ----
     use Coord::{Col, Const, Index, Public};
@@ -437,7 +437,7 @@ impl Program {
             "a table exceeds 2^{MAX_LOG_ROWS} rows"
         );
         let pi = [exec.mem.word(0), exec.mem.word(1)];
-        let l = layout(&self.prog, log_mem, row_counts, pi);
+        let l = layout(&self.bytecode_cols, log_mem, row_counts, pi);
 
         // The stacked witness is written exactly ONCE: allocate it, carve one window
         // per committed column, and have every fill write its column straight into
