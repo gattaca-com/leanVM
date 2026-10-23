@@ -14,6 +14,14 @@ use primitives::field::F64;
 use primitives::log2_strict_usize;
 use primitives::stream::Stream;
 
+/// Where an encode stopped writing its buffer back: the deep pass's layers, still to run on any row read.
+#[derive(Clone, Copy, Debug)]
+pub struct DeepRows {
+    log_d: usize,
+    num_ntts: usize,
+    deep_start: usize,
+}
+
 /// Table of the normalized subspace polynomials at the basis.
 ///
 /// - Row `i` holds `s_i(b_j)` for every basis element `b_j` with `j >= i`.
@@ -61,13 +69,29 @@ pub type RowSink<'a> = dyn Fn(usize, &[F64]) + Sync + 'a;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF64 {
     evals: Vec<Vec<F64>>,
+    /// Per eval row, the subset sums of `row[1..]` over each byte of a block index:
+    /// a twiddle of a block below `2^24` is three loads and two XORs.
+    tables: Vec<Box<[[F64; 256]; 3]>>,
 }
 
 impl AdditiveNttF64 {
     fn new(basis: &[F64]) -> Self {
-        Self {
-            evals: generate_evals_from_subspace(basis),
-        }
+        let evals = generate_evals_from_subspace(basis);
+        let tables = evals
+            .iter()
+            .map(|row| {
+                let basis = &row[1..];
+                let mut t = Box::new([[F64::ZERO; 256]; 3]);
+                for (k, part) in t.iter_mut().enumerate() {
+                    let sub = &basis[(8 * k).min(basis.len())..(8 * k + 8).min(basis.len())];
+                    for (x, slot) in part.iter_mut().enumerate() {
+                        *slot = span_get(sub, x);
+                    }
+                }
+                t
+            })
+            .collect();
+        Self { evals, tables }
     }
 
     /// Standard NTT with basis `{1, x, …, x^(dim-1)}`. Requires `dim ≤ 63` so
@@ -87,9 +111,15 @@ impl AdditiveNttF64 {
     ///
     /// - It is `s_i(sum_j bit_j(block) * b_(i+1+j))`, with `i = L - layer - 1` on a `2^L`-point domain.
     /// - The normalized `s_i` is F_2-linear, so this is a subset sum of row `i` of the table.
+    #[inline]
     pub fn twiddle(&self, layer: usize, block: usize) -> F64 {
-        let v = &self.evals[self.log_domain_size() - layer - 1];
-        span_get(&v[1..], block)
+        let row = self.log_domain_size() - layer - 1;
+        if block < 1 << 24 {
+            let t = &self.tables[row];
+            t[0][block & 255] + t[1][(block >> 8) & 255] + t[2][(block >> 16) & 255]
+        } else {
+            span_get(&self.evals[row][1..], block)
+        }
     }
 
     /// The seven twiddles a radix-8 group needs, breadth-first: layer `layer`,
@@ -100,19 +130,11 @@ impl AdditiveNttF64 {
     /// one scan of the three basis rows replaces seven.
     pub(crate) fn twiddles_radix8(&self, layer: usize, block: usize) -> [F64; 7] {
         let l = self.log_domain_size();
-        let (v0, v1, v2) = (
-            &self.evals[l - layer - 1],
-            &self.evals[l - layer - 2],
-            &self.evals[l - layer - 3],
-        );
-        let (mut t0, mut a, mut c) = (F64::ZERO, F64::ZERO, F64::ZERO);
-        for j in 0..layer {
-            if (block >> j) & 1 == 1 {
-                t0 += v0[1 + j];
-                a += v1[2 + j];
-                c += v2[3 + j];
-            }
-        }
+        let (v1, v2) = (&self.evals[l - layer - 2], &self.evals[l - layer - 3]);
+        // `a` and `c` are the deeper layers' twiddles of this block's first sub-block.
+        let t0 = self.twiddle(layer, block);
+        let a = self.twiddle(layer + 1, 2 * block);
+        let c = self.twiddle(layer + 2, 4 * block);
         let (d, e0, e1) = (v1[1], v2[1], v2[2]);
         [t0, a, a + d, c, c + e0, c + e1, c + e0 + e1]
     }
@@ -161,6 +183,67 @@ impl AdditiveNttF64 {
         self.transform(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows));
     }
 
+    /// [`Self::encode_interleaved_in_place_with`] without writing the deep pass back.
+    ///
+    /// - Each deep sub-block is finished in scratch and handed to `on_rows` from there.
+    /// - The buffer keeps what the gathered passes left, and [`DeepRows::rows`] finishes any row again.
+    /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
+    ///
+    /// A queried row costs one sub-block transform, against a write of the whole codeword saved.
+    pub fn encode_interleaved_in_place_without_deep(
+        &self,
+        data: &mut [F64],
+        num_ntts: usize,
+        log_inv_rate: usize,
+        on_rows: &RowSink<'_>,
+    ) -> Option<DeepRows> {
+        let msg = parallel::SendPtr(data.as_mut_ptr());
+        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
+    }
+
+    /// [`Self::encode_interleaved_with`] without writing the deep pass back, as
+    /// [`Self::encode_interleaved_in_place_without_deep`] does.
+    pub fn encode_interleaved_without_deep(
+        &self,
+        data: &mut [F64],
+        msg: &[F64],
+        num_ntts: usize,
+        log_inv_rate: usize,
+        on_rows: &RowSink<'_>,
+    ) -> Option<DeepRows> {
+        assert_eq!(
+            msg.len() << log_inv_rate,
+            data.len(),
+            "the codeword is 2^log_inv_rate messages"
+        );
+        let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
+        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
+    }
+
+    /// Codeword rows `positions` of a buffer left by [`Self::encode_interleaved_in_place_without_deep`].
+    pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
+        let DeepRows { log_d, num_ntts, deep_start } = *deep;
+        let log_sub = log_d - deep_start;
+        let sub_len = num_ntts << log_sub;
+        let mut subs: Vec<usize> = positions.iter().map(|&q| q >> log_sub).collect();
+        subs.sort_unstable();
+        subs.dedup();
+        let finished: Vec<Vec<F64>> = parallel::map_collect(subs.len(), |i| {
+            let sub_idx = subs[i];
+            let mut sub = data[sub_idx * sub_len..][..sub_len].to_vec();
+            self.run_layers(&mut sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx);
+            sub
+        });
+        positions
+            .iter()
+            .map(|&q| {
+                let sub = &finished[subs.binary_search(&(q >> log_sub)).expect("every queried sub-block is finished")];
+                let row = q & ((1 << log_sub) - 1);
+                sub[row * num_ntts..][..num_ntts].to_vec()
+            })
+            .collect()
+    }
+
     /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.
     ///
     /// - The result equals encoding in place.
@@ -201,8 +284,8 @@ impl AdditiveNttF64 {
     ///
     ///     gathered pass:  one task per row group of 2^g rows, 2^(d - layer - g) apart
     ///                     gathered into L2 scratch, all g layers run there, written back
-    ///     deep pass:      one task per contiguous sub-block, its layers run in place
-    ///                     (or in scratch, when a separate message has to be copied in)
+    ///     deep pass:      one task per run of contiguous sub-blocks, at least an L2 budget of rows,
+    ///                     its layers run in place (or in scratch, when a separate message has to be copied in)
     /// ```
     ///
     /// - When every layer fits one L3-sized sub-block, the deep pass is the whole transform: one sweep.
@@ -232,6 +315,19 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         on_rows: Option<&RowSink<'_>>,
     ) {
+        self.transform_deferring_deep(data, num_ntts, start, msg, on_rows, false);
+    }
+
+    /// [`Self::transform`]; with `defer_deep`, the deep pass's results go only to `on_rows`, not back into the buffer.
+    fn transform_deferring_deep(
+        &self,
+        data: &mut [F64],
+        num_ntts: usize,
+        start: usize,
+        msg: Option<parallel::SendPtr<F64>>,
+        on_rows: Option<&RowSink<'_>>,
+        defer_deep: bool,
+    ) -> Option<DeepRows> {
         // The buffer is 2^log_d rows of `num_ntts` words.
         assert!(num_ntts > 0);
         assert_eq!(data.len() % num_ntts, 0);
@@ -246,7 +342,7 @@ impl AdditiveNttF64 {
 
         // How many rows, as a log, each cache budget holds.
         //
-        //     56 lanes:  2^16 / 56 -> 2^10 rows in L2,  2^18 / 56 -> 2^12 rows in L3
+        //     51 lanes:  2^17 / 51 -> 2^11 rows in L2,  2^18 / 51 -> 2^12 rows in L3
         let fit = |words: usize| (words / num_ntts).max(1).ilog2() as usize;
         let (fit2, fit3) = (fit(L2_WORDS), fit(L3_WORDS));
 
@@ -261,14 +357,8 @@ impl AdditiveNttF64 {
         // Where the deep pass starts.
         //
         //     every layer fits one L3 sub-block  ->  deep pass only, one sweep
-        //     otherwise                          ->  as few gathered passes as an L3 deep pass needs,
-        //                                            then the smallest deep pass, at least L2-sized, they leave
-        let rest = log_d - start;
-        let deep = if rest <= fit3 {
-            fit3
-        } else {
-            fit2.max(rest.saturating_sub((rest - fit3).div_ceil(fit2) * fit2))
-        };
+        //     otherwise                          ->  the deep pass keeps one L2 sub-block of layers
+        let deep = if log_d - start <= fit3 { fit3 } else { fit2 };
         let deep_start = log_d.saturating_sub(deep).max(par_log).max(start);
 
         // A buffer this large is evicted before the next pass reads it back.
@@ -297,26 +387,31 @@ impl AdditiveNttF64 {
         let fuse = 0 < deep_start && deep_start < log_d;
         let deep_rows = on_rows.filter(|_| fuse);
 
-        // Phase 3: the deep pass, one task per contiguous sub-block.
+        // Phase 3: the deep pass, one task per run of contiguous sub-blocks.
         if deep_start < log_d {
-            let log_sub = log_d - deep_start;
+            // A task takes at least an L2 budget of rows, so a high rate's tiny sub-blocks
+            // still reach the hasher in whole batches.
+            let log_sub = (log_d - deep_start).max(fit2.min(log_d - par_log));
             let sub_len = num_ntts << log_sub;
             let block_len = data.len() >> start;
+            let outer = log_d - log_sub;
             parallel::chunks_mut(data, sub_len, |sub_idx, sub| match msg {
-                // A separate message: build the sub-block in scratch, then write it out once.
+                // A separate message: build the task's rows in scratch, then write them out once.
                 //
                 // Streamed out whole, the codeword is written without ever being read.
                 Some(m) => with_scratch(sub_len, |scratch| {
-                    // A sub-block sits at the same offset in every replica.
+                    // A task sits at the same offset in every replica, or covers whole replicas.
                     //
-                    //     sub-block at offset off of its replica  <-  message words [off, off + sub_len)
+                    //     task at offset off of its replica  <-  message words [off, off + sub_len)
                     let off = (sub_idx * sub_len) % block_len;
-                    // SAFETY:
-                    // - The external message is valid for one whole replica of words.
-                    // - It is disjoint from the codeword.
-                    // - This sub-block ends inside its replica, so the read stays in bounds.
-                    scratch.copy_from_slice(unsafe { std::slice::from_raw_parts(m.add(off), sub_len) });
-                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx);
+                    for part in scratch.chunks_mut(block_len) {
+                        // SAFETY:
+                        // - The external message is valid for one whole replica of words.
+                        // - It is disjoint from the codeword.
+                        // - Each part ends inside its replica, so the read stays in bounds.
+                        part.copy_from_slice(unsafe { std::slice::from_raw_parts(m.add(off), part.len()) });
+                    }
+                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx);
                     if let Some(f) = deep_rows {
                         f(sub_idx << log_sub, scratch);
                     }
@@ -326,9 +421,17 @@ impl AdditiveNttF64 {
                         sub.copy_from_slice(scratch);
                     }
                 }),
+                // The rows are hashed from scratch and the buffer keeps its pre-deep state.
+                None if defer_deep && deep_rows.is_some() => with_scratch(sub_len, |scratch| {
+                    scratch.copy_from_slice(sub);
+                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx);
+                    if let Some(f) = deep_rows {
+                        f(sub_idx << log_sub, scratch);
+                    }
+                }),
                 // The replicas are already in place: run the layers where they are.
                 None => {
-                    self.run_layers(sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx);
+                    self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx);
                     if let Some(f) = deep_rows {
                         f(sub_idx << log_sub, sub);
                     }
@@ -342,6 +445,11 @@ impl AdditiveNttF64 {
             let log_rows = log_d - log_tasks.min(log_d);
             parallel::chunks_mut(data, num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
         }
+        (defer_deep && deep_rows.is_some() && msg.is_none()).then_some(DeepRows {
+            log_d,
+            num_ntts,
+            deep_start,
+        })
     }
 
     /// Run layers `layer..layer + g` in one sweep of the buffer, one row group at a time.
@@ -389,44 +497,35 @@ impl AdditiveNttF64 {
         // Without one, a task is one (block, residue) pair.
         let n_tasks = if msg.is_some() { step } else { step << layer };
         let base = parallel::SendPtr(data.as_mut_ptr());
-        // With a message, every block of a residue starts from the same rows: they are gathered
-        // once, and each block but the last transforms a copy.
-        let n_blocks = if msg.is_some() { 1usize << layer } else { 1 };
-        let len = rows * num_ntts;
         parallel::for_each_chunk(n_tasks, |lo, hi| {
-            // One L2-resident scratch of 2^g rows (two with copies) serves every group of the task.
-            with_scratch(if n_blocks > 1 { 2 * len } else { len }, |scratch| {
-                let (gathered, work) = scratch.split_at_mut(len);
+            // One L2-resident scratch of 2^g rows serves every group of the task.
+            with_scratch(rows * num_ntts, |scratch| {
                 // One fence at the end of the task covers all its streaming stores.
                 let stream = stream.then(Stream::new);
-                // Row `i` of residue `r`, as a word offset inside its block.
-                let row = |r: usize, i: usize| (r + (i << log_step)) * num_ntts;
-                let block_off = |block: usize| (block << (log_d - layer)) * num_ntts;
-                // Gather: the scattered rows become one contiguous 2^g-row buffer.
-                let gather = |dst: &mut [F64], block: usize, r: usize| {
-                    let src_row = |i: usize| match msg {
-                        Some(m) => m.0.wrapping_add(row(r, i)).cast_const(),
-                        None => base.0.wrapping_add(block_off(block) + row(r, i)).cast_const(),
-                    };
-                    for (i, dst) in dst.chunks_exact_mut(num_ntts).enumerate() {
-                        // No prefetcher follows rows this far apart.
-                        if i + PREFETCH_ROWS < rows {
-                            prefetch(src_row(i + PREFETCH_ROWS), num_ntts);
-                        }
+                let mut group = |block: usize, r: usize| {
+                    // Row `i` of the group, as a word offset inside its block.
+                    let row = |i: usize| (r + (i << log_step)) * num_ntts;
+                    let block_off = (block << (log_d - layer)) * num_ntts;
+                    // Gather: the scattered rows become one contiguous 2^g-row buffer.
+                    for (i, dst) in scratch.chunks_exact_mut(num_ntts).enumerate() {
                         // SAFETY:
                         // - The message and the codeword both cover every row addressed here.
                         // - Tasks own disjoint residues, so no other task writes these rows.
-                        // - A residue reads all its message rows before it writes any of block 0.
-                        dst.copy_from_slice(unsafe { std::slice::from_raw_parts(src_row(i), num_ntts) });
+                        // - Block 0 is written last, after every read of the message in it.
+                        let src = unsafe {
+                            match msg {
+                                Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
+                                None => base.slice(block_off + row(i), num_ntts),
+                            }
+                        };
+                        dst.copy_from_slice(src);
                     }
-                };
-                // Transform, then scatter every row back to its place.
-                let finish = |buf: &mut [F64], block: usize, r: usize| {
-                    // A (layer + g)-layer domain whose sub-block index is the global block.
-                    self.run_layers(buf, layer + g, num_ntts, layer, layer + g, layer, block);
-                    for (i, src) in buf.chunks_exact(num_ntts).enumerate() {
+                    // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
+                    self.run_layers(scratch, layer + g, num_ntts, layer, layer + g, layer, block);
+                    // Scatter: every row returns to its place.
+                    for (i, src) in scratch.chunks_exact(num_ntts).enumerate() {
                         // SAFETY: this group alone owns these rows of the codeword.
-                        let dst = unsafe { base.slice(block_off(block) + row(r, i), num_ntts) };
+                        let dst = unsafe { base.slice(block_off + row(i), num_ntts) };
                         match &stream {
                             Some(s) => s.copy(dst, src),
                             None => dst.copy_from_slice(src),
@@ -435,18 +534,13 @@ impl AdditiveNttF64 {
                 };
                 for t in lo..hi {
                     if msg.is_some() {
-                        gather(gathered, 0, t);
-                        // Block 0 may be the message itself, so it is written last.
-                        for block in (1..n_blocks).rev() {
-                            work.copy_from_slice(gathered);
-                            finish(work, block, t);
+                        // Block 0 may be the message itself, so it is transformed last.
+                        for block in (0..1usize << layer).rev() {
+                            group(block, t);
                         }
-                        finish(gathered, 0, t);
                     } else {
                         // Task index = block * step + residue.
-                        let (block, r) = (t >> log_step, t & (step - 1));
-                        gather(gathered, block, r);
-                        finish(gathered, block, r);
+                        group(t >> log_step, t & (step - 1));
                     }
                 }
             });
@@ -604,6 +698,43 @@ fn butterfly_interleaved_fused_3layer(block: &mut [F64], t: &[F64; 7], eighth: u
 }
 
 /// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
+///
+/// On AVX-512 they run on registers: each row's vectors are loaded and stored once per group.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline(always)]
+fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
+    // Inlined into the sweep: a call would pass the vectors through memory.
+    fused_lanes_avx512(
+        rows,
+        t,
+        #[inline(always)]
+        |v, t| radix8_regs(v, t),
+    );
+}
+
+/// [`radix8_butterflies`] on registers.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline(always)]
+fn radix8_regs(v: &mut RowVectors<8>, t: &[Twiddle; 7]) {
+    // Layer L: rows 4 apart, one twiddle for the whole block.
+    butterfly_regs(v, 0, 4, t[0]);
+    butterfly_regs(v, 1, 5, t[0]);
+    butterfly_regs(v, 2, 6, t[0]);
+    butterfly_regs(v, 3, 7, t[0]);
+    // Layer L+1: rows 2 apart, one twiddle per half.
+    butterfly_regs(v, 0, 2, t[1]);
+    butterfly_regs(v, 1, 3, t[1]);
+    butterfly_regs(v, 4, 6, t[2]);
+    butterfly_regs(v, 5, 7, t[2]);
+    // Layer L+2: adjacent rows, one twiddle per quarter.
+    butterfly_regs(v, 0, 1, t[3]);
+    butterfly_regs(v, 2, 3, t[4]);
+    butterfly_regs(v, 4, 5, t[5]);
+    butterfly_regs(v, 6, 7, t[6]);
+}
+
+/// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[inline(always)]
 fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
     let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
@@ -630,11 +761,13 @@ fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
 ///
 /// ```text
 ///     input, lane-major:   [ block 0 | block 1 | ... | block n-1 ]   each 2^rows_log words
-///     output, row-major:   row x = [ block n-1 word x, ..., block 1 word x, block 0 word x ]
+///     output, row-major:   row x = [ 0, ..., 0, block n-1 word x, ..., block 0 word x ]
 /// ```
 ///
-/// - Codeword lane `t` takes message block `n - 1 - t`.
-/// - Any lane count works: a commitment encodes only the lanes that carry data.
+/// - A row is `row_words >= n` words: the first `row_words - n` lanes are zero padding.
+/// - Codeword lane `t` past the padding takes message block `row_words - 1 - t`.
+/// - Any lane count works: a commitment encodes only the lanes that carry data, and a caller pads
+///   the row to the vector width.
 ///
 /// # Why descending
 ///
@@ -651,35 +784,41 @@ fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
 /// - The finished tile goes out as one contiguous run.
 /// - That keeps an n-way gather at a `2^rows_log` stride near memory bandwidth.
 #[timed]
-pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, log_rows: usize) {
+pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, row_words: usize, log_rows: usize) {
     let rows = 1usize << log_rows;
     assert!(n_lanes > 0, "a commitment needs at least one lane");
+    assert!(n_lanes <= row_words, "a row holds its lanes");
     assert_eq!(msg.len(), n_lanes * rows, "message is n_lanes contiguous lane blocks");
-    assert_eq!(out.len(), msg.len(), "the transpose is the same words, reordered");
+    assert_eq!(out.len(), row_words * rows, "the output is whole padded rows");
 
     /// Words per cache-resident row tile.
     const TILE_WORDS: usize = 4096;
-    assert!(n_lanes <= TILE_WORDS, "a codeword row must fit the transpose tile");
+    assert!(row_words <= TILE_WORDS, "a codeword row must fit the transpose tile");
     // Largest power-of-two row count whose tile fits: both it and `rows` are then
     // powers of two, so the tiles cover every row. They have to: this is the sole
     // initializer of an uninitialized codeword's message region, and a truncating
     // tile count would leave the tail reading the previous phase's plausible bytes,
     // whose symptom is a proof that stops verifying rather than a crash.
-    let tile_rows = (1usize << (TILE_WORDS / n_lanes).ilog2()).min(rows);
+    let tile_rows = (1usize << (TILE_WORDS / row_words).ilog2()).min(rows);
     assert_eq!(rows % tile_rows, 0, "row tiles must cover every row");
 
     // Nothing reads the output back before a buffer this large is evicted.
     let stream = out.len() >= STREAM_MIN_WORDS;
-    parallel::chunks_mut(out, tile_rows * n_lanes, |t, out_tile| {
+    let pad = row_words - n_lanes;
+    parallel::chunks_mut(out, tile_rows * row_words, |t, out_tile| {
         with_scratch(out_tile.len(), |tile| {
             // First message row this tile covers.
             let r0 = t * tile_rows;
-            // Fill the tile column by column: lane `lane` takes every `n_lanes`-th word.
-            for lane in 0..n_lanes {
-                let block = n_lanes - 1 - lane;
-                let src = &msg[block * rows + r0..][..tile_rows];
-                for (slot, &word) in tile[lane..].iter_mut().step_by(n_lanes).zip(src) {
-                    *slot = word;
+            // Fill the tile column by column: lane `lane` takes every `row_words`-th word.
+            for lane in 0..row_words {
+                let slots = tile[lane..].iter_mut().step_by(row_words);
+                if lane < pad {
+                    slots.for_each(|slot| *slot = F64::ZERO);
+                } else {
+                    let src = &msg[(row_words - 1 - lane) * rows + r0..][..tile_rows];
+                    for (slot, &word) in slots.zip(src) {
+                        *slot = word;
+                    }
                 }
             }
             // Write the finished tile out as one contiguous run.
@@ -692,31 +831,13 @@ pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, log_ro
     });
 }
 
-/// Rows a gather fetches ahead of the one it copies.
-const PREFETCH_ROWS: usize = 8;
-
-/// Hint the cache lines of `len` words at `p` into L1. A hint only: it never faults.
-#[inline(always)]
-pub(crate) fn prefetch(p: *const F64, len: usize) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-        let (start, end) = (p as usize & !63, p as usize + 8 * len);
-        for line in (start..end).step_by(64) {
-            // SAFETY: a prefetch never faults, whatever the address.
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(line as *const i8) };
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = (p, len);
-}
-
 /// Words one L2-resident unit of work may span: a gathered row group or a deep sub-block.
 ///
 /// # Why this value
 ///
-/// - 2^16 words is 512 KiB.
-/// - Two SMT threads share a core's L2 of 1 MiB, so each budgets for half.
+/// - 2^17 words is 1 MiB, a whole Zen 5 L2.
+/// - Two SMT threads then spill each other's units into L3, which costs far less than a DRAM sweep.
+/// - At 51 lanes it plans one gathered pass plus the deep pass, where 2^16 words planned two plus one.
 ///
 /// # On Apple silicon
 ///
@@ -725,7 +846,7 @@ pub(crate) fn prefetch(p: *const F64, len: usize) {
 /// - So the budget is sized to push layers into the deep pass, not to fit a cache.
 /// - It exceeds [`L3_WORDS`], which then changes no plan.
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-const L2_WORDS: usize = 1 << 16;
+const L2_WORDS: usize = 1 << 17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const L2_WORDS: usize = 1 << 21;
 
@@ -849,20 +970,6 @@ fn butterfly_interleaved_block(block: &mut [F64], twiddle: F64, block_size_half:
     }
 }
 
-/// The transposed butterfly over every lane of a (top row, bottom row) pair:
-/// `s = u + v; new_u = s; new_v = v + s*t`.
-pub(crate) fn transposed_butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
-    assert_eq!(top.len(), bot.len());
-    // The forward butterfly of (v, s) leaves v + s*t in v and s + (v + s*t) in s, which one more XOR undoes.
-    for (u, v) in top.iter_mut().zip(bot.iter()) {
-        *u += *v;
-    }
-    butterfly_lanes(bot, top, twiddle);
-    for (u, v) in top.iter_mut().zip(bot.iter()) {
-        *u += *v;
-    }
-}
-
 /// Butterfly all `num_ntts` lanes of one (top row, bottom row) pair with a
 /// shared twiddle: new_u = u + v*t; new_v = v + new_u.
 ///
@@ -873,24 +980,26 @@ pub(crate) fn transposed_butterfly_lanes(top: &mut [F64], bot: &mut [F64], twidd
 #[inline]
 fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
     debug_assert_eq!(top.len(), bot.len());
+    // Every layer's block 0 has twiddle zero: the butterfly is then `v' = v + u`, no product.
+    if twiddle == F64::ZERO {
+        for (v, &u) in bot.iter_mut().zip(top.iter()) {
+            *v += u;
+        }
+        return;
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     {
         let vectors = top.len() / 8;
-        let tail = top.len() % 8;
-        // SAFETY: the target features are enabled at compile time; each full
-        // iteration reads and writes exactly eight elements from both rows, and
-        // the masked tail only the `tail` elements left.
+        // SAFETY: the target features are enabled at compile time and each
+        // iteration reads and writes exactly eight elements from both rows.
         unsafe {
             for i in 0..vectors {
-                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0);
+                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0, 0xFF);
             }
-            if tail != 0 {
-                butterfly_lanes_avx512_masked(
-                    top.as_mut_ptr().add(8 * vectors),
-                    bot.as_mut_ptr().add(8 * vectors),
-                    twiddle.0,
-                    (1u8 << tail) - 1,
-                );
+            let tail = top.len() - 8 * vectors;
+            if tail > 0 {
+                let mask = (1u8 << tail) - 1;
+                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * vectors), bot.as_mut_ptr().add(8 * vectors), twiddle.0, mask);
             }
         }
     }
@@ -902,22 +1011,18 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
     ))]
     {
         let vectors = top.len() / 4;
-        let tail = top.len() % 4;
-        // SAFETY: the target features are enabled at compile time; each full
-        // iteration reads and writes exactly four elements from both rows, and
-        // the masked tail only the `tail` elements left.
+        // SAFETY: the target features are enabled at compile time and each
+        // iteration reads and writes exactly four elements from both rows.
         unsafe {
             for i in 0..vectors {
                 butterfly_lanes_avx2(top.as_mut_ptr().add(4 * i), bot.as_mut_ptr().add(4 * i), twiddle.0);
             }
-            if tail != 0 {
-                butterfly_lanes_avx2_masked(
-                    top.as_mut_ptr().add(4 * vectors),
-                    bot.as_mut_ptr().add(4 * vectors),
-                    twiddle.0,
-                    tail,
-                );
-            }
+        }
+        for lane in 4 * vectors..top.len() {
+            let v = bot[lane];
+            let new_u = top[lane] + v * twiddle;
+            top[lane] = new_u;
+            bot[lane] = v + new_u;
         }
     }
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -957,6 +1062,34 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
     }
 }
 
+/// The transpose of [`butterfly_lanes`]: `s = u + v; u' = s; v' = s * t + v` over a pair of rows.
+/// Only AVX-512 has a kernel; other targets take the scalar loop.
+pub(crate) fn transpose_butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
+    debug_assert_eq!(top.len(), bot.len());
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    {
+        // SAFETY: the target features are enabled at compile time and each call
+        // touches only the words its mask selects, all within both rows.
+        unsafe {
+            let vectors = top.len() / 8;
+            for i in 0..vectors {
+                transpose_butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0, 0xFF);
+            }
+            let tail = top.len() - 8 * vectors;
+            if tail > 0 {
+                let mask = (1u8 << tail) - 1;
+                transpose_butterfly_lanes_avx512(top.as_mut_ptr().add(8 * vectors), bot.as_mut_ptr().add(8 * vectors), twiddle.0, mask);
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    for (u, v) in top.iter_mut().zip(bot.iter_mut()) {
+        let s = *u + *v;
+        *u = s;
+        *v += s * twiddle;
+    }
+}
+
 /// [`butterfly_lanes_avx512`] at half the width, for a machine with VPCLMULQDQ
 /// but no AVX-512. Without it the base encode's innermost loop is scalar there,
 /// which costs it about half again as much.
@@ -974,76 +1107,35 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
 #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
 unsafe fn butterfly_lanes_avx2(top: *mut F64, bot: *mut F64, twiddle: u64) {
     use core::arch::x86_64::*;
-    // SAFETY: the caller supplies valid four-element rows and the function's
-    // target features cover every intrinsic below.
-    unsafe {
-        let (new_u, new_v) = butterfly_ymm(_mm256_loadu_si256(top.cast()), _mm256_loadu_si256(bot.cast()), twiddle);
-        _mm256_storeu_si256(top.cast(), new_u);
-        _mm256_storeu_si256(bot.cast(), new_v);
-    }
-}
-
-/// [`butterfly_lanes_avx2`] over the first `n < 4` lanes only.
-///
-/// # Safety
-/// Requires VPCLMULQDQ + AVX2; `top` and `bot` must each address `n` readable
-/// and writable F64 values.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "vpclmulqdq",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
-#[inline]
-#[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-unsafe fn butterfly_lanes_avx2_masked(top: *mut F64, bot: *mut F64, twiddle: u64, n: usize) {
-    use core::arch::x86_64::*;
-    // SAFETY: masked-off lanes are neither read nor written, and the caller
-    // supplies the `n` lanes that are.
-    unsafe {
-        let mask = _mm256_cmpgt_epi64(_mm256_set1_epi64x(n as i64), _mm256_setr_epi64x(0, 1, 2, 3));
-        let u = _mm256_maskload_epi64(top.cast(), mask);
-        let v = _mm256_maskload_epi64(bot.cast(), mask);
-        let (new_u, new_v) = butterfly_ymm(u, v, twiddle);
-        _mm256_maskstore_epi64(top.cast(), mask, new_u);
-        _mm256_maskstore_epi64(bot.cast(), mask, new_v);
-    }
-}
-
-/// Four butterflies `u' = u + v * t`, `v' = v + u'` in registers.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "vpclmulqdq",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
-#[inline]
-#[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-fn butterfly_ymm(
-    u: core::arch::x86_64::__m256i,
-    v: core::arch::x86_64::__m256i,
-    twiddle: u64,
-) -> (core::arch::x86_64::__m256i, core::arch::x86_64::__m256i) {
-    use core::arch::x86_64::*;
 
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-    fn reduce(p: __m256i, r: __m256i) -> __m256i {
+    unsafe fn reduce(p: __m256i, r: __m256i) -> __m256i {
         let t = _mm256_clmulepi64_epi128::<0x01>(p, r);
         let u = _mm256_clmulepi64_epi128::<0x01>(t, r);
         _mm256_xor_si256(_mm256_xor_si256(p, t), u)
     }
 
-    let tw = _mm256_set1_epi64x(twiddle as i64);
-    let r = _mm256_set1_epi64x(0x1b);
-    let even = reduce(_mm256_clmulepi64_epi128::<0x00>(v, tw), r);
-    let odd = reduce(_mm256_clmulepi64_epi128::<0x11>(v, tw), r);
-    // The odd products land in each lane's low half; swap them up, then take
-    // the odd qwords (32-bit elements 2, 3, 6, 7) from them.
-    let odd = _mm256_shuffle_epi32::<0x4e>(odd);
-    let product = _mm256_blend_epi32::<0b1100_1100>(even, odd);
-    let new_u = _mm256_xor_si256(u, product);
-    (new_u, _mm256_xor_si256(v, new_u))
+    // SAFETY: the caller supplies valid four-element rows and the function's
+    // target features cover every intrinsic below.
+    unsafe {
+        let u = _mm256_loadu_si256(top.cast());
+        let v = _mm256_loadu_si256(bot.cast());
+        let tw = _mm256_set1_epi64x(twiddle as i64);
+        let r = _mm256_set1_epi64x(0x1b);
+
+        let even = reduce(_mm256_clmulepi64_epi128::<0x00>(v, tw), r);
+        let odd = reduce(_mm256_clmulepi64_epi128::<0x11>(v, tw), r);
+        // The odd products land in each lane's low half; swap them up, then take
+        // the odd qwords (32-bit elements 2, 3, 6, 7) from them.
+        let odd = _mm256_shuffle_epi32::<0x4e>(odd);
+        let product = _mm256_blend_epi32::<0b1100_1100>(even, odd);
+
+        let new_u = _mm256_xor_si256(u, product);
+        let new_v = _mm256_xor_si256(v, new_u);
+        _mm256_storeu_si256(top.cast(), new_u);
+        _mm256_storeu_si256(bot.cast(), new_v);
+    }
 }
 
 /// Eight F64 butterflies as four independent NEON lane-pair reductions.
@@ -1120,49 +1212,21 @@ unsafe fn butterfly_lanes_neon_8(top: *mut F64, bot: *mut F64, twiddle: u64) {
     }
 }
 
-/// Eight F64 butterflies with a shared twiddle, one per 64-bit lane of an AVX-512 register.
-///
-/// # Safety
-///
-/// - Requires VPCLMULQDQ and AVX-512F.
-/// - Each pointer must address eight readable and writable words.
+/// `g(spill)` per top nibble `n` of a product's high word: `spill = n ^ n>>1 ^ n>>3`, the bits
+/// `g(hi) = hi * (x^4 + x^3 + x + 1)` pushes past x^63, then `g(spill)` itself, which fits a byte.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline]
-#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx2")]
-unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64) {
-    use core::arch::x86_64::*;
-    // SAFETY:
-    // - The caller supplies two valid eight-word rows.
-    // - This function's target features cover every intrinsic below.
-    unsafe {
-        let (new_u, new_v) = butterfly_zmm(_mm512_loadu_si512(top.cast()), _mm512_loadu_si512(bot.cast()), twiddle);
-        _mm512_storeu_si512(top.cast(), new_u);
-        _mm512_storeu_si512(bot.cast(), new_v);
+const G_SPILL: [u8; 16] = {
+    let mut t = [0u8; 16];
+    let mut n = 0;
+    while n < 16 {
+        let s = n ^ (n >> 1) ^ (n >> 3);
+        t[n] = (s ^ (s << 1) ^ (s << 3) ^ (s << 4)) as u8;
+        n += 1;
     }
-}
+    t
+};
 
-/// [`butterfly_lanes_avx512`] over the lanes set in `mask` only.
-///
-/// # Safety
-///
-/// - Requires VPCLMULQDQ and AVX-512F.
-/// - Each pointer must address the masked lanes, readable and writable; the others are never touched.
-#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline]
-#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx2")]
-unsafe fn butterfly_lanes_avx512_masked(top: *mut F64, bot: *mut F64, twiddle: u64, mask: u8) {
-    use core::arch::x86_64::*;
-    // SAFETY: masked loads and stores touch only the lanes the caller vouches for.
-    unsafe {
-        let u = _mm512_maskz_loadu_epi64(mask, top.cast());
-        let v = _mm512_maskz_loadu_epi64(mask, bot.cast());
-        let (new_u, new_v) = butterfly_zmm(u, v, twiddle);
-        _mm512_mask_storeu_epi64(top.cast(), mask, new_u);
-        _mm512_mask_storeu_epi64(bot.cast(), mask, new_v);
-    }
-}
-
-/// Eight butterflies `u' = u + v * t`, `v' = v + u'` in registers, one per 64-bit lane.
+/// `u ^ v * tw` in each of the eight 64-bit lanes of an AVX-512 register, for the two kernels below.
 ///
 /// # Algorithm
 ///
@@ -1173,46 +1237,176 @@ unsafe fn butterfly_lanes_avx512_masked(top: *mut F64, bot: *mut F64, twiddle: u
 ///     unpack:     lo = [ lo(p_0), lo(p_1), ..., lo(p_7) ]     hi = [ hi(p_0), ..., hi(p_7) ]
 ///
 ///     reduce:     p = lo + hi * x^64,  x^64 = x^4 + x^3 + x + 1
-///                 p mod f = lo ^ g(hi ^ spill),  g(y) = y ^ y<<1 ^ y<<3 ^ y<<4
+///                 p mod f = lo ^ g(hi) ^ g(spill),  g(y) = y ^ y<<1 ^ y<<3 ^ y<<4 = z ^ z<<3, z = y ^ y<<1
 ///                 spill = hi>>63 ^ hi>>61 ^ hi>>60, the bits g pushes past x^63
+///                 g(spill) is a byte fixed by hi's top nibble: one `vpshufb` lookup
 /// ```
 ///
-/// - The unpacks stay inside 128-bit lanes, so no shuffle crosses lanes.
-/// - The reduction takes shifts and three-way XORs, `vpternlogq 0x96`, instead of two more carry-less multiplies.
+/// - The unpacks and the lookup stay inside 128-bit lanes, so no shuffle crosses lanes.
+/// - The reduction takes three shifts and three-way XORs, `vpternlogq 0x96`, instead of two more carry-less multiplies.
 /// - Zen 5 has one carry-less multiplier per core, so those two would dominate the kernel.
+///
+/// # Safety
+///
+/// Callable only where VPCLMULQDQ, AVX-512F and AVX-512BW are enabled, which the kernels' target features guarantee.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline]
-#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx2")]
-fn butterfly_zmm(
+#[inline(always)]
+unsafe fn mul_xor_avx512(
     u: core::arch::x86_64::__m512i,
     v: core::arch::x86_64::__m512i,
-    twiddle: u64,
-) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    tw: core::arch::x86_64::__m512i,
+) -> core::arch::x86_64::__m512i {
     use core::arch::x86_64::*;
 
-    let tw = _mm512_set1_epi64(twiddle as i64);
-    // Products v * t: even lanes, then odd lanes, one 128-bit product per 128-bit lane.
-    let even = _mm512_clmulepi64_epi128::<0x00>(v, tw);
-    let odd = _mm512_clmulepi64_epi128::<0x11>(v, tw);
-    // Back to lane order: qword i of lo / hi is the low / high half of lane i's product.
-    let lo = _mm512_unpacklo_epi64(even, odd);
-    let hi = _mm512_unpackhi_epi64(even, odd);
+    // SAFETY: the caller's target features cover every intrinsic below.
+    unsafe {
+        // Products v * t: even lanes, then odd lanes, one 128-bit product per 128-bit lane.
+        let even = _mm512_clmulepi64_epi128::<0x00>(v, tw);
+        let odd = _mm512_clmulepi64_epi128::<0x11>(v, tw);
+        // Back to lane order: qword i of lo / hi is the low / high half of lane i's product.
+        let lo = _mm512_unpacklo_epi64(even, odd);
+        let hi = _mm512_unpackhi_epi64(even, odd);
 
-    // Reduce modulo x^64 + x^4 + x^3 + x + 1 with shifts and three-way XORs.
-    const XOR3: i32 = 0x96;
-    // The bits of hi * (x^4 + x^3 + x + 1) that land past x^63.
-    let spill = _mm512_ternarylogic_epi64::<XOR3>(
-        _mm512_srli_epi64::<63>(hi),
-        _mm512_srli_epi64::<61>(hi),
-        _mm512_srli_epi64::<60>(hi),
-    );
-    // Both hi and spill are multiplied by the same constant, so fold them first.
-    let x = _mm512_xor_si512(hi, spill);
-    // g(x) = x ^ x<<1 ^ x<<3 ^ x<<4, split across two three-way XORs.
-    let fx = _mm512_ternarylogic_epi64::<XOR3>(x, _mm512_slli_epi64::<1>(x), _mm512_slli_epi64::<3>(x));
-    // u' = u + v * t, with the product's lo and g(x) folded in one step.
-    let new_u = _mm512_ternarylogic_epi64::<XOR3>(u, lo, _mm512_xor_si512(fx, _mm512_slli_epi64::<4>(x)));
-    (new_u, _mm512_xor_si512(v, new_u))
+        // Reduce modulo x^64 + x^4 + x^3 + x + 1: p mod f = lo ^ g(hi) ^ g(spill), g linear.
+        const XOR3: i32 = 0x96;
+        // g(spill) depends on hi's top nibble alone, and fits a byte: one in-lane table lookup.
+        let nibble = _mm512_srli_epi64::<60>(hi);
+        let g_spill = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(_mm_loadu_si128(G_SPILL.as_ptr().cast())), nibble);
+        // g(hi) = y ^ y<<3, with y = hi ^ hi<<1.
+        let y = _mm512_xor_si512(hi, _mm512_slli_epi64::<1>(hi));
+        _mm512_ternarylogic_epi64::<XOR3>(
+            _mm512_ternarylogic_epi64::<XOR3>(u, lo, g_spill),
+            y,
+            _mm512_slli_epi64::<3>(y),
+        )
+    }
+}
+
+/// Eight F64 butterflies with a shared twiddle, one per 64-bit lane of an AVX-512 register.
+///
+/// # Safety
+///
+/// - Requires VPCLMULQDQ, AVX-512F and AVX-512BW.
+/// - Each pointer must address the words `mask` selects, readable and writable.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline]
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw", enable = "avx2")]
+unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64, mask: u8) {
+    use core::arch::x86_64::*;
+
+    // SAFETY:
+    // - The caller supplies two rows valid for the lanes `mask` selects.
+    // - This function's target features cover every intrinsic below.
+    unsafe {
+        // Load both rows and broadcast the twiddle to every lane.
+        let u = _mm512_maskz_loadu_epi64(mask, top.cast());
+        let v = _mm512_maskz_loadu_epi64(mask, bot.cast());
+        let tw = _mm512_set1_epi64(twiddle as i64);
+        // Butterfly top: u' = u + v * t. Bottom: v' = v + u'.
+        let new_u = mul_xor_avx512(u, v, tw);
+        let new_v = _mm512_xor_si512(v, new_u);
+        _mm512_mask_storeu_epi64(top.cast(), mask, new_u);
+        _mm512_mask_storeu_epi64(bot.cast(), mask, new_v);
+    }
+}
+
+/// Eight-lane vectors of every row that a register kernel keeps in flight.
+///
+/// One vector's butterflies form a dependent chain, so a second vector covers its latency.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+const LANE_VECTORS: usize = 2;
+
+/// A broadcast twiddle, and whether it is zero: the butterfly is then `v' = v + u`, with no product.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+type Twiddle = (core::arch::x86_64::__m512i, bool);
+
+/// The vectors of `N` rows held in registers: `v[row][k]` is vector `k` of the row.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+type RowVectors<const N: usize> = [[core::arch::x86_64::__m512i; LANE_VECTORS]; N];
+
+/// Butterfly rows `top` and `bot` of every vector in flight.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline(always)]
+fn butterfly_regs<const N: usize>(v: &mut RowVectors<N>, top: usize, bot: usize, (tw, zero): Twiddle) {
+    for k in 0..LANE_VECTORS {
+        let (u, w) = (v[top][k], v[bot][k]);
+        // SAFETY: the target features are enabled at compile time.
+        let new_u = if zero { u } else { unsafe { mul_xor_avx512(u, w, tw) } };
+        v[top][k] = new_u;
+        v[bot][k] = unsafe { core::arch::x86_64::_mm512_xor_si512(w, new_u) };
+    }
+}
+
+/// Runs `kernel` on `N` equal-length rows held in registers, [`LANE_VECTORS`] eight-lane vectors of every row at a time.
+///
+/// - A vector is loaded and stored once, however many butterflies `kernel` applies to it.
+/// - The kernel orders its butterflies breadth-first, so the vectors in flight hide each other's latency.
+/// - The last chunk may be short: its vectors past the row's end load as zeros and are not stored.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline(always)]
+fn fused_lanes_avx512<const N: usize, const T: usize>(
+    rows: &mut [&mut [F64]; N],
+    twiddles: &[F64; T],
+    kernel: impl Fn(&mut RowVectors<N>, &[Twiddle; T]),
+) {
+    use core::arch::x86_64::*;
+
+    const CHUNK: usize = 8 * LANE_VECTORS;
+    let len = rows[0].len();
+    debug_assert!(rows.iter().all(|row| row.len() == len));
+    let ptrs: [*mut F64; N] = std::array::from_fn(|i| rows[i].as_mut_ptr());
+    // SAFETY: the target features are enabled at compile time, and every load and store
+    // stays inside its row: a whole chunk ends by `len`, and a short one is masked at `len`.
+    unsafe {
+        let tw = twiddles.map(|t| (_mm512_set1_epi64(t.0 as i64), t == F64::ZERO));
+        let mut lane = 0;
+        while lane + CHUNK <= len {
+            let mut v: RowVectors<N> =
+                std::array::from_fn(|i| std::array::from_fn(|k| _mm512_loadu_si512(ptrs[i].add(lane + 8 * k).cast())));
+            kernel(&mut v, &tw);
+            for i in 0..N {
+                for k in 0..LANE_VECTORS {
+                    _mm512_storeu_si512(ptrs[i].add(lane + 8 * k).cast(), v[i][k]);
+                }
+            }
+            lane += CHUNK;
+        }
+        if lane < len {
+            // The lanes of vector `k` of the short chunk: all eight, the row's last few, or none.
+            let mask = |k: usize| ((1u16 << len.saturating_sub(lane + 8 * k).min(8)) - 1) as u8;
+            let mut v: RowVectors<N> = std::array::from_fn(|i| {
+                std::array::from_fn(|k| _mm512_maskz_loadu_epi64(mask(k), ptrs[i].add(lane + 8 * k).cast()))
+            });
+            kernel(&mut v, &tw);
+            for i in 0..N {
+                for k in 0..LANE_VECTORS {
+                    _mm512_mask_storeu_epi64(ptrs[i].add(lane + 8 * k).cast(), mask(k), v[i][k]);
+                }
+            }
+        }
+    }
+}
+
+/// [`butterfly_lanes_avx512`] transposed: `s = u + v; u' = s; v' = s * t + v`.
+///
+/// # Safety
+///
+/// Same as [`butterfly_lanes_avx512`].
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline]
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw", enable = "avx2")]
+unsafe fn transpose_butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64, mask: u8) {
+    use core::arch::x86_64::*;
+
+    // SAFETY: as in `butterfly_lanes_avx512`.
+    unsafe {
+        let u = _mm512_maskz_loadu_epi64(mask, top.cast());
+        let v = _mm512_maskz_loadu_epi64(mask, bot.cast());
+        let tw = _mm512_set1_epi64(twiddle as i64);
+        let s = _mm512_xor_si512(u, v);
+        _mm512_mask_storeu_epi64(top.cast(), mask, s);
+        _mm512_mask_storeu_epi64(bot.cast(), mask, mul_xor_avx512(v, s, tw));
+    }
 }
 
 /// Two F64 butterflies with a shared twiddle, NEON-resident end to end.
@@ -1421,24 +1615,59 @@ mod tests {
             let rows = 1usize << log_rows;
             let msg: Vec<F64> = (0..rows * n_lanes).map(|_| F64(rng.next_u64())).collect();
 
-            let mut got = vec![F64::ZERO; msg.len() << log_inv_rate];
-            transpose_lane_major(&mut got[..msg.len()], &msg, n_lanes, log_rows);
-            ntt.encode_interleaved_in_place(&mut got, n_lanes, log_inv_rate);
+            let row_words = n_lanes.next_multiple_of(8);
+            let mut got = vec![F64::ZERO; (row_words << log_rows) << log_inv_rate];
+            transpose_lane_major(&mut got[..row_words << log_rows], &msg, n_lanes, row_words, log_rows);
+            ntt.encode_interleaved_in_place(&mut got, row_words, log_inv_rate);
 
             let block_len = 1usize << log_d;
-            for lane in 0..n_lanes {
-                // Lane `lane` encodes message block `n_lanes - 1 - lane`.
-                let block = n_lanes - 1 - lane;
+            for lane in 0..row_words {
+                // The leading lanes are zero padding, the rest encode message block `row_words - 1 - lane`.
                 let mut want = vec![F64::ZERO; block_len];
-                replicate_rows(&mut want, &msg[block * rows..(block + 1) * rows]);
-                ntt.transform(&mut want, 1, log_inv_rate, None, None);
+                if lane >= row_words - n_lanes {
+                    let block = row_words - 1 - lane;
+                    replicate_rows(&mut want, &msg[block * rows..(block + 1) * rows]);
+                    ntt.transform(&mut want, 1, log_inv_rate, None, None);
+                }
                 for pos in 0..block_len {
                     assert_eq!(
-                        got[pos * n_lanes + lane],
+                        got[pos * row_words + lane],
                         want[pos],
                         "lane {lane} pos {pos} at log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Without the deep writeback, the handed-over rows and the rows finished on demand
+    /// must equal the full encode's, wherever the plan splits off a deep pass.
+    #[test]
+    fn deferred_deep_rows_match_the_full_encode() {
+        let mut rng = Rng::new(0xDEE9);
+        for (log_d, lanes, log_inv_rate, split) in [(14usize, 51usize, 1usize, true), (14, 64, 2, true), (9, 8, 1, true), (4, 8, 4, false)] {
+            let ntt = AdditiveNttF64::standard(log_d);
+            let msg_len = (lanes << log_d) >> log_inv_rate;
+            let msg: Vec<F64> = (0..msg_len).map(|_| F64(rng.next_u64())).collect();
+            let mut want = vec![F64::ZERO; msg_len << log_inv_rate];
+            want[..msg_len].copy_from_slice(&msg);
+            ntt.encode_interleaved_in_place(&mut want, lanes, log_inv_rate);
+
+            let mut got = vec![F64::ZERO; msg_len << log_inv_rate];
+            got[..msg_len].copy_from_slice(&msg);
+            let handed = std::sync::Mutex::new(vec![F64::ZERO; got.len()]);
+            let deep = ntt.encode_interleaved_in_place_without_deep(&mut got, lanes, log_inv_rate, &|row, rows| {
+                handed.lock().unwrap()[row * lanes..][..rows.len()].copy_from_slice(rows)
+            });
+            assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, log_d={log_d}, lanes={lanes}");
+            assert_eq!(deep.is_some(), split, "plan, log_d={log_d}, lanes={lanes}");
+            let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+            let rows = match deep {
+                Some(deep) => ntt.finish_rows(&got, &deep, &positions),
+                None => positions.iter().map(|&q| got[q * lanes..][..lanes].to_vec()).collect(),
+            };
+            for (&q, row) in positions.iter().zip(&rows) {
+                assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_d={log_d}, lanes={lanes}");
             }
         }
     }
@@ -1449,7 +1678,7 @@ mod tests {
         let mut rng = Rng::new(2);
         let log_d = 7;
         let n = 1usize << log_d;
-        for lanes in [1usize, 2, 4, 8, 64] {
+        for lanes in [1usize, 2, 4, 8, 17, 24, 64] {
             // SoA buffer + per-lane copies.
             let mut soa = vec![F64::ZERO; n * lanes];
             let mut per_lane: Vec<Vec<F64>> = vec![vec![F64::ZERO; n]; lanes];

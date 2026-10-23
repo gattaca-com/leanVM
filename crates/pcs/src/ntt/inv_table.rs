@@ -147,7 +147,12 @@ impl InvNttTableByteSingleGf8 {
         unsafe {
             let base = self.data.as_ptr().cast::<u8>();
             let iota = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
-            let row = |b: usize| _mm512_loadu_si512(base.add(bytes[b] as usize * 64).cast());
+            // Byte `b` scaled by the row size, from one 64-bit load.
+            let word = u64::from_le_bytes(bytes.try_into().unwrap());
+            let row = |b: usize| {
+                let offset = word.rotate_left(6).rotate_right(8 * b as u32) & 0x3FC0;
+                _mm512_loadu_si512(base.add(offset as usize).cast())
+            };
             let mut acc = row(0);
             for b in 1..self.n_chunks {
                 let idx = _mm512_xor_si512(iota, _mm512_set1_epi64(b as i64));

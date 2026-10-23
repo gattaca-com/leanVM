@@ -49,7 +49,7 @@
 //!    `rs_eq_ind[y] = Phi(eq(r_suffix, y))` where `Phi : E -> E` is the
 //!    composed map above. Completeness:
 //!    `sum_y rs_eq_ind[y] * packed[y] == sumcheck_claim`, which is exactly
-//!    the claim shape [`super::whir::recursive_prover_with_basis`]
+//!    the claim shape [`super::stack_open::open_batch_mixed_whir_stacked`]
 //!    proves (with `b_initial = rs_eq_ind`, `target = sumcheck_claim`).
 //!    A nonzero discrepancy gives a nonzero polynomial in the six challenges;
 //!    its total degree is below `2^32`, hence its failure probability is below
@@ -63,8 +63,13 @@
 //! builds the vector at all: it evaluates its MLE at the WHIR final point from
 //! `Phi`'s challenges.
 
+use flux_profiler::timed;
 use fiat_shamir::transcript::ProverState;
-use primitives::field::{F64, F192};
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+use primitives::bit_fold::{BLOCK, BitFold};
+use primitives::field::{F64, F192, mul4};
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+use primitives::field::xor_into8;
 
 use super::pack::PACKING_WIDTH;
 use super::tensor_algebra::{DEGREE_E, transpose_s_hat};
@@ -126,15 +131,8 @@ pub const COMPOSITION_SHIFTS: [usize; 6] = [32, 16, 8, 4, 2, 1];
 /// nonzero error lies in the kernel for EVERY coefficient choice and passes
 /// with probability one.
 pub fn build_coordinate_weights(challenges: &[F192; COMPOSITION_SHIFTS.len()]) -> Vec<F192> {
-    // b_w has only bit w set: bits 0..64 are K's power basis, and bits 64/128
-    // shift it by Y / Y^2.
-    let basis = |w: usize| match w / PACKING_WIDTH {
-        0 => F192::new(1u64 << (w % PACKING_WIDTH), 0, 0),
-        1 => F192::new(0, 1u64 << (w % PACKING_WIDTH), 0),
-        _ => F192::new(0, 0, 1u64 << (w % PACKING_WIDTH)),
-    };
     (0..DEGREE_E)
-        .map(|w| apply_composed_map(basis(w), challenges))
+        .map(|w| apply_composed_map(coordinate_basis(w), challenges))
         .collect()
 }
 
@@ -181,6 +179,7 @@ pub fn inner_product_ext(a: &[F192], b: &[F192]) -> F192 {
 /// for `i in 0..64` (bit i = polynomial-basis coordinate of the u64).
 ///
 /// The prover takes these from lincheck, so this is the reference for tests and the unprepared fallback.
+#[timed]
 pub fn fold_1b_rows(packed_witness: &[F64], suffix_tensor: &[F192]) -> Vec<F192> {
     assert_eq!(packed_witness.len(), suffix_tensor.len());
     parallel::fold_reduce(
@@ -216,6 +215,7 @@ fn xor_accs(mut a: Vec<F192>, b: Vec<F192>) -> Vec<F192> {
 /// Naive reference: a per-position bit-scan over the three 64-bit limbs.
 /// See [`fold_ext_elems`] for the bytewise-table production version.
 #[cfg(test)]
+#[timed]
 pub fn fold_ext_elems_naive(suffix_tensor: &[F192], coordinate_weights: &[F192]) -> Vec<F192> {
     assert_eq!(coordinate_weights.len(), DEGREE_E);
     parallel::map_collect(suffix_tensor.len(), |i| {
@@ -244,14 +244,17 @@ pub fn fold_ext_elems_naive(suffix_tensor: &[F192], coordinate_weights: &[F192])
 }
 
 /// Number of bytes in an E element (= lookup tables for the fold).
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 const FOLD_N_BYTES: usize = 24;
 /// Entries per byte-lookup table.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 const FOLD_TABLE_SIZE: usize = 256;
 
 /// Build the 24x256 byte-lookup table for [`fold_ext_elems`]:
 /// `table[k * 256 + v] = sum_{bit b set in v} coordinate_weights[k * 8 + b]`.
 /// Byte order: bytes 0..8 are the little-endian bytes of `c0` (bits 0..64),
 /// bytes 8..16 those of `c1` (bits 64..128), and bytes 16..24 those of `c2`.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 fn build_fold_byte_table_ext(coordinate_weights: &[F192]) -> Box<FoldByteTable> {
     assert_eq!(coordinate_weights.len(), DEGREE_E);
     let mut tables: Box<FoldByteTable> = Box::new([[F192::ZERO; FOLD_TABLE_SIZE]; FOLD_N_BYTES]);
@@ -275,10 +278,12 @@ fn build_fold_byte_table_ext(coordinate_weights: &[F192]) -> Box<FoldByteTable> 
 /// loop, so neither lookup carries a bounds check and the row stride folds into
 /// the address. Flat, this is 24 bounds checks and 24 stride multiplies per
 /// output slot, and the address registers they force live do not fit.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 type FoldByteTable = [[F192; FOLD_TABLE_SIZE]; FOLD_N_BYTES];
 
 /// One folded output slot: `sum_{k=0..24} tables[k][byte_k(elem)]`, tree-reduced
 /// so the XORs pipeline.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))))]
 #[inline(always)]
 fn fold_one_slot_ext(elem: F192, tables: &FoldByteTable) -> F192 {
     let bytes = [elem.c0.to_le_bytes(), elem.c1.to_le_bytes(), elem.c2.to_le_bytes()];
@@ -293,18 +298,122 @@ fn fold_one_slot_ext(elem: F192, tables: &FoldByteTable) -> F192 {
 
 /// Deferred, lambda-baked ring-switch output used by the stacked opener.
 ///
-/// Keeping the split eq factors and the tiny byte table avoids materializing
-/// one full `rs_eq_ind` vector per claim.  The table already contains the
-/// claim's batching scalar, so combining several claims needs only additions.
+/// Keeping the split eq factors and the folded map avoids materializing one full
+/// `rs_eq_ind` vector per claim. The map already contains the claim's batching
+/// scalar, so combining several claims needs only additions.
 pub(crate) struct DeferredRingSwitchOutput {
     pub(crate) batched_sumcheck_claim: F192,
+    pub(crate) weight: RingWeight,
+}
+
+/// `Phi(eq(point, y))` over a claim's suffix domain, for an F_2-linear `Phi` given by its
+/// value on every coordinate basis element of `E`.
+#[derive(Clone)]
+pub(crate) struct RingWeight {
+    weights: Vec<F192>,
+    point: Vec<F192>,
     eq_lo: Vec<F192>,
     eq_hi: Vec<F192>,
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
     table: Box<FoldByteTable>,
+    /// The weights, one per bit of a product row (an F192 padded to [`FOLD_ROW_BYTES`]),
+    /// for the GFNI fold of 64 rows at a time.
+    #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+    fold: BitFold,
+}
+
+/// A product row for the GFNI fold: an F192 zero-padded to the next power of two the kernel takes.
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+const FOLD_ROW_BYTES: usize = 32;
+
+/// The `w`-th `F_2`-coordinate basis element of `E`: bits 0..64 are K's power
+/// basis, and bits 64/128 shift it by Y / Y^2.
+pub(crate) fn coordinate_basis(w: usize) -> F192 {
+    match w / PACKING_WIDTH {
+        0 => F192::new(1u64 << (w % PACKING_WIDTH), 0, 0),
+        1 => F192::new(0, 1u64 << (w % PACKING_WIDTH), 0),
+        _ => F192::new(0, 0, 1u64 << (w % PACKING_WIDTH)),
+    }
+}
+
+impl RingWeight {
+    fn new(weights: Vec<F192>, point: Vec<F192>, eq_lo: Vec<F192>, eq_hi: Vec<F192>) -> Self {
+        assert_eq!(weights.len(), DEGREE_E);
+        debug_assert_eq!(eq_lo.len() * eq_hi.len(), 1 << point.len());
+        #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+        let fold = {
+            let mut padded = weights.clone();
+            padded.resize(8 * FOLD_ROW_BYTES, F192::ZERO);
+            BitFold::new(&padded)
+        };
+        Self {
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
+            table: build_fold_byte_table_ext(&weights),
+            #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+            fold,
+            weights,
+            point,
+            eq_lo,
+            eq_hi,
+        }
+    }
+
+    pub(crate) fn from_point(weights: Vec<F192>, point: Vec<F192>) -> Self {
+        let (eq_lo, eq_hi) = build_eq_split_ext(&point);
+        Self::new(weights, point, eq_lo, eq_hi)
+    }
+
+    pub(crate) fn point(&self) -> &[F192] {
+        &self.point
+    }
+
+    /// `Phi(value)`.
+    pub(crate) fn apply(&self, value: F192) -> F192 {
+        let mut acc = F192::ZERO;
+        for (limb, word) in [value.c0, value.c1, value.c2].into_iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                acc += self.weights[limb * PACKING_WIDTH + bits.trailing_zeros() as usize];
+                bits &= bits - 1;
+            }
+        }
+        acc
+    }
+
+    /// `out[j] += Phi(eq(point, start + j))`.
+    pub(crate) fn add_chunk(&self, start: usize, out: &mut [F192]) {
+        let block_len = self.eq_lo.len();
+        assert!(start + out.len() <= block_len * self.eq_hi.len());
+        let mut done = 0;
+        while done < out.len() {
+            let index = start + done;
+            let lo = index % block_len;
+            let len = (block_len - lo).min(out.len() - done);
+            let e_hi = self.eq_hi[index / block_len];
+            #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+            self.fold_products_gfni(&self.eq_lo[lo..lo + len], e_hi, &mut out[done..done + len]);
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
+            {
+                let (slots4, slots_r) = out[done..done + len].as_chunks_mut::<4>();
+                let (lo4, lo_r) = self.eq_lo[lo..lo + len].as_chunks::<4>();
+                for (slots, e_lo) in slots4.iter_mut().zip(lo4) {
+                    let products = mul4(*e_lo, [e_hi; 4]);
+                    for (slot, product) in slots.iter_mut().zip(products) {
+                        *slot += fold_one_slot_ext(product, &self.table);
+                    }
+                }
+                for (slot, &e_lo) in slots_r.iter_mut().zip(lo_r) {
+                    *slot += fold_one_slot_ext(e_lo * e_hi, &self.table);
+                }
+            }
+            done += len;
+        }
+    }
 }
 
 /// Finish a ring-switch claim without materializing its dense weight vector.
-/// The batching scalar is baked into both the target and the byte table.
+/// The batching scalar is baked into both the target and the map.
+#[timed]
 pub(crate) fn prove_finish_deferred(
     state: RingSwitchProveState,
     coordinate_weights: &[F192],
@@ -315,9 +424,7 @@ pub(crate) fn prove_finish_deferred(
     let scaled_weights: Vec<F192> = coordinate_weights.iter().map(|&x| lambda * x).collect();
     DeferredRingSwitchOutput {
         batched_sumcheck_claim: lambda * sumcheck_claim,
-        eq_lo: state.eq_lo,
-        eq_hi: state.eq_hi,
-        table: build_fold_byte_table_ext(&scaled_weights),
+        weight: RingWeight::new(scaled_weights, state.point, state.eq_lo, state.eq_hi),
     }
 }
 
@@ -325,20 +432,43 @@ pub(crate) fn prove_finish_deferred(
 /// basis, accumulating, so `out` arrives zeroed. No per-claim dense vector is
 /// allocated or read back. `start` is an offset into the basis, which lets a
 /// caller cover it one cache-resident window at a time.
+#[cfg(test)]
 pub(crate) fn combine_deferred_chunk(outputs: &[DeferredRingSwitchOutput], start: usize, out: &mut [F192]) {
     for claim in outputs {
-        let block_len = claim.eq_lo.len();
-        assert!(start + out.len() <= block_len * claim.eq_hi.len());
-        let mut done = 0;
-        while done < out.len() {
-            let index = start + done;
-            let lo = index % block_len;
-            let len = (block_len - lo).min(out.len() - done);
-            let e_hi = claim.eq_hi[index / block_len];
-            for (slot, &e_lo) in out[done..done + len].iter_mut().zip(&claim.eq_lo[lo..lo + len]) {
-                *slot += fold_one_slot_ext(e_lo * e_hi, &claim.table);
+        claim.weight.add_chunk(start, out);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+impl RingWeight {
+    /// `out[j] += Phi(e_lo[j] * e_hi)`, 64 products at a time through the GFNI fold.
+    #[inline]
+    fn fold_products_gfni(&self, e_lo: &[F192], e_hi: F192, out: &mut [F192]) {
+        debug_assert_eq!(e_lo.len(), out.len());
+        let mut rows = [[0u64; FOLD_ROW_BYTES / 8]; BLOCK];
+        let mut folded = [F192::ZERO; BLOCK];
+        for (e_lo, out) in e_lo.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
+            let n = e_lo.len();
+            let (lo4, lo_r) = e_lo.as_chunks::<4>();
+            for (k, e_lo) in lo4.iter().enumerate() {
+                for (j, p) in mul4(*e_lo, [e_hi; 4]).into_iter().enumerate() {
+                    rows[4 * k + j] = [p.c0, p.c1, p.c2, 0];
+                }
             }
-            done += len;
+            for (j, &e_lo) in lo_r.iter().enumerate() {
+                let p = e_lo * e_hi;
+                rows[4 * lo4.len() + j] = [p.c0, p.c1, p.c2, 0];
+            }
+            // SAFETY: `[u64; 4]` and `[u8; 32]` have the same size, and every bit pattern is a valid byte row.
+            let bytes: &[[u8; FOLD_ROW_BYTES]; BLOCK] = unsafe { &*rows.as_ptr().cast() };
+            self.fold.fold_block(&bytes[..n], &mut folded);
+            let (out8, out_r) = out.as_chunks_mut::<8>();
+            for (o, f) in out8.iter_mut().zip(folded.as_chunks::<8>().0) {
+                xor_into8(o, f);
+            }
+            for (o, f) in out_r.iter_mut().zip(&folded[8 * out8.len()..]) {
+                *o += *f;
+            }
         }
     }
 }
@@ -371,6 +501,7 @@ fn build_eq_split_ext(point: &[F192]) -> (Vec<F192>, Vec<F192>) {
 #[derive(Clone)]
 pub struct RingSwitchProveState {
     s_hat_v: Vec<F192>,
+    point: Vec<F192>,
     eq_lo: Vec<F192>,
     eq_hi: Vec<F192>,
 }
@@ -383,6 +514,7 @@ pub struct RingSwitchProveState {
 /// its family itself, see `flock::hash`), which is what lets this
 /// phase touch no transcript at all. `precomputed_s_hat_v` is `None` only for a
 /// caller that wants them folded out of the witness instead.
+#[timed]
 pub fn prove_prepare(
     packed_witness: &[F64],
     suffix_point: &[F192],
@@ -406,7 +538,12 @@ pub fn prove_prepare(
             fold_1b_rows(packed_witness, &full)
         }
     };
-    RingSwitchProveState { s_hat_v, eq_lo, eq_hi }
+    RingSwitchProveState {
+        s_hat_v,
+        point: suffix_point.to_vec(),
+        eq_lo,
+        eq_hi,
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +573,7 @@ mod tests {
                 let (eq_lo, eq_hi) = build_eq_split_ext(&point);
                 RingSwitchProveState {
                     s_hat_v: rng.ext_vec(PACKING_WIDTH),
+                    point: point.clone(),
                     eq_lo,
                     eq_hi,
                 }

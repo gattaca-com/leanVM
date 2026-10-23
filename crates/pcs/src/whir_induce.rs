@@ -8,9 +8,11 @@
 //! transposed-NTT fast path with the dispatch between them.
 
 use flux_profiler::timed;
+use crate::ntt::additive_ntt_f64::transpose_butterfly_lanes;
 use crate::ntt::AdditiveNttF64;
+use crate::whir_ntt_ext::words_mut;
 use crate::whir::build_eq_table_ext;
-use primitives::field::{F64, F192};
+use primitives::field::{F64, F192, Weights8, dot_base};
 
 // ===================================================================
 // LCH novel-basis evaluations over K (mirror of whir's extension-field block)
@@ -101,13 +103,11 @@ fn invert_sks(sks_vks: &[F64]) -> Vec<F64> {
 
 /// Dense induce: `basis_poly[j] = Σ_i w_i · W-hat_j(q_i)`,
 /// `enforced_sum = Σ_i w_i · <row_i, eq(v_challenges, ·)>`, for the per-query
-/// batching weights `w` of [`primitives::field::powers`]. Mirror of the
-/// dense `whir::induce_sumcheck_poly` (per-worker accumulation).
+/// batching weights `w` of [`primitives::field::powers`].
 ///
-/// The LCH doubling recurrence runs into a HALF-size scratch and its last level
-/// expands straight into the worker's accumulator, so each query touches the
-/// accumulator once instead of writing a full-size table and adding it back.
-/// Addition in E is XOR, so reassociating across workers is bit-exact.
+/// `W-hat_j(q) = Π_k W-hat_k(q)^(bit k of j)` is a K value and a tensor over the
+/// bits of `j`. Split at `lo` bits, `basis_poly[j] = Σ_i (w_i · high_i(j >> lo)) ·
+/// low_i(j mod 2^lo)`: one packed mixed dot over the queries per output.
 #[timed]
 pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     log_msg_cols: usize,
@@ -117,70 +117,55 @@ pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     queries: &[usize],
     weights: &[F192],
 ) -> (Vec<F192>, F192) {
-    let n = 1usize << log_msg_cols;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
-    debug_assert_eq!(
-        v_challenges.len(),
-        opened_rows
-            .first()
-            .map(|r| r.len().trailing_zeros() as usize)
-            .unwrap_or(0)
-    );
-
+    assert_eq!(weights.len(), n_queries);
     let eq = build_eq_table_ext(v_challenges);
-    debug_assert_eq!(weights.len(), n_queries);
+    let enforced_sum = opened_rows
+        .iter()
+        .zip(weights)
+        .fold(F192::ZERO, |sum, (row, &w)| sum + T::dot(row, &eq) * w);
+
     let inv_sks_vks = invert_sks(sks_vks);
-    debug_assert!(inv_sks_vks.len() > log_msg_cols);
+    let lo = log_msg_cols / 2;
+    let padded = n_queries.next_multiple_of(8);
+    // `low[j * padded + i] = low_i(j)`, `high[i << (log_msg_cols - lo) | j] = high_i(j)`.
+    let mut low = vec![F64::ZERO; padded << lo];
+    let mut high = Vec::with_capacity(n_queries << (log_msg_cols - lo));
+    let mut sks = vec![F64::ZERO; log_msg_cols];
+    for (i, &q) in queries.iter().enumerate() {
+        normalized_sks_at(F64(q as u64), sks_vks, &inv_sks_vks, &mut sks);
+        for (j, v) in tensor_k(&sks[..lo]).into_iter().enumerate() {
+            low[j * padded + i] = v;
+        }
+        high.extend(tensor_k(&sks[lo..]));
+    }
+    let mut basis = vec![F192::ZERO; 1 << log_msg_cols];
+    parallel::chunks_mut(&mut basis, 1 << lo, |j, out: &mut [F192]| {
+        let scaled = |i: usize| match weights.get(i) {
+            Some(w) => w.mul_base(high[(i << (log_msg_cols - lo)) | j]),
+            None => F192::ZERO,
+        };
+        let packed: Vec<Weights8> = (0..padded / 8)
+            .map(|g| Weights8::new(&std::array::from_fn(|t| scaled(8 * g + t))))
+            .collect();
+        for (out, low) in out.iter_mut().zip(low.chunks_exact(padded)) {
+            *out = dot_base(&packed, low).reduce();
+        }
+    });
+    (basis, enforced_sum)
+}
 
-    let half = 1usize << log_msg_cols.saturating_sub(1);
-    parallel::map_reduce_with_state(
-        n_queries,
-        || (vec![F64::ZERO; log_msg_cols.max(1)], vec![F192::ZERO; half]),
-        // SAFETY: zero is a valid F192, and the expansion below accumulates into it.
-        || (vec![F192::ZERO; n], F192::ZERO),
-        |(sks_at_x, scratch), (accum_basis, local_sum), i| {
-            let ap = weights[i];
-            *local_sum += T::dot(&opened_rows[i], &eq) * ap;
-
-            if log_msg_cols == 0 {
-                accum_basis[0] += ap;
-                return;
-            }
-            let q_field = F64(queries[i] as u64);
-            normalized_sks_at(q_field, sks_vks, &inv_sks_vks, &mut sks_at_x[..log_msg_cols]);
-            scratch[0] = ap;
-            for k in 0..log_msg_cols - 1 {
-                let s_at_x = sks_at_x[k];
-                let (lo, hi) = scratch.split_at_mut(1usize << k);
-                for (h, &l) in hi.iter_mut().zip(lo.iter()) {
-                    *h = l.mul_base(s_at_x);
-                }
-            }
-            let s_at_x = sks_at_x[log_msg_cols - 1];
-            let (lo, hi) = accum_basis.split_at_mut(half);
-            for ((l, h), &v) in lo.iter_mut().zip(hi.iter_mut()).zip(scratch.iter()) {
-                *l += v;
-                *h += v.mul_base(s_at_x);
-            }
-        },
-        |(mut basis_poly, sum), (partial, partial_sum)| {
-            const PAR_THRESHOLD: usize = 4096;
-            if n < PAR_THRESHOLD {
-                for (acc, &v) in basis_poly.iter_mut().zip(partial.iter()) {
-                    *acc += v;
-                }
-            } else {
-                let chunk = parallel::recommended_chunk_size(n);
-                parallel::chunks_mut_zip(&mut basis_poly, &partial, chunk, |_, accs, vs| {
-                    for (acc, &v) in accs.iter_mut().zip(vs) {
-                        *acc += v;
-                    }
-                });
-            }
-            (basis_poly, sum + partial_sum)
-        },
-    )
+/// `t[j] = Π_k s[k]^(bit k of j)`, over K.
+fn tensor_k(s: &[F64]) -> Vec<F64> {
+    let mut t = Vec::with_capacity(1 << s.len());
+    t.push(F64::ONE);
+    for &x in s {
+        for j in 0..t.len() {
+            t.push(t[j] * x);
+        }
+    }
+    t
 }
 
 /// Just the `enforced_sum` half of [`induce_sumcheck_poly`]:
@@ -280,17 +265,6 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     }
 }
 
-/// Transposed forward additive NTT, `F^T`, in place over `2^log_d` E-values
-/// with K-twiddles. Forward butterfly is `M = [[1, t], [1, t+1]]`; transpose
-/// `M^T = [[1, 1], [t, t+1]]` is `s = a + b; top = s; bot = t*s + b` (here
-/// `s.mul_base(t) + b`), applied in reverse layer order. Mirror of
-/// `whir::transpose_forward_ntt` (one parallel sweep per layer).
-fn transpose_forward_ntt_ext(ntt: &AdditiveNttF64, data: &mut [F192], log_d: usize) {
-    debug_assert_eq!(data.len(), 1usize << log_d);
-    debug_assert!(log_d <= ntt.log_domain_size());
-    transpose_layers_ext(ntt, data, log_d, (0..log_d).rev());
-}
-
 /// Elements per cache-resident window of the layer-blocked run below.
 const TRANSPOSE_CHUNK: usize = 1 << 16;
 
@@ -305,27 +279,34 @@ const TRANSPOSE_CHUNK: usize = 1 << 16;
 /// for the run instead of one sweep per layer. This is the sub-group
 /// decomposition the interleaved encode already uses for its deep layers,
 /// applied in the transpose direction.
-fn transpose_layers_ext(ntt: &AdditiveNttF64, data: &mut [F192], log_d: usize, layers: impl Iterator<Item = usize>) {
-    transpose_layers_ext_windowed(ntt, data, log_d, layers, TRANSPOSE_CHUNK);
+///
+/// `data` starts at element `offset` of the domain, aligned to every block it pairs within.
+fn transpose_layers_ext(
+    ntt: &AdditiveNttF64,
+    data: &mut [F192],
+    offset: usize,
+    log_d: usize,
+    layers: impl Iterator<Item = usize>,
+) {
+    transpose_layers_ext_windowed(ntt, data, offset, log_d, layers, TRANSPOSE_CHUNK);
+}
+
+/// The transposed forward butterfly, applied to each pair of E elements as K words. The forward
+/// butterfly is `M = [[1, t], [1, t+1]]`, so `M^T = [[1, 1], [t, t+1]]` is
+/// `s = a + b; top = s; bot = t*s + b`.
+fn transpose_butterfly_ext(t: F64, top: &mut [F192], bot: &mut [F192]) {
+    transpose_butterfly_lanes(words_mut(top), words_mut(bot), t);
 }
 
 fn transpose_layers_ext_windowed(
     ntt: &AdditiveNttF64,
     data: &mut [F192],
+    offset: usize,
     log_d: usize,
     layers: impl Iterator<Item = usize>,
     window_len: usize,
 ) {
     let n_threads = parallel::num_threads();
-    let butterfly = |t: F64, top: &mut [F192], bot: &mut [F192]| {
-        for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
-            let a = *a_ref;
-            let b = *b_ref;
-            let s = a + b;
-            *a_ref = s;
-            *b_ref = s.mul_base(t) + b;
-        }
-    };
     let layers: Vec<usize> = layers.collect();
     debug_assert!(layers.windows(2).all(|w| w[0] > w[1]), "layers descend");
     // Keep a window per worker, or the blocked run costs more in lost
@@ -340,53 +321,97 @@ fn transpose_layers_ext_windowed(
     };
     if blocked > 1 {
         parallel::chunks_mut(data, window_len, |c, window: &mut [F192]| {
-            let base = c * window_len;
+            let base = offset + c * window_len;
             for &layer in &layers[..blocked] {
                 let block_size = 1usize << (log_d - layer);
                 let bsh = block_size >> 1;
                 for (b, block) in window.chunks_mut(block_size).enumerate() {
                     let (top, bot) = block.split_at_mut(bsh);
-                    butterfly(ntt.twiddle(layer, base / block_size + b), top, bot);
+                    transpose_butterfly_ext(ntt.twiddle(layer, base / block_size + b), top, bot);
                 }
             }
         });
     }
-    for &layer in &layers[if blocked > 1 { blocked } else { 0 }..] {
-        let num_blocks = 1usize << layer;
+    let mut deep = &layers[if blocked > 1 { blocked } else { 0 }..];
+    while let Some(&layer) = deep.first() {
         let block_size = 1usize << (log_d - layer);
+        let (first, num_blocks) = (offset / block_size, data.len() / block_size);
         let bsh = block_size >> 1;
+        // Fuse consecutive layers into one pass over each super-block, when it keeps every worker busy.
+        let fused = deep.iter().take(MAX_FUSED).enumerate().take_while(|&(j, &l)| l + j == layer).count();
+        let super_len = block_size << (fused - 1);
+        if fused > 1 && data.len() / super_len >= n_threads {
+            parallel::chunks_mut(data, super_len, |sb, chunk: &mut [F192]| {
+                fused_transpose_layers(ntt, chunk, layer, fused, offset / super_len + sb)
+            });
+            deep = &deep[fused..];
+            continue;
+        }
+        deep = &deep[1..];
         if num_blocks >= n_threads {
             parallel::chunks_mut(data, block_size, |block, chunk: &mut [F192]| {
                 let (top, bot) = chunk.split_at_mut(bsh);
-                butterfly(ntt.twiddle(layer, block), top, bot);
+                transpose_butterfly_ext(ntt.twiddle(layer, first + block), top, bot);
             });
         } else {
             for block in 0..num_blocks {
-                let t = ntt.twiddle(layer, block);
+                let t = ntt.twiddle(layer, first + block);
                 let chunk = &mut data[block * block_size..(block + 1) * block_size];
                 let (top, bot) = chunk.split_at_mut(bsh);
                 let chunk_len = parallel::recommended_chunk_size(bsh);
-                parallel::chunks_mut2(top, bot, chunk_len, |_, top_c, bot_c| butterfly(t, top_c, bot_c));
+                parallel::chunks_mut2(top, bot, chunk_len, |_, top_c, bot_c| transpose_butterfly_ext(t, top_c, bot_c));
             }
         }
     }
 }
 
-/// Sparse-prefix variant of [`transpose_forward_ntt_ext`], keeping only the first
-/// `keep` outputs: the input has only `positions.len()` nonzeros, and the first
-/// `k` transpose steps (forward layers `log_d-1 .. log_d-k`, pairing distances
-/// `1 .. 2^(k-1)`) mix only WITHIN `2^k`-aligned windows. We process just the
-/// windows that contain a nonzero (a dense `2^k` transpose each, disjoint so
-/// window-parallel), then the remaining steps in two sweeps of the buffer (see
-/// [`transpose_dense_rest`]). Output is identical to the first `keep` entries of
-/// `transpose_forward_ntt_ext` on the scattered input. Mirror of
-/// `whir::transpose_forward_ntt_sparse`.
+/// Layers one fused pass takes, which bounds the rows it keeps in L1.
+const MAX_FUSED: usize = 3;
+/// Elements per row strip of a fused pass: `2^MAX_FUSED` strips of this width fit L1.
+const FUSED_STRIP: usize = 128;
+
+/// `fused` consecutive layers `layer, layer-1, ..` over one super-block, the
+/// `sb`-th, in a single pass. Its `2^fused` rows pair at distance `1, 2, 4, ..`
+/// rows, one layer each. The rows are independent column by column, so each
+/// strip of columns runs every layer while it sits in L1.
+fn fused_transpose_layers(ntt: &AdditiveNttF64, sb_data: &mut [F192], layer: usize, fused: usize, sb: usize) {
+    let rows = 1usize << fused;
+    let row_len = sb_data.len() >> fused;
+    let base = sb_data.as_mut_ptr();
+    for c in (0..row_len).step_by(FUSED_STRIP.min(row_len)) {
+        let w = FUSED_STRIP.min(row_len);
+        for j in 0..fused {
+            for r in (0..rows).filter(|r| r >> j & 1 == 0) {
+                let t = ntt.twiddle(layer - j, (sb << (fused - 1 - j)) + (r >> (j + 1)));
+                // SAFETY: rows `r` and `r + 2^j` are distinct, so the two strips are disjoint and inside `sb_data`.
+                let (top, bot) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(base.add(r * row_len + c), w),
+                        std::slice::from_raw_parts_mut(base.add((r + (1 << j)) * row_len + c), w),
+                    )
+                };
+                transpose_butterfly_ext(t, top, bot);
+            }
+        }
+    }
+}
+
+/// `F^T` of a sparse input, keeping only the low `2^(log_d - log_inv_rate)` outputs.
+///
+/// The input has `positions.len()` nonzeros. Transpose step `s` mixes only within
+/// `2^(s+1)`-aligned blocks, so the early steps run on the blocks that hold a
+/// nonzero while those are a minority, and the rest sweep densely down to layer
+/// `log_inv_rate`. Every step acts within one of the `2^log_inv_rate` replicas of
+/// the message domain. The last `log_inv_rate` steps pair across replicas and
+/// every kept output is a `top = a + b` of them, so they collapse to a sum over
+/// the replicas: the transpose of the encode's free replication.
+/// Mirror of `whir::transpose_forward_ntt_sparse`.
 fn transpose_forward_ntt_sparse_ext(
     ntt: &AdditiveNttF64,
     positions: &[usize],
     values: &[F192],
     log_d: usize,
-    keep: usize,
+    log_inv_rate: usize,
 ) -> Vec<F192> {
     let _span = tracing::info_span!(
         "NTT",
@@ -395,204 +420,85 @@ fn transpose_forward_ntt_sparse_ext(
         nonzero = positions.len()
     )
     .entered();
-    transpose_sparse_windowed(ntt, positions, values, log_d, keep, TRANSPOSE_WINDOW_LOG)
+    // One replica at a time, so the working set is a quarter of the domain and stays in cache.
+    let n_keep = 1usize << (log_d - log_inv_rate);
+    let mut kept = vec![F192::ZERO; n_keep];
+    transpose_replica(ntt, positions, values, &mut kept, 0, log_d, log_inv_rate);
+    let mut replica = vec![F192::ZERO; n_keep];
+    for offset in (n_keep..1usize << log_d).step_by(n_keep) {
+        replica.fill(F192::ZERO);
+        transpose_replica(ntt, positions, values, &mut replica, offset, log_d, log_inv_rate);
+        for (out, &x) in kept.iter_mut().zip(&replica) {
+            *out += x;
+        }
+    }
+    kept
 }
 
-fn transpose_sparse_windowed(
+/// The steps of [`transpose_forward_ntt_sparse_ext`] that act within the replica at `offset`, on a zeroed `data`.
+fn transpose_replica(
     ntt: &AdditiveNttF64,
     positions: &[usize],
     values: &[F192],
+    data: &mut [F192],
+    offset: usize,
     log_d: usize,
-    keep: usize,
-    window_log: usize,
-) -> Vec<F192> {
-    use std::collections::HashMap;
-    let n = 1usize << log_d;
-    assert!(keep.is_power_of_two() && keep <= n);
-    // No prefix for small domains: just scatter + full dense transpose.
-    let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
-
-    if k == 0 {
-        // SAFETY: zero is a valid F192, and the scatter below reads these slots.
-        let mut data = vec![F192::ZERO; n];
-        for (&p, &v) in positions.iter().zip(values) {
-            data[p] += v;
-        }
-        if log_d > 0 {
-            transpose_forward_ntt_ext(ntt, &mut data, log_d);
-        }
-        data.truncate(keep);
-        return data;
-    }
-
-    let wmask = (1usize << k) - 1;
-    // Group nonzeros into 2^k windows.
-    let mut windows: HashMap<usize, Vec<F192>> = HashMap::new();
+    log_inv_rate: usize,
+) {
+    let mut local = Vec::with_capacity(positions.len());
     for (&p, &v) in positions.iter().zip(values) {
-        let buf = windows.entry(p >> k).or_insert_with(|| vec![F192::ZERO; 1 << k]);
-        buf[p & wmask] += v;
+        if let Some(p) = p.checked_sub(offset).filter(|&p| p < data.len()) {
+            data[p] += v;
+            local.push(p);
+        }
     }
-
-    // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
-    let mut win_vec: Vec<(usize, Vec<F192>)> = windows.into_iter().collect();
-    parallel::chunks_mut(&mut win_vec, 1, |_, win| {
-        let (w, buf) = &mut win[0];
-        let w = *w;
-        for s in 0..k {
-            let layer = log_d - 1 - s;
-            let bsh = 1usize << s; // pairing distance
-            let block_size = bsh << 1;
-            let nblocks = (1usize << k) / block_size;
-            for jb in 0..nblocks {
-                // global block index = ((w<<k) + jb*block_size) >> (s+1).
-                let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
-                let base = jb * block_size;
-                for r in 0..bsh {
-                    let a = buf[base + r];
-                    let b = buf[base + r + bsh];
-                    let sab = a + b;
-                    buf[base + r] = sab;
-                    buf[base + r + bsh] = sab.mul_base(t) + b;
-                }
-            }
+    let mut blocks: Vec<usize> = Vec::with_capacity(local.len());
+    let mut s = 0;
+    while s < log_d - log_inv_rate {
+        blocks.clear();
+        blocks.extend(local.iter().map(|&p| p >> (s + 1)));
+        blocks.sort_unstable();
+        blocks.dedup();
+        if 2 * (blocks.len() << (s + 1)) > data.len() {
+            break;
         }
-    });
-    win_vec.sort_unstable_by_key(|(w, _)| *w);
-    transpose_dense_rest(ntt, &win_vec, k, log_d, keep, window_log)
-}
-
-/// Rows, as a log, of the cache-resident windows of [`transpose_dense_rest`].
-const TRANSPOSE_WINDOW_LOG: usize = 15;
-
-/// Consecutive residues one gathered group of [`transpose_dense_rest`] takes: eight E values are three whole cache lines.
-const TRANSPOSE_RESIDUES: usize = 8;
-
-/// The dense steps after the sparse prefix, in two sweeps of the buffer.
-///
-/// ```text
-///     window pass:    one task per 2^w-row window, built from the sparse windows inside it,
-///                     every layer whose blocks fit the window run there
-///     gathered pass:  one task per group of rows r + i * 2^w, for 8 consecutive residues r,
-///                     the remaining top layers run in a scratch, layer 0 only for the outputs kept
-/// ```
-fn transpose_dense_rest(
-    ntt: &AdditiveNttF64,
-    windows: &[(usize, Vec<F192>)],
-    k: usize,
-    log_d: usize,
-    keep: usize,
-    window_log: usize,
-) -> Vec<F192> {
-    use crate::ntt::{prefetch, transposed_butterfly_lanes};
-    let n = 1usize << log_d;
-    let w_log = window_log.min(log_d).max(k);
-    let win = 1usize << w_log;
-    // The top layers left after the windows, run as one gathered transform of 2^top rows.
-    let top = log_d - w_log;
-    let as_words = |e: &mut [F192]| {
-        // SAFETY: an F192 is three F64 words with no padding.
-        unsafe { std::slice::from_raw_parts_mut(e.as_mut_ptr().cast::<F64>(), 3 * e.len()) }
-    };
-
-    // SAFETY: the window pass writes every slot before the gathered pass reads it.
-    let mut data = unsafe { primitives::uninit_vec::<F192>(n) };
-    parallel::chunks_mut(&mut data, win, |c, window| {
-        window.fill(F192::ZERO);
-        let base = c << w_log;
-        let first = windows.partition_point(|(w, _)| (*w << k) < base);
-        for (w, buf) in windows[first..].iter().take_while(|(w, _)| (*w << k) < base + win) {
-            window[(*w << k) - base..][..buf.len()].copy_from_slice(buf);
+        let (layer, half) = (log_d - 1 - s, 1usize << s);
+        for &b in &blocks {
+            let (top, bot) = data[2 * b * half..2 * (b + 1) * half].split_at_mut(half);
+            transpose_butterfly_ext(ntt.twiddle(layer, (offset >> (s + 1)) + b), top, bot);
         }
-        // Layers whose blocks fit the window, block sizes 2^(k+1) .. 2^w.
-        for layer in (top..log_d - k).rev() {
-            let block_size = 1usize << (log_d - layer);
-            for (b, block) in window.chunks_mut(block_size).enumerate() {
-                let (lo, hi) = block.split_at_mut(block_size / 2);
-                transposed_butterfly_lanes(
-                    as_words(lo),
-                    as_words(hi),
-                    ntt.twiddle(layer, (base >> (log_d - layer)) + b),
-                );
-            }
-        }
-    });
-    if top == 0 {
-        data.truncate(keep);
-        return data;
+        s += 1;
     }
-    assert!(keep < n, "layer 0 keeps only its top half");
-    // Rows kept from each group: those below `keep`.
-
-    let rows = 1usize << top;
-    let kept_rows = (keep >> w_log).max(1);
-    let group = TRANSPOSE_RESIDUES.min(win);
-    let base = parallel::SendPtr(data.as_mut_ptr());
-    parallel::for_each_chunk(win / group, |lo, hi| {
-        let mut scratch = vec![F192::ZERO; rows * group];
-        for g in lo..hi {
-            let r = g * group;
-            let at = |i: usize| (i << w_log) + r;
-            for (i, dst) in scratch.chunks_exact_mut(group).enumerate() {
-                if i + 8 < rows {
-                    prefetch(base.0.wrapping_add(at(i + 8)).cast::<F64>(), 3 * group);
-                }
-                // SAFETY: the window pass wrote every row, and this group alone owns these residues.
-                dst.copy_from_slice(unsafe { base.slice(at(i), group) });
-            }
-            // Layer `layer` pairs rows 2^(top-1-layer) apart, inside blocks of 2^(top-layer) rows.
-            for layer in (0..top).rev() {
-                let block_rows = 1usize << (top - layer);
-                for (b, block) in scratch.chunks_mut(block_rows * group).enumerate() {
-                    let (lo, hi) = block.split_at_mut(block_rows / 2 * group);
-                    if kept_rows <= block_rows / 2 {
-                        // Every later layer reads only the first `kept_rows` of each block, all in its top
-                        // half, whose output is the sum.
-                        for (a, &b) in lo[..kept_rows * group].iter_mut().zip(hi.iter()) {
-                            *a += b;
-                        }
-                    } else {
-                        transposed_butterfly_lanes(as_words(lo), as_words(hi), ntt.twiddle(layer, b));
-                    }
-                }
-            }
-            for (i, src) in scratch.chunks_exact(group).take(kept_rows).enumerate() {
-                // SAFETY: as above.
-                unsafe { base.slice(at(i), group) }.copy_from_slice(src);
-            }
-        }
-    });
-    data.truncate(keep);
-    data
+    transpose_layers_ext(ntt, data, offset, log_d, (log_inv_rate..log_d - s).rev());
 }
 
 /// `F^T`-based fast path for [`induce_sumcheck_poly`]: scatter per-query
 /// E-weights into the codeword domain, apply `F^T` with K-twiddles, keep the
 /// low `2^log_msg_cols` outputs. Byte-identical output to the dense path
-/// (pinned by `induce_via_ntt_matches_dense`).
-pub(crate) fn induce_sumcheck_poly_via_ntt<T: RowElem>(
+/// (pinned by `induce_via_ntt_matches_dense`). Mirror of
+/// `whir::induce_sumcheck_poly_via_ntt` with the L0 mixed row dot.
+pub(crate) fn induce_sumcheck_poly_via_ntt_base(
     log_msg_cols: usize,
     log_inv_rate: usize,
-    opened_rows: &[Vec<T>],
+    opened_rows: &[Vec<F64>],
     v_challenges: &[F192],
     queries: &[usize],
     weights: &[F192],
 ) -> (Vec<F192>, F192) {
-    let n = 1usize << log_msg_cols;
     let log_block = log_msg_cols + log_inv_rate;
     let block_len = 1usize << log_block;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
-    assert!(queries.iter().all(|&q| q < block_len), "queries lie in the codeword");
 
     let eq = build_eq_table_ext(v_challenges);
     debug_assert_eq!(weights.len(), n_queries);
 
     let mut enforced_sum = F192::ZERO;
     for i in 0..n_queries {
-        enforced_sum += T::dot(&opened_rows[i], &eq) * weights[i];
+        enforced_sum += F64::dot(&opened_rows[i], &eq) * weights[i];
     }
 
-    let mut coeffs = if log_block == 0 {
+    let coeffs = if log_block == 0 {
         // SAFETY: zero is a valid F192, and the loop below reads these slots.
         let mut c = vec![F192::ZERO; block_len];
         for i in 0..n_queries {
@@ -601,61 +507,39 @@ pub(crate) fn induce_sumcheck_poly_via_ntt<T: RowElem>(
         c
     } else {
         let ntt = AdditiveNttF64::standard(log_block);
-        transpose_forward_ntt_sparse_ext(&ntt, queries, weights, log_block, n)
+        transpose_forward_ntt_sparse_ext(&ntt, queries, weights, log_block, log_inv_rate)
     };
-    coeffs.truncate(n);
     (coeffs, enforced_sum)
 }
 
-/// Cost-based dispatch: the dense expansion costs a pass over the `2^log_msg_cols`
-/// outputs per query, the NTT a few passes over the `2^log_inv_rate` times larger
-/// codeword domain, so the NTT wins once a level opens more queries than its blowup.
+/// Query density threshold for choosing the sparse NTT over dense expansion.
+const NTT_QUERIES_PER_BLOWUP: usize = 8;
+
+/// Cost-based dispatch: the NTT overtakes the dense expansion once a level
+/// opens more than [`NTT_QUERIES_PER_BLOWUP`] queries per unit of blowup.
 #[inline]
 pub(crate) fn induce_use_ntt_heuristic(log_msg_cols: usize, log_inv_rate: usize, n_queries: usize) -> bool {
-    log_msg_cols >= 12 && n_queries > 1usize << log_inv_rate
+    log_msg_cols >= 12 && n_queries > NTT_QUERIES_PER_BLOWUP * (1usize << log_inv_rate)
 }
 
 /// Dispatch between the dense [`induce_sumcheck_poly`] and the sparse
-/// [`induce_sumcheck_poly_via_ntt`]. Both paths produce identical output, so a
-/// mis-dispatch only costs time.
-pub(crate) fn induce_sumcheck_poly_auto<T: RowElem>(
+/// [`induce_sumcheck_poly_via_ntt_base`] for L0 (base-field rows). Mirror of
+/// `whir::induce_sumcheck_poly_auto`: in the recursive PCS this fires
+/// only at the top level (large message domain, many queries); deeper levels
+/// stay dense. Both paths produce identical output, so a mis-dispatch only
+/// costs time.
+pub(crate) fn induce_sumcheck_poly_auto_base(
     log_msg_cols: usize,
     log_inv_rate: usize,
     sks_vks: &[F64],
-    opened_rows: &[Vec<T>],
+    opened_rows: &[Vec<F64>],
     v_challenges: &[F192],
     queries: &[usize],
     weights: &[F192],
 ) -> (Vec<F192>, F192) {
     if induce_use_ntt_heuristic(log_msg_cols, log_inv_rate, queries.len()) {
-        induce_sumcheck_poly_via_ntt(log_msg_cols, log_inv_rate, opened_rows, v_challenges, queries, weights)
+        induce_sumcheck_poly_via_ntt_base(log_msg_cols, log_inv_rate, opened_rows, v_challenges, queries, weights)
     } else {
         induce_sumcheck_poly(log_msg_cols, sks_vks, opened_rows, v_challenges, queries, weights)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use primitives::test_rng::Rng;
-
-    /// The sparse transpose against the dense one, with windows small enough to leave a gathered pass.
-    #[test]
-    fn sparse_transpose_matches_dense() {
-        let mut rng = Rng::new(0x7A);
-        for (log_d, window_log, keep_log) in [(13usize, 9usize, 12usize), (14, 11, 11), (12, 12, 11), (16, 8, 15)] {
-            let ntt = AdditiveNttF64::standard(log_d);
-            let n = 1usize << log_d;
-            let positions: Vec<usize> = (0..50).map(|_| rng.next_u64() as usize % n).collect();
-            let values = rng.ext_vec(positions.len());
-            let mut want = vec![F192::ZERO; n];
-            for (&p, &v) in positions.iter().zip(&values) {
-                want[p] += v;
-            }
-            transpose_forward_ntt_ext(&ntt, &mut want, log_d);
-            want.truncate(1 << keep_log);
-            let got = transpose_sparse_windowed(&ntt, &positions, &values, log_d, 1 << keep_log, window_log);
-            assert_eq!(got, want, "log_d={log_d}, window_log={window_log}");
-        }
     }
 }
