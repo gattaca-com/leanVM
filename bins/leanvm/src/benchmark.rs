@@ -3,11 +3,13 @@
 //! signature counts and a blob count; recursion accepts these counts per leaf.
 
 use bench::{Plan, Timing};
+use flux_profiler::timed;
 use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rec_aggregation::{EthereumProof, aggregate, aggregate_with_stats, signers_cache};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use signatures::{lean_sphincs, lean_xmss};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 fn blobs(n: usize, seed: u64) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -142,6 +144,51 @@ pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize
     );
 }
 
+/// The recursion benchmark's children, from `target/children-cache` when a file made
+/// for these parameters and this guest still holds. Only the node step is measured,
+/// so re-proving the children (minutes on one core) is not worth repeating. The name
+/// binds the parameters and the guest's transcript seed (protocol and bytecode); a
+/// file that does not parse, or has a child that fails `verify`, is regenerated.
+#[timed]
+fn cached_children(
+    n: usize,
+    per_leaf: usize,
+    lean_sphincs_per_leaf: usize,
+    blobs_per_leaf: usize,
+    log_inv_rate: usize,
+    prove: impl FnOnce() -> Vec<EthereumProof>,
+) -> Vec<EthereumProof> {
+    let seed = leanvm_core::cpu::fs_seed(rec_aggregation::aggregation::unified_guest());
+    let mut hasher = DefaultHasher::new();
+    (n, per_leaf, lean_sphincs_per_leaf, blobs_per_leaf, log_inv_rate).hash(&mut hasher);
+    seed.iter()
+        .for_each(|word| (word.c0, word.c1, word.c2).hash(&mut hasher));
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/children-cache")
+        .join(format!("recursion_children_{:016x}.bin", hasher.finish()));
+    let load = || -> Option<Vec<EthereumProof>> {
+        let files: Vec<Vec<u8>> = bincode::deserialize(&std::fs::read(&path).ok()?).ok()?;
+        let children: Vec<_> = files
+            .iter()
+            .map(|bytes| EthereumProof::from_bytes(bytes).ok())
+            .collect::<Option<_>>()?;
+        (children.len() == n && children.iter().all(|child| child.verify().is_ok())).then_some(children)
+    };
+    if let Some(children) = load() {
+        return children;
+    }
+    let children = prove();
+    let files: Vec<Vec<u8>> = children.iter().map(EthereumProof::to_bytes).collect();
+    let saved = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, bincode::serialize(&files).expect("serialize children cache")));
+    if let Err(error) = saved {
+        eprintln!("warning: could not write children cache to {}: {error}", path.display());
+    }
+    children
+}
+
 /// Prove `n` leaves with signatures and distinct blob payloads, then aggregate them in one
 /// recursion step and verify the result. The leaves are built once; only the
 /// recursion step is measured.
@@ -178,19 +225,21 @@ pub fn run_recursion(
     let guest_instructions = rec_aggregation::aggregation::unified_guest().code_len();
     let compile_time = started.elapsed();
 
-    let children: Vec<EthereumProof> = (0..n)
-        .map(|k| {
-            aggregate(
-                &[],
-                all[k * per_leaf..(k + 1) * per_leaf].to_vec(),
-                all_lean_sphincs[k * lean_sphincs_per_leaf..(k + 1) * lean_sphincs_per_leaf].to_vec(),
-                &blobs(blobs_per_leaf, k as u64),
-                None,
-                log_inv_rate,
-            )
-            .expect("leaf aggregates")
-        })
-        .collect();
+    let children = cached_children(n, per_leaf, lean_sphincs_per_leaf, blobs_per_leaf, log_inv_rate, || {
+        (0..n)
+            .map(|k| {
+                aggregate(
+                    &[],
+                    all[k * per_leaf..(k + 1) * per_leaf].to_vec(),
+                    all_lean_sphincs[k * lean_sphincs_per_leaf..(k + 1) * lean_sphincs_per_leaf].to_vec(),
+                    &blobs(blobs_per_leaf, k as u64),
+                    None,
+                    log_inv_rate,
+                )
+                .expect("leaf aggregates")
+            })
+            .collect()
+    });
 
     if enable_tracing {
         bench::init_tracing();
