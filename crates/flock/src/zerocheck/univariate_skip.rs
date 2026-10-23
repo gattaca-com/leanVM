@@ -40,6 +40,56 @@ use primitives::field::{F8, F192, phi8_192 as phi8};
 
 pub use primitives::multilinear::eq_table as build_eq;
 
+/// The tail of identical padding blocks, as one weighted block.
+///
+/// A sum over units (a unit is `2^unit_log` witness bits, at most a block) is linear in the eq weights.
+/// The last `n_blocks_log` challenges select the block, so with `r_in` the unit variables inside a block:
+///
+/// ```text
+///     sum over units >= live  =  weight * sum_i eq(r_in, i) F(live + i)
+/// ```
+///
+/// `weight` is the eq mass of the padding blocks, and the sum on the right runs over the first one alone.
+pub struct SharedPadding {
+    /// Units before the first padding block.
+    pub live: usize,
+    /// `eq(r_in, i)` for each unit `i` of a block.
+    pub eq: Vec<F192>,
+    /// `sum_{j >= live_blocks} eq(r_blk, j)`.
+    pub weight: F192,
+}
+
+impl SharedPadding {
+    /// `r_units` holds one challenge per variable of the unit index, low bit first.
+    /// `None` when there is no padding tail, or a block is smaller than a unit.
+    pub fn new(padding: &super::PaddingSpec, unit_log: usize, r_units: &[F192]) -> Option<Self> {
+        let in_log = padding.k_log.checked_sub(unit_log)?;
+        let (r_in, r_blk) = r_units.split_at(in_log);
+        if padding.live_blocks >> r_blk.len() != 0 {
+            return None;
+        }
+        Some(Self {
+            live: padding.live_blocks << in_log,
+            eq: build_eq(r_in),
+            weight: F192::ONE + eq_mass_below(r_blk, padding.live_blocks),
+        })
+    }
+}
+
+/// `sum_{j < k} eq(r, j)` for `k < 2^r.len()`, by one walk down the bits of `k`; the whole cube weighs 1.
+pub fn eq_mass_below(r: &[F192], k: usize) -> F192 {
+    let (mut below, mut prefix) = (F192::ZERO, F192::ONE);
+    for (i, &r) in r.iter().enumerate().rev() {
+        if (k >> i) & 1 == 1 {
+            below += prefix * (F192::ONE + r);
+            prefix *= r;
+        } else {
+            prefix *= F192::ONE + r;
+        }
+    }
+    below
+}
+
 /// Pack a bit vector LSB-first into bytes.
 #[cfg(test)]
 pub fn pack_bits(bits: &[bool]) -> Vec<u8> {
@@ -74,8 +124,13 @@ impl SplitEq {
     pub const MAX_N_HI: usize = 7;
 
     pub fn new(r: &[F192]) -> Self {
+        Self::with_n_hi(r, Self::MAX_N_HI)
+    }
+
+    /// The split with at most `n_hi` variables in the hi half.
+    pub fn with_n_hi(r: &[F192], n_hi: usize) -> Self {
         let n = r.len();
-        let n_hi = n.min(Self::MAX_N_HI);
+        let n_hi = n.min(n_hi);
         let n_lo = n - n_hi;
         Self {
             n_lo,

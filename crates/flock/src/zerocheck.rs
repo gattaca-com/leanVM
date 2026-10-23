@@ -24,16 +24,15 @@ use primitives::field::{F8, F192};
 
 use pcs::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 
-pub mod bit_fold;
+pub use primitives::bit_fold;
 pub mod multilinear;
 pub mod univariate_skip;
 pub mod univariate_skip_optimized;
 
 use bit_fold::BitFold;
 use multilinear::{
-    PackedWitness, bit_round_materialize, bit_round_pair, fold_and_compute_round_pair_into,
-    fold_and_compute_round_single_into, fold_in_place_pair, fold_in_place_single, interpolate_at_z_combined,
-    round_pair_naive, round_single_naive,
+    PackedWitness, Tables, bit_round_materialize, bit_round_pair, fold_in_place_pair, fold_in_place_single,
+    interpolate_at_z_combined, round_pair_naive, round_single_naive,
 };
 use primitives::multilinear::lagrange_weights_naive;
 use univariate_skip_optimized::{
@@ -124,6 +123,28 @@ fn send_round(
     g0 + chi * (g0 + g1 + (F192::ONE + chi) * g_inf)
 }
 
+/// `a` and `b` must hold every block the prover reads.
+///
+/// That is all blocks, or with a padding tail the blocks up to and including the template block `live_blocks`.
+/// A tail needs blocks of at least `2^(k_skip + N_INNER)` bits, so the kernels' units fit within one.
+fn assert_ab_cover(a_len: usize, b_len: usize, m: usize, padding: &PaddingSpec) {
+    let total = (1usize << m) / 8;
+    let tail = padding.live_blocks < 1usize << (m - padding.k_log);
+    let needed = if tail {
+        (padding.live_blocks + 1) << (padding.k_log - 3)
+    } else {
+        total
+    };
+    assert!(
+        !tail || padding.k_log >= K_SKIP + N_INNER,
+        "blocks hold whole round-1 units"
+    );
+    assert!(
+        a_len == b_len && (needed..=total).contains(&a_len),
+        "a, b cover the blocks read"
+    );
+}
+
 /// THE zerocheck prover entry: proves `a·b ⊕ c = 0` over the padded cube,
 /// leaving `(â, b̂, ĉ)` claimed at one point for lincheck to batch.
 #[timed]
@@ -141,10 +162,8 @@ pub fn prove_packed_padded(
         "prove requires m >= k_skip + N_INNER (= {})",
         k_skip + N_INNER
     );
-    let expected_bytes = (1usize << m) / 8;
-    assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
-    assert_eq!(c_packed.len(), expected_bytes);
+    assert_eq!(c_packed.len(), (1usize << m) / 8);
+    assert_ab_cover(a_packed.len(), b_packed.len(), m, padding);
     let n_mlv = m - k_skip;
 
     // ---- Construct the equality tail (with fixed constants in the inner 7 dims) ----
@@ -218,7 +237,7 @@ pub fn prove_packed_padded(
     }
     let materialize_level = mlv_chis.len();
     let fold = BitFold::at_level(&lagrange, &mlv_chis);
-    let ((g1, g_inf), [mut a_mlv, mut b_mlv, mut c_mlv]) =
+    let ((g1, g_inf), [a_mlv, b_mlv, c_mlv]) =
         bit_round_materialize(bits, &fold, &r_rest[materialize_level + 1..], padding);
     c_running = send_round(ps, c_running, r_rest[materialize_level], None, g1, g_inf, &mut mlv_chis);
     drop(span);
@@ -227,73 +246,38 @@ pub fn prove_packed_padded(
     // ---- Remaining rounds, on the stored tables ----
     //
     // Iter i: fold (a, b, c) at ρ_{i+1}, compute the next round's message, sample
-    // ρ_{i+2}. Use the fused parallel path while log_n ≥ 10; below that the
-    // SplitEq inner can't form lo_size ≥ 2, so we fall back to
+    // ρ_{i+2}. The fused rounds run on `Tables` while the folded table fills a group of
+    // 32 positions; below that the tables are written out and we fall back to
     // fold_in_place_* + round_*_naive.
-    //
-    // Ping-pong scratch buffers for the fused path: each fused round folds
-    // (a_mlv, b_mlv, c_mlv) of size N into size N/2. Rather than allocating a
-    // fresh buffer per round, we alternate between persistent ones, one per
-    // folded table. Scratch capacity = N/2 (the largest fused output); only
-    // needed when the first round is actually fused.
-    let n_in = a_mlv.len();
-    let (mut a_nxt, mut b_nxt, mut c_nxt) = if n_in >= 1024 {
-        // SAFETY (x3): the fused rounds below write every slot they read; a
-        // buffer is only ever read over the prefix a round just wrote.
-        unsafe {
-            (
-                primitives::uninit_vec::<F192>(n_in / 2),
-                primitives::uninit_vec::<F192>(n_in / 2),
-                primitives::uninit_vec::<F192>(n_in / 2),
-            )
-        }
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
-    };
+    let mut tables = Tables::new([a_mlv, b_mlv, c_mlv], n_mlv - materialize_level, m, padding);
+    let mut dense = (!tables.can_fold()).then(|| tables.dense());
 
     for i in materialize_level..(n_mlv - 1) {
         let chi_prev = mlv_chis[i];
-        let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
         // The eq weights of the variables the next round does not bind.
         let r_eq = &r_rest[i + 2..];
 
-        let (m1, mi) = if log_n_before >= 10 {
-            let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..half],
-                &mut b_nxt[..half],
-                chi_prev,
-                r_eq,
-            );
-            let m1c = fold_and_compute_round_single_into(&c_mlv, &mut c_nxt[..half], chi_prev, r_eq);
-            // Swap current <-> scratch, then shrink the new current to the
-            // folded size. The old (larger) buffer becomes scratch; we only
-            // ever write its leading `half` slots next round, so its stale
-            // length is harmless.
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
-            std::mem::swap(&mut c_mlv, &mut c_nxt);
-            a_mlv.truncate(half);
-            b_mlv.truncate(half);
-            c_mlv.truncate(half);
-            (m1 + m1c, mi)
-        } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, chi_prev);
-            fold_in_place_single(&mut c_mlv, chi_prev);
-            let (m1, mi) = round_pair_naive(&a_mlv, &b_mlv, r_eq);
-            (m1 + round_single_naive(&c_mlv, r_eq), mi)
+        let (m1, mi) = match dense.as_mut() {
+            None => {
+                let message = tables.fold_round(chi_prev, r_eq);
+                dense = (!tables.can_fold()).then(|| tables.dense());
+                message
+            }
+            Some([a, b, c]) => {
+                fold_in_place_pair(a, b, chi_prev);
+                fold_in_place_single(c, chi_prev);
+                let (m1, mi) = round_pair_naive(a, b, r_eq);
+                (m1 + round_single_naive(c, r_eq), mi)
+            }
         };
 
         let r = r_rest[i + 1];
         let g0 = (r == F192::ONE).then(|| {
             // happens only with probability 2^(-192). We keep it for completeness, but not strictly necessary in the real world
+            let [a, b, c] = dense.clone().unwrap_or_else(|| tables.dense());
             let eq = primitives::multilinear::eq_table(r_eq);
-            (0..eq.len()).fold(F192::ZERO, |acc, x| {
-                acc + eq[x] * (a_mlv[2 * x] * b_mlv[2 * x] + c_mlv[2 * x])
-            })
+            (0..eq.len()).fold(F192::ZERO, |acc, x| acc + eq[x] * (a[2 * x] * b[2 * x] + c[2 * x]))
         });
         c_running = send_round(ps, c_running, r, g0, m1, mi, &mut mlv_chis);
     }
@@ -302,6 +286,7 @@ pub fn prove_packed_padded(
     //
     // Only a and b are bound: ĉ comes from the terminal identity below, so
     // `c_mlv`'s last fold would be work for a value nobody reads.
+    let [mut a_mlv, mut b_mlv, _] = dense.expect("the tables end below the fused size");
     let chi_last = *mlv_chis.last().expect("at least one ρ sampled");
     fold_in_place_pair(&mut a_mlv, &mut b_mlv, chi_last);
     debug_assert_eq!(a_mlv.len(), 1);
@@ -421,7 +406,7 @@ mod tests {
     /// sides read off the terminal identity.
     #[test]
     fn claims_are_true_evaluations() {
-        // 16 and 17 reach the fused single-table kernel (gated on log_n ≥ 10),
+        // 16 and 17 reach the fused single-table kernel (gated on `Tables::can_fold`),
         // which the smaller sizes never touch.
         for &m in &[13usize, 14, 15, 16, 17] {
             let mut rng = Rng::new(2024 + m as u64);
@@ -469,6 +454,41 @@ mod tests {
                     && claim.c_eval == quirky_eval(&c, claim.z, chi);
                 assert!(!all_true, "false statement (m={m}, seed={seed}) left every claim true");
             }
+        }
+    }
+
+    /// **A tail of identical blocks is folded once.** Every block from `live_blocks` on repeats that one, as the
+    /// hash witness's padding does, and the prover must leave the same proof and claim as with every block live.
+    /// The shortened `a` and `b` of the tail runs hold no block past the first of the tail.
+    #[test]
+    fn identical_tail_blocks_leave_the_same_proof() {
+        let (k_log, m) = (14usize, 18usize);
+        let (n_blocks, block_bits) = (1usize << (m - k_log), 1usize << k_log);
+        for live_blocks in [0usize, 1, 5, 11, 15] {
+            let mut rng = Rng::new(0x7A11 + live_blocks as u64);
+            let [mut a, mut b] = [(); 2].map(|()| rng.bits(1 << m));
+            let mut c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            for x in [&mut a, &mut b, &mut c] {
+                x.chunks_mut(block_bits).for_each(|block| block[16_000..].fill(false));
+                for j in live_blocks + 1..n_blocks {
+                    x.copy_within(live_blocks * block_bits..(live_blocks + 1) * block_bits, j * block_bits);
+                }
+            }
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            // With a tail, `a` and `b` stop after the template block; `c` stays whole.
+            let run = |live_blocks: usize| {
+                let padding = PaddingSpec {
+                    k_log,
+                    useful_bits_per_block: 16_000,
+                    live_blocks,
+                };
+                let ab_len = ((live_blocks + 1) * block_bits / 8).min(c_p.len());
+                let mut ps = fiat_shamir::transcript::ProverState::from_label(b"flock-test-v0");
+                let claim = prove_packed_padded(&a_p[..ab_len], &b_p[..ab_len], &c_p, m, &padding, &mut ps);
+                (claim, ps.into_proof().stream)
+            };
+            assert_eq!(run(live_blocks), run(n_blocks), "live_blocks={live_blocks}");
         }
     }
 

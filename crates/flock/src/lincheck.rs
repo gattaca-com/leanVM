@@ -616,6 +616,13 @@ const GFNI_TILE: usize = 8;
 ///
 /// One register is 64 consecutive `i_inner` of a stripe, already byte-sliced.
 /// So a stripe costs 24 affine products per 64 outputs, into accumulators kept byte-sliced until the end.
+///
+/// **Whole tiles of identical blocks fold once.** Every block from `live_blocks` on repeats block `live_blocks`.
+/// Tiles are folded up to the first one starting at or past `live_blocks`, which stands for the rest:
+///
+/// ```text
+///     sum over blocks j >= first of eq_outer[j] z(j, i)  =  W z(first, i),    W = sum_{j >= first} eq_outer[j]
+/// ```
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "gfni",
@@ -627,13 +634,14 @@ fn partial_fold_packed_z_gfni(
     m: usize,
     k_log: usize,
     useful_bits: usize,
+    live_blocks: usize,
     eq_outer: &[F192],
 ) -> Vec<F192> {
     use crate::zerocheck::bit_fold::gfni::{OUT_BYTES, store_f192, weight_matrices};
     use core::arch::x86_64::*;
 
     let (k, n_stripes) = (1usize << k_log, 1usize << (m - k_log - 3));
-    assert_eq!(z_packed.len(), n_stripes * k);
+    assert!(z_packed.len() >= stripes_read(m, k_log, live_blocks) * k);
     assert_eq!(eq_outer.len(), 8 * n_stripes);
     assert!(
         k >= 64 && n_stripes.is_multiple_of(GFNI_TILE),
@@ -641,10 +649,12 @@ fn partial_fold_packed_z_gfni(
     );
     // Rows past `useful_bits` are honest zeros; a group straddling the boundary folds them in harmlessly.
     let groups = useful_bits.div_ceil(64);
+    let n_tiles = n_stripes / GFNI_TILE;
+    let live_tiles = live_blocks.div_ceil(8 * GFNI_TILE).clamp(1, n_tiles);
 
     // One byte-sliced accumulator per worker, one tile of stripes per task.
     let acc = parallel::map_reduce_with_state(
-        n_stripes / GFNI_TILE,
+        live_tiles,
         || (),
         // SAFETY: an all-zero bit pattern is a valid register value.
         || vec![unsafe { core::mem::zeroed::<[__m512i; OUT_BYTES]>() }; groups],
@@ -697,19 +707,53 @@ fn partial_fold_packed_z_gfni(
         // SAFETY: as above.
         unsafe { store_f192(acc, out) };
     }
+    if live_tiles < n_tiles {
+        let first = 8 * GFNI_TILE * live_tiles;
+        let weight = eq_outer[first..].iter().fold(F192::ZERO, |sum, &e| sum + e);
+        // Bit 0 of a stripe byte is the first block's.
+        for (out, &byte) in out.iter_mut().zip(&z_packed[live_tiles * GFNI_TILE * k..][..k]) {
+            let mask = 0u64.wrapping_sub(u64::from(byte & 1));
+            *out += F192::new(weight.c0 & mask, weight.c1 & mask, weight.c2 & mask);
+        }
+    }
     out
+}
+
+/// The stripes at the front of `z_packed` that [`prove_padded_capture_s_hat_v`] reads, for blocks from
+/// `live_blocks` on repeating block `live_blocks`, in a witness of `m` variables.
+///
+/// The GFNI fold stops one stripe past its live tiles. The others read every stripe.
+/// A shorter `z_packed` is therefore enough, and the producer need not write the repeats.
+pub fn stripes_read(m: usize, k_log: usize, live_blocks: usize) -> usize {
+    let n_stripes = 1usize << (m - k_log - 3);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    if k_log >= 6 && n_log_ok_for_tile(m, k_log, GFNI_TILE) {
+        let live_tiles = live_blocks.div_ceil(8 * GFNI_TILE).clamp(1, n_stripes / GFNI_TILE);
+        return (live_tiles * GFNI_TILE + 1).min(n_stripes);
+    }
+    let _ = live_blocks;
+    n_stripes
 }
 
 /// Dispatch helper: pick the fastest single-matrix partial fold available
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
 /// the dense path on honestly-padded witnesses).
+///
+/// Blocks from `live_blocks` on repeat block `live_blocks`, which the GFNI fold uses to fold them once.
+/// The other folds read every block.
 #[timed]
 fn partial_fold_packed_z_best(
     z_packed: &[u8],
     m: usize,
     k_log: usize,
     useful_bits: usize,
+    live_blocks: usize,
     eq_outer: &[F192],
 ) -> Vec<F192> {
     #[cfg(all(
@@ -719,7 +763,7 @@ fn partial_fold_packed_z_best(
         target_feature = "avx512vbmi"
     ))]
     if k_log >= 6 && n_log_ok_for_tile(m, k_log, GFNI_TILE) {
-        return partial_fold_packed_z_gfni(z_packed, m, k_log, useful_bits, eq_outer);
+        return partial_fold_packed_z_gfni(z_packed, m, k_log, useful_bits, live_blocks, eq_outer);
     }
     if n_log_ok_for_tile(m, k_log, NEON_TILE_T) {
         #[cfg(any(
@@ -998,6 +1042,9 @@ fn sumcheck_bind_both_and_eval_next(comb: &mut Vec<F192>, z: &mut Vec<F192>, r: 
 /// The lincheck prover. Its claim retains the transmitted post-sumcheck
 /// `z_partial`, which is exactly the AB claim's 64-entry ring-switch `s_hat_v`.
 /// The opening reuses it without a second witness scan or transmission.
+///
+/// Blocks from `live_blocks` on repeat block `live_blocks`, so the partial fold may read them once.
+/// Pass the block count when none repeat. `z_packed` may then stop after [`stripes_read`] stripes.
 #[timed]
 pub fn prove_padded_capture_s_hat_v(
     z_packed: &[u8],
@@ -1005,6 +1052,7 @@ pub fn prove_padded_capture_s_hat_v(
     k_log: usize,
     k_skip: usize,
     useful_bits: usize,
+    live_blocks: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
     ps: &mut ProverState,
@@ -1051,7 +1099,14 @@ pub fn prove_padded_capture_s_hat_v(
     let mut z_vec = tracing::info_span!("Partial fold").in_scope(|| {
         let mut eq_x_outer = build_eq(&x_ab.x_outer);
         eq_x_outer.resize(eq_x_outer.len().max(8), F192::ZERO);
-        partial_fold_packed_z_best(z_packed, k_log + n_log.max(3), k_log, useful_bits, &eq_x_outer)
+        partial_fold_packed_z_best(
+            z_packed,
+            k_log + n_log.max(3),
+            k_log,
+            useful_bits,
+            live_blocks,
+            &eq_x_outer,
+        )
     });
 
     let span = tracing::info_span!("Sumcheck").entered();
@@ -1131,7 +1186,7 @@ mod tests {
         x_ab: &QuirkyPoint,
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> LincheckClaim {
-        prove_padded_capture_s_hat_v(z_packed, m, k_log, k_skip, 1 << k_log, circuit, x_ab, ps)
+        prove_padded_capture_s_hat_v(z_packed, m, k_log, k_skip, 1 << k_log, usize::MAX, circuit, x_ab, ps)
     }
 
     /// Test shim: the padded fast fold with a dense (no-padding) block.
@@ -1278,29 +1333,44 @@ mod tests {
     /// Whichever fold the dispatch picks on this target matches the scalar reference, dense and padded.
     #[test]
     fn partial_fold_best_matches_serial() {
-        // (m, k_log, useful_bits): small shapes on the untiled fallback, then tiled ones, padded included.
-        let cases: &[(usize, usize, usize)] = &[
-            (10, 3, 1 << 3),
-            (14, 5, 1 << 5),
-            (16, 8, 1 << 8),
-            (18, 10, 1 << 10),
-            (20, 10, 597),
-            (20, 14, 15_409),
-            (21, 14, 16_000),
+        // (m, k_log, useful_bits, live_blocks): small shapes on the untiled fallback, then tiled ones, padded included.
+        // The blocks from `live_blocks` on repeat that block; `usize::MAX` repeats none.
+        let cases: &[(usize, usize, usize, usize)] = &[
+            (10, 3, 1 << 3, usize::MAX),
+            (14, 5, 1 << 5, usize::MAX),
+            (16, 8, 1 << 8, usize::MAX),
+            (18, 10, 1 << 10, usize::MAX),
+            (20, 10, 597, usize::MAX),
+            (20, 14, 15_409, usize::MAX),
+            (21, 14, 16_000, usize::MAX),
+            // Tails: inside a tile, on a tile boundary, in the last tile, from block 0, and none (the block count).
+            (21, 14, 16_000, 100),
+            (21, 14, 15_409, 64),
+            (21, 14, 16_000, 65),
+            (21, 14, 16_000, 127),
+            (21, 14, 16_000, 128),
+            (21, 14, 16_000, 0),
+            (22, 14, 15_409, 70),
         ];
-        for &(m, k_log, useful_bits) in cases {
+        for &(m, k_log, useful_bits, live_blocks) in cases {
             let k = 1usize << k_log;
-            let mut rng = Rng::new(0xF01D + (m * 31 + useful_bits) as u64);
+            let mut rng = Rng::new(0xF01D + (m * 31 + useful_bits).wrapping_add(live_blocks) as u64);
             let mut z = rng.bits(1 << m);
             // Honest padding: zero rows [useful, k) of every block.
             for block in z.chunks_mut(k) {
                 block[useful_bits..].fill(false);
             }
+            for j in live_blocks.saturating_add(1)..1usize << (m - k_log) {
+                z.copy_within(live_blocks * k..(live_blocks + 1) * k, j * k);
+            }
             let z_packed = pack_z_lincheck(&z, m, k_log);
             let eq = build_eq(&rng.ext_vec(m - k_log));
             let serial = partial_fold_packed_z(&z_packed, m, k_log, &eq);
-            let best = partial_fold_packed_z_best(&z_packed, m, k_log, useful_bits, &eq);
-            assert_eq!(serial, best, "m={m} k_log={k_log} useful={useful_bits}");
+            let best = partial_fold_packed_z_best(&z_packed, m, k_log, useful_bits, live_blocks, &eq);
+            assert_eq!(
+                serial, best,
+                "m={m} k_log={k_log} useful={useful_bits} live={live_blocks}"
+            );
         }
     }
 

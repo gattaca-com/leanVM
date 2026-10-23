@@ -12,6 +12,9 @@ pub const PACKING_WIDTH: usize = 1 << LOG_PACKING;
 pub struct PaddingSpec {
     pub k_log: usize,
     pub useful_bits_per_block: usize,
+    /// Blocks from this index on copy block `live_blocks` bit for bit, so a prover computes that block once.
+    /// At least the block count when there is no such tail.
+    pub live_blocks: usize,
 }
 
 impl PaddingSpec {
@@ -20,6 +23,7 @@ impl PaddingSpec {
         Self {
             k_log: m,
             useful_bits_per_block: 1usize << m,
+            live_blocks: 1,
         }
     }
 }

@@ -39,7 +39,7 @@ use primitives::field::{F8, F192, PHI_8_TABLE_192 as PHI_8_TABLE, phi8_192 as ph
 
 #[cfg(test)]
 use super::univariate_skip::pack_bits;
-use super::univariate_skip::{SplitEq, ntt_extend_vec};
+use super::univariate_skip::{SharedPadding, SplitEq, ntt_extend_vec};
 use super::{K_SKIP, N_INNER, PaddingSpec};
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,9 @@ use super::{K_SKIP, N_INNER, PaddingSpec};
 const ELL: usize = 64;
 const N_CHUNKS: usize = 8;
 const N_MEDIUM: usize = 4;
+
+/// Variables of the `x_outer` index that pick a task; the rest index its weights.
+const X_HI_VARS: usize = 9;
 
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
@@ -430,57 +433,56 @@ fn shift_reduce_inner_ab_fused_neon(
     }
 }
 
-/// Dispatch helper: picks the fused NEON kernel when available, otherwise scalar.
+/// Dispatch helper: the medium windows `0..rows.len()` of one `x_outer`, one `shift_reduce` row each.
+/// Picks the fused NEON kernel when available, otherwise scalar.
 #[inline]
-fn shift_reduce_inner_ab(
+fn shift_reduce_ab(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
+    rows: &mut [[u8; 64]],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        shift_reduce_inner_ab_fused_neon(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out);
-    }
     #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw"))]
     {
         // SAFETY: gfni and avx512bw are statically enabled at compile time.
-        unsafe { shift_reduce_inner_ab_gfni_512(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out) };
+        unsafe { shift_reduce_ab_gfni_512(a_packed, b_packed, inv_table, chunk_byte_base, rows) };
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "gfni", not(target_feature = "avx512bw")))]
-    {
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw")))]
+    for (b_med, out) in rows.iter_mut().enumerate() {
+        #[cfg(target_arch = "aarch64")]
+        shift_reduce_inner_ab_fused_neon(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out);
+        #[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
         // SAFETY: gfni is statically enabled at compile time.
-        unsafe { shift_reduce_inner_ab_gfni(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out) };
-    }
-    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "gfni"))))]
-    {
+        unsafe {
+            shift_reduce_inner_ab_gfni(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out)
+        };
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "gfni"))))]
         shift_reduce_inner_ab_scalar(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out);
     }
 }
 
-/// The GFNI kernel one register wide: `ELL` is 64, so the whole column is one
-/// ZMM and the combine issues a quarter of the instructions the 128-bit arm
-/// does. Byte unpacking and `packus` both work within 128-bit lanes and are
-/// exact inverses there, so the widened accumulators may sit in a different
-/// order than the narrow arm's and still narrow back to the same bytes.
+/// The GFNI kernel one register wide: `ELL` is 64, so the whole column is one ZMM.
+///
+/// `sum_K x^K y_K` is a Horner chain in F_8, one `gf2p8mulb` by `x` per step,
+/// so no widening and no final reduction are needed.
 ///
 /// # Safety
 /// Requires the `gfni` and `avx512bw` target features.
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw"))]
 #[target_feature(enable = "gfni", enable = "avx512f", enable = "avx512bw")]
-unsafe fn shift_reduce_inner_ab_gfni_512(
+unsafe fn shift_reduce_ab_gfni_512(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
+    rows: &mut [[u8; 64]],
 ) {
     use core::arch::x86_64::*;
 
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    // One window reads `N_CHUNKS * 8` bytes of each of `a` and `b`.
+    let end = chunk_byte_base + rows.len() * N_CHUNKS * 8;
+    let (a_packed, b_packed) = (&a_packed[chunk_byte_base..end], &b_packed[chunk_byte_base..end]);
     // `inv_table.apply` overwrites every lane, so these need no re-zeroing per K.
     let mut a_col = [F8::ZERO; ELL];
     let mut b_col = [F8::ZERO; ELL];
@@ -488,42 +490,23 @@ unsafe fn shift_reduce_inner_ab_gfni_512(
     // SAFETY: the target features are carried by the function; the loads and
     // stores stay within a_col/b_col/out, each exactly `ELL` bytes.
     unsafe {
-        let (mut acc_lo, mut acc_hi) = (_mm512_setzero_si512(), _mm512_setzero_si512());
-        let zero = _mm512_setzero_si512();
-
-        for k in 0..8 {
-            let chunk_off = byte_base_b + k * N_CHUNKS;
-            inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], &mut a_col);
-            inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], &mut b_col);
-            let y = _mm512_gf2p8mul_epi8(
-                _mm512_loadu_si512(a_col.as_ptr().cast()),
-                _mm512_loadu_si512(b_col.as_ptr().cast()),
-            );
-            let shift = _mm_cvtsi32_si128(k as i32);
-            acc_lo = _mm512_xor_si512(acc_lo, _mm512_sll_epi16(_mm512_unpacklo_epi8(y, zero), shift));
-            acc_hi = _mm512_xor_si512(acc_hi, _mm512_sll_epi16(_mm512_unpackhi_epi8(y, zero), shift));
+        let x = _mm512_set1_epi8(2);
+        let windows = a_packed
+            .chunks_exact(N_CHUNKS * 8)
+            .zip(b_packed.chunks_exact(N_CHUNKS * 8));
+        for (out, (a, b)) in rows.iter_mut().zip(windows) {
+            let mut acc = _mm512_setzero_si512();
+            for k in (0..8).rev() {
+                inv_table.apply(&a[k * N_CHUNKS..][..N_CHUNKS], &mut a_col);
+                inv_table.apply(&b[k * N_CHUNKS..][..N_CHUNKS], &mut b_col);
+                let y = _mm512_gf2p8mul_epi8(
+                    _mm512_loadu_si512(a_col.as_ptr().cast()),
+                    _mm512_loadu_si512(b_col.as_ptr().cast()),
+                );
+                acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), y);
+            }
+            _mm512_storeu_si512(out.as_mut_ptr().cast(), acc);
         }
-
-        // Vectorized gf8_reduce over u16 lanes: two-step fold of the high byte
-        // h with h ^ (h<<1) ^ (h<<3) ^ (h<<4)  (x^8 = x^4+x^3+x+1).
-        let mask_ff = _mm512_set1_epi16(0xff);
-        let fold = |p: __m512i| -> __m512i {
-            let h = _mm512_srli_epi16::<8>(p);
-            _mm512_xor_si512(
-                _mm512_and_si512(p, mask_ff),
-                _mm512_xor_si512(
-                    _mm512_xor_si512(h, _mm512_slli_epi16::<1>(h)),
-                    _mm512_xor_si512(_mm512_slli_epi16::<3>(h), _mm512_slli_epi16::<4>(h)),
-                ),
-            )
-        };
-        // Two folds bring 15-bit accumulators down to 8 bits; the second fold's
-        // high byte is at most 0x0f, so lanes stay below 256 for `packus`.
-        let reduce = |p: __m512i| _mm512_and_si512(fold(fold(p)), mask_ff);
-        _mm512_storeu_si512(
-            out.as_mut_ptr().cast(),
-            _mm512_packus_epi16(reduce(acc_lo), reduce(acc_hi)),
-        );
     }
 }
 
@@ -645,6 +628,15 @@ fn shift_reduce_inner_ab_scalar(
 // The map from the 16 bytes of a lane to F192 is GF(2)-linear.
 // ---------------------------------------------------------------------------
 
+/// What an `x_outer` weighs, as `Convert::accumulate` takes it: `eq_lo` itself.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+)))]
+type Weights = F192;
+
 /// The per-`x_hi` sums of one worker, one per lane for `A B` and for `C`.
 #[cfg(not(all(
     target_arch = "x86_64",
@@ -671,9 +663,13 @@ impl Convert {
         }
     }
 
+    fn weights(eq_lo: F192) -> Weights {
+        eq_lo
+    }
+
     /// Add one `x_outer`'s medium bytes, one 64-lane row per medium position, at weight `eq_lo`.
     #[inline(always)]
-    fn accumulate(&mut self, ab: &[[u8; 64]], c: &[[u8; 64]], eq_lo: F192) {
+    fn accumulate(&mut self, ab: &[[u8; 64]], c: &[[u8; 64]], eq_lo: &Weights) {
         let convert = convert_table();
         for lane in 0..ELL {
             let mut cf_ab = F192::ZERO;
@@ -682,8 +678,8 @@ impl Convert {
                 cf_ab += row[ab[lane] as usize];
                 cf_c += row[c[lane] as usize];
             }
-            self.ab[lane] += cf_ab * eq_lo;
-            self.c[lane] += cf_c * eq_lo;
+            self.ab[lane] += cf_ab * *eq_lo;
+            self.c[lane] += cf_c * *eq_lo;
         }
     }
 
@@ -694,13 +690,21 @@ impl Convert {
 
 /// The per-`x_hi` sums of one worker, byte-sliced: register `o` holds byte `o` of every lane's sum.
 ///
-/// The weight `eq_lo` rides the GFNI matrices, rebuilt for each `x_outer`:
+/// The weight `eq_lo` rides the GFNI matrices, built once per `x_outer` position and shared by every `x_hi`:
 ///
 /// ```text
 ///     w[b][s] = (gamma^b * eq_lo) * phi_8(2^s)        phi_8(2^s) lies in the GF(2^64) base field
 /// ```
 ///
-/// So an `x_outer` costs 16 products and 16 mixed products, not a product per lane.
+/// So an `x_outer` position costs 16 products and 16 mixed products, not a product per lane.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+type Weights = [[u64; 24]; N_MEDIUM_VALUES];
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "gfni",
@@ -724,17 +728,9 @@ impl Convert {
         unsafe { core::mem::zeroed() }
     }
 
-    /// Add one `x_outer`'s medium bytes, one 64-lane row per medium position, at weight `eq_lo`.
-    #[inline(always)]
-    fn accumulate(&mut self, ab: &[[u8; 64]], c: &[[u8; 64]], eq_lo: F192) {
-        // SAFETY: the module is compiled only with these target features enabled.
-        unsafe { self.accumulate_gfni(ab, c, eq_lo) }
-    }
-
-    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "gfni")]
-    fn accumulate_gfni(&mut self, ab: &[[u8; 64]], c: &[[u8; 64]], eq_lo: F192) {
+    /// The matrices of the weights `(gamma^b eq_lo) phi_8(2^s)`, for each medium position `b`.
+    fn weights(eq_lo: F192) -> Weights {
         use crate::zerocheck::bit_fold::gfni::weight_matrices;
-        use core::arch::x86_64::*;
         use primitives::field::{F64, mul_base8, mul4};
 
         // phi_8 of the unit bytes, as base-field scalars.
@@ -747,21 +743,34 @@ impl Convert {
             })
         });
 
-        // Matrices of medium position b: the weights (gamma^b eq_lo) phi_8(2^s).
-        let gamma = gamma_powers();
         let mut matrices = [[0u64; 24]; N_MEDIUM_VALUES];
+        let gamma = gamma_powers();
         for (quad, m) in gamma.as_chunks::<4>().0.iter().zip(matrices.as_chunks_mut::<4>().0) {
             let t = mul4(*quad, [eq_lo; 4]);
             for (t, m) in t.iter().zip(m) {
-                *m = weight_matrices(&mul_base8(*t, *units));
+                // SAFETY: the module is compiled only with these target features enabled.
+                *m = unsafe { weight_matrices(&mul_base8(*t, *units)) };
             }
         }
+        matrices
+    }
+
+    /// Add one `x_outer`'s medium bytes, one 64-lane row per medium position, at its `weights`.
+    #[inline(always)]
+    fn accumulate(&mut self, ab: &[[u8; 64]], c: &[[u8; 64]], weights: &Weights) {
+        // SAFETY: the module is compiled only with these target features enabled.
+        unsafe { self.accumulate_gfni(ab, c, weights) }
+    }
+
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "gfni")]
+    fn accumulate_gfni(&mut self, ab: &[[u8; 64]], c: &[[u8; 64]], matrices: &Weights) {
+        use core::arch::x86_64::*;
 
         // Eight output bytes at a time keep sixteen accumulators in registers.
         for g in 0..3 {
             let mut acc_ab: [__m512i; 8] = std::array::from_fn(|l| self.ab[8 * g + l]);
             let mut acc_c: [__m512i; 8] = std::array::from_fn(|l| self.c[8 * g + l]);
-            for ((ab, c), m) in ab.iter().zip(c).zip(&matrices) {
+            for ((ab, c), m) in ab.iter().zip(c).zip(matrices) {
                 // SAFETY: each row is 64 bytes.
                 let (xa, xc) = unsafe {
                     (
@@ -831,7 +840,7 @@ impl WorkerState {
 fn accumulate_x_outer<const FULL: bool>(
     n_b_med: usize,
     chunk_byte_base: usize,
-    eq_lo_val: F192,
+    weights: &Weights,
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
@@ -840,15 +849,14 @@ fn accumulate_x_outer<const FULL: bool>(
 ) {
     let n_b_med = if FULL { 1 << N_MEDIUM } else { n_b_med };
 
+    shift_reduce_ab(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        &mut state.chunk_ab_bytes[..n_b_med],
+    );
     for b_med in 0..n_b_med {
-        shift_reduce_inner_ab(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            &mut state.chunk_ab_bytes[b_med],
-        );
         let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
         let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
             .try_into()
@@ -861,46 +869,43 @@ fn accumulate_x_outer<const FULL: bool>(
     state.partials.accumulate(
         &state.chunk_ab_bytes[..n_b_med],
         &state.chunk_c_bytes[..n_b_med],
-        eq_lo_val,
+        weights,
     );
 }
 
-/// Process one outer value.
+/// Process `n` consecutive outer values from `first`, weighted by `eq_lo_scaled` from its start.
 #[inline]
 fn process_one_x_hi(
-    x_hi: usize,
-    big_lo_size: usize,
-    n_lo_and_inner: usize,
+    first: usize,
+    n: usize,
     within_outer_mask: usize,
     b_med_counts: &[u8],
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
-    eq_lo_scaled: &[F192],
+    weights: &[Weights],
     eq_hi_val: F192,
     state: &mut WorkerState,
 ) {
     state.partials = Convert::new();
 
-    let n_lo = n_lo_and_inner - N_INNER;
-
-    for x_outer_lo in 0..big_lo_size {
-        let x_outer = x_outer_lo | (x_hi << n_lo);
+    for x_outer_lo in 0..n {
+        let x_outer = first + x_outer_lo;
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
         }
 
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let eq_lo_val = eq_lo_scaled[x_outer_lo];
+        let chunk_byte_base = (x_outer << N_INNER) * N_CHUNKS;
+        let weights = &weights[x_outer_lo];
 
         if n_b_med == (1 << N_MEDIUM) {
             accumulate_x_outer::<true>(
                 n_b_med,
                 chunk_byte_base,
-                eq_lo_val,
+                weights,
                 a_packed,
                 b_packed,
                 c_packed,
@@ -911,7 +916,7 @@ fn process_one_x_hi(
             accumulate_x_outer::<false>(
                 n_b_med,
                 chunk_byte_base,
-                eq_lo_val,
+                weights,
                 a_packed,
                 b_packed,
                 c_packed,
@@ -992,41 +997,55 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
         k_skip + N_INNER
     );
     let total_bytes = (1usize << m) / 8;
-    assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
     assert_eq!(c_packed.len(), total_bytes);
+    super::assert_ab_cover(a_packed.len(), b_packed.len(), m, padding);
     assert_eq!(r_rest.len(), m - k_skip);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEq::new(&r_rest[N_INNER..]);
+    let eq = SplitEq::with_n_hi(&r_rest[N_INNER..], X_HI_VARS);
     let big_lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    let n_lo_and_inner = eq.n_lo + N_INNER;
 
     let d_inv_val = d_inv();
-    let eq_lo_scaled: Vec<F192> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let weights_of =
+        |eq: &[F192]| -> Vec<Weights> { parallel::map_collect(eq.len(), |i| Convert::weights(eq[i] * d_inv_val)) };
+    let lo_weights = weights_of(&eq.lo);
     let eq_hi = &eq.hi;
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
+    // The padding blocks past the live ones are one block of outer values, folded once and weighted.
+    let shared = SharedPadding::new(padding, K_SKIP + N_INNER, &r_rest[N_INNER..]);
+    let (live_outer, shared_weights) = match &shared {
+        Some(s) => (s.live, weights_of(&s.eq)),
+        None => (eq_hi.len() * big_lo_size, Vec::new()),
+    };
+    let n_live_tasks = live_outer.div_ceil(big_lo_size);
+
     // One `WorkerState` per worker (it carries multi-KB scratch), folded over the
     // `x_hi` values that worker claims and combined at the end.
     let (res_ab, res_c_s) = parallel::fold_reduce(
-        hi_size,
+        n_live_tasks + shared.is_some() as usize,
         WorkerState::new,
         |state, x_hi| {
-            let eq_hi_val = eq_hi[x_hi];
+            let (first, n, weights, eq_hi_val) = match &shared {
+                Some(s) if x_hi == n_live_tasks => (live_outer, s.eq.len(), &shared_weights, s.weight),
+                _ => (
+                    x_hi * big_lo_size,
+                    (live_outer - x_hi * big_lo_size).min(big_lo_size),
+                    &lo_weights,
+                    eq_hi[x_hi],
+                ),
+            };
             process_one_x_hi(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
+                first,
+                n,
                 within_outer_mask,
                 &b_med_counts,
                 a_packed,
                 b_packed,
                 c_packed,
                 inv_table,
-                &eq_lo_scaled,
+                weights,
                 eq_hi_val,
                 state,
             );
@@ -1063,7 +1082,7 @@ mod tests {
             let ab: Vec<[u8; 64]> = (0..n).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
             let c: Vec<[u8; 64]> = (0..n).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
             let eq = rng.ext();
-            partials.accumulate(&ab, &c, eq);
+            partials.accumulate(&ab, &c, &Convert::weights(eq));
             for lane in 0..ELL {
                 let conv = |rows: &[[u8; 64]]| {
                     rows.iter()
@@ -1098,7 +1117,7 @@ mod tests {
             let mut out_scalar = [0u8; 64];
             shift_reduce_inner_ab_scalar(&a_packed, &b_packed, &inv_table, 0, 0, &mut out_scalar);
             let mut out_gfni = [0u8; 64];
-            shift_reduce_inner_ab(&a_packed, &b_packed, &inv_table, 0, 0, &mut out_gfni);
+            shift_reduce_ab(&a_packed, &b_packed, &inv_table, 0, std::slice::from_mut(&mut out_gfni));
             assert_eq!(out_scalar, out_gfni);
         }
     }
@@ -1244,17 +1263,21 @@ mod tests {
         use crate::zerocheck::PaddingSpec;
         use crate::zerocheck::univariate_skip::pack_bits;
 
-        // (k_log, useful_bits, n_blocks_log): pick n_blocks_log so
+        // (k_log, useful_bits, n_blocks_log, live_blocks): pick n_blocks_log so
         // m = k_log + n_blocks_log is small enough to keep the test fast
         // while still exercising the kernel's parallel + boundary paths.
+        // The blocks from `live_blocks` on repeat that block.
         let cases = [
-            (14usize, 16_000usize, 0usize), // BLAKE2s, m=14
-            (15, 31_401, 0),                // SHA-2,  m=15
-            (16, 42_560, 0),                // Keccak, m=16
-            (16, 42_560, 3),                // Keccak, m=19 (multiple hashes)
+            (14usize, 16_000usize, 0usize, 1usize), // BLAKE2s, m=14
+            (15, 31_401, 0, 1),                     // SHA-2,  m=15
+            (16, 42_560, 0, 1),                     // Keccak, m=16
+            (16, 42_560, 3, 8),                     // Keccak, m=19 (multiple hashes)
+            (14, 16_000, 4, 5),                     // BLAKE2s, m=18, a repeated tail
+            (14, 16_000, 4, 0),
+            (15, 31_401, 3, 5),
         ];
 
-        for (k_log, useful_bits, n_blocks_log) in cases {
+        for (k_log, useful_bits, n_blocks_log, live_blocks) in cases {
             let m = k_log + n_blocks_log;
             assert!(m >= K_SKIP + N_INNER);
 
@@ -1276,6 +1299,14 @@ mod tests {
                     c[idx] = false;
                 }
             }
+            for x in [&mut a, &mut b, &mut c] {
+                for blk in live_blocks + 1..n_blocks {
+                    x.copy_within(
+                        live_blocks * block_size..(live_blocks + 1) * block_size,
+                        blk * block_size,
+                    );
+                }
+            }
 
             let outer = rng.ext_vec(m - K_SKIP - N_INNER);
             let r = build_protocol_r_rest(m, &outer);
@@ -1290,9 +1321,20 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+                live_blocks,
             };
-            let (padded_ab, padded_c) =
-                round1_shift_reduce_extract_c_packed_padded(&a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding);
+            // `a` and `b` stop after the template block when a tail repeats.
+            let ab_len = ((live_blocks + 1) * block_size / 8).min(c_p.len());
+            let (padded_ab, padded_c) = round1_shift_reduce_extract_c_packed_padded(
+                &a_p[..ab_len],
+                &b_p[..ab_len],
+                &c_p,
+                m,
+                K_SKIP,
+                &r,
+                &table,
+                &padding,
+            );
 
             assert_eq!(
                 dense_ab, padded_ab,

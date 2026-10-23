@@ -629,10 +629,11 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     // the SAME WHIR as every leanVM point claim (the point claims become the
     // opener's `point_claims`).
     let flock_reduction = w.flock_reduction;
-    let reduced = crate::stage!("Flock reduction", || { flock_reduction.prove(&mut ps) });
+    let offset = w.layout.placements[QFLOCK].offset;
+    let q_flock = &w.q[offset..offset + (1usize << w.layout.placements[QFLOCK].n_vars)];
+    let reduced = crate::stage!("Flock reduction", || { flock_reduction.prove(q_flock, &mut ps) });
     let n_blocks = flock_reduction.n_blocks();
     drop(flock_reduction);
-    let offset = w.layout.placements[QFLOCK].offset;
     let ring = crate::hash_flock::ring_switch_open(n_blocks, offset, &reduced);
     crate::stage!("PCS open", || { pcs::open(&mut ps, &committed, &w.q, &slots, &ring) });
     Ok((

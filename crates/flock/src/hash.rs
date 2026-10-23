@@ -82,14 +82,15 @@
 //! witness bits. Pinning them to a caller's values is the embedding
 //! protocol's job, via PCS openings at fixed indices.
 
+use flux_profiler::timed;
 use crate::gf2::{
     ADD3_BITS, CARRY_BITS_PER_ADD, MatrixSide, WireWord, back_add, back_add3_fused, walk_add, walk_add3_fused,
     wire_from_const, wire_from_slot_base, wire_rotl, wire_rotr, wire_xor,
 };
 use crate::witness::packed_bytes;
 use crate::witness::{
-    BitRecord, add_carry_parts, add3_fused_parts, drive_witness_packed_and_lincheck, or_bit_at,
-    write_lin_word_ab_packed,
+    BitRecord, LANES, V32, V64, add_carry_parts, add3_fused_parts, drive_witness_packed_and_lincheck,
+    drive_witness_packed_and_lincheck_into,
 };
 use pcs::pack::{LOG_PACKING, PACKING_WIDTH};
 use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen};
@@ -186,43 +187,10 @@ fn g_slot(g: usize, off: usize) -> usize {
 // Reference BLAKE2s compression, the witness oracle.
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn g_fn(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
-    v[d] = (v[d] ^ v[a]).rotate_right(16);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(12);
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
-    v[d] = (v[d] ^ v[a]).rotate_right(8);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(7);
-}
-
-/// The 16-word working state a compression starts from: the chaining value,
-/// the first four IV words, and the last four IV words XOR'd with the counter
-/// and the finalization flags.
-fn initial_state(h: &[u32; 8], t: u64, f0: u32, f1: u32) -> [u32; 16] {
-    let mut v = [0u32; 16];
-    v[..8].copy_from_slice(h);
-    v[8..12].copy_from_slice(&BLAKE2S_IV[..4]);
-    v[12] = BLAKE2S_IV[4] ^ (t as u32);
-    v[13] = BLAKE2S_IV[5] ^ ((t >> 32) as u32);
-    v[14] = BLAKE2S_IV[6] ^ f0;
-    v[15] = BLAKE2S_IV[7] ^ f1;
-    v
-}
-
 /// BLAKE2s compression function (RFC 7693 §3.2). Returns the new chaining
 /// value `h'[i] = h[i] ^ v[i] ^ v[i+8]`.
 pub fn blake2s_compress(h: &[u32; 8], m: &[u32; 16], t: u64, f0: u32, f1: u32) -> [u32; 8] {
-    let mut v = initial_state(h, t, f0, f1);
-    for r in 0..N_ROUNDS {
-        for g in 0..N_G_PER_ROUND {
-            let [la, lb, lc, ld] = G_LANES[g];
-            g_fn(&mut v, la, lb, lc, ld, m[SIGMA[r][2 * g]], m[SIGMA[r][2 * g + 1]]);
-        }
-    }
-    std::array::from_fn(|i| h[i] ^ v[i] ^ v[i + 8])
+    primitives::hash::compress_with_flags(h, m, t, f0, f1)
 }
 
 /// One BLAKE2s compression input: `(h, m, t, f0, f1)`.
@@ -371,6 +339,7 @@ pub fn bilinear_walk_pair(u: &[F192], w: &[F192]) -> (F192, F192) {
 /// The matrix-vector products `(A_0 w, B_0 w)`, i.e. every row's inner product
 /// with `w`, by one forward walk. This takes O(circuit) additions instead of one
 /// pass over the nonzeros, and neither matrix is materialized.
+#[timed]
 pub fn row_values_walk(w: &[F192]) -> (Vec<F192>, Vec<F192>) {
     assert_eq!(w.len(), K);
     let mut sink = crate::gf2::RowValues::new(K, w[Z_CONST_POS]);
@@ -505,6 +474,7 @@ fn marginal_walk_side(side: MatrixSide, u: &[F192]) -> Vec<F192> {
 
 /// The two column marginals `(A_0ᵀ u, B_0ᵀ u)`, by one backward walk per matrix.
 /// Neither matrix is materialized.
+#[timed]
 pub fn marginal_walk_pair(u: &[F192]) -> (Vec<F192>, Vec<F192>) {
     (
         marginal_walk_side(MatrixSide::A, u),
@@ -513,6 +483,7 @@ pub fn marginal_walk_pair(u: &[F192]) -> (Vec<F192>, Vec<F192>) {
 }
 
 /// The α-batched column marginal `(A_0 + α B_0)ᵀ u` used by lincheck.
+#[timed]
 pub fn marginal_walk(alpha: F192, u: &[F192]) -> Vec<F192> {
     let (mut a, b) = marginal_walk_pair(u);
     for (a, b) in a.iter_mut().zip(b) {
@@ -554,118 +525,190 @@ const REC_C2: usize = G_ADD_C2;
 /// last sub-block offset within it, must fit 192 bits.
 const _: () = assert!(G_STRIDE <= 3 * 64 && REC_C2 < 3 * 64);
 
-/// Build the (z, a, b) blocks for ONE compression instance, into this
-/// instance's `K / 64` words of each packed table. Buffers must be zero on
-/// entry.
-///
-/// **No c buffer.** Since `C = I`, `c == z` byte-for-byte; callers use
-/// `z_packed` directly as the c-side input to zerocheck.
-fn build_block_witness_ab_packed_into(
-    h: &[u32; 8],
-    m: &[u32; 16],
-    t: u64,
-    f0: u32,
-    f1: u32,
-    z: &mut [u64],
-    a: &mut [u64],
-    b: &mut [u64],
+/// `u64` words per block.
+const WORDS: usize = K / 64;
+/// The G blocks start on a word boundary, and a round's eight fill whole words, so every round
+/// has the same bit alignment.
+const GS_WORD: usize = GS_BASE / 64;
+const ROUND_WORDS: usize = N_G_PER_ROUND * G_STRIDE / 64;
+const _: () = assert!(
+    GS_BASE.is_multiple_of(64) && (N_G_PER_ROUND * G_STRIDE).is_multiple_of(64) && USEFUL_BITS.is_multiple_of(64)
+);
+const _: () = assert!(
+    Z_CONST_POS.is_multiple_of(64) && MSG_BASE - Z_CONST_POS == 128 && COUNTER_LO_BASE.is_multiple_of(64)
+);
+
+/// G block `gi` of a round, for every lane: updates the state `v` and appends its record to the
+/// round's bit stream of each table (`z`, `a`, `b`), each with its partial word `carry`.
+/// Inlined with a literal `gi`, so the state lanes stay in registers.
+#[inline(always)]
+fn g_block(
+    gi: usize,
+    r: usize,
+    m: &[V32; 16],
+    v: &mut [V32; 16],
+    out: [&mut [V64; ROUND_WORDS]; 3],
+    carry: &mut [V64; 3],
 ) {
-    const U64_PER_BLOCK: usize = K / 64;
-    debug_assert_eq!(z.len(), U64_PER_BLOCK);
-    debug_assert_eq!(a.len(), U64_PER_BLOCK);
-    debug_assert_eq!(b.len(), U64_PER_BLOCK);
+    let [la, lb, lc, ld] = G_LANES[gi];
+    let mx = m[SIGMA[r][2 * gi]];
+    let my = m[SIGMA[r][2 * gi + 1]];
+    let (a_val, b_val, c_val, d_val) = (v[la], v[lb], v[lc], v[ld]);
 
-    or_bit_at(z, Z_CONST_POS);
-    or_bit_at(a, Z_CONST_POS);
-    or_bit_at(b, Z_CONST_POS);
+    // `G_STRIDE = 184` fits a 192-bit record.
+    let mut rz = BitRecord::<3>::new();
+    let mut ra = BitRecord::<3>::new();
+    let mut rb = BitRecord::<3>::new();
 
-    for w in 0..8 {
-        write_lin_word_ab_packed(h_bit(w, 0), h[w], z, a, b);
+    macro_rules! add_into {
+        ($pos:ident, $x:expr, $y:expr) => {{
+            let (sum, left, right, carry) = add_carry_parts($x, $y);
+            rz.push::<$pos>(carry);
+            ra.push::<$pos>(left);
+            rb.push::<$pos>(right);
+            sum
+        }};
     }
-    for i in 0..16 {
-        write_lin_word_ab_packed(m_bit(i, 0), m[i], z, a, b);
+    macro_rules! add3_into {
+        ($maj:ident, $rip:ident, $x:expr, $y:expr, $z:expr) => {{
+            let (sum, maj, rip) = add3_fused_parts($x, $y, $z);
+            rz.push::<$maj>(maj.2);
+            ra.push::<$maj>(maj.0);
+            rb.push::<$maj>(maj.1);
+            rz.push::<$rip>(rip.2);
+            ra.push::<$rip>(rip.0);
+            rb.push::<$rip>(rip.1);
+            sum
+        }};
     }
-    write_lin_word_ab_packed(COUNTER_LO_BASE, t as u32, z, a, b);
-    write_lin_word_ab_packed(COUNTER_HI_BASE, (t >> 32) as u32, z, a, b);
-    write_lin_word_ab_packed(FINAL_BASE, f0, z, a, b);
-    write_lin_word_ab_packed(LAST_NODE_BASE, f1, z, a, b);
 
-    let mut v = initial_state(h, t, f0, f1);
+    let a_1 = add3_into!(REC_MAJ_A1, REC_RIP_A1, a_val, b_val, mx);
+    let d_1 = (d_val ^ a_1).rotate_right(16);
+    let c_1 = add_into!(REC_C1, c_val, d_1);
+    let b_1 = (b_val ^ c_1).rotate_right(12);
+    let a_2 = add3_into!(REC_MAJ_A2, REC_RIP_A2, a_1, b_1, my);
+    let d_2 = (d_1 ^ a_2).rotate_right(8);
+    let c_2 = add_into!(REC_C2, c_1, d_2);
+    let b_2 = (b_1 ^ c_2).rotate_right(7);
+
+    let [oz, oa, ob] = out;
+    rz.append(oz, G_STRIDE * gi, G_STRIDE, &mut carry[0]);
+    ra.append(oa, G_STRIDE * gi, G_STRIDE, &mut carry[1]);
+    rb.append(ob, G_STRIDE * gi, G_STRIDE, &mut carry[2]);
+
+    v[la] = a_2;
+    v[lb] = b_2;
+    v[lc] = c_2;
+    v[ld] = d_2;
+}
+
+/// A free input or lin-id word in row `i`: `(z, a) = (lo, hi)` packed, `b` all-ones.
+/// **c is not written**: since `C = I`, `c == z` byte-for-byte.
+#[inline(always)]
+fn write_lin_row(rows: [&mut [V64]; 3], i: usize, lo: V32, hi: V32) {
+    let [z, a, b] = rows;
+    z[i] = V64::pair(lo, hi);
+    a[i] = z[i];
+    b[i] = V64::splat(!0);
+}
+
+/// Build the (z, a, b) blocks of eight compressions, one per lane, into `rows`: the three
+/// tables of `WORDS` rows each, row `i` holding word `i` of every lane's block. Every row is written.
+/// `progress(r + 1, N_ROUNDS)` follows round `r`.
+fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: &mut dyn FnMut(usize, usize)) {
+    let (z, rest) = rows.split_at_mut(WORDS);
+    let (a, b) = rest.split_at_mut(WORDS);
+    let gather = |f: &dyn Fn(&Compression) -> u32| V32(std::array::from_fn(|l| f(blocks[l])));
+    let h: [V32; 8] = std::array::from_fn(|w| gather(&|c| c.0[w]));
+    let m: [V32; 16] = std::array::from_fn(|i| gather(&|c| c.1[i]));
+    let (t_lo, t_hi) = (gather(&|c| c.2 as u32), gather(&|c| (c.2 >> 32) as u32));
+    let (f0, f1) = (gather(&|c| c.3), gather(&|c| c.4));
+
+    macro_rules! lin {
+        ($i:expr, $lo:expr, $hi:expr) => {
+            write_lin_row([&mut *z, &mut *a, &mut *b], $i, $lo, $hi)
+        };
+    }
+    for i in 0..4 {
+        lin!(CV_BASE / 64 + i, h[2 * i], h[2 * i + 1]);
+    }
+    for i in 0..8 {
+        lin!(MSG_BASE / 64 + i, m[2 * i], m[2 * i + 1]);
+    }
+    lin!(COUNTER_LO_BASE / 64, t_lo, t_hi);
+    lin!(FINAL_BASE / 64, f0, f1);
+    // The constant wire, then zeros up to the message.
+    for t in [&mut *z, &mut *a, &mut *b] {
+        t[Z_CONST_POS / 64] = V64::splat(1);
+        t[Z_CONST_POS / 64 + 1] = V64::ZERO;
+        t[GS_WORD + N_ROUNDS * ROUND_WORDS..].fill(V64::ZERO);
+    }
+
+    let mut v = [V32::splat(0); 16];
+    v[..8].copy_from_slice(&h);
+    for i in 0..4 {
+        v[8 + i] = V32::splat(BLAKE2S_IV[i]);
+    }
+    v[12] = V32::splat(BLAKE2S_IV[4]) ^ t_lo;
+    v[13] = V32::splat(BLAKE2S_IV[5]) ^ t_hi;
+    v[14] = V32::splat(BLAKE2S_IV[6]) ^ f0;
+    v[15] = V32::splat(BLAKE2S_IV[7]) ^ f1;
+
     for r in 0..N_ROUNDS {
-        for g_in_round in 0..N_G_PER_ROUND {
-            let g = r * N_G_PER_ROUND + g_in_round;
-            let [la, lb, lc, ld] = G_LANES[g_in_round];
-            let mx = m[SIGMA[r][2 * g_in_round]];
-            let my = m[SIGMA[r][2 * g_in_round + 1]];
-            let (a_val, b_val, c_val, d_val) = (v[la], v[lb], v[lc], v[ld]);
-
-            // `G_STRIDE = 184` fits a 192-bit record.
-            let mut rz = BitRecord::<3>::new();
-            let mut ra = BitRecord::<3>::new();
-            let mut rb = BitRecord::<3>::new();
-
-            macro_rules! add_into {
-                ($pos:ident, $x:expr, $y:expr) => {{
-                    let (sum, left, right, carry) = add_carry_parts($x, $y);
-                    rz.push::<$pos>(carry);
-                    ra.push::<$pos>(left);
-                    rb.push::<$pos>(right);
-                    sum
-                }};
-            }
-            macro_rules! add3_into {
-                ($maj:ident, $rip:ident, $x:expr, $y:expr, $z:expr) => {{
-                    let (sum, maj, rip) = add3_fused_parts($x, $y, $z);
-                    rz.push::<$maj>(maj.2);
-                    ra.push::<$maj>(maj.0);
-                    rb.push::<$maj>(maj.1);
-                    rz.push::<$rip>(rip.2);
-                    ra.push::<$rip>(rip.0);
-                    rb.push::<$rip>(rip.1);
-                    sum
-                }};
-            }
-
-            let a_1 = add3_into!(REC_MAJ_A1, REC_RIP_A1, a_val, b_val, mx);
-            let d_1 = (d_val ^ a_1).rotate_right(16);
-            let c_1 = add_into!(REC_C1, c_val, d_1);
-            let b_1 = (b_val ^ c_1).rotate_right(12);
-            let a_2 = add3_into!(REC_MAJ_A2, REC_RIP_A2, a_1, b_1, my);
-            let d_2 = (d_1 ^ a_2).rotate_right(8);
-            let c_2 = add_into!(REC_C2, c_1, d_2);
-            let b_2 = (b_1 ^ c_2).rotate_right(7);
-
-            let g_base = GS_BASE + G_STRIDE * g;
-            rz.flush(z, g_base);
-            ra.flush(a, g_base);
-            rb.flush(b, g_base);
-
-            v[la] = a_2;
-            v[lb] = b_2;
-            v[lc] = c_2;
-            v[ld] = d_2;
+        let word = GS_WORD + r * ROUND_WORDS;
+        let oz: &mut [V64; ROUND_WORDS] = z[word..].first_chunk_mut().unwrap();
+        let oa: &mut [V64; ROUND_WORDS] = a[word..].first_chunk_mut().unwrap();
+        let ob: &mut [V64; ROUND_WORDS] = b[word..].first_chunk_mut().unwrap();
+        let mut carry = [V64::ZERO; 3];
+        macro_rules! g {
+            ($($gi:literal)*) => {$(
+                g_block($gi, r, &m, &mut v, [&mut *oz, &mut *oa, &mut *ob], &mut carry);
+            )*};
         }
+        g!(0 1 2 3 4 5 6 7);
+        progress(r + 1, N_ROUNDS);
     }
 
-    for w in 0..8 {
-        write_lin_word_ab_packed(out_bit(w, 0), h[w] ^ v[w] ^ v[w + 8], z, a, b);
+    for i in 0..4 {
+        let out = |w: usize| h[w] ^ v[w] ^ v[w + 8];
+        lin!(OUT_BASE / 64 + i, out(2 * i), out(2 * i + 1));
     }
 }
 
 /// Produce `(z, a, b, z_lincheck)` for `blocks.len()` compressions padded to
 /// `2^n_blocks_log` slots. Mirror of `blake2s`'s generator; see it for the
 /// buffer shapes and the lincheck stripe indexing.
+#[timed]
 pub fn generate_witness_with_ab_packed_and_lincheck(
     blocks: &[Compression],
     n_blocks_log: usize,
 ) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u8>) {
-    let padding = padding_block();
-    drive_witness_packed_and_lincheck(
+    let stripe_groups = 1usize << (n_blocks_log.max(3) - 3);
+    drive_witness_packed_and_lincheck::<WORDS, _, _>(
         blocks,
-        Some(&padding),
+        &padding_block(),
         n_blocks_log,
-        K_LOG,
-        |&(ref h, ref m, t, f0, f1), z, a, b| build_block_witness_ab_packed_into(h, m, t, f0, f1, z, a, b),
+        stripe_groups,
+        build_group_rows,
+    )
+}
+
+/// [`generate_witness_with_ab_packed_and_lincheck`] with the packed `z` written into `z`,
+/// which may be uninitialized; returns `(a, b, z_lincheck)`.
+#[timed]
+pub fn generate_witness_into_z(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    z: &mut [u64],
+) -> (Vec<u64>, Vec<u64>, Vec<u8>) {
+    let stripe_groups = crate::lincheck::stripes_read(K_LOG + n_blocks_log.max(3), K_LOG, blocks.len().max(1));
+    drive_witness_packed_and_lincheck_into::<WORDS, _, _>(
+        blocks,
+        &padding_block(),
+        n_blocks_log,
+        stripe_groups,
+        z,
+        build_group_rows,
     )
 }
 
@@ -677,6 +720,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 /// power-of-two shape that can hold `n_blocks` compressions.
 #[derive(Clone, Debug)]
 pub struct Blake2sSetup {
+    n_blocks: usize,
     n_blocks_log: usize,
 }
 
@@ -684,6 +728,7 @@ impl Blake2sSetup {
     /// Build a setup for `n_blocks` BLAKE2s compressions.
     pub fn new(n_blocks: usize) -> Self {
         Self {
+            n_blocks,
             n_blocks_log: min_n_blocks_log(n_blocks),
         }
     }
@@ -801,6 +846,7 @@ impl Blake2sSetup {
     ///
     /// Does NOT open the PCS; the caller discharges the returned claim in the
     /// one stacked opening (`leanvm_core`'s `pcs::open`).
+    #[timed]
     pub fn prove_reduction_precomputed(
         &self,
         z_packed: &[u64],
@@ -816,6 +862,7 @@ impl Blake2sSetup {
     /// **Flock reduction, first stage (prover): the zerocheck.** Reduces
     /// `a·b ⊕ c = 0` over the cube to evaluation claims on `(â, b̂, ĉ)`, all
     /// three at one point.
+    #[timed]
     pub fn prove_zerocheck(
         &self,
         z_packed: &[u64],
@@ -828,8 +875,8 @@ impl Blake2sSetup {
         // The fused generator packs 64 Boolean coordinates per word.
         let packed_len = 1usize << (self.m() - 6);
         assert_eq!(z_packed.len(), packed_len, "wrong packed witness length");
-        assert_eq!(a_packed_words.len(), packed_len, "wrong packed A·z length");
-        assert_eq!(b_packed_words.len(), packed_len, "wrong packed B·z length");
+        // `A·z` and `B·z` may stop after the padding template block; the zerocheck checks they reach it.
+        assert_eq!(a_packed_words.len(), b_packed_words.len(), "wrong packed B·z length");
 
         // No bind_statement here: the embedding protocol (leanVM) seeds its
         // transcript with the R1CS digest and binds the instance
@@ -839,6 +886,7 @@ impl Blake2sSetup {
         let padding = crate::zerocheck::PaddingSpec {
             k_log: K_LOG,
             useful_bits_per_block: USEFUL_BITS,
+            live_blocks: self.n_blocks,
         };
         let zc_claim = crate::zerocheck::prove_packed_padded(
             packed_bytes(a_packed_words),
@@ -857,6 +905,7 @@ impl Blake2sSetup {
     /// **Flock reduction, second stage (prover): the lincheck.** Reduces the
     /// zerocheck's `(â, b̂, ĉ)` claims to the `2^k_skip` bit slices of `z` at
     /// one point, against the per-block matrices.
+    #[timed]
     pub fn prove_lincheck(
         &self,
         stage: ZerocheckStage,
@@ -864,9 +913,10 @@ impl Blake2sSetup {
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> SliceClaim {
         let _span = tracing::info_span!("Lincheck").entered();
-        assert_eq!(
-            z_packed_lincheck.len(),
-            K << self.n_blocks_log.saturating_sub(3),
+        // Past the stripes the lincheck reads, the rest repeat the last one and need not be there.
+        assert!(
+            z_packed_lincheck.len()
+                >= crate::lincheck::stripes_read(K_LOG + self.n_blocks_log.max(3), K_LOG, self.n_blocks) * K,
             "wrong lincheck stripe length"
         );
 
@@ -877,6 +927,7 @@ impl Blake2sSetup {
             K_LOG,
             K_SKIP,
             USEFUL_BITS,
+            self.n_blocks,
             &WalkLincheckCircuit,
             &x_ab,
             ps,
@@ -1028,6 +1079,63 @@ mod tests {
                 crate::lincheck::pack_z_lincheck(&z, m, K_LOG),
                 "{n_blocks} compressions"
             );
+        }
+    }
+
+    /// Whole groups of padding are built once and copied, so the batch must equal one
+    /// whose padding slots are all real input blocks.
+    /// `a` and `b` keep only the groups up to the first padding block's, a prefix of the explicit ones.
+    #[test]
+    fn padding_groups_match_explicit_padding() {
+        let mut rng = Rng::new(0x9ADD1);
+        let mut blocks: Vec<Compression> = (0..9)
+            .map(|i| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    64 * (i + 1),
+                    0,
+                    0,
+                )
+            })
+            .collect();
+        let (z, a, b, stripes) = generate_witness_with_ab_packed_and_lincheck(&blocks, 6);
+        blocks.resize(64, padding_block());
+        let explicit = generate_witness_with_ab_packed_and_lincheck(&blocks, 6);
+        // Blocks 0..16 are the two groups holding block 9, the first padding block.
+        let ab_words = 16 * K / 64;
+        assert_eq!(a.len(), ab_words);
+        assert_eq!(b.len(), ab_words);
+        assert!(z == explicit.0 && a[..] == explicit.1[..ab_words] && b[..] == explicit.2[..ab_words]);
+        assert!(stripes == explicit.3);
+    }
+
+    /// `generate_witness_into_z` writes the same `z`, `a` and `b`, and the stripes the lincheck reads.
+    #[test]
+    fn trimmed_stripes_are_a_prefix() {
+        let mut rng = Rng::new(0x57121);
+        for n_blocks in [3usize, 64, 1000, 1025] {
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|i| {
+                    (
+                        std::array::from_fn(|_| rng.next_u32()),
+                        std::array::from_fn(|_| rng.next_u32()),
+                        64 * (i as u64 + 1),
+                        0,
+                        0,
+                    )
+                })
+                .collect();
+            let n_blocks_log = min_n_blocks_log(n_blocks);
+            let full = generate_witness_with_ab_packed_and_lincheck(&blocks, n_blocks_log);
+            let mut z = vec![0u64; full.0.len()];
+            let (a, b, stripes) = generate_witness_into_z(&blocks, n_blocks_log, &mut z);
+            assert!(z == full.0 && a == full.1 && b == full.2, "{n_blocks} blocks");
+            assert_eq!(
+                stripes.len(),
+                crate::lincheck::stripes_read(K_LOG + n_blocks_log.max(3), K_LOG, n_blocks) * K
+            );
+            assert!(stripes[..] == full.3[..stripes.len()], "{n_blocks} blocks");
         }
     }
 
