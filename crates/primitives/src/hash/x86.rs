@@ -234,35 +234,19 @@ impl Lanes32 for Avx512 {
                 s[4 * a + 2] = _mm512_unpacklo_epi64(hi01, hi23);
                 s[4 * a + 3] = _mm512_unpackhi_epi64(hi01, hi23);
             }
-            // Phases 3 and 4: word w is lane w / 4 of the four s entries with c = w % 4.
+            // Phases 3 and 4: per c, a 4x4 transpose of 128-bit lanes over s[c], s[4 + c], s[8 + c], s[12 + c].
             //
-            // The first shuffles broadcast that lane, then 0x88 keeps lanes 0 and 2 of each half.
-            macro_rules! word {
-                ($w:expr) => {{
-                    const L: i32 = ($w / 4) as i32;
-                    const C: usize = ($w % 4) as usize;
-                    const IMM_L: i32 = L * 0x55;
-                    let p = _mm512_shuffle_i32x4::<IMM_L>(s[C], s[4 + C]);
-                    let q = _mm512_shuffle_i32x4::<IMM_L>(s[8 + C], s[12 + C]);
-                    block[$w] = Self(_mm512_shuffle_i32x4::<0x88>(p, q));
-                }};
+            // Stage one joins the low lane pair or the high lane pair of two inputs, stage two takes their even or odd lanes.
+            for c in 0..4 {
+                let lo = |x: usize, y: usize| _mm512_shuffle_i32x4::<0x44>(s[x], s[y]);
+                let hi = |x: usize, y: usize| _mm512_shuffle_i32x4::<0xEE>(s[x], s[y]);
+                let (t0, t1) = (lo(c, 4 + c), hi(c, 4 + c));
+                let (t2, t3) = (lo(8 + c, 12 + c), hi(8 + c, 12 + c));
+                block[c] = Self(_mm512_shuffle_i32x4::<0x88>(t0, t2));
+                block[4 + c] = Self(_mm512_shuffle_i32x4::<0xDD>(t0, t2));
+                block[8 + c] = Self(_mm512_shuffle_i32x4::<0x88>(t1, t3));
+                block[12 + c] = Self(_mm512_shuffle_i32x4::<0xDD>(t1, t3));
             }
-            word!(0);
-            word!(1);
-            word!(2);
-            word!(3);
-            word!(4);
-            word!(5);
-            word!(6);
-            word!(7);
-            word!(8);
-            word!(9);
-            word!(10);
-            word!(11);
-            word!(12);
-            word!(13);
-            word!(14);
-            word!(15);
         }
     }
 }
