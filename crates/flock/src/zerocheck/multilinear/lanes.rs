@@ -89,7 +89,7 @@ pub(super) fn pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], paddi
     let mut lo = build_eq(&r_blk[..n_lo]);
     lo.resize(LANES, F192::ZERO);
     let pack = |w: &[F192]| -> [F192x8; 8] {
-        std::array::from_fn(|v| F192x8::from_array(w[8 * v..8 * v + 8].try_into().expect("eight lanes")))
+        std::array::from_fn(|v| F192x8::from_array(&std::array::from_fn(|l| w[ByteAcc::x8_lane(v, l)])))
     };
     let lo_packed = pack(&lo);
     // The template's group weighs it by the eq mass of the whole tail, and the lanes after it by nothing.
@@ -174,8 +174,8 @@ fn group(
     let mut acc: QuadSums = [[Prod8::ZERO; 8]; 8];
     // The `c` folds of the quad classes 1, 2, 3, added over the quads.
     let mut c_fold = [ByteAcc::zero(); 3];
-    // The folded `a` and `b` of the step's two quads.
-    let mut folded = [[[[F192x8::ZERO; 8]; 4]; 2]; 2];
+    // The folded `a` and `b` of the quad.
+    let mut folded = [[[F192x8::ZERO; 8]; 4]; 2];
     for step in 0..n_lines {
         for (r, lines) in regs.iter_mut().zip(tables) {
             r.load(std::array::from_fn(|lane| &lines[lane][step]));
@@ -205,17 +205,17 @@ fn group(
             prefetch(0);
             let mut fold = ByteAcc::zero();
             fold.add_fold(ra, i * CHUNKS, m);
-            folded[0][q][j] = fold.to_x8();
+            folded[0][j] = fold.to_x8();
             prefetch(1);
             let mut fold = ByteAcc::zero();
             fold.add_fold(rb, i * CHUNKS, mb);
-            folded[1][q][j] = fold.to_x8();
+            folded[1][j] = fold.to_x8();
             prefetch(2);
             if j > 0 {
                 c_fold[j - 1].add_fold(rc, i * CHUNKS, m);
             }
             if j == 3 {
-                quad_sums(&folded[0][q], &folded[1][q], &mut acc);
+                quad_sums(&folded[0], &folded[1], &mut acc);
             }
         }
     }

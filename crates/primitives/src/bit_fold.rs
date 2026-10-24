@@ -565,17 +565,76 @@ pub mod gfni {
             Self(unsafe { [_mm512_setzero_si512(); 64] })
         }
 
+        #[cfg(test)]
+        pub(super) fn registers(&self) -> &[__m512i; 64] {
+            &self.0
+        }
+
         /// Replace the registers with the transpose of `lines`.
+        ///
+        /// Four stages of unpacks inside the 128-bit lanes, then two of lane shuffles. On a Zen 5 the unpacks issue
+        /// on more ports than a byte permute does. Both groups work in place: the first writes each register where
+        /// the second leaves it, so the transpose needs no scratch to stay in the L1.
         #[inline(always)]
         pub fn load(&mut self, lines: [&[u8; 64]; 64]) {
-            static STAGES: LazyLock<Vec<Stage>> = LazyLock::new(|| input_stages(6));
-            let (stages_of, dst) = (&**STAGES, self.0.as_mut_ptr());
+            let dst = self.0.as_mut_ptr();
             // SAFETY: a line is 64 bytes, and `dst` holds 64 registers.
-            let first = |r: usize| unsafe { _mm512_loadu_si512(lines[r].as_ptr().cast()) };
-            stages::<64, 8>(stages_of, 0, first, dst);
-            // SAFETY: the first group wrote every register.
-            let second = |r: usize| unsafe { _mm512_load_si512(dst.add(r).cast()) };
-            stages::<64, 8>(stages_of, 3, second, dst);
+            unsafe {
+                // Register bit `s` against the offset bits inside a 128-bit lane, 16 registers at a time.
+                for t in 0..4 {
+                    let mut x: [__m512i; 16] =
+                        std::array::from_fn(|k| _mm512_loadu_si512(lines[16 * t + k].as_ptr().cast()));
+                    unpack_stage::<1, 16>(&mut x, |u, w| (_mm512_unpacklo_epi8(u, w), _mm512_unpackhi_epi8(u, w)));
+                    unpack_stage::<2, 16>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi16(u, w), _mm512_unpackhi_epi16(u, w))
+                    });
+                    unpack_stage::<4, 16>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi32(u, w), _mm512_unpackhi_epi32(u, w))
+                    });
+                    unpack_stage::<8, 16>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi64(u, w), _mm512_unpackhi_epi64(u, w))
+                    });
+                    for (k, r) in x.into_iter().enumerate() {
+                        _mm512_store_si512(dst.add(BYTE_OF_REG[16 * t + k] as usize).cast(), r);
+                    }
+                }
+                // Register bits 4 and 5 against the lane index, four registers at a time.
+                for k in 0..16 {
+                    let at = [0, 16, 32, 48].map(|o| dst.add(BYTE_OF_REG[o + k] as usize));
+                    let [a, b, c, d] = at.map(|p| _mm512_load_si512(p.cast()));
+                    let (a, b) = (_mm512_shuffle_i64x2::<0x44>(a, b), _mm512_shuffle_i64x2::<0xEE>(a, b));
+                    let (c, d) = (_mm512_shuffle_i64x2::<0x44>(c, d), _mm512_shuffle_i64x2::<0xEE>(c, d));
+                    let (a, c) = (_mm512_shuffle_i64x2::<0x88>(a, c), _mm512_shuffle_i64x2::<0xDD>(a, c));
+                    let (b, d) = (_mm512_shuffle_i64x2::<0x88>(b, d), _mm512_shuffle_i64x2::<0xDD>(b, d));
+                    for (p, r) in at.into_iter().zip([a, b, c, d]) {
+                        _mm512_store_si512(p.cast(), r);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The byte of the lines that register `z` holds when the stages are done: the four low bits of `z` reversed, and
+    /// the two high bits swapped.
+    const BYTE_OF_REG: [u8; 64] = {
+        let mut f = [0u8; 64];
+        let mut z = 0;
+        while z < 64 {
+            f[z] = ((z as u8 & 15).reverse_bits() >> 4) | (z as u8 >> 4 & 1) << 5 | (z as u8 >> 5) << 4;
+            z += 1;
+        }
+        f
+    };
+
+    /// One stage of the lane unpacks: registers `z` and `z | BIT` become the low and the high halves of their interleave.
+    #[inline(always)]
+    fn unpack_stage<const BIT: usize, const N: usize>(
+        x: &mut [__m512i; N],
+        interleave: impl Fn(__m512i, __m512i) -> (__m512i, __m512i),
+    ) {
+        for i in 0..N / 2 {
+            let z = i / BIT * 2 * BIT + i % BIT;
+            (x[z], x[z | BIT]) = interleave(x[z], x[z | BIT]);
         }
     }
 
@@ -602,11 +661,32 @@ pub mod gfni {
             );
         }
 
-        /// The 64 sums as eight vectors of eight, lane `l` of vector `r` being lane `8 r + l`.
+        /// The 64 sums as eight vectors of eight, lane `l` of vector `v` being sum [`x8_lane`](Self::x8_lane)`(v, l)`.
         #[cfg(target_feature = "vpclmulqdq")]
         #[inline(always)]
         pub fn to_x8(&self) -> [F192x8; 8] {
-            x8_from_acc::<0>(&self.0)
+            let c: [[__m512i; 8]; 3] = std::array::from_fn(|i| {
+                let mut x: [__m512i; 8] = std::array::from_fn(|o| self.0[8 * i + o]);
+                // SAFETY: the module is compiled only with these target features enabled.
+                unsafe {
+                    unpack_stage::<1, 8>(&mut x, |u, w| (_mm512_unpacklo_epi8(u, w), _mm512_unpackhi_epi8(u, w)));
+                    unpack_stage::<2, 8>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi16(u, w), _mm512_unpackhi_epi16(u, w))
+                    });
+                    unpack_stage::<4, 8>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi32(u, w), _mm512_unpackhi_epi32(u, w))
+                    });
+                }
+                x
+            });
+            std::array::from_fn(|r| F192x8::from_coeffs(c[0][r], c[1][r], c[2][r]))
+        }
+
+        /// The lane of the 64 sums that lane `l` of vector `v` of [`to_x8`](Self::to_x8) holds.
+        ///
+        /// The byte unpacks inside the 128-bit lanes leave the sums in this order, which costs no cross-lane shuffle.
+        pub const fn x8_lane(v: usize, l: usize) -> usize {
+            2 * ((v as u8).reverse_bits() >> 5) as usize + (l & 1) + 16 * (l >> 1)
         }
     }
 
@@ -743,6 +823,27 @@ pub mod gfni {
 mod tests {
     use super::*;
     use crate::test_rng::Rng;
+
+    /// Register `j` holds byte `j` of the 64 lines, line `p` in byte `p`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    #[test]
+    fn line_regs_transpose_the_lines() {
+        let mut rng = Rng::new(0x71_4E);
+        let lines: Vec<[u8; 64]> = (0..64).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
+        let mut regs = gfni::LineRegs::new();
+        regs.load(std::array::from_fn(|p| &lines[p]));
+        for j in 0..64 {
+            let mut got = [0u8; 64];
+            // SAFETY: the cfg above enables the target features, and a register is 64 bytes.
+            unsafe { core::arch::x86_64::_mm512_storeu_si512(got.as_mut_ptr().cast(), regs.registers()[j]) };
+            assert_eq!(got, std::array::from_fn(|p| lines[p][j]), "register {j}");
+        }
+    }
 
     /// Every row width, full and short blocks, against the byte-table fold.
     #[test]
