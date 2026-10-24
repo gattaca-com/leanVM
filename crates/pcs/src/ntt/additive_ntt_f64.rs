@@ -478,6 +478,25 @@ impl AdditiveNttF64 {
     ///
     /// - Every block's rows come from the message.
     /// - One task takes one residue across all blocks, block 0 last.
+    ///
+    /// # Streaming the scatter
+    ///
+    /// - A burst of streaming stores after each group saturates the write-combining buffers and overlaps nothing.
+    /// - So a streaming task keeps two scratches and drains the previous group during this group's transform.
+    /// - The sweeps call a hook once per row group, and each call moves an equal share of the previous group's lines.
+    /// - The shares round up, so the group is out by the last call.
+    /// - The task's last group drains after its loop, before the fence.
+    ///
+    /// # Why a late scatter is safe
+    ///
+    /// - Group k's rows reach the codeword after group k+1 gathered, so group k+1 must not read them.
+    /// - Without a message, a group reads only its own rows, and groups are disjoint.
+    /// - With a message, group k+1 reads the message rows of one residue `t`, and group k writes one block's rows.
+    /// - If group k is block `b > 0` of residue `t`, it writes block `b`, which is not the message.
+    /// - If group k is block 0 of residue `t`, group k+1 is residue `t + 1`, whose rows it does not write.
+    /// - Group k+2 gathers into the scratch group k drained, and that drain ended with group k+1's transform.
+    ///
+    /// Without whole cache lines (rows or codeword start off 64 bytes), a group scatters at once.
     #[allow(clippy::too_many_arguments)]
     #[timed]
     fn gathered_pass(
@@ -497,11 +516,18 @@ impl AdditiveNttF64 {
         // Without one, a task is one (block, residue) pair.
         let n_tasks = if msg.is_some() { step } else { step << layer };
         let base = parallel::SendPtr(data.as_mut_ptr());
+        // Whole cache lines in every row, so a finished group can drain a line at a time.
+        let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
+        let drain_per_hook = (rows * num_ntts / 8).div_ceil(hook_calls(layer + g, layer, layer + g, layer));
         parallel::for_each_chunk(n_tasks, |lo, hi| {
             // One L2-resident scratch of 2^g rows serves every group of the task.
-            with_scratch(rows * num_ntts, |scratch| {
+            // A draining task has two: one transforms while the other empties.
+            let deferred = stream && lines_ok;
+            with_scratch(rows * num_ntts * (1 + usize::from(deferred)), |both| {
                 // One fence at the end of the task covers all its streaming stores.
                 let stream = stream.then(Stream::new);
+                let (mut scratch, mut idle) = both.split_at_mut(rows * num_ntts);
+                let mut drain = Drain::default();
                 let mut group = |block: usize, r: usize| {
                     // Row `i` of the group, as a word offset inside its block.
                     let row = |i: usize| (r + (i << log_step)) * num_ntts;
@@ -521,14 +547,37 @@ impl AdditiveNttF64 {
                         dst.copy_from_slice(src);
                     }
                     // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
-                    self.run_layers(scratch, layer + g, num_ntts, layer, layer + g, layer, block, no_hook);
-                    // Scatter: every row returns to its place.
-                    for (i, src) in scratch.chunks_exact(num_ntts).enumerate() {
-                        // SAFETY: this group alone owns these rows of the codeword.
-                        let dst = unsafe { base.slice(block_off + row(i), num_ntts) };
-                        match &stream {
-                            Some(s) => s.copy(dst, src),
-                            None => dst.copy_from_slice(src),
+                    let (log_n, outer) = (layer + g, layer);
+                    match &stream {
+                        Some(s) if deferred => {
+                            // The previous group drains while this one transforms; the rest drains now.
+                            self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, || {
+                                drain.step(s, drain_per_hook)
+                            });
+                            drain.step(s, usize::MAX);
+                            // This group drains during the next transform, while the other scratch is gathered into.
+                            drain = Drain {
+                                // SAFETY: the group's first row lies inside the codeword.
+                                dst: unsafe { base.0.add(block_off + row(0)) },
+                                src: scratch.as_ptr(),
+                                row_len: num_ntts,
+                                dst_stride: step * num_ntts,
+                                rows,
+                                ..Drain::default()
+                            };
+                            std::mem::swap(&mut scratch, &mut idle);
+                        }
+                        _ => {
+                            self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, no_hook);
+                            // Scatter: every row returns to its place.
+                            for (i, src) in scratch.chunks_exact(num_ntts).enumerate() {
+                                // SAFETY: this group alone owns these rows of the codeword.
+                                let dst = unsafe { base.slice(block_off + row(i), num_ntts) };
+                                match &stream {
+                                    Some(s) => s.copy(dst, src),
+                                    None => dst.copy_from_slice(src),
+                                }
+                            }
                         }
                     }
                 };
@@ -542,6 +591,9 @@ impl AdditiveNttF64 {
                         // Task index = block * step + residue.
                         group(t >> log_step, t & (step - 1));
                     }
+                }
+                if let Some(s) = &stream {
+                    drain.step(s, usize::MAX);
                 }
             });
         });
@@ -646,6 +698,72 @@ impl AdditiveNttF64 {
                     data[idx1] = new_v;
                     data[idx0] = u + new_v * twiddle;
                 }
+            }
+        }
+    }
+}
+
+/// How many times [`AdditiveNttF64::run_layers`] calls its hook over `first_layer..end_layer`.
+fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usize) -> usize {
+    let (mut layer, mut calls) = (first_layer, 0);
+    while layer < end_layer {
+        let block_size = 1usize << (log_d - layer);
+        let radix = radix_layers(layer, end_layer, block_size);
+        // Every block of the sweep calls once per row group, and a group takes `2^radix` rows.
+        calls += (1usize << (layer - outer_log)) * (block_size >> radix);
+        layer += radix;
+    }
+    calls
+}
+
+/// A finished row group of a gathered pass, leaving its scratch for the codeword a few lines at a time.
+///
+/// - `dst` is the group's first row in the codeword, `dst_stride` words before its next.
+/// - `src` is the group's contiguous scratch.
+/// - `row`, `line` are the next cache line to move.
+/// - Both sides are whole, aligned cache lines: the caller checks the codeword's alignment and `row_len % 8 == 0`.
+struct Drain {
+    dst: *mut F64,
+    src: *const F64,
+    row_len: usize,
+    dst_stride: usize,
+    rows: usize,
+    row: usize,
+    line: usize,
+}
+
+impl Default for Drain {
+    /// A group with no rows left to move.
+    fn default() -> Self {
+        Self {
+            dst: std::ptr::null_mut(),
+            src: std::ptr::null(),
+            row_len: 0,
+            dst_stride: 0,
+            rows: 0,
+            row: 0,
+            line: 0,
+        }
+    }
+}
+
+impl Drain {
+    /// Stream out up to `lines` more cache lines.
+    #[inline(always)]
+    fn step(&mut self, stream: &Stream, lines: usize) {
+        for _ in 0..lines.min((self.rows - self.row) * (self.row_len / 8) - self.line) {
+            // SAFETY:
+            // - The cursor is inside the group, so both lines are in bounds and line-aligned.
+            // - Only this group's owner writes these rows of the codeword.
+            // - The scratch half is neither written nor gathered into until its group has drained.
+            unsafe {
+                let dst = self.dst.add(self.row * self.dst_stride + self.line * 8);
+                let src = self.src.add(self.row * self.row_len + self.line * 8);
+                stream.copy_lines(dst.cast::<Line>(), &*src.cast::<Line>());
+            }
+            self.line += 1;
+            if self.line == self.row_len / 8 {
+                (self.row, self.line) = (self.row + 1, 0);
             }
         }
     }
@@ -913,15 +1031,16 @@ const L3_WORDS: usize = 1 << 18;
 /// - A smaller buffer stays in L3 for the next pass, which a streaming store would give up.
 const STREAM_MIN_WORDS: usize = 1 << 23;
 
+/// One cache line of words.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line([F64; 8]);
+
 /// Lend this thread's scratch buffer, grown to the requested length.
 ///
 /// - It is cache-line aligned, so a full-width load never splits a line.
 /// - It lives as long as the thread, so no pass allocates in its hot loop.
 fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
-    // One cache line of words.
-    #[derive(Clone, Copy)]
-    #[repr(C, align(64))]
-    struct Line([F64; 8]);
     thread_local! {
         static SCRATCH: RefCell<Vec<Line>> = const { RefCell::new(Vec::new()) };
     }
@@ -1557,6 +1676,8 @@ mod tests {
         //     (14, 64, 0 or 1)        one gathered pass, then deep sub-blocks
         //     (10, 2048, 0)           wide rows shrink the cache budgets: one gathered pass
         //     (12, 2048, 1)           two gathered passes, with streaming stores
+        //     (18, 48, 1)             one gathered pass whose groups drain a line at a time
+        //     (20, 9, 1)              streaming stores, rows that are not whole cache lines
         //
         // A non-zero start is the commit path, which enters at the rate layer.
         let mut rng = Rng::new(0xC0FFEE);
@@ -1568,6 +1689,8 @@ mod tests {
             (14, 64, 1),
             (10, 2048, 0),
             (12, 2048, 1),
+            (18, 48, 1),
+            (20, 9, 1),
         ] {
             let ntt = AdditiveNttF64::standard(log_d);
             let original: Vec<F64> = (0..lanes << log_d).map(|_| F64(rng.next_u64())).collect();
@@ -1597,6 +1720,8 @@ mod tests {
         //     (14, 8, 1)             one gathered pass reading the first replica
         //     (14, 64, 2)            one gathered pass reading the first replica
         //     (12, 2048, 1)          two gathered passes, with streaming stores
+        //     (18, 48, 2)            one gathered pass reading the first replica, groups draining a line at a time
+        //     (20, 9, 2)             the same with rows that are not whole cache lines
         //     (4, 8, 4)              rate = log_d: no layer left, rows handed over at the end
         //
         // The handed-over rows must tile the codeword once, each block already final.
@@ -1607,6 +1732,8 @@ mod tests {
             (14, 8, 1),
             (14, 64, 2),
             (12, 2048, 1),
+            (18, 48, 2),
+            (20, 9, 2),
             (4, 8, 4),
         ] {
             let ntt = AdditiveNttF64::standard(log_d);
