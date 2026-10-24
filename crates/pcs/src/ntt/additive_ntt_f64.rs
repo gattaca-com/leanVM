@@ -395,6 +395,13 @@ impl AdditiveNttF64 {
             let sub_len = num_ntts << log_sub;
             let block_len = data.len() >> start;
             let outer = log_d - log_sub;
+            // While a sub-block transforms, the next one is prefetched into L2, spread over its row groups.
+            let (base, total) = (parallel::SendPtr(data.as_mut_ptr()), data.len());
+            let hooks = hook_calls(log_d, deep_start, log_d, outer);
+            let prefetch_next = |sub_idx: usize| {
+                let next = (sub_idx + 1) * sub_len;
+                prefetch_spread(&base, next, if next < total { sub_len } else { 0 }, hooks)
+            };
             parallel::chunks_mut(data, sub_len, |sub_idx, sub| match msg {
                 // A separate message: build the task's rows in scratch, then write them out once.
                 //
@@ -424,14 +431,16 @@ impl AdditiveNttF64 {
                 // The rows are hashed from scratch and the buffer keeps its pre-deep state.
                 None if defer_deep && deep_rows.is_some() => with_scratch(sub_len, |scratch| {
                     scratch.copy_from_slice(sub);
-                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, no_hook);
+                    let hook = prefetch_next(sub_idx);
+                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
                     if let Some(f) = deep_rows {
                         f(sub_idx << log_sub, scratch);
                     }
                 }),
                 // The replicas are already in place: run the layers where they are.
                 None => {
-                    self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx, no_hook);
+                    let hook = prefetch_next(sub_idx);
+                    self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
                     if let Some(f) = deep_rows {
                         f(sub_idx << log_sub, sub);
                     }
@@ -767,6 +776,30 @@ impl Drain {
                 (self.row, self.line) = (self.row + 1, 0);
             }
         }
+    }
+}
+
+/// A hook that prefetches `words` words at `base + start` into L2, evenly over `calls` calls.
+///
+/// - A sub-block that fills the L2 cannot be prefetched whole before its predecessor is done.
+/// - Spread over the predecessor's sweeps, the lines arrive while it is still working.
+fn prefetch_spread(base: &parallel::SendPtr<F64>, start: usize, words: usize, calls: usize) -> impl FnMut() {
+    let lines = words / 8;
+    let per_call = lines.div_ceil(calls.max(1));
+    // Only an address is formed, never a reference.
+    let first = base.0.wrapping_add(start);
+    let mut done = 0;
+    move || {
+        let end = (done + per_call).min(lines);
+        #[cfg(target_arch = "x86_64")]
+        for line in done..end {
+            // SAFETY: a prefetch of any address is harmless.
+            unsafe {
+                let line = first.wrapping_add(8 * line).cast();
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(line)
+            };
+        }
+        done = end;
     }
 }
 
