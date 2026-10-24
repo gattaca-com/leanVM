@@ -300,6 +300,10 @@ pub(super) unsafe fn compress_groups<S: Lanes32, const G: usize>(
 ///
 /// No transpose then sits between two dependent compressions.
 ///
+/// A set's next block is transposed in two halves, around the kernel:
+/// the first groups just before it, the rest just after it.
+/// The out-of-order core then fills the kernel's idle head and tail with them.
+///
 /// Out of line on purpose: inlined into the dispatcher, the walk measured slower.
 ///
 /// # Safety
@@ -316,6 +320,8 @@ unsafe fn hash_sets<S: Lanes32, const G: usize>(
     t_offset: u64,
     out: *mut u8,
 ) {
+    // Groups `..head` of the next block are transposed before the kernel, the rest after it.
+    let head = G.div_ceil(2);
     let n_blocks = len / BLOCK_LEN;
     let steps = n_sets * n_blocks;
     // No set: nothing to read, not even the first block.
@@ -327,9 +333,10 @@ unsafe fn hash_sets<S: Lanes32, const G: usize>(
     //
     //     set s, group g, lane l    input (s * G + g) * WIDTH + l
     let set_bytes = G * S::WIDTH * len;
-    let transpose = |step: usize, buf: &mut [MaybeUninit<[S; 16]>; G]| {
+    let transpose = |step: usize, buf: &mut [MaybeUninit<[S; 16]>; G], groups: std::ops::Range<usize>| {
         let (set, b) = (step / n_blocks, step % n_blocks);
-        for (g, block) in buf.iter_mut().enumerate() {
+        for g in groups {
+            let block = &mut buf[g];
             let first = set * set_bytes + g * S::WIDTH * len + b * BLOCK_LEN;
             // SAFETY: `step < steps`, so block `b` of every input in the group is in bounds.
             unsafe { S::transpose(src.add(first), len, block.as_mut_ptr().as_mut_unchecked()) };
@@ -345,7 +352,7 @@ unsafe fn hash_sets<S: Lanes32, const G: usize>(
 
     // Prologue: the first block has no compression to hide behind.
     if S::TRANSPOSE_AHEAD {
-        transpose(0, even);
+        transpose(0, even, 0..G);
     }
     for step in 0..steps {
         // Ahead, this step reads one buffer while the next step fills the other.
@@ -354,10 +361,11 @@ unsafe fn hash_sets<S: Lanes32, const G: usize>(
         } else {
             (&mut *even, &mut *odd)
         };
+        let ahead = S::TRANSPOSE_AHEAD && step + 1 < steps;
         if !S::TRANSPOSE_AHEAD {
-            transpose(step, cur);
-        } else if step + 1 < steps {
-            transpose(step + 1, next);
+            transpose(step, cur, 0..G);
+        } else if ahead {
+            transpose(step + 1, next, 0..head);
         }
 
         // Block `b` ends at byte `(b + 1) * 64`, after the shared prefix.
@@ -367,6 +375,9 @@ unsafe fn hash_sets<S: Lanes32, const G: usize>(
         let m = std::array::from_fn(|g| unsafe { cur[g].assume_init_ref() });
         // SAFETY: the blocks are initialized, and `h` is this set's chaining value.
         unsafe { S::compress_groups::<G>(&mut h, m, t, b + 1 == n_blocks) };
+        if ahead {
+            transpose(step + 1, next, head..G);
+        }
 
         // Last block of the set: write its digests, then restart for the next set.
         if b + 1 == n_blocks {
