@@ -204,7 +204,7 @@ impl Terms {
     }
 
     /// `P(l, .)` for the lane's words.
-    fn project_lane<const CHUNKS: usize>(&self, lane: &[F64], row: &mut [F192]) {
+    fn project_lane<const CHUNKS: usize>(&self, lane: &[F64], row: &mut [F192], repeats: &mut [bool]) {
         let n_blocks = lane.len() >> self.low_vars;
         let mut q = vec![F192::ZERO; n_blocks * self.patterns.len()];
         let mut sigmas = vec![F192::ZERO; ROWS * self.rings.len()];
@@ -219,7 +219,11 @@ impl Terms {
             let block = lane
                 .get(h << self.low_vars..)
                 .and_then(|rest| rest.get(..1 << self.low_vars));
-            if prev.map(words) != block.map(words) {
+            let same = prev.map(words) == block.map(words);
+            if let Some(repeat) = repeats.get_mut(h) {
+                *repeat = same;
+            }
+            if !same {
                 for ((fold, mass), sigma) in folds.iter_mut().zip(&mut masses).zip(sigmas.chunks_exact_mut(ROWS)) {
                     if let Some(folded) = fold.take() {
                         for (s, v) in sigma.as_chunks_mut::<8>().0.iter_mut().zip(folded.as_chunks::<8>().0) {
@@ -279,20 +283,26 @@ impl Terms {
         }
     }
 
-    fn project(&self, stack: &[F64]) -> Vec<F192> {
+    /// `P`, and which blocks of the stack repeat their predecessor in the lane.
+    fn project(&self, stack: &[F64]) -> (Vec<F192>, Vec<bool>) {
         let (block, n_terms) = (1usize << self.lane_vars, self.n_terms());
+        let n_blocks = block >> self.low_vars;
         let mut p = vec![F192::ZERO; stack.len() / block * n_terms];
+        let mut repeats = vec![false; stack.len() >> self.low_vars];
+        let repeats_ptr = parallel::SendPtr(repeats.as_mut_ptr());
         parallel::chunks_mut(&mut p, n_terms, |l, row| {
             let lane = &stack[l * block..(l + 1) * block];
+            // SAFETY: lane `l` owns the blocks `l * n_blocks..(l + 1) * n_blocks`, in bounds and disjoint.
+            let repeats = unsafe { repeats_ptr.slice(l * n_blocks, n_blocks) };
             match self.low_vars {
-                6 => self.project_lane::<8>(lane, row),
-                7 => self.project_lane::<16>(lane, row),
-                8 => self.project_lane::<32>(lane, row),
-                9 => self.project_lane::<64>(lane, row),
-                _ => self.project_lane::<128>(lane, row),
+                6 => self.project_lane::<8>(lane, row, repeats),
+                7 => self.project_lane::<16>(lane, row, repeats),
+                8 => self.project_lane::<32>(lane, row, repeats),
+                9 => self.project_lane::<64>(lane, row, repeats),
+                _ => self.project_lane::<128>(lane, row, repeats),
             }
         });
-        p
+        (p, repeats)
     }
 }
 
@@ -420,11 +430,13 @@ pub(super) fn project(
             }
         }
     }
-    let p = terms.project(stack);
+    let (p, repeats) = terms.project(stack);
     InitialBasis {
         p,
         a,
         block: n_terms,
+        repeats,
+        repeat_len: 1 << low_vars,
         lift: Box::new(terms),
     }
 }

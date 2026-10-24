@@ -710,6 +710,9 @@ pub(crate) struct InitialBasis {
     pub(crate) p: Vec<F192>,
     pub(crate) a: Vec<F192>,
     pub(crate) block: usize,
+    /// For every block of `repeat_len` words of the committed lanes, whether it equals the block before it in its lane.
+    pub(crate) repeats: Vec<bool>,
+    pub(crate) repeat_len: usize,
     pub(crate) lift: Box<dyn LaneLift>,
 }
 
@@ -752,33 +755,71 @@ fn add_scaled(acc: &mut [F192], v: &[F192], s: F192) {
     }
 }
 
-/// The witness after every lane round, straight from the base lanes: `sum_l eq(rs, l) * base_l`.
-#[timed]
-fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192]) -> Vec<F192> {
-    const CHUNK: usize = 256;
-    let weights = primitives::multilinear::eq_table(rs);
-    let mut out = vec![F192::ZERO; block];
-    parallel::chunks_mut(&mut out, CHUNK, |c, out| {
-        let x0 = c * CHUNK;
-        // The products stay unreduced across the lanes: one reduction per output.
-        #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-        {
-            let mut acc = [Acc8::ZERO; CHUNK / 8];
-            for (l, lane) in base.chunks_exact(block).enumerate() {
-                for (a, k) in acc.iter_mut().zip(lane[x0..x0 + out.len()].as_chunks::<8>().0) {
-                    *a ^= primitives::field::mul_base_splat8(weights[l], k);
-                }
-            }
-            for (o, a) in out.as_chunks_mut::<8>().0.iter_mut().zip(acc) {
-                *o = a.reduce_each();
+/// `out[x] += sum_l w_l * (cur_l[x] + prev_l[x])` over `(w_l, cur_l, prev_l)`.
+#[inline]
+fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a [F64], &'a [F64])>) {
+    // The products stay unreduced across the lanes: one reduction per output.
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    {
+        let mut acc = [Acc8::ZERO; 128];
+        let acc = &mut acc[..out.len() / 8];
+        for (w, cur, prev) in deltas {
+            for ((a, c), p) in acc.iter_mut().zip(cur.as_chunks::<8>().0).zip(prev.as_chunks::<8>().0) {
+                *a ^= primitives::field::mul_base_splat8(w, &std::array::from_fn(|i| F64(c[i].0 ^ p[i].0)));
             }
         }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-        for (l, lane) in base.chunks_exact(block).enumerate() {
-            let src = &lane[x0..x0 + out.len()];
-            for (o, k) in out.as_chunks_mut::<8>().0.iter_mut().zip(src.as_chunks::<8>().0) {
-                primitives::field::xor_into8(o, &primitives::field::mul_base8(weights[l], *k));
+        for (o, a) in out.as_chunks_mut::<8>().0.iter_mut().zip(acc) {
+            primitives::field::xor_into8(o, &a.reduce_each());
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    for (w, cur, prev) in deltas {
+        for ((o, c), p) in out
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(cur.as_chunks::<8>().0)
+            .zip(prev.as_chunks::<8>().0)
+        {
+            primitives::field::xor_into8(
+                o,
+                &primitives::field::mul_base8(w, std::array::from_fn(|i| F64(c[i].0 ^ p[i].0))),
+            );
+        }
+    }
+}
+
+/// The witness after every lane round, straight from the base lanes: `sum_l eq(rs, l) * base_l`.
+///
+/// A block that repeats its predecessor in its lane adds what that lane added to the block before, so a block
+/// of the sum is the block before it plus the deltas of the lanes whose block changed. A task starts from nothing.
+#[timed]
+fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run: usize) -> Vec<F192> {
+    const TASK: usize = 32;
+    let weights = primitives::multilinear::eq_table(rs);
+    let n_blocks = block / run;
+    let zeros = vec![F64(0); run];
+    let mut out = vec![F192::ZERO; block];
+    parallel::chunks_mut(&mut out, TASK * run, |c, out| {
+        for i in 0..out.len() / run {
+            if i > 0 {
+                out.copy_within((i - 1) * run..i * run, i * run);
             }
+            let h = c * TASK + i;
+            let changed = |l: &usize| i == 0 || !repeats[l * n_blocks + h];
+            let deltas = base
+                .chunks_exact(block)
+                .enumerate()
+                .filter(|(l, _)| changed(l))
+                .map(|(l, lane)| {
+                    let prev = if i == 0 {
+                        &zeros[..]
+                    } else {
+                        &lane[(h - 1) * run..h * run]
+                    };
+                    (weights[l], &lane[h * run..(h + 1) * run], prev)
+                });
+            add_lane_deltas(&mut out[i * run..(i + 1) * run], deltas);
         }
     });
     out
@@ -797,6 +838,9 @@ pub(crate) struct SumcheckProver<'a> {
     /// Elements of a lane block of the tables, and of the committed lanes.
     block: usize,
     lane_block: usize,
+    /// Which blocks of `repeat_len` words of `base` repeat their predecessor.
+    repeats: Vec<bool>,
+    repeat_len: usize,
     /// Taken by the last lane round.
     lift: Option<Box<dyn LaneLift>>,
     /// The lane challenges so far.
@@ -817,8 +861,17 @@ impl<'a> SumcheckProver<'a> {
     pub(crate) fn new(f: &'a [F64], b1: InitialBasis, h1: F192, lane_block: usize) -> (Self, SumcheckMessage) {
         let _span = tracing::info_span!("Sumcheck round", round = 0, log_size = f.len().ilog2()).entered();
         assert!(lane_block > 0 && f.len().is_multiple_of(lane_block));
-        let InitialBasis { p, a, block, lift } = b1;
+        let InitialBasis {
+            p,
+            a,
+            block,
+            repeats,
+            repeat_len,
+            lift,
+        } = b1;
         assert_eq!(p.len(), f.len() / lane_block * block);
+        assert_eq!(repeats.len(), f.len() / repeat_len);
+        assert!(lane_block.is_multiple_of(repeat_len));
         let msg = round_msg_blocks(&p, &a, block);
         let inst = Self {
             base: f,
@@ -826,6 +879,8 @@ impl<'a> SumcheckProver<'a> {
             combined_basis: a,
             block,
             lane_block,
+            repeats,
+            repeat_len,
             lift: Some(lift),
             lane_rs: Vec::new(),
             t_r: h1,
@@ -859,7 +914,13 @@ impl<'a> SumcheckProver<'a> {
         self.combined_basis = fold_blocks(&self.combined_basis, self.block, r);
         let msg = if last {
             let lift = self.lift.take().expect("the lift is taken by the last lane round only");
-            self.f = fold_all_lanes(self.base, self.lane_block, &self.lane_rs);
+            self.f = fold_all_lanes(
+                self.base,
+                self.lane_block,
+                &self.lane_rs,
+                &self.repeats,
+                self.repeat_len,
+            );
             self.combined_basis = lift.lift(&self.combined_basis);
             round_msg_lsb(&self.f, &self.combined_basis)
         } else {
