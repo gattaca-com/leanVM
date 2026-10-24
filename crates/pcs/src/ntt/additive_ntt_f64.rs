@@ -591,7 +591,10 @@ impl AdditiveNttF64 {
         let base = parallel::SendPtr(data.as_mut_ptr());
         // Whole cache lines in every row, so a finished group can drain a line at a time.
         let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
-        let drain_per_hook = (rows * num_ntts / 8).div_ceil(hook_calls(layer + g, layer, layer + g, layer));
+        let hooks = hook_calls(layer + g, layer, layer + g, layer);
+        // A small group's rows arrive without help, and its bookkeeping would cost more than it saves.
+        let fetch_ahead = rows * num_ntts >= FETCH_AHEAD_MIN_WORDS;
+        let drain_per_hook = (rows * num_ntts / 8).div_ceil(hooks);
         parallel::for_each_chunk(n_tasks, |lo, hi| {
             // One L2-resident scratch of 2^g rows serves every group of the task.
             // A draining task has two: one transforms while the other empties.
@@ -601,7 +604,8 @@ impl AdditiveNttF64 {
                 let stream = stream.then(Stream::new);
                 let (mut scratch, mut idle) = both.split_at_mut(rows * num_ntts);
                 let mut drain = Drain::default();
-                let mut group = |block: usize, r: usize| {
+                // `next`: the first row of the group after this one, and which share of its lines this group fetches.
+                let mut group = |block: usize, r: usize, next: Option<(*const F64, std::ops::Range<usize>)>| {
                     // Row `i` of the group, as a word offset inside its block.
                     let row = |i: usize| (r + (i << log_step)) * num_ntts;
                     let block_off = (block << (log_d - layer)) * num_ntts;
@@ -624,8 +628,11 @@ impl AdditiveNttF64 {
                     match &stream {
                         Some(s) if deferred => {
                             // The previous group drains while this one transforms; the rest drains now.
+                            let (first, lines) = next.unwrap_or((std::ptr::null(), 0..0));
+                            let mut fetch = prefetch_rows(first, num_ntts, step * num_ntts, lines, hooks);
                             self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, || {
-                                drain.step(s, drain_per_hook)
+                                drain.step(s, drain_per_hook);
+                                fetch();
                             });
                             drain.step(s, usize::MAX);
                             // This group drains during the next transform, while the other scratch is gathered into.
@@ -654,15 +661,26 @@ impl AdditiveNttF64 {
                         }
                     }
                 };
+                let lines = rows * num_ntts / 8;
                 for t in lo..hi {
-                    if msg.is_some() {
+                    if let Some(m) = msg {
                         // Block 0 may be the message itself, so it is transformed last.
-                        for block in (0..1usize << layer).rev() {
-                            group(block, t);
+                        // The residue after this one reads fresh rows: its lines are fetched over this one's groups.
+                        let blocks = 1usize << layer;
+                        for (k, block) in (0..blocks).rev().enumerate() {
+                            let next = (fetch_ahead && t + 1 < hi).then(|| {
+                                let first = m.0.cast_const().wrapping_add((t + 1) * num_ntts);
+                                (first, (k * lines) >> layer..((k + 1) * lines) >> layer)
+                            });
+                            group(block, t, next);
                         }
                     } else {
-                        // Task index = block * step + residue.
-                        group(t >> log_step, t & (step - 1));
+                        // Task index = block * step + residue; the next task reads its own, disjoint rows.
+                        let next = (fetch_ahead && t + 1 < hi).then(|| {
+                            let (block, r) = ((t + 1) >> log_step, (t + 1) & (step - 1));
+                            (base.0.cast_const().wrapping_add(((block << (log_d - layer)) + r) * num_ntts), 0..lines)
+                        });
+                        group(t >> log_step, t & (step - 1), next);
                     }
                 }
                 if let Some(s) = &stream {
@@ -864,6 +882,41 @@ fn prefetch_spread(base: &parallel::SendPtr<F64>, start: usize, words: usize, ca
             };
         }
         done = end;
+    }
+}
+
+/// A hook that prefetches cache lines `lines` of a row group into L2, evenly over `calls` calls.
+///
+/// - The group's rows are `row_words` words long and `stride` words apart, from `first`.
+/// - Line `n` is line `n % (row_words / 8)` of row `n / (row_words / 8)`.
+fn prefetch_rows(
+    first: *const F64,
+    row_words: usize,
+    stride: usize,
+    lines: std::ops::Range<usize>,
+    calls: usize,
+) -> impl FnMut() {
+    let per_row = row_words / 8;
+    let mut left = lines.len();
+    // A group with nothing to fetch divides nothing.
+    let per_call = if left == 0 { 0 } else { left.div_ceil(calls) };
+    // The cursor: the next line's row and its offset inside the row, so no call divides.
+    let (mut row, mut col) = if left == 0 { (0, 0) } else { (lines.start / per_row, lines.start % per_row) };
+    move || {
+        for _ in 0..per_call.min(left) {
+            // Only an address is formed, never a reference.
+            let line = first.wrapping_add(row * stride + col * 8);
+            // SAFETY: a prefetch of any address is harmless.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(line.cast())
+            };
+            col += 1;
+            if col == per_row {
+                (row, col) = (row + 1, 0);
+            }
+        }
+        left = left.saturating_sub(per_call);
     }
 }
 
@@ -1127,6 +1180,9 @@ const L3_WORDS: usize = 1 << 18;
 /// - A streaming store then skips the read an ordinary store makes before it writes.
 /// - A smaller buffer stays in L3 for the next pass, which a streaming store would give up.
 const STREAM_MIN_WORDS: usize = 1 << 23;
+
+/// Gathered groups of at least this many words fetch the next group's source rows while they transform.
+const FETCH_AHEAD_MIN_WORDS: usize = 1 << 13;
 
 /// One cache line of words.
 #[derive(Clone, Copy)]
