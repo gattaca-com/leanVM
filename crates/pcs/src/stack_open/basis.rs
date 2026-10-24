@@ -16,13 +16,14 @@
 use primitives::bit_fold::BitFold;
 use primitives::bits::bit_transpose_64bytes;
 use primitives::field::{
-    Acc8, F64, F192, F192Unreduced, Weights8, dot_base, fold_lones8_ext, msg_lone8_ext, xor_into8,
+    Acc8, F64, F192, F192Unreduced, F192x8, Weights8, dot_base, fold_lones8_ext, msg_lone8_ext, xor_into8,
 };
+use primitives::stream::Stream;
 
 use super::{RingSwitchOpen, StackClaim};
 use crate::ring_switch::{RingWeight, coordinate_basis};
 use crate::tensor_algebra::{DEGREE_E, transpose_s_hat};
-use crate::whir::{InitialBasis, LaneLift};
+use crate::whir::{InitialBasis, LaneLift, SumcheckMessage, accumulate_msg, adjacent_dots};
 
 /// Bits of a block's low part.
 const LOW_VARS: usize = 10;
@@ -120,8 +121,8 @@ struct Pattern {
 }
 
 enum Low {
-    /// Every position: the table for `add`, packed for the dot against a block.
-    Dense { table: Vec<F192>, packed: Vec<Weights8> },
+    /// Every position: the table in vectors of eight for the lift, packed for the dot against a block.
+    Dense { table: Vec<F192x8>, packed: Vec<Weights8> },
     /// Few positions: the support of `pi`.
     Sparse(Vec<(usize, F192)>),
 }
@@ -135,6 +136,7 @@ impl Low {
             Low::Sparse(support.map(|(x, &c)| (x, c)).collect())
         } else {
             let packed = table.as_chunks::<8>().0.iter().map(Weights8::new).collect();
+            let table = table.as_chunks::<8>().0.iter().map(F192x8::from_array).collect();
             Low::Dense { table, packed }
         }
     }
@@ -147,22 +149,6 @@ impl Low {
                 .iter()
                 .fold(F192Unreduced::ZERO, |acc, &(x, c)| acc ^ c.mul_base_unreduced(block[x]))
                 .reduce(),
-        }
-    }
-
-    /// `out[x] += g * pi(x)`.
-    fn add(&self, g: F192, out: &mut [F192]) {
-        match self {
-            Low::Dense { table, .. } => {
-                for (o, t) in out.as_chunks_mut::<8>().0.iter_mut().zip(table.as_chunks::<8>().0) {
-                    xor_into8(o, &scale8(t, g));
-                }
-            }
-            Low::Sparse(support) => {
-                for &(x, c) in support {
-                    out[x] += g * c;
-                }
-            }
         }
     }
 }
@@ -319,31 +305,76 @@ impl Terms {
 
 impl LaneLift for Terms {
     /// `b[h * 2^m + x] = sum_claims A[c] * gamma_c(h) * pi_c(x) + sum_rings Phi'(e(x))`, where
-    /// `Phi'` weighs the ring's coordinates by its 192 terms of `a`.
-    fn lift(&self, a: &[F192]) -> Vec<F192> {
-        let mut b = vec![F192::ZERO; 1 << self.lane_vars];
-        parallel::chunks_mut(&mut b, 1 << self.low_vars, |h, block| {
-            for pattern in &self.patterns {
-                let g = pattern
-                    .claims
+    /// `Phi'` weighs the ring's coordinates by its 192 terms of `a`, and the message of `f` against `b`.
+    ///
+    /// Each block is built in an L1 scratch, read for the message and streamed out. The dense patterns
+    /// share one reduction per vector, and the next block of `f` is prefetched while they run.
+    fn lift(&self, a: &[F192], f: &[F192]) -> (Vec<F192>, SumcheckMessage) {
+        let block = 1usize << self.low_vars;
+        let rings: Vec<_> = self
+            .rings
+            .iter()
+            .map(|ring| {
+                let vars = ring.point.len().min(self.lane_vars);
+                let weights = a[ring.first..ring.first + DEGREE_E].to_vec();
+                let weight = RingWeight::from_point(weights, ring.point[..vars].to_vec());
+                (weight, ring.x_offset, 1usize << vars)
+            })
+            .collect();
+        // SAFETY: every block is streamed out whole before the message pass ends.
+        let mut b = unsafe { primitives::uninit_vec::<F192>(1 << self.lane_vars) };
+        let b_ptr = parallel::SendPtr(b.as_mut_ptr());
+        let (u_0, u_2) = accumulate_msg(b.len() / block, b.len() / 2, |h| {
+            let mut scratch = [F192::ZERO; 1 << LOW_VARS];
+            let out = &mut scratch[..block];
+            let gs = self.patterns.iter().map(|p| {
+                p.claims
                     .iter()
-                    .fold(F192::ZERO, |sum, &c| sum + a[c] * self.gamma[c][h]);
-                if g != F192::ZERO {
-                    pattern.low.add(g, block);
+                    .fold(F192::ZERO, |sum, &c| sum + a[c] * self.gamma[c][h])
+            });
+            let (mut dense, mut sparse) = (Vec::new(), Vec::new());
+            for (pattern, g) in self.patterns.iter().zip(gs).filter(|(_, g)| *g != F192::ZERO) {
+                match &pattern.low {
+                    Low::Dense { table, .. } => dense.push((table, F192x8::splat(g))),
+                    Low::Sparse(support) => sparse.push((support, g)),
                 }
             }
+            let next = f.as_ptr().wrapping_add((h + 1) * block);
+            for (k, o) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                #[cfg(target_arch = "x86_64")]
+                for line in 0..3 {
+                    let at = next.wrapping_add(8 * k).cast::<i8>().wrapping_add(64 * line);
+                    // SAFETY: a prefetch of any address is harmless.
+                    unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(at) };
+                }
+                let products = dense.iter().map(|(table, g)| table[k].mul_unreduced(*g));
+                *o = products
+                    .reduce(|acc, p| acc ^ p)
+                    .map_or([F192::ZERO; 8], |acc| acc.reduce_lanes().to_array());
+            }
+            for (support, g) in sparse {
+                for &(x, c) in support {
+                    out[x] += g * c;
+                }
+            }
+            for (weight, offset, len) in &rings {
+                let (lo, hi) = ((h * block).max(*offset), ((h + 1) * block).min(offset + len));
+                if lo < hi {
+                    weight.add_chunk(lo - offset, &mut out[lo - h * block..hi - h * block]);
+                }
+            }
+            let (u_0, u_2, _) = adjacent_dots::<false>(&f[h * block..][..block], out);
+            // SAFETY: block `h` is in bounds, and no other task writes it.
+            unsafe { Stream::new().copy_uninit(b_ptr.add(h * block), out) };
+            (u_0, u_2)
         });
-        const CHUNK: usize = 1 << 12;
-        for ring in &self.rings {
-            let vars = ring.point.len().min(self.lane_vars);
-            let weight = RingWeight::from_point(
-                a[ring.first..ring.first + DEGREE_E].to_vec(),
-                ring.point[..vars].to_vec(),
-            );
-            let dst = &mut b[ring.x_offset..ring.x_offset + (1 << vars)];
-            parallel::chunks_mut(dst, CHUNK, |i, out| weight.add_chunk(i * CHUNK, out));
-        }
-        b
+        (
+            b,
+            SumcheckMessage {
+                u_0: u_0.reduce(),
+                u_2: u_2.reduce(),
+            },
+        )
     }
 }
 

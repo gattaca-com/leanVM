@@ -316,15 +316,10 @@ pub(crate) struct RingWeight {
     eq_hi: Vec<F192>,
     #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
     table: Box<FoldByteTable>,
-    /// The weights, one per bit of a product row (an F192 padded to [`FOLD_ROW_BYTES`]),
-    /// for the GFNI fold of 64 rows at a time.
+    /// The weights of a product row's low 128 bits and of its top 64, for the GFNI fold of 64 rows at a time.
     #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-    fold: BitFold,
+    fold: (BitFold, BitFold),
 }
-
-/// A product row for the GFNI fold: an F192 zero-padded to the next power of two the kernel takes.
-#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-const FOLD_ROW_BYTES: usize = 32;
 
 /// The `w`-th `F_2`-coordinate basis element of `E`: bits 0..64 are K's power
 /// basis, and bits 64/128 shift it by Y / Y^2.
@@ -341,11 +336,7 @@ impl RingWeight {
         assert_eq!(weights.len(), DEGREE_E);
         debug_assert_eq!(eq_lo.len() * eq_hi.len(), 1 << point.len());
         #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-        let fold = {
-            let mut padded = weights.clone();
-            padded.resize(8 * FOLD_ROW_BYTES, F192::ZERO);
-            BitFold::new(&padded)
-        };
+        let fold = (BitFold::new(&weights[..128]), BitFold::new(&weights[128..]));
         Self {
             #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi")))]
             table: build_fold_byte_table_ext(&weights),
@@ -445,23 +436,28 @@ impl RingWeight {
     #[inline]
     fn fold_products_gfni(&self, e_lo: &[F192], e_hi: F192, out: &mut [F192]) {
         debug_assert_eq!(e_lo.len(), out.len());
-        let mut rows = [[0u64; FOLD_ROW_BYTES / 8]; BLOCK];
+        let mut head = [[0u64; 2]; BLOCK];
+        let mut tail = [0u64; BLOCK];
         let mut folded = [F192::ZERO; BLOCK];
         for (e_lo, out) in e_lo.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
             let n = e_lo.len();
             let (lo4, lo_r) = e_lo.as_chunks::<4>();
+            let mut put = |i: usize, p: F192| {
+                head[i] = [p.c0, p.c1];
+                tail[i] = p.c2;
+            };
             for (k, e_lo) in lo4.iter().enumerate() {
                 for (j, p) in mul4(*e_lo, [e_hi; 4]).into_iter().enumerate() {
-                    rows[4 * k + j] = [p.c0, p.c1, p.c2, 0];
+                    put(4 * k + j, p);
                 }
             }
             for (j, &e_lo) in lo_r.iter().enumerate() {
-                let p = e_lo * e_hi;
-                rows[4 * lo4.len() + j] = [p.c0, p.c1, p.c2, 0];
+                put(4 * lo4.len() + j, e_lo * e_hi);
             }
-            // SAFETY: `[u64; 4]` and `[u8; 32]` have the same size, and every bit pattern is a valid byte row.
-            let bytes: &[[u8; FOLD_ROW_BYTES]; BLOCK] = unsafe { &*rows.as_ptr().cast() };
-            self.fold.fold_block(&bytes[..n], &mut folded);
+            // SAFETY: `[u64; N]` and `[u8; 8 * N]` have the same size, and every bit pattern is a valid byte row.
+            let (head_rows, tail_rows): (&[[u8; 16]; BLOCK], &[[u8; 8]; BLOCK]) =
+                unsafe { (&*head.as_ptr().cast(), &*tail.as_ptr().cast()) };
+            self.fold.0.fold_block_pair(&self.fold.1, &head_rows[..n], &tail_rows[..n], &mut folded);
             let (out8, out_r) = out.as_chunks_mut::<8>();
             for (o, f) in out8.iter_mut().zip(folded.as_chunks::<8>().0) {
                 xor_into8(o, f);

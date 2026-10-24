@@ -432,7 +432,7 @@ fn deinterleave(x: &[F192; 16]) -> ([F192; 8], [F192; 8]) {
 /// when `ODD`, `sum f1*b1` over the same pairs (the other half of the inner product `sum f*b` once
 /// `u_0 = sum f0*b0` is added). A trailing odd element contributes nothing.
 #[inline]
-fn adjacent_dots<const ODD: bool>(f: &[F192], b: &[F192]) -> (Acc8, Acc8, Acc8) {
+pub(crate) fn adjacent_dots<const ODD: bool>(f: &[F192], b: &[F192]) -> (Acc8, Acc8, Acc8) {
     let (f16, f_r) = f.as_chunks::<16>();
     let (b16, b_r) = b.as_chunks::<16>();
     let (mut u_0, mut u_2, mut odd) = (Acc8::ZERO, Acc8::ZERO, Acc8::ZERO);
@@ -604,7 +604,7 @@ const ROUND_CHUNK: usize = 2048;
 /// instances where dispatch costs more than the work. Unreduced accumulators
 /// combine by XOR and `reduce` is linear, so both paths land on the same message.
 #[inline]
-fn accumulate_msg(n_tasks: usize, n_pairs: usize, task: impl Fn(usize) -> (Acc8, Acc8) + Sync) -> (Acc8, Acc8) {
+pub(crate) fn accumulate_msg(n_tasks: usize, n_pairs: usize, task: impl Fn(usize) -> (Acc8, Acc8) + Sync) -> (Acc8, Acc8) {
     const PAR_THRESHOLD: usize = 4096;
     if n_pairs < PAR_THRESHOLD {
         let mut u_0 = Acc8::ZERO;
@@ -705,7 +705,7 @@ fn fold_blocks(x: &[F192], block: usize, r: F192) -> Vec<F192> {
 
 /// The weight over one lane block after every lane round, rebuilt from the term table's last row.
 pub(crate) trait LaneLift {
-    fn lift(&self, a: &[F192]) -> Vec<F192>;
+    fn lift(&self, a: &[F192], f: &[F192]) -> (Vec<F192>, SumcheckMessage);
 }
 
 /// The basis the sumcheck starts from: the weight as terms, `b(l, x) = sum_t a[l][t] * K_t(x)`,
@@ -944,8 +944,9 @@ impl<'a> SumcheckProver<'a> {
                 &self.repeats,
                 self.repeat_len,
             );
-            self.combined_basis = lift.lift(&self.combined_basis);
-            round_msg_lsb(&self.f, &self.combined_basis)
+            let (b, msg) = lift.lift(&self.combined_basis, &self.f);
+            self.combined_basis = b;
+            msg
         } else {
             round_msg_blocks(&self.f, &self.combined_basis, self.block)
         };

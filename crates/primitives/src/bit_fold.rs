@@ -89,6 +89,22 @@ impl BitFold {
         self.imp.fold_block(rows, out);
     }
 
+    /// Fold up to 64 rows split in two runs of bytes: `self` weighs the `A` bytes of `head`, `tail` the `B` of `tail_rows`.
+    ///
+    /// The sums are added before the output transpose, so a row of 24 bytes costs 24 input bytes, not 32.
+    #[inline]
+    pub fn fold_block_pair<const A: usize, const B: usize>(
+        &self,
+        tail: &Self,
+        head_rows: &[[u8; A]],
+        tail_rows: &[[u8; B]],
+        out: &mut [F192; BLOCK],
+    ) {
+        debug_assert!(A == self.n_chunks && B == tail.n_chunks);
+        assert!(head_rows.len() <= BLOCK && head_rows.len() == tail_rows.len());
+        self.imp.fold_block_pair(&tail.imp, head_rows, tail_rows, out);
+    }
+
     /// Fold up to 64 consecutive rows into eight vectors, eight values each, in the order `GROUP_LOG` picks.
     ///
     /// Value `p` is the fold of row `p`, and a short block is zero-padded. Lane `l` of vector `r` holds the value
@@ -226,6 +242,19 @@ mod portable {
         pub(super) fn fold_block<const CHUNKS: usize>(&self, rows: &[[u8; CHUNKS]], out: &mut [F192; BLOCK]) {
             for (o, row) in out.iter_mut().zip(rows) {
                 *o = fold_row_lookup(&self.tables, row);
+            }
+        }
+
+        #[inline]
+        pub(super) fn fold_block_pair<const A: usize, const B: usize>(
+            &self,
+            tail: &Self,
+            head_rows: &[[u8; A]],
+            tail_rows: &[[u8; B]],
+            out: &mut [F192; BLOCK],
+        ) {
+            for ((o, head), tail_row) in out.iter_mut().zip(head_rows).zip(tail_rows) {
+                *o = fold_row_lookup(&self.tables, head) + fold_row_lookup(&tail.tables, tail_row);
             }
         }
 
@@ -726,6 +755,23 @@ pub mod gfni {
             unsafe { store_f192(&acc, out) };
         }
 
+        #[inline]
+        pub(super) fn fold_block_pair<const A: usize, const B: usize>(
+            &self,
+            tail: &Self,
+            head_rows: &[[u8; A]],
+            tail_rows: &[[u8; B]],
+            out: &mut [F192; BLOCK],
+        ) {
+            let (mut acc, tail_acc) = (self.accumulate_rows(head_rows), tail.accumulate_rows(tail_rows));
+            for (a, t) in acc.iter_mut().zip(&tail_acc) {
+                // SAFETY: the module is compiled only with these target features enabled.
+                *a = unsafe { _mm512_xor_si512(*a, *t) };
+            }
+            // SAFETY: as above.
+            unsafe { store_f192(&acc, out) };
+        }
+
         /// The block as eight vectors, straight from the accumulators.
         #[cfg(target_feature = "vpclmulqdq")]
         #[inline]
@@ -899,6 +945,26 @@ mod tests {
         check::<32>(&mut rng);
         check::<64>(&mut rng);
         check::<128>(&mut rng);
+    }
+
+    /// Two runs of bytes against the sum of their folds, full and short blocks.
+    #[test]
+    fn fold_block_pair_adds_both_runs() {
+        let mut rng = Rng::new(0x9A1_2B);
+        let weights: Vec<F192> = (0..192).map(|_| rng.ext()).collect();
+        let (head, tail) = (BitFold::new(&weights[..128]), BitFold::new(&weights[128..]));
+        for len in [BLOCK, 5] {
+            let head_rows: Vec<[u8; 16]> = (0..len).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
+            let tail_rows: Vec<[u8; 8]> = (0..len).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
+            let mut out = [F192::ZERO; BLOCK];
+            head.fold_block_pair(&tail, &head_rows, &tail_rows, &mut out);
+            let (mut by_head, mut by_tail) = ([F192::ZERO; BLOCK], [F192::ZERO; BLOCK]);
+            head.fold_block(&head_rows, &mut by_head);
+            tail.fold_block(&tail_rows, &mut by_tail);
+            for p in 0..len {
+                assert_eq!(out[p], by_head[p] + by_tail[p], "len={len}, row {p}");
+            }
+        }
     }
 
     /// The byte tables against the definition: the sum of the weights of the set bits.
