@@ -231,7 +231,7 @@ impl AdditiveNttF64 {
         let finished: Vec<Vec<F64>> = parallel::map_collect(subs.len(), |i| {
             let sub_idx = subs[i];
             let mut sub = data[sub_idx * sub_len..][..sub_len].to_vec();
-            self.run_layers(&mut sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx);
+            self.run_layers(&mut sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, no_hook);
             sub
         });
         positions
@@ -411,7 +411,7 @@ impl AdditiveNttF64 {
                         // - Each part ends inside its replica, so the read stays in bounds.
                         part.copy_from_slice(unsafe { std::slice::from_raw_parts(m.add(off), part.len()) });
                     }
-                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx);
+                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, no_hook);
                     if let Some(f) = deep_rows {
                         f(sub_idx << log_sub, scratch);
                     }
@@ -424,14 +424,14 @@ impl AdditiveNttF64 {
                 // The rows are hashed from scratch and the buffer keeps its pre-deep state.
                 None if defer_deep && deep_rows.is_some() => with_scratch(sub_len, |scratch| {
                     scratch.copy_from_slice(sub);
-                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx);
+                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, no_hook);
                     if let Some(f) = deep_rows {
                         f(sub_idx << log_sub, scratch);
                     }
                 }),
                 // The replicas are already in place: run the layers where they are.
                 None => {
-                    self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx);
+                    self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx, no_hook);
                     if let Some(f) = deep_rows {
                         f(sub_idx << log_sub, sub);
                     }
@@ -521,7 +521,7 @@ impl AdditiveNttF64 {
                         dst.copy_from_slice(src);
                     }
                     // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
-                    self.run_layers(scratch, layer + g, num_ntts, layer, layer + g, layer, block);
+                    self.run_layers(scratch, layer + g, num_ntts, layer, layer + g, layer, block, no_hook);
                     // Scatter: every row returns to its place.
                     for (i, src) in scratch.chunks_exact(num_ntts).enumerate() {
                         // SAFETY: this group alone owns these rows of the codeword.
@@ -552,6 +552,7 @@ impl AdditiveNttF64 {
     /// - The domain has `2^d` rows and splits into `2^o` equal sub-blocks.
     /// - The buffer is one of them; its index fixes the global block index, and so the twiddle, of each block.
     /// - Three layers fuse into one radix-8 sweep where blocks are wide enough, then two, then one.
+    /// - `hook` runs once after each row group of each sweep.
     #[allow(clippy::too_many_arguments)]
     fn run_layers(
         &self,
@@ -562,6 +563,7 @@ impl AdditiveNttF64 {
         end_layer: usize,
         outer_log: usize,
         sub_idx: usize,
+        mut hook: impl FnMut(),
     ) {
         let mut layer = first_layer;
         while layer < end_layer {
@@ -572,16 +574,22 @@ impl AdditiveNttF64 {
             // A block's index in the whole domain, which picks its twiddle.
             let global = |block_in_buf: usize| sub_idx * num_blocks_in_buf + block_in_buf;
 
-            if layer + 2 < end_layer && block_size >= 8 {
+            if radix_layers(layer, end_layer, block_size) == 3 {
                 // Three layers to go and blocks of at least 8 rows: one radix-8 sweep.
                 let eighth = block_size >> 3;
                 for block_in_buf in 0..num_blocks_in_buf {
                     let t = self.twiddles_radix8(layer, global(block_in_buf));
                     let start = block_in_buf * block_elems;
-                    butterfly_interleaved_fused_3layer(&mut buf[start..start + block_elems], &t, eighth, num_ntts);
+                    butterfly_interleaved_fused_3layer(
+                        &mut buf[start..start + block_elems],
+                        &t,
+                        eighth,
+                        num_ntts,
+                        &mut hook,
+                    );
                 }
                 layer += 3;
-            } else if layer + 1 < end_layer && block_size >= 4 {
+            } else if radix_layers(layer, end_layer, block_size) == 2 {
                 // Two layers to go: one radix-4 sweep.
                 let quarter = block_size >> 2;
                 for block_in_buf in 0..num_blocks_in_buf {
@@ -597,6 +605,7 @@ impl AdditiveNttF64 {
                         t_inner_b,
                         quarter,
                         num_ntts,
+                        &mut hook,
                     );
                 }
                 layer += 2;
@@ -611,6 +620,7 @@ impl AdditiveNttF64 {
                         twiddle,
                         block_size_half,
                         num_ntts,
+                        &mut hook,
                     );
                 }
                 layer += 1;
@@ -641,6 +651,22 @@ impl AdditiveNttF64 {
     }
 }
 
+/// The hook of a sweep nobody listens to.
+///
+/// One named function, so every such caller shares one instance of the sweeps.
+fn no_hook() {}
+
+/// How many layers the sweep starting at `layer` fuses, when the rows of its blocks number `block_size`.
+fn radix_layers(layer: usize, end_layer: usize, block_size: usize) -> usize {
+    if layer + 2 < end_layer && block_size >= 8 {
+        3
+    } else if layer + 1 < end_layer && block_size >= 4 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Visit every row group of a fused multi-layer block.
 ///
 /// ```text
@@ -664,6 +690,7 @@ fn fused_rows<const N: usize>(
     stride_rows: usize,
     num_ntts: usize,
     do_one: impl Fn(&mut [&mut [F64]; N]),
+    mut hook: impl FnMut(),
 ) {
     // Words from one slab to the next.
     let stride = stride_rows * num_ntts;
@@ -678,6 +705,7 @@ fn fused_rows<const N: usize>(
         let mut rows: [&mut [F64]; N] =
             std::array::from_fn(|i| unsafe { std::slice::from_raw_parts_mut(base.add(i * stride + off), num_ntts) });
         do_one(&mut rows);
+        hook();
     }
 }
 
@@ -693,8 +721,14 @@ fn fused_rows<const N: usize>(
 ///
 /// - The eight rows stay in L1 across all twelve butterflies.
 /// - The seven twiddles are breadth-first: one for layer L, two for L+1, four for L+2.
-fn butterfly_interleaved_fused_3layer(block: &mut [F64], t: &[F64; 7], eighth: usize, num_ntts: usize) {
-    fused_rows::<8>(block, eighth, num_ntts, |rows| radix8_butterflies(rows, t));
+fn butterfly_interleaved_fused_3layer(
+    block: &mut [F64],
+    t: &[F64; 7],
+    eighth: usize,
+    num_ntts: usize,
+    hook: impl FnMut(),
+) {
+    fused_rows::<8>(block, eighth, num_ntts, |rows| radix8_butterflies(rows, t), hook);
 }
 
 /// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
@@ -949,25 +983,39 @@ fn butterfly_interleaved_fused_2layer(
     t_inner_b: F64,
     quarter: usize,
     num_ntts: usize,
+    hook: impl FnMut(),
 ) {
-    fused_rows::<4>(block, quarter, num_ntts, |rows| {
-        let [row_a, row_b, row_c, row_d] = rows;
-        // Layer L: rows 2 apart, one twiddle for the block.
-        butterfly_lanes(row_a, row_c, t_outer);
-        butterfly_lanes(row_b, row_d, t_outer);
-        // Layer L+1: adjacent rows, one twiddle per half.
-        butterfly_lanes(row_a, row_b, t_inner_a);
-        butterfly_lanes(row_c, row_d, t_inner_b);
-    });
+    fused_rows::<4>(
+        block,
+        quarter,
+        num_ntts,
+        |rows| {
+            let [row_a, row_b, row_c, row_d] = rows;
+            // Layer L: rows 2 apart, one twiddle for the block.
+            butterfly_lanes(row_a, row_c, t_outer);
+            butterfly_lanes(row_b, row_d, t_outer);
+            // Layer L+1: adjacent rows, one twiddle per half.
+            butterfly_lanes(row_a, row_b, t_inner_a);
+            butterfly_lanes(row_c, row_d, t_inner_b);
+        },
+        hook,
+    );
 }
 
 #[inline]
-fn butterfly_interleaved_block(block: &mut [F64], twiddle: F64, block_size_half: usize, num_ntts: usize) {
+fn butterfly_interleaved_block(
+    block: &mut [F64],
+    twiddle: F64,
+    block_size_half: usize,
+    num_ntts: usize,
+    mut hook: impl FnMut(),
+) {
     let half_offset = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(half_offset);
     for r in 0..block_size_half {
         let off = r * num_ntts;
         butterfly_lanes(&mut top[off..off + num_ntts], &mut bot[off..off + num_ntts], twiddle);
+        hook();
     }
 }
 
