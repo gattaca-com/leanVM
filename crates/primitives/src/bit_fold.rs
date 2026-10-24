@@ -31,6 +31,8 @@ pub const GFNI: bool = cfg!(all(
 pub struct BitFold {
     /// Bytes per row.
     n_chunks: usize,
+    /// The weight of every bit of a row.
+    weights: Vec<F192>,
     /// The target's fold kernel data.
     imp: Imp,
 }
@@ -49,6 +51,7 @@ impl BitFold {
         );
         Self {
             n_chunks,
+            weights: weights.to_vec(),
             imp: Imp::new(weights),
         }
     }
@@ -71,6 +74,11 @@ impl BitFold {
     /// Bytes per row.
     pub fn n_chunks(&self) -> usize {
         self.n_chunks
+    }
+
+    /// The weight of every bit of a row.
+    pub fn weights(&self) -> &[F192] {
+        &self.weights
     }
 
     /// Fold up to 64 consecutive rows into `out[..rows.len()]`.
@@ -444,6 +452,164 @@ pub mod gfni {
         out
     }
 
+    /// The stages `first..first + log2(TILE)` of the input transpose of `CHUNKS`-byte rows, one tile of `TILE` registers
+    /// at a time: register `r` is read through `load` and written to `dst`.
+    ///
+    /// A stage swaps offset bit `s` with register bit `s + skew`, so a group of stages exchanges within the tiles
+    /// of registers that differ only in that group's register bits.
+    #[inline(always)]
+    fn stages<const CHUNKS: usize, const TILE: usize>(
+        input: &[Stage],
+        first: usize,
+        load: impl Fn(usize) -> __m512i,
+        dst: *mut __m512i,
+    ) {
+        let skew = CHUNKS.trailing_zeros().saturating_sub(6) as usize;
+        let (low, bits) = (first + skew, TILE.trailing_zeros() as usize);
+        for t in 0..CHUNKS / TILE {
+            // The tile's register `k` is register `base | k << low`.
+            let base = ((t >> low) << (low + bits)) | (t & ((1 << low) - 1));
+            let mut tile: [__m512i; TILE] = std::array::from_fn(|k| load(base | k << low));
+            for i in 0..bits {
+                input[first + i].apply(1 << i, &mut tile);
+            }
+            for (k, r) in tile.into_iter().enumerate() {
+                // SAFETY: every register index is below CHUNKS, and `dst` holds CHUNKS registers.
+                unsafe { _mm512_store_si512(dst.add(base | k << low).cast(), r) };
+            }
+        }
+    }
+
+    /// Phase 2, from one register per input byte: every output byte accumulates one affine product per input register.
+    ///
+    /// With `PREFETCH`, `next` is the block that follows, and its cache lines load two per input register pair.
+    /// The pass is affine-bound, so the next block's fetch hides behind it, where a burst before the pass stalled.
+    #[inline(always)]
+    fn accumulate_into<const N: usize, const PREFETCH: bool>(
+        acc: &mut [__m512i; OUT_BYTES],
+        regs: &[__m512i; N],
+        matrices: &[[u64; OUT_BYTES]; N],
+        next: *const u8,
+    ) {
+        // SAFETY: the module is compiled only with these target features enabled.
+        unsafe {
+            for (i, (pair, m)) in regs.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0).enumerate() {
+                if PREFETCH {
+                    // A prefetch past the end of the data is harmless.
+                    _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i).cast());
+                    _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i + 64).cast());
+                }
+                for o in 0..OUT_BYTES {
+                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[0], _mm512_set1_epi64(m[0][o] as i64));
+                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[1], _mm512_set1_epi64(m[1][o] as i64));
+                    acc[o] = _mm512_ternarylogic_epi64::<0x96>(acc[o], g0, g1);
+                }
+            }
+        }
+    }
+
+    /// Stages taking row-major rows of `2^c` bytes, 64 of them, to one register per input byte.
+    fn input_stages(c: usize) -> Vec<Stage> {
+        // Input address of a byte: bits 0..c are its byte j in the row, bits c..c+6 its row p.
+        //
+        //     in a register        offset = address bits 0..6     register = address bits 6..c+6
+        //     after the stages     offset = p                     register = j, rotated when c > 6
+        //
+        // Stage s swaps offset bit s with register bit s + (c - 6 when c > 6).
+        let n_stages = c.min(6);
+        // Without a rotation, a short row leaves offset = (p high bits, then p low bits).
+        let plain = |p: usize| {
+            if c >= 6 {
+                p
+            } else {
+                (p >> (6 - c)) | ((p & ((1 << (6 - c)) - 1)) << c)
+            }
+        };
+        (0..n_stages)
+            .map(|s| {
+                let last = s + 1 == n_stages;
+                Stage::swap(1 << s, |f| if last { plain(f) } else { f })
+            })
+            .collect()
+    }
+
+    /// The eight vectors of 24 registers of output bytes, in the order of [`BitFold::fold_block_x8`] for group size `2^G`.
+    #[cfg(target_feature = "vpclmulqdq")]
+    #[inline(always)]
+    fn x8_from_acc<const G: usize>(acc: &[__m512i; OUT_BYTES]) -> [F192x8; 8] {
+        let [c0, c1, c2] = coefficients::<G>(acc);
+        std::array::from_fn(|r| F192x8::from_coeffs(c0[r], c1[r], c2[r]))
+    }
+
+    /// The matrices of every byte of a row's weights, as [`weight_matrices`] gives them.
+    pub fn byte_matrices(weights: &[F192]) -> Vec<[u64; OUT_BYTES]> {
+        // SAFETY: the module is compiled only with these target features enabled.
+        weights
+            .as_chunks()
+            .0
+            .iter()
+            .map(|w| unsafe { weight_matrices(w) })
+            .collect()
+    }
+
+    /// 64 lines of 64 bytes, transposed: register `j` holds byte `j` of every line, one line per byte of the register.
+    ///
+    /// The lines of a block of instances sit one block apart, so folding with lines as lanes puts an instance in
+    /// each lane.
+    pub struct LineRegs([__m512i; 64]);
+
+    impl LineRegs {
+        /// Registers to be [`load`](Self::load)ed.
+        pub fn new() -> Self {
+            // SAFETY: the module is compiled only with these target features enabled.
+            Self(unsafe { [_mm512_setzero_si512(); 64] })
+        }
+
+        /// Replace the registers with the transpose of `lines`.
+        #[inline(always)]
+        pub fn load(&mut self, lines: [&[u8; 64]; 64]) {
+            static STAGES: LazyLock<Vec<Stage>> = LazyLock::new(|| input_stages(6));
+            let (stages_of, dst) = (&**STAGES, self.0.as_mut_ptr());
+            // SAFETY: a line is 64 bytes, and `dst` holds 64 registers.
+            let first = |r: usize| unsafe { _mm512_loadu_si512(lines[r].as_ptr().cast()) };
+            stages::<64, 8>(stages_of, 0, first, dst);
+            // SAFETY: the first group wrote every register.
+            let second = |r: usize| unsafe { _mm512_load_si512(dst.add(r).cast()) };
+            stages::<64, 8>(stages_of, 3, second, dst);
+        }
+    }
+
+    /// 24 registers of output bytes, register `o` holding byte `o` of 64 sums of weights, one per lane.
+    #[derive(Clone, Copy)]
+    pub struct ByteAcc([__m512i; OUT_BYTES]);
+
+    impl ByteAcc {
+        pub fn zero() -> Self {
+            // SAFETY: the module is compiled only with these target features enabled.
+            Self(unsafe { [_mm512_setzero_si512(); OUT_BYTES] })
+        }
+
+        /// Add, per lane, the sum of the weights of the set bits of registers `first..first + N`.
+        ///
+        /// `matrices[j]` weighs the bits of register `first + j`, as [`byte_matrices`] builds them.
+        #[inline(always)]
+        pub fn add_fold<const N: usize>(&mut self, regs: &LineRegs, first: usize, matrices: &[[u64; OUT_BYTES]; N]) {
+            accumulate_into::<N, false>(
+                &mut self.0,
+                regs.0[first..first + N].try_into().expect("N registers"),
+                matrices,
+                std::ptr::null(),
+            );
+        }
+
+        /// The 64 sums as eight vectors of eight, lane `l` of vector `r` being lane `8 r + l`.
+        #[cfg(target_feature = "vpclmulqdq")]
+        #[inline(always)]
+        pub fn to_x8(&self) -> [F192x8; 8] {
+            x8_from_acc::<0>(&self.0)
+        }
+    }
+
     /// The GFNI matrices and the input transpose.
     #[derive(Clone, Debug)]
     pub(super) struct Imp {
@@ -458,28 +624,7 @@ pub mod gfni {
             let n_chunks = weights.len() / 8;
             let c = n_chunks.trailing_zeros() as usize;
 
-            // Input address of a byte: bits 0..c are its byte j in the row, bits c..c+6 its row p.
-            //
-            //     in a register        offset = address bits 0..6     register = address bits 6..c+6
-            //     after the stages     offset = p                     register = j, rotated when c > 6
-            //
-            // Stage s swaps offset bit s with register bit s + (c - 6 when c > 6).
-            let n_stages = c.min(6);
             let skew = c.saturating_sub(6);
-            // Without a rotation, a short row leaves offset = (p high bits, then p low bits).
-            let plain = |p: usize| {
-                if c >= 6 {
-                    p
-                } else {
-                    (p >> (6 - c)) | ((p & ((1 << (6 - c)) - 1)) << c)
-                }
-            };
-            let input = (0..n_stages)
-                .map(|s| {
-                    let last = s + 1 == n_stages;
-                    Stage::swap(1 << s, |f| if last { plain(f) } else { f })
-                })
-                .collect();
 
             // Register `r` then holds input byte `j(r)`: its bits are register bits skew.. then 0..skew.
             let byte_of_reg = |r: usize| (r >> skew) | ((r & ((1 << skew) - 1)) << (c - skew));
@@ -488,7 +633,10 @@ pub mod gfni {
             let matrices = (0..n_chunks)
                 .flat_map(|r| unsafe { weight_matrices(&bytes[byte_of_reg(r)]) })
                 .collect();
-            Self { matrices, input }
+            Self {
+                matrices,
+                input: input_stages(c),
+            }
         }
 
         #[inline]
@@ -502,9 +650,7 @@ pub mod gfni {
         #[cfg(target_feature = "vpclmulqdq")]
         #[inline]
         pub(super) fn fold_block_x8<const CHUNKS: usize, const G: usize>(&self, rows: &[[u8; CHUNKS]]) -> [F192x8; 8] {
-            let acc = self.accumulate_rows(rows);
-            let [c0, c1, c2] = coefficients::<G>(&acc);
-            std::array::from_fn(|r| F192x8::from_coeffs(c0[r], c1[r], c2[r]))
+            x8_from_acc::<G>(&self.accumulate_rows(rows))
         }
 
         #[cfg(not(target_feature = "vpclmulqdq"))]
@@ -543,40 +689,17 @@ pub mod gfni {
             // The first group reads the rows, the next ones the registers the previous group wrote.
             let mut from = rows.as_ptr().cast::<__m512i>();
             for first in (0..c.min(6)).step_by(3) {
+                // SAFETY: `from` holds CHUNKS registers, the rows or what the previous group wrote.
+                let load = |r: usize| unsafe { _mm512_loadu_si512(from.add(r).cast()) };
                 match c.min(6) - first {
-                    1 => self.stages::<CHUNKS, 2>(first, from, dst),
-                    2 => self.stages::<CHUNKS, 4>(first, from, dst),
-                    _ => self.stages::<CHUNKS, 8>(first, from, dst),
+                    1 => stages::<CHUNKS, 2>(&self.input, first, load, dst),
+                    2 => stages::<CHUNKS, 4>(&self.input, first, load, dst),
+                    _ => stages::<CHUNKS, 8>(&self.input, first, load, dst),
                 }
                 from = dst;
             }
             // SAFETY: the first group wrote every register.
             self.accumulate::<CHUNKS, true>(unsafe { regs.assume_init_ref() }, next)
-        }
-
-        /// The stages `first..first + log2(TILE)`, one tile of `TILE` registers at a time, `from` to `dst`.
-        ///
-        /// A stage swaps offset bit `s` with register bit `s + skew`, so a group of stages exchanges within the tiles
-        /// of registers that differ only in that group's register bits.
-        #[inline(always)]
-        fn stages<const CHUNKS: usize, const TILE: usize>(&self, first: usize, from: *const __m512i, dst: *mut __m512i) {
-            let skew = CHUNKS.trailing_zeros().saturating_sub(6) as usize;
-            let (low, bits) = (first + skew, TILE.trailing_zeros() as usize);
-            for t in 0..CHUNKS / TILE {
-                // The tile's register `k` is register `base | k << low`.
-                let base = ((t >> low) << (low + bits)) | (t & ((1 << low) - 1));
-                // SAFETY: every register index is below CHUNKS, and `from` and `dst` hold CHUNKS registers.
-                unsafe {
-                    let mut tile: [__m512i; TILE] =
-                        std::array::from_fn(|k| _mm512_loadu_si512(from.add(base | k << low).cast()));
-                    for i in 0..bits {
-                        self.input[first + i].apply(1 << i, &mut tile);
-                    }
-                    for (k, r) in tile.into_iter().enumerate() {
-                        _mm512_store_si512(dst.add(base | k << low).cast(), r);
-                    }
-                }
-            }
         }
 
         #[inline]
@@ -598,10 +721,9 @@ pub mod gfni {
             self.accumulate::<CHUNKS, false>(&regs, std::ptr::null())
         }
 
-        /// Phase 2, from one register per input byte: every output byte accumulates one affine product per input register.
+        /// Phase 2 of the block, from one register per input byte: 24 registers of output bytes.
         ///
-        /// With `PREFETCH`, `next` is the block that follows, and its cache lines load two per input register pair.
-        /// The pass is affine-bound, so the next block's fetch hides behind it, where a burst before the pass stalled.
+        /// With `PREFETCH`, `next` is the block that follows (see [`accumulate_into`]).
         #[inline(always)]
         fn accumulate<const CHUNKS: usize, const PREFETCH: bool>(
             &self,
@@ -609,23 +731,10 @@ pub mod gfni {
             next: *const u8,
         ) -> [__m512i; OUT_BYTES] {
             // SAFETY: the module is compiled only with these target features enabled.
-            unsafe {
-                let mut acc = [_mm512_setzero_si512(); OUT_BYTES];
-                let matrices: &[[u64; OUT_BYTES]] = self.matrices.as_chunks().0;
-                for (i, (pair, m)) in regs.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0).enumerate() {
-                    if PREFETCH {
-                        // A prefetch past the end of the data is harmless.
-                        _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i).cast());
-                        _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i + 64).cast());
-                    }
-                    for o in 0..OUT_BYTES {
-                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[0], _mm512_set1_epi64(m[0][o] as i64));
-                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[1], _mm512_set1_epi64(m[1][o] as i64));
-                        acc[o] = _mm512_ternarylogic_epi64::<0x96>(acc[o], g0, g1);
-                    }
-                }
-                acc
-            }
+            let mut acc = unsafe { [_mm512_setzero_si512(); OUT_BYTES] };
+            let matrices = self.matrices.as_chunks::<OUT_BYTES>().0;
+            accumulate_into::<CHUNKS, PREFETCH>(&mut acc, regs, matrices.try_into().expect("a matrix per register"), next);
+            acc
         }
     }
 }
