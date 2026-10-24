@@ -755,16 +755,25 @@ fn add_scaled(acc: &mut [F192], v: &[F192], s: F192) {
     }
 }
 
-/// `out[x] += sum_l w_l * (cur_l[x] + prev_l[x])` over `(w_l, cur_l, prev_l)`.
+/// `out[x] += sum_l w_l * (cur_l[x] + prev_l[x])` over `(w_l, cur_l, prev_l, next_l)`.
+///
+/// Each line of `cur_l` read also prefetches the same line of `next_l` into L2 (when not empty), so the
+/// next block streams in while this one multiplies.
 #[inline]
-fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a [F64], &'a [F64])>) {
+fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a [F64], &'a [F64], &'a [F64])>) {
     // The products stay unreduced across the lanes: one reduction per output.
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     {
         let mut acc = [Acc8::ZERO; 128];
         let acc = &mut acc[..out.len() / 8];
-        for (w, cur, prev) in deltas {
-            for ((a, c), p) in acc.iter_mut().zip(cur.as_chunks::<8>().0).zip(prev.as_chunks::<8>().0) {
+        for (w, cur, prev, next) in deltas {
+            let lines = cur.as_chunks::<8>().0.iter().zip(prev.as_chunks::<8>().0);
+            for (j, (a, (c, p))) in acc.iter_mut().zip(lines).enumerate() {
+                if !next.is_empty() {
+                    // SAFETY: a prefetch never faults, and `next` is as long as `cur`.
+                    let line = unsafe { next.as_ptr().add(8 * j) };
+                    unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(line.cast()) };
+                }
                 *a ^= primitives::field::mul_base_splat8(w, &std::array::from_fn(|i| F64(c[i].0 ^ p[i].0)));
             }
         }
@@ -773,7 +782,7 @@ fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a
         }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-    for (w, cur, prev) in deltas {
+    for (w, cur, prev, _) in deltas {
         for ((o, c), p) in out
             .as_chunks_mut::<8>()
             .0
@@ -801,7 +810,8 @@ fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run
     let zeros = vec![F64(0); run];
     let mut out = vec![F192::ZERO; block];
     parallel::chunks_mut(&mut out, TASK * run, |c, out| {
-        for i in 0..out.len() / run {
+        let out_blocks = out.len() / run;
+        for i in 0..out_blocks {
             if i > 0 {
                 out.copy_within((i - 1) * run..i * run, i * run);
             }
@@ -817,7 +827,13 @@ fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run
                     } else {
                         &lane[(h - 1) * run..h * run]
                     };
-                    (weights[l], &lane[h * run..(h + 1) * run], prev)
+                    // The lane's next block, when this task reads it.
+                    let next = if i + 1 < out_blocks && !repeats[l * n_blocks + h + 1] {
+                        &lane[(h + 1) * run..(h + 2) * run]
+                    } else {
+                        &[][..]
+                    };
+                    (weights[l], &lane[h * run..(h + 1) * run], prev, next)
                 });
             add_lane_deltas(&mut out[i * run..(i + 1) * run], deltas);
         }
