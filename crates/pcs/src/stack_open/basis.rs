@@ -34,6 +34,12 @@ fn scale8(t: &[F192; 8], g: F192) -> [F192; 8] {
     fold_lones8_ext(t, g + F192::ONE)
 }
 
+/// The words of a block, compared as `u64`s so that equality is a `memcmp`.
+fn words(block: &[F64]) -> &[u64] {
+    // SAFETY: `F64` is a `u64`.
+    unsafe { std::slice::from_raw_parts(block.as_ptr().cast(), block.len()) }
+}
+
 /// What a weight does to one bit of the stack index.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Factor {
@@ -203,30 +209,53 @@ impl Terms {
         let mut q = vec![F192::ZERO; n_blocks * self.patterns.len()];
         let mut sigmas = vec![F192::ZERO; ROWS * self.rings.len()];
         let mut cols = [[0u8; ROWS]; CHUNKS];
-        let mut folded = [F192::ZERO; ROWS];
-        for (h, block) in lane.chunks_exact(1 << self.low_vars).enumerate() {
-            for (pattern, q) in self.patterns.iter().zip(q.chunks_exact_mut(n_blocks)) {
+        // Padding repeats blocks. A run of equal blocks shares its dots and its folds, and a fold's weight is the
+        // run's `e_hi` mass.
+        let mut dots = vec![None; self.patterns.len()];
+        let mut folds: Vec<Option<[F192; ROWS]>> = vec![None; self.rings.len()];
+        let mut masses = vec![F192::ZERO; self.rings.len()];
+        let mut prev: Option<&[F64]> = None;
+        for h in 0..=n_blocks {
+            let block = lane
+                .get(h << self.low_vars..)
+                .and_then(|rest| rest.get(..1 << self.low_vars));
+            if prev.map(words) != block.map(words) {
+                for ((fold, mass), sigma) in folds.iter_mut().zip(&mut masses).zip(sigmas.chunks_exact_mut(ROWS)) {
+                    if let Some(folded) = fold.take() {
+                        for (s, v) in sigma.as_chunks_mut::<8>().0.iter_mut().zip(folded.as_chunks::<8>().0) {
+                            xor_into8(s, &scale8(v, *mass));
+                        }
+                    }
+                    *mass = F192::ZERO;
+                }
+                dots.fill(None);
+                prev = block;
+            }
+            let Some(block) = block else { break };
+            for ((pattern, q), dot) in self.patterns.iter().zip(q.chunks_exact_mut(n_blocks)).zip(&mut dots) {
                 if pattern.active[h] {
-                    q[h] = pattern.low.dot(block);
+                    q[h] = *dot.get_or_insert_with(|| pattern.low.dot(block));
                 }
             }
             let mut transposed = false;
-            for (ring, sigma) in self.rings.iter().zip(sigmas.chunks_exact_mut(ROWS)) {
+            for ((ring, fold), mass) in self.rings.iter().zip(&mut folds).zip(&mut masses) {
                 let e_hi = ring.e_hi[h];
                 if e_hi == F192::ZERO {
                     continue;
                 }
-                if !transposed {
-                    for (col, group) in cols.iter_mut().zip(block.as_chunks::<8>().0) {
-                        // SAFETY: `F64` is a `u64`, so eight of them are 64 bytes.
-                        bit_transpose_64bytes(unsafe { &*group.as_ptr().cast() }, col);
+                *mass += e_hi;
+                fold.get_or_insert_with(|| {
+                    if !transposed {
+                        for (col, group) in cols.iter_mut().zip(block.as_chunks::<8>().0) {
+                            // SAFETY: `F64` is a `u64`, so eight of them are 64 bytes.
+                            bit_transpose_64bytes(unsafe { &*group.as_ptr().cast() }, col);
+                        }
+                        transposed = true;
                     }
-                    transposed = true;
-                }
-                ring.fold.fold_columns(&cols, &mut folded);
-                for (s, v) in sigma.as_chunks_mut::<8>().0.iter_mut().zip(folded.as_chunks::<8>().0) {
-                    xor_into8(s, &scale8(v, e_hi));
-                }
+                    let mut folded = [F192::ZERO; ROWS];
+                    ring.fold.fold_columns(&cols, &mut folded);
+                    folded
+                });
             }
         }
         // `P(l, c) = sum_h gamma_c(h) * Q(h)` over the claim's blocks.
