@@ -1518,6 +1518,7 @@ mod tests {
 
     /// The encode shapes of a 2:1 recursion node, timed one at a time: the base commit, then each
     /// extension level as `(log_msg_cols, log_inv_rate)` over 16 lanes. `ENCODE_REPS` sets the passes.
+    /// `ENCODE_N8=1` runs the shapes of an 8:1 node instead, and `ENCODE_ROOTS=1` prints every root.
     #[test]
     #[ignore]
     fn encode_shapes_report() {
@@ -1538,18 +1539,29 @@ mod tests {
             }
             println!("{name}: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
         };
-        let (log_rows, n_lanes, log_batch) = (19usize, 47usize, 6usize);
+        let roots = std::env::var("ENCODE_ROOTS").is_ok();
+        let n8 = std::env::var("ENCODE_N8").is_ok();
+        let (log_rows, n_lanes, log_batch) = (if n8 { 21usize } else { 19 }, 47usize, 6usize);
         let message: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
         time("base encode", &mut || {
-            std::hint::black_box(commit(&message, log_rows + log_batch, log_batch, 2));
+            let (c, _) = commit(&message, log_rows + log_batch, log_batch, 2);
+            if roots {
+                println!("root {:?}", c.root);
+            }
+            std::hint::black_box(c);
         });
-        for (log_msg_cols, log_inv_rate) in [(15usize, 5usize), (11, 8), (7, 11), (3, 14)] {
+        let ext_shapes = if n8 { [(17usize, 5usize), (13, 8), (9, 11), (5, 14)] } else { [(15, 5), (11, 8), (7, 11), (3, 14)] };
+        for (log_msg_cols, log_inv_rate) in ext_shapes {
             let poly = rng.ext_vec(16 << log_msg_cols);
             let ntt = AdditiveNttF64::standard(log_msg_cols + log_inv_rate);
             time(
                 &format!("ext encode log_domain {}", log_msg_cols + log_inv_rate),
                 &mut || {
-                    std::hint::black_box(ligero_commit_ext(&poly, log_msg_cols, 4, log_inv_rate, &ntt));
+                    let w = ligero_commit_ext(&poly, log_msg_cols, 4, log_inv_rate, &ntt);
+                    if roots {
+                        println!("root {:?}", &w.root()[..8]);
+                    }
+                    std::hint::black_box(w);
                 },
             );
         }
