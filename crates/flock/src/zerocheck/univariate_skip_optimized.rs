@@ -42,6 +42,14 @@ use super::univariate_skip::pack_bits;
 use super::univariate_skip::{SharedPadding, SplitEq, ntt_extend_vec};
 use super::{K_SKIP, N_INNER, PaddingSpec};
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+mod soa;
+
 // ---------------------------------------------------------------------------
 // Protocol constants: fixed by the optimization design.
 // ---------------------------------------------------------------------------
@@ -808,11 +816,35 @@ impl Convert {
 /// Per-worker scratch and local accumulators.
 struct WorkerState {
     partials: Convert,
-    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    /// The shift-reduced rows of the windows in flight: one `x_outer`'s, or a group's.
+    chunk_ab_bytes: [[u8; 64]; GROUP_X_OUTERS << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     local_res_ab: [F192; ELL],
     local_res_c_s: [F192; ELL],
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    group: Box<soa::Scratch>,
 }
+
+/// Consecutive full `x_outer`s the group kernel takes at once: 64 windows. One where there is none.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+const GROUP_X_OUTERS: usize = 4;
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+)))]
+const GROUP_X_OUTERS: usize = 1;
 
 impl WorkerState {
     /// The two accumulators, once every claimed `x_hi` has been folded in.
@@ -823,10 +855,17 @@ impl WorkerState {
     fn new() -> Self {
         Self {
             partials: Convert::new(),
-            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_ab_bytes: [[0u8; 64]; GROUP_X_OUTERS << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F192::ZERO; ELL],
             local_res_c_s: [F192::ZERO; ELL],
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "gfni",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi"
+            ))]
+            group: soa::Scratch::new(),
         }
     }
 }
@@ -856,6 +895,20 @@ fn accumulate_x_outer<const FULL: bool>(
         chunk_byte_base,
         &mut state.chunk_ab_bytes[..n_b_med],
     );
+    fold_x_outer(n_b_med, chunk_byte_base, weights, c_packed, 0, state);
+}
+
+/// Bit-transpose the `c` windows of one `x_outer` and fold them and its shift-reduced rows
+/// (from `state.chunk_ab_bytes[ab_first..]`) into the per-lane sums.
+#[inline(always)]
+fn fold_x_outer(
+    n_b_med: usize,
+    chunk_byte_base: usize,
+    weights: &Weights,
+    c_packed: &[u8],
+    ab_first: usize,
+    state: &mut WorkerState,
+) {
     for b_med in 0..n_b_med {
         let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
         let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -867,10 +920,22 @@ fn accumulate_x_outer<const FULL: bool>(
     // Bounded so the trip count is the constant the protocol size gives it.
     let n_b_med = n_b_med.min(N_MEDIUM_VALUES);
     state.partials.accumulate(
-        &state.chunk_ab_bytes[..n_b_med],
+        &state.chunk_ab_bytes[ab_first..ab_first + n_b_med],
         &state.chunk_c_bytes[..n_b_med],
         weights,
     );
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+fn soa_matrices(inv_table: &InvNttTableByteSingleGf8) -> &'static soa::Matrices {
+    // The table is the protocol's, so the matrices are the same for every call.
+    static MATRICES: OnceLock<soa::Matrices> = OnceLock::new();
+    MATRICES.get_or_init(|| soa::Matrices::new(inv_table))
 }
 
 /// Process `n` consecutive outer values from `first`, weighted by `eq_lo_scaled` from its start.
@@ -886,9 +951,19 @@ fn process_one_x_hi(
     inv_table: &InvNttTableByteSingleGf8,
     weights: &[Weights],
     eq_hi_val: F192,
+    grouped: bool,
     state: &mut WorkerState,
 ) {
     state.partials = Convert::new();
+    let _ = grouped;
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    let (soa_mats, mut grouped_until) = (soa_matrices(inv_table), 0);
 
     for x_outer_lo in 0..n {
         let x_outer = first + x_outer_lo;
@@ -896,6 +971,54 @@ fn process_one_x_hi(
         let n_b_med = b_med_counts[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
+        }
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi"
+        ))]
+        {
+            if x_outer_lo < grouped_until {
+                continue;
+            }
+
+            let full = |i: usize| b_med_counts[(x_outer + i) & within_outer_mask] as usize == 1 << N_MEDIUM;
+            if grouped && x_outer_lo + GROUP_X_OUTERS <= n && (0..GROUP_X_OUTERS).all(full) {
+                let base = (x_outer << N_INNER) * N_CHUNKS;
+                let len = soa::GROUP * soa::WINDOW_BYTES;
+                // The next group's rows, which the kernel touches while it computes.
+                let next = [a_packed, b_packed, c_packed].map(|d| d.as_ptr().wrapping_add(base + len));
+                let WorkerState {
+                    chunk_ab_bytes, group, ..
+                } = &mut *state;
+                // SAFETY: the target features are enabled at compile time, and the slices are `len` bytes.
+                unsafe {
+                    soa::shift_reduce_group(
+                        a_packed[base..base + len].as_ptr(),
+                        b_packed[base..base + len].as_ptr(),
+                        soa_mats,
+                        group,
+                        chunk_ab_bytes,
+                        next,
+                    )
+                };
+                for i in 0..GROUP_X_OUTERS {
+                    let first_row = i << N_MEDIUM;
+                    let base = base + (i << (N_MEDIUM + 6));
+                    fold_x_outer(
+                        1 << N_MEDIUM,
+                        base,
+                        &weights[x_outer_lo + i],
+                        c_packed,
+                        first_row,
+                        state,
+                    );
+                }
+                grouped_until = x_outer_lo + GROUP_X_OUTERS;
+                continue;
+            }
         }
 
         let chunk_byte_base = (x_outer << N_INNER) * N_CHUNKS;
@@ -990,6 +1113,23 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F192>, Vec<F192>) {
+    round1_padded(
+        a_packed, b_packed, c_packed, m, k_skip, r_rest, inv_table, padding, true,
+    )
+}
+
+/// [`round1_shift_reduce_extract_c_packed_padded`], with the group kernel switchable for tests.
+fn round1_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r_rest: &[F192],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    grouped: bool,
+) -> (Vec<F192>, Vec<F192>) {
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -1047,6 +1187,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
                 inv_table,
                 weights,
                 eq_hi_val,
+                grouped,
                 state,
             );
         },
@@ -1248,6 +1389,60 @@ mod tests {
                 assert_eq!(naive_ab[i], c_s * opt_ab[i], "AB mismatch at i={i}");
                 assert_eq!(naive_c[i], c_s * opt_c[i], "C mismatch at i={i}");
             }
+        }
+    }
+
+    /// The 64-window group kernel against the table kernel, on tasks long enough to hold groups:
+    /// dense, and with padding that leaves full, partial and empty `x_outer`s.
+    #[test]
+    fn grouped_matches_ungrouped() {
+        // (k_log, useful_bits, n_blocks_log, live_blocks); live_blocks 0 means dense.
+        let cases = [
+            (14usize, 16_384usize, 10usize, 0usize),
+            (14, 16_000, 10, 700),
+            (15, 31_400, 9, 300),
+            (16, 42_560, 8, 100),
+        ];
+        for (k_log, useful_bits, n_blocks_log, live_blocks) in cases {
+            let m = k_log + n_blocks_log;
+            let mut rng = Rng::new(0x6A0_0000 + m as u64);
+            let block_bytes = 1usize << (k_log - 3);
+            let n_blocks = 1usize << n_blocks_log;
+            let mut packed: Vec<Vec<u8>> = (0..3)
+                .map(|_| {
+                    let mut x: Vec<u8> = (0..n_blocks * block_bytes).map(|_| rng.next_u8()).collect();
+                    for blk in x.chunks_exact_mut(block_bytes) {
+                        blk[useful_bits / 8..].fill(0);
+                    }
+                    x
+                })
+                .collect();
+            let padding = if live_blocks == 0 {
+                PaddingSpec::dense(m)
+            } else {
+                for x in &mut packed {
+                    for blk in live_blocks + 1..n_blocks {
+                        x.copy_within(
+                            live_blocks * block_bytes..(live_blocks + 1) * block_bytes,
+                            blk * block_bytes,
+                        );
+                    }
+                }
+                PaddingSpec {
+                    k_log,
+                    useful_bits_per_block: useful_bits,
+                    live_blocks,
+                }
+            };
+            let outer = rng.ext_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r_rest(m, &outer);
+            let table = make_inv_table();
+            let run = |grouped| {
+                round1_padded(
+                    &packed[0], &packed[1], &packed[2], m, K_SKIP, &r, &table, &padding, grouped,
+                )
+            };
+            assert_eq!(run(true), run(false), "k_log={k_log} live={live_blocks}");
         }
     }
 
