@@ -274,6 +274,13 @@ impl LigeroWitness {
     }
 }
 
+/// The bytes the level-1 commit of a `log_n`-variable opening holds: its `F192` codeword and its
+/// Merkle tree. They are the largest buffers the opening allocates.
+pub fn level1_bytes(config: &ProverConfig, log_n: usize) -> usize {
+    let shapes = config.level_shapes(log_n);
+    shapes.block_len[1] * ((size_of::<F192>() << shapes.ks[1]) + 2 * size_of::<Hash>())
+}
+
 /// Commit an extension-field polynomial at one recursive WHIR level.
 ///
 /// - Each lane of the row-major message is RS-encoded with base-field twiddles.

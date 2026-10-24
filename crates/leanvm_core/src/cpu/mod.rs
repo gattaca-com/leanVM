@@ -502,6 +502,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     let committed = crate::stage!("Commit", || {
         pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
     });
+    pcs::reserve_level1(w.layout.shape.mu, log_inv_rate);
 
     // BLAKE2s to flock (§hash_flock), single PCS: q_flock is ALWAYS a column in
     // `w.q` (≥1 instance, a program with no BLAKE2s carries one padding instance,

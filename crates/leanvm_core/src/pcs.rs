@@ -118,6 +118,13 @@ pub fn commit(
     }
 }
 
+/// Reserve one extent for the bus's transients and the level-1 commit's codeword.
+/// The transients are carved from it and coalesce back when freed. The codeword then reuses
+/// their pages instead of mapping fresh ones.
+pub fn reserve_level1(mu: usize, log_inv_rate: usize) {
+    primitives::reserve_extent(::pcs::whir::level1_bytes(&whir_config(mu, log_inv_rate), mu));
+}
+
 // The batching challenges are just `sample()`d inside the stacked opener: every
 // claim they combine is already bound: the values rode the stream
 // (`add_scalar`) during the bus / constraint sub-protocols or, for the
