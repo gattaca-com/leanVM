@@ -1516,6 +1516,33 @@ mod tests {
         }
     }
 
+    /// The L0 induce at the shapes of a 2:1 and an 8:1 recursion node, with 112 queries each.
+    /// `INDUCE_REPS` sets the passes.
+    #[test]
+    #[ignore]
+    fn induce_shapes_report() {
+        // The test binary runs under the CLI's allocator (see `encode_shapes_report`).
+        let reps = std::env::var("INDUCE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5usize);
+        let mut rng = Rng::new(11);
+        let (lanes_log, n_queries) = (5usize, 112usize);
+        for (name, log_msg_cols, log_inv_rate) in [("n2", 19usize, 2usize), ("n8", 21, 2)] {
+            let block_len = 1usize << (log_msg_cols + log_inv_rate);
+            let qs: Vec<usize> = (0..n_queries).map(|_| (rng.next_u64() as usize) % block_len).collect();
+            let rows: Vec<Vec<F64>> = (0..n_queries)
+                .map(|_| (0..1usize << lanes_log).map(|_| F64(rng.next_u64())).collect())
+                .collect();
+            let v_challenges: Vec<F192> = (0..lanes_log).map(|_| rng.ext()).collect();
+            let weights = powers(rng.ext(), n_queries);
+            let run = || induce_sumcheck_poly_via_ntt_base(log_msg_cols, log_inv_rate, &rows, &v_challenges, &qs, &weights);
+            std::hint::black_box(run());
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(run());
+            }
+            println!("induce {name}: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+        }
+    }
+
     /// The encode shapes of a 2:1 recursion node, timed one at a time: the base commit, then each
     /// extension level as `(log_msg_cols, log_inv_rate)` over 16 lanes. `ENCODE_REPS` sets the passes.
     /// `ENCODE_N8=1` runs the shapes of an 8:1 node instead, and `ENCODE_ROOTS=1` prints every root.
