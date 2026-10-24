@@ -1482,13 +1482,13 @@ mod tests {
     }
 
     /// The sparse transposed-NTT induce must be byte-identical to the dense
-    /// LCH-expansion induce (same guarantee the original pins). Covers both
-    /// the windowed sparse-prefix path (log_block >= 12, k = 8) and the
-    /// scatter + full-dense-transpose path (log_block < 12, k = 0).
+    /// LCH-expansion induce (same guarantee the original pins). Covers a domain
+    /// of a single window (`log_msg_cols` of 10 or less), and the ones of 2 to 6
+    /// layers above the windows of the second pass (`log_msg_cols` 12 to 16).
     #[test]
     fn induce_via_ntt_matches_dense() {
         let mut rng = Rng::new(9);
-        for (log_msg_cols, log_inv_rate, lanes_log, n_queries) in [(12usize, 1usize, 5usize, 130usize), (12, 2, 5, 130), (6, 2, 3, 40), (7, 3, 3, 40)] {
+        for (log_msg_cols, log_inv_rate, lanes_log, n_queries) in [(12usize, 1usize, 5usize, 130usize), (12, 2, 5, 130), (6, 2, 3, 40), (7, 3, 3, 40), (14, 2, 5, 130), (13, 3, 4, 100), (16, 1, 5, 130)] {
             let block_len = 1usize << (log_msg_cols + log_inv_rate);
             let lanes = 1usize << lanes_log;
             // Distinct sorted query positions plus one aligned random row each.

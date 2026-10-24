@@ -265,146 +265,40 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     }
 }
 
-/// Elements per cache-resident window of the layer-blocked run below.
-const TRANSPOSE_CHUNK: usize = 1 << 16;
-
-/// The transposed-butterfly sweep over `layers`, in the order given: parallel
-/// over blocks once there are enough of them, over rows within a block
-/// otherwise.
-///
-/// Layers arrive in descending order, so blocks GROW along the run and the ones
-/// that fit a cache-resident window are a prefix. Blocks also nest, so such a
-/// window holds complete blocks of every layer in that prefix and the whole
-/// prefix runs back-to-back inside it: one read and one write of DRAM traffic
-/// for the run instead of one sweep per layer. This is the sub-group
-/// decomposition the interleaved encode already uses for its deep layers,
-/// applied in the transpose direction.
-///
-/// `data` starts at element `offset` of the domain, aligned to every block it pairs within.
-fn transpose_layers_ext(
-    ntt: &AdditiveNttF64,
-    data: &mut [F192],
-    offset: usize,
-    log_d: usize,
-    layers: impl Iterator<Item = usize>,
-) {
-    transpose_layers_ext_windowed(ntt, data, offset, log_d, layers, TRANSPOSE_CHUNK);
-}
-
 /// The transposed forward butterfly, applied to each pair of E elements as K words. The forward
 /// butterfly is `M = [[1, t], [1, t+1]]`, so `M^T = [[1, 1], [t, t+1]]` is
-/// `s = a + b; top = s; bot = t*s + b`.
+/// `s = a + b; top = s; bot = t*s + b`. At `t = 0`, the first block of a layer, it needs no product.
 fn transpose_butterfly_ext(t: F64, top: &mut [F192], bot: &mut [F192]) {
-    transpose_butterfly_lanes(words_mut(top), words_mut(bot), t);
-}
-
-fn transpose_layers_ext_windowed(
-    ntt: &AdditiveNttF64,
-    data: &mut [F192],
-    offset: usize,
-    log_d: usize,
-    layers: impl Iterator<Item = usize>,
-    window_len: usize,
-) {
-    let n_threads = parallel::num_threads();
-    let layers: Vec<usize> = layers.collect();
-    debug_assert!(layers.windows(2).all(|w| w[0] > w[1]), "layers descend");
-    // Keep a window per worker, or the blocked run costs more in lost
-    // parallelism than it saves in traffic.
-    let blocked = if data.len() >= window_len.saturating_mul(n_threads) {
-        layers
-            .iter()
-            .position(|&l| (1usize << (log_d - l)) > window_len)
-            .unwrap_or(layers.len())
+    if t.is_zero() {
+        top.iter_mut().zip(bot.iter()).for_each(|(a, &b)| *a += b);
     } else {
-        0
-    };
-    if blocked > 1 {
-        parallel::chunks_mut(data, window_len, |c, window: &mut [F192]| {
-            let base = offset + c * window_len;
-            for &layer in &layers[..blocked] {
-                let block_size = 1usize << (log_d - layer);
-                let bsh = block_size >> 1;
-                for (b, block) in window.chunks_mut(block_size).enumerate() {
-                    let (top, bot) = block.split_at_mut(bsh);
-                    transpose_butterfly_ext(ntt.twiddle(layer, base / block_size + b), top, bot);
-                }
-            }
-        });
-    }
-    let mut deep = &layers[if blocked > 1 { blocked } else { 0 }..];
-    while let Some(&layer) = deep.first() {
-        let block_size = 1usize << (log_d - layer);
-        let (first, num_blocks) = (offset / block_size, data.len() / block_size);
-        let bsh = block_size >> 1;
-        // Fuse consecutive layers into one pass over each super-block, when it keeps every worker busy.
-        let fused = deep.iter().take(MAX_FUSED).enumerate().take_while(|&(j, &l)| l + j == layer).count();
-        let super_len = block_size << (fused - 1);
-        if fused > 1 && data.len() / super_len >= n_threads {
-            parallel::chunks_mut(data, super_len, |sb, chunk: &mut [F192]| {
-                fused_transpose_layers(ntt, chunk, layer, fused, offset / super_len + sb)
-            });
-            deep = &deep[fused..];
-            continue;
-        }
-        deep = &deep[1..];
-        if num_blocks >= n_threads {
-            parallel::chunks_mut(data, block_size, |block, chunk: &mut [F192]| {
-                let (top, bot) = chunk.split_at_mut(bsh);
-                transpose_butterfly_ext(ntt.twiddle(layer, first + block), top, bot);
-            });
-        } else {
-            for block in 0..num_blocks {
-                let t = ntt.twiddle(layer, first + block);
-                let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top, bot) = chunk.split_at_mut(bsh);
-                let chunk_len = parallel::recommended_chunk_size(bsh);
-                parallel::chunks_mut2(top, bot, chunk_len, |_, top_c, bot_c| transpose_butterfly_ext(t, top_c, bot_c));
-            }
-        }
+        transpose_butterfly_lanes(words_mut(top), words_mut(bot), t);
     }
 }
 
-/// Layers one fused pass takes, which bounds the rows it keeps in L1.
-const MAX_FUSED: usize = 3;
-/// Elements per row strip of a fused pass: `2^MAX_FUSED` strips of this width fit L1.
-const FUSED_STRIP: usize = 128;
-
-/// `fused` consecutive layers `layer, layer-1, ..` over one super-block, the
-/// `sb`-th, in a single pass. Its `2^fused` rows pair at distance `1, 2, 4, ..`
-/// rows, one layer each. The rows are independent column by column, so each
-/// strip of columns runs every layer while it sits in L1.
-fn fused_transpose_layers(ntt: &AdditiveNttF64, sb_data: &mut [F192], layer: usize, fused: usize, sb: usize) {
-    let rows = 1usize << fused;
-    let row_len = sb_data.len() >> fused;
-    let base = sb_data.as_mut_ptr();
-    for c in (0..row_len).step_by(FUSED_STRIP.min(row_len)) {
-        let w = FUSED_STRIP.min(row_len);
-        for j in 0..fused {
-            for r in (0..rows).filter(|r| r >> j & 1 == 0) {
-                let t = ntt.twiddle(layer - j, (sb << (fused - 1 - j)) + (r >> (j + 1)));
-                // SAFETY: rows `r` and `r + 2^j` are distinct, so the two strips are disjoint and inside `sb_data`.
-                let (top, bot) = unsafe {
-                    (
-                        std::slice::from_raw_parts_mut(base.add(r * row_len + c), w),
-                        std::slice::from_raw_parts_mut(base.add((r + (1 << j)) * row_len + c), w),
-                    )
-                };
-                transpose_butterfly_ext(t, top, bot);
-            }
-        }
-    }
-}
+/// Log of the elements per window of the first pass of [`transpose_forward_ntt_sparse_ext`].
+const WINDOW_LOG: usize = 10;
+/// Elements per column strip of its second pass.
+const STRIP: usize = 16;
 
 /// `F^T` of a sparse input, keeping only the low `2^(log_d - log_inv_rate)` outputs.
 ///
 /// The input has `positions.len()` nonzeros. Transpose step `s` mixes only within
-/// `2^(s+1)`-aligned blocks, so the early steps run on the blocks that hold a
-/// nonzero while those are a minority, and the rest sweep densely down to layer
-/// `log_inv_rate`. Every step acts within one of the `2^log_inv_rate` replicas of
-/// the message domain. The last `log_inv_rate` steps pair across replicas and
-/// every kept output is a `top = a + b` of them, so they collapse to a sum over
-/// the replicas: the transpose of the encode's free replication.
+/// `2^(s+1)`-aligned blocks, and every step acts within one of the `2^log_inv_rate`
+/// replicas of the message domain. The last `log_inv_rate` steps pair across
+/// replicas and every kept output is a `top = a + b` of them, so they collapse to
+/// a sum over the replicas: the transpose of the encode's free replication.
+///
+/// The steps run as a two-level decomposition, so that a replica is never swept
+/// layer by layer:
+/// - Pass 1 cuts the domain into windows of `2^WINDOW_LOG` elements, runs the steps
+///   that stay inside a window on the windows that hold a nonzero (the others stay
+///   zero), and stores each strip of `STRIP` columns of them together.
+/// - Pass 2 runs the steps that pair windows, one strip of columns at a time over
+///   the rows (windows) of each replica, and sums the replicas. A layer skips the
+///   blocks of rows that are still zero, as pass 1 does, and the sum is the only
+///   thing written to the output.
+///
 /// Mirror of `whir::transpose_forward_ntt_sparse`.
 fn transpose_forward_ntt_sparse_ext(
     ntt: &AdditiveNttF64,
@@ -420,41 +314,101 @@ fn transpose_forward_ntt_sparse_ext(
         nonzero = positions.len()
     )
     .entered();
-    // One replica at a time, so the working set is a quarter of the domain and stays in cache.
-    let n_keep = 1usize << (log_d - log_inv_rate);
-    let mut kept = vec![F192::ZERO; n_keep];
-    transpose_replica(ntt, positions, values, &mut kept, 0, log_d, log_inv_rate);
-    let mut replica = vec![F192::ZERO; n_keep];
-    for offset in (n_keep..1usize << log_d).step_by(n_keep) {
-        replica.fill(F192::ZERO);
-        transpose_replica(ntt, positions, values, &mut replica, offset, log_d, log_inv_rate);
-        for (out, &x) in kept.iter_mut().zip(&replica) {
-            *out += x;
-        }
+    let log_keep = log_d - log_inv_rate;
+    let log_window = WINDOW_LOG.min(log_keep);
+    let (n_keep, window, strip) = (1usize << log_keep, 1usize << log_window, STRIP.min(1 << log_window));
+    let (k, n_replicas) = (log_keep - log_window, 1usize << log_inv_rate);
+    let rows = 1usize << k;
+    let mut nonzeros: Vec<(usize, F192)> = positions.iter().copied().zip(values.iter().copied()).collect();
+    nonzeros.sort_unstable_by_key(|&(p, _)| p);
+    let mut occupied = vec![false; 1 << (log_d - log_window)];
+    for &(p, _) in &nonzeros {
+        occupied[p >> log_window] = true;
     }
+
+    // Window `r` of replica `j`, strip `c` is at `j * n_keep + (c * rows + r) * strip`: a strip's rows are contiguous.
+    // SAFETY: pass 1 writes every element of an occupied window, and pass 2 reads only those.
+    let mut stage = unsafe { primitives::uninit_vec::<F192>(1 << log_d) };
+    let stage_ptr = parallel::SendPtr(stage.as_mut_ptr());
+    parallel::for_each_chunk(occupied.len(), |first, end| {
+        let mut data = vec![F192::ZERO; window];
+        for w in (first..end).filter(|&w| occupied[w]) {
+            let range = nonzeros.partition_point(|&(p, _)| p < w << log_window)
+                ..nonzeros.partition_point(|&(p, _)| p < (w + 1) << log_window);
+            data.fill(F192::ZERO);
+            transpose_window(ntt, &nonzeros[range], &mut data, w << log_window, log_d);
+            let (replica, row) = (w / rows, w % rows);
+            for (c, src) in data.chunks_exact(strip).enumerate() {
+                // SAFETY: each (window, strip) pair owns its `strip` elements.
+                unsafe { stage_ptr.slice(replica * n_keep + (c * rows + row) * strip, strip) }.copy_from_slice(src);
+            }
+        }
+    });
+
+    // Per replica and layer `j` of pass 2, the blocks of `2^(j+1)` rows that are not zero, with their twiddles.
+    let plans: Vec<Vec<Vec<(usize, F64)>>> = (0..n_replicas)
+        .map(|replica| {
+            let mut live = occupied[replica * rows..(replica + 1) * rows].to_vec();
+            (0..k)
+                .map(|j| {
+                    let len = 2 << j;
+                    let blocks: Vec<usize> = (0..rows / len)
+                        .filter(|&b| live[b * len..(b + 1) * len].contains(&true))
+                        .collect();
+                    blocks.iter().for_each(|&b| live[b * len..(b + 1) * len].fill(true));
+                    let layer = log_d - log_window - 1 - j;
+                    blocks
+                        .into_iter()
+                        .map(|b| (b, ntt.twiddle(layer, (replica << (k - 1 - j)) + b)))
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+
+    // SAFETY: pass 2 writes every element.
+    let mut kept = unsafe { primitives::uninit_vec::<F192>(n_keep) };
+    let kept_ptr = parallel::SendPtr(kept.as_mut_ptr());
+    parallel::for_each_chunk(window / strip, |first, end| {
+        let (mut sum, mut tile) = (vec![F192::ZERO; rows * strip], vec![F192::ZERO; rows * strip]);
+        let stream = primitives::stream::Stream::new();
+        for c in first..end {
+            let run_replica = |tile: &mut [F192], replica: usize| {
+                for (r, row) in tile.chunks_exact_mut(strip).enumerate() {
+                    if occupied[replica * rows + r] {
+                        row.copy_from_slice(&stage[replica * n_keep + (c * rows + r) * strip..][..strip]);
+                    } else {
+                        row.fill(F192::ZERO);
+                    }
+                }
+                transpose_rows(tile, &plans[replica]);
+            };
+            run_replica(&mut sum, 0);
+            for replica in 1..n_replicas {
+                run_replica(&mut tile, replica);
+                sum.iter_mut().zip(&tile).for_each(|(s, &t)| *s += t);
+            }
+            for (r, src) in sum.chunks_exact(strip).enumerate() {
+                // SAFETY: each (strip, row) pair owns its `strip` elements.
+                unsafe { stream.copy_uninit(kept_ptr.add(r * window + c * strip), src) };
+            }
+        }
+    });
     kept
 }
 
-/// The steps of [`transpose_forward_ntt_sparse_ext`] that act within the replica at `offset`, on a zeroed `data`.
-fn transpose_replica(
-    ntt: &AdditiveNttF64,
-    positions: &[usize],
-    values: &[F192],
-    data: &mut [F192],
-    offset: usize,
-    log_d: usize,
-    log_inv_rate: usize,
-) {
-    let mut local = Vec::with_capacity(positions.len());
-    for (&p, &v) in positions.iter().zip(values) {
-        if let Some(p) = p.checked_sub(offset).filter(|&p| p < data.len()) {
-            data[p] += v;
-            local.push(p);
-        }
+/// The steps of [`transpose_forward_ntt_sparse_ext`] that act within one window `data` of the
+/// domain, at `offset`: it holds zeros but for the `nonzeros`, whose positions are in the window.
+fn transpose_window(ntt: &AdditiveNttF64, nonzeros: &[(usize, F192)], data: &mut [F192], offset: usize, log_d: usize) {
+    let log_window = data.len().ilog2() as usize;
+    let mut local = Vec::with_capacity(nonzeros.len());
+    for &(p, v) in nonzeros {
+        data[p - offset] += v;
+        local.push(p - offset);
     }
     let mut blocks: Vec<usize> = Vec::with_capacity(local.len());
     let mut s = 0;
-    while s < log_d - log_inv_rate {
+    while s < log_window {
         blocks.clear();
         blocks.extend(local.iter().map(|&p| p >> (s + 1)));
         blocks.sort_unstable();
@@ -469,7 +423,26 @@ fn transpose_replica(
         }
         s += 1;
     }
-    transpose_layers_ext(ntt, data, offset, log_d, (log_inv_rate..log_d - s).rev());
+    for layer in (log_d - log_window..log_d - s).rev() {
+        let block_size = 1usize << (log_d - layer);
+        for (b, block) in data.chunks_exact_mut(block_size).enumerate() {
+            let (top, bot) = block.split_at_mut(block_size / 2);
+            transpose_butterfly_ext(ntt.twiddle(layer, offset / block_size + b), top, bot);
+        }
+    }
+}
+
+/// One layer per entry of `plan` over the `2^k` equal rows of `tile`, row distance `1, 2, 4, ..`:
+/// the `(block, twiddle)` pairs to butterfly. Rows pair element by element, so a block of
+/// `2^(j+1)` rows is one contiguous pair of halves.
+fn transpose_rows(tile: &mut [F192], plan: &[Vec<(usize, F64)>]) {
+    for (j, blocks) in plan.iter().enumerate() {
+        let len = tile.len() >> (plan.len() - 1 - j);
+        for &(b, t) in blocks {
+            let (top, bot) = tile[b * len..(b + 1) * len].split_at_mut(len / 2);
+            transpose_butterfly_ext(t, top, bot);
+        }
+    }
 }
 
 /// `F^T`-based fast path for [`induce_sumcheck_poly`]: scatter per-query
