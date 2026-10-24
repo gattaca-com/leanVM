@@ -167,6 +167,18 @@ impl Low {
     }
 }
 
+/// Adds each ring's pending fold of an ended run of equal blocks into its `sigma`, weighed by the run's mass.
+fn flush(folds: &mut [Option<[F192; ROWS]>], masses: &mut [F192], sigmas: &mut [F192]) {
+    for ((fold, mass), sigma) in folds.iter_mut().zip(masses).zip(sigmas.chunks_exact_mut(ROWS)) {
+        if let Some(folded) = fold.take() {
+            for (s, v) in sigma.as_chunks_mut::<8>().0.iter_mut().zip(folded.as_chunks::<8>().0) {
+                xor_into8(s, &scale8(v, *mass));
+            }
+        }
+        *mass = F192::ZERO;
+    }
+}
+
 /// A ring claim's block structure and where its terms sit.
 struct Ring {
     /// Folds a bit row of a block against `e_lo`.
@@ -204,8 +216,13 @@ impl Terms {
     }
 
     /// `P(l, .)` for the lane's words.
+    ///
+    /// The lane is swept in runs of `RUN` blocks, one pass per table, so a pattern's packed weights or a ring's
+    /// fold matrices stay in L1 across the run while the run's words stay in L2.
     fn project_lane<const CHUNKS: usize>(&self, lane: &[F64], row: &mut [F192], repeats: &mut [bool]) {
+        const RUN: usize = 32;
         let n_blocks = lane.len() >> self.low_vars;
+        let block = |h: usize| &lane[h << self.low_vars..][..1 << self.low_vars];
         let mut q = vec![F192::ZERO; n_blocks * self.patterns.len()];
         let mut sigmas = vec![F192::ZERO; ROWS * self.rings.len()];
         let mut cols = [[0u8; ROWS]; CHUNKS];
@@ -214,54 +231,48 @@ impl Terms {
         let mut dots = vec![None; self.patterns.len()];
         let mut folds: Vec<Option<[F192; ROWS]>> = vec![None; self.rings.len()];
         let mut masses = vec![F192::ZERO; self.rings.len()];
-        let mut prev: Option<&[F64]> = None;
-        for h in 0..=n_blocks {
-            let block = lane
-                .get(h << self.low_vars..)
-                .and_then(|rest| rest.get(..1 << self.low_vars));
-            let same = prev.map(words) == block.map(words);
-            if let Some(repeat) = repeats.get_mut(h) {
-                *repeat = same;
+        for start in (0..n_blocks).step_by(RUN) {
+            let blocks = start..(start + RUN).min(n_blocks);
+            for h in blocks.clone() {
+                repeats[h] = h > 0 && words(block(h - 1)) == words(block(h));
             }
-            if !same {
-                for ((fold, mass), sigma) in folds.iter_mut().zip(&mut masses).zip(sigmas.chunks_exact_mut(ROWS)) {
-                    if let Some(folded) = fold.take() {
-                        for (s, v) in sigma.as_chunks_mut::<8>().0.iter_mut().zip(folded.as_chunks::<8>().0) {
-                            xor_into8(s, &scale8(v, *mass));
-                        }
-                    }
-                    *mass = F192::ZERO;
-                }
-                dots.fill(None);
-                prev = block;
-            }
-            let Some(block) = block else { break };
             for ((pattern, q), dot) in self.patterns.iter().zip(q.chunks_exact_mut(n_blocks)).zip(&mut dots) {
-                if pattern.active[h] {
-                    q[h] = *dot.get_or_insert_with(|| pattern.low.dot(block));
+                for h in blocks.clone() {
+                    if !repeats[h] {
+                        *dot = None;
+                    }
+                    if pattern.active[h] {
+                        q[h] = *dot.get_or_insert_with(|| pattern.low.dot(block(h)));
+                    }
                 }
             }
-            let mut transposed = false;
-            for ((ring, fold), mass) in self.rings.iter().zip(&mut folds).zip(&mut masses) {
-                let e_hi = ring.e_hi[h];
-                if e_hi == F192::ZERO {
-                    continue;
+            for h in blocks {
+                if !repeats[h] {
+                    flush(&mut folds, &mut masses, &mut sigmas);
                 }
-                *mass += e_hi;
-                fold.get_or_insert_with(|| {
-                    if !transposed {
-                        for (col, group) in cols.iter_mut().zip(block.as_chunks::<8>().0) {
-                            // SAFETY: `F64` is a `u64`, so eight of them are 64 bytes.
-                            bit_transpose_64bytes(unsafe { &*group.as_ptr().cast() }, col);
-                        }
-                        transposed = true;
+                let mut transposed = false;
+                for ((ring, fold), mass) in self.rings.iter().zip(&mut folds).zip(&mut masses) {
+                    let e_hi = ring.e_hi[h];
+                    if e_hi == F192::ZERO {
+                        continue;
                     }
-                    let mut folded = [F192::ZERO; ROWS];
-                    ring.fold.fold_columns(&cols, &mut folded);
-                    folded
-                });
+                    *mass += e_hi;
+                    fold.get_or_insert_with(|| {
+                        if !transposed {
+                            for (col, group) in cols.iter_mut().zip(block(h).as_chunks::<8>().0) {
+                                // SAFETY: `F64` is a `u64`, so eight of them are 64 bytes.
+                                bit_transpose_64bytes(unsafe { &*group.as_ptr().cast() }, col);
+                            }
+                            transposed = true;
+                        }
+                        let mut folded = [F192::ZERO; ROWS];
+                        ring.fold.fold_columns(&cols, &mut folded);
+                        folded
+                    });
+                }
             }
         }
+        flush(&mut folds, &mut masses, &mut sigmas);
         // `P(l, c) = sum_h gamma_c(h) * Q(h)` over the claim's blocks.
         for (p, pattern) in self.patterns.iter().enumerate() {
             let q = &q[p * n_blocks..(p + 1) * n_blocks];
