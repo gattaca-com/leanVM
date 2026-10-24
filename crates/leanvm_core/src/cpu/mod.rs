@@ -568,7 +568,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     let n_blocks = flock_reduction.n_blocks();
     drop(flock_reduction);
     let ring = crate::hash_flock::ring_switch_open(n_blocks, offset, &reduced);
-    crate::stage!("PCS open", || { pcs::open(&mut ps, &committed, &w.q, &slots, &ring) });
+    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, &w.q, &slots, &ring) });
     Ok((
         ps.into_proof(),
         Stats {

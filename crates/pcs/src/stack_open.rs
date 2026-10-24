@@ -166,7 +166,7 @@ pub fn open_batch_mixed_whir_stacked(
     ps: &mut ProverState,
     log_n: usize,
     stack: &[F64],
-    prover_data: &ProverData,
+    prover_data: ProverData,
     config: &ProverConfig,
     point_claims: &[StackClaim],
     ring: &RingSwitchOpen,
@@ -244,8 +244,7 @@ pub fn open_batch_mixed_whir_stacked(
         stack,
         initial_basis,
         target,
-        prover_data.l0(),
-        &prover_data.merkle_tree,
+        prover_data,
         ps,
     );
 }

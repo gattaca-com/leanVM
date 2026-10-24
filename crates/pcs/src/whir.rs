@@ -1113,10 +1113,10 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     witness: &[F64],
     b_initial: InitialBasis,
     target: F192,
-    l0_codeword: L0Codeword<'_>,
-    l0_tree: &[Hash],
+    prover_data: ProverData,
     ps: &mut ProverState,
 ) {
+    let (l0_codeword, l0_tree) = (prover_data.l0(), &prover_data.merkle_tree[..]);
     let r = config.level_steps;
     let initial_k = config.initial_k;
 
@@ -1231,6 +1231,9 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         &queries_0,
         opened_row(&queries_0, &images_0),
     ));
+    // Nothing reads the L0 codeword or its tree again, and the next levels' buffers can be served
+    // from their memory.
+    drop(prover_data);
     drop(span);
 
     // Induce basis_0 from the L0 opens. L0 dominates the induce phase, where
@@ -1476,7 +1479,7 @@ mod tests {
                 let prove = |msg: &[F64]| {
                     let (cm, pd) = commit(msg, log_n, pc.initial_k, pc.log_inv_rates[0]);
                     let mut ps = fiat_shamir::transcript::ProverState::from_label(b"whir-test");
-                    open_batch_mixed_whir_stacked(&mut ps, log_n, msg, &pd, &pc, &claims, &ring);
+                    open_batch_mixed_whir_stacked(&mut ps, log_n, msg, pd, &pc, &claims, &ring);
                     (cm.root, ps.into_proof())
                 };
                 let (root_trunc, fs_trunc) = prove(&witness[..used]);
