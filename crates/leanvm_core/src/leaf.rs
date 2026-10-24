@@ -968,6 +968,7 @@ pub fn prove_balance(
     cols: &[&[F64]],
     owners: &[Vec<Option<(usize, usize)>>; 3],
     tables: &[(usize, usize)],
+    rows: &[usize],
     ps: &mut ProverState,
 ) -> BusProof {
     let push_lay = layout(push);
@@ -1043,7 +1044,7 @@ pub fn prove_balance(
         }
     });
     let (table_evals, prod_sums, blocks) =
-        crate::stage!("Bus table evals", || tables_and_prods_at(cols, tables, &forms, &bus_gkr.point));
+        crate::stage!("Bus table evals", || tables_and_prods_at(cols, tables, rows, &forms, &bus_gkr.point));
     let sigmas: [Vec<F192>; 3] = std::array::from_fn(|s| {
         let sigmas: Vec<F192> = forms[s]
             .iter()
@@ -1080,11 +1081,16 @@ pub fn prove_balance(
 /// across the three sides and the several blocks that carry the same address, so an
 /// address costs one pass however often it is flushed. `tables[t] = (base, n_cols)` in
 /// the global schema; a pair names LOCAL column indices.
+///
+/// A block wholly past `rows[t]` holds the padding row in every row, so each column is a constant
+/// `v` there and its dot is `v`, since `low` sums to one. Those blocks are not swept: each
+/// accumulator takes `v` times the sum of their `high` weights, and each dot is written as `v`.
 #[allow(clippy::type_complexity)]
 #[timed]
 fn tables_and_prods_at(
     cols: &[&[F64]],
     tables: &[(usize, usize)],
+    rows: &[usize],
     forms: &[Vec<BusForm>; 3],
     zeta: &[F192],
 ) -> (Vec<Vec<F192>>, Vec<Vec<(usize, usize, F192)>>, Vec<TableBlocks>) {
@@ -1095,8 +1101,9 @@ fn tables_and_prods_at(
 
     let (evals, (prods, blocks)) = tables
         .iter()
+        .zip(rows)
         .enumerate()
-        .map(|(t, &(base, n_cols))| {
+        .map(|(t, (&(base, n_cols), &rows))| {
             let tau = crate::log2_strict_usize(cols[base].len());
             let mut pairs: Vec<(usize, usize)> = forms
                 .iter()
@@ -1135,12 +1142,14 @@ fn tables_and_prods_at(
                     unsafe { out.add(a * n_blocks + h).write(d) };
                 }
             };
-            let sums = parallel::map_reduce_with_state(
-                high.len().div_ceil(BLOCKS),
+            // Blocks with a real row; the rest are constant. A table of one block is never skipped.
+            let real = if n_blocks > 0 { rows.div_ceil(block) } else { high.len() };
+            let mut sums = parallel::map_reduce_with_state(
+                real.div_ceil(BLOCKS),
                 || vec![F64::ZERO; block],
                 || vec![F192Unreduced::ZERO; n_acc],
                 |prod, acc, task| {
-                    for h in task * BLOCKS..((task + 1) * BLOCKS).min(high.len()) {
+                    for h in task * BLOCKS..((task + 1) * BLOCKS).min(real) {
                         let span = |c: usize| &cols[base + c][h * block..(h + 1) * block];
                         for (c, slot) in acc[..n_cols].iter_mut().enumerate() {
                             let d = dot(span(c));
@@ -1162,6 +1171,17 @@ fn tables_and_prods_at(
                     left
                 },
             );
+            if real < high.len() {
+                let mass = high[real..].iter().fold(F192::ZERO, |acc, &w| acc + w);
+                let row = |c: usize| cols[base + c][real * block];
+                let constants = (0..n_cols)
+                    .map(row)
+                    .chain(pairs.iter().map(|&(a, b)| row(a) * row(b)));
+                for (a, (v, slot)) in constants.zip(&mut sums).enumerate() {
+                    *slot ^= mass.mul_base_unreduced(v);
+                    (real..high.len()).for_each(|h| keep(a, h, F192::from(v)));
+                }
+            }
             let evals = sums[..n_cols].iter().map(|s| s.reduce()).collect();
             let prods = pairs
                 .iter()

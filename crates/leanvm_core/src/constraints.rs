@@ -51,6 +51,8 @@ pub type Constraint<'a> = Box<dyn Fn(&[F192], &[F192], bool) -> F192 + Sync + 'a
 /// One table's place in the shared batch.
 pub struct Air<'a> {
     pub tau: usize,
+    /// Rows before the table's padding, at most `2^tau`.
+    pub rows: usize,
     pub n_constraints: usize,
     pub eval: Constraint<'a>,
 }
@@ -147,7 +149,10 @@ fn block_endpoint(v: &[F192], eqh: &[F192], at_one: bool) -> F192 {
 
 /// Every column's `F_c(x) = Σ_h eqh[h]·col_c[x + BLOCK·h]`, `BLOCK` values each, column after column:
 /// the column folded by the challenges above the block, which leave `BLOCK` rows.
-pub fn partial_evals(cols: &[&[F64]], eqh: &[F192]) -> Vec<F192> {
+///
+/// Only the first `real` blocks are read. Every block past them holds the same value in each of a
+/// column's rows (a table's padding), so together they add that value times their weights to every `x`.
+pub fn partial_evals(cols: &[&[F64]], eqh: &[F192], real: usize) -> Vec<F192> {
     /// Vectors per set of accumulators.
     const VECS: usize = 4;
     /// Rows per set of accumulators.
@@ -156,28 +161,38 @@ pub fn partial_evals(cols: &[&[F64]], eqh: &[F192]) -> Vec<F192> {
     const STEPS: usize = BLOCK / STEP;
     /// Blocks ahead that the reads are prefetched: a stride of `BLOCK` rows is beyond the hardware prefetcher.
     const AHEAD: usize = 16;
-    let log_blocks = eqh.len().trailing_zeros();
+    let real = real.min(eqh.len());
+    let mass = eqh[real..].iter().fold(F192::ZERO, |acc, &e| acc + e);
     // SAFETY: the tasks below write every entry.
     let mut out = unsafe { primitives::uninit_vec::<F192>(cols.len() * BLOCK) };
     parallel::chunks_mut(&mut out, BLOCK, |c, out| {
         let col = cols[c];
+        let padding = (real < eqh.len()).then(|| {
+            F192x8::splat(mass).mul_base_unreduced(F64x8::from_array(&[col[real * BLOCK]; 8]))
+        });
         for x in (0..BLOCK).step_by(STEP) {
             let mut acc = [Prod8::ZERO; VECS];
             // The reads of all columns in order: by column, then set of accumulators, then block.
-            let now = ((c * STEPS + x / STEP) << log_blocks) + AHEAD;
-            for (h, &e) in eqh.iter().enumerate() {
-                let next = now + h;
-                let set = next >> log_blocks;
+            let ahead = (c * STEPS + x / STEP) * real + AHEAD;
+            let (mut set, mut block) = (ahead / real.max(1), ahead % real.max(1));
+            for (h, &e) in eqh[..real].iter().enumerate() {
                 if let Some(next_col) = cols.get(set / STEPS) {
-                    let p = next_col.as_ptr().wrapping_add((next % eqh.len()) * BLOCK + set % STEPS * STEP);
+                    let p = next_col.as_ptr().wrapping_add(block * BLOCK + set % STEPS * STEP);
                     prefetch_lines(p.cast(), 64 * VECS);
+                }
+                block += 1;
+                if block == real {
+                    (set, block) = (set + 1, 0);
                 }
                 let w = F192x8::splat(e);
                 for (v, a) in acc.iter_mut().enumerate() {
                     *a ^= w.mul_base_unreduced(load_k(col, h * BLOCK + x + 8 * v));
                 }
             }
-            for (v, a) in acc.iter().enumerate() {
+            for (v, a) in acc.iter_mut().enumerate() {
+                if let Some(padding) = padding {
+                    *a ^= padding;
+                }
                 out[x + 8 * v..][..8].copy_from_slice(&a.reduce_lanes().to_array());
             }
         }
@@ -610,6 +625,7 @@ fn fold_lb(lb: &mut Vec<F192>, r: F192) {
 /// One table of the batch, and what the rounds have made of it.
 struct Table<'a> {
     tau: usize,
+    rows: usize,
     sigma: F192,
     /// Its summand's factor: the challenges it sat out, then the eq factors of the rounds it was active.
     weight: F192,
@@ -660,7 +676,7 @@ impl Table<'_> {
     /// With the challenges above a block drawn (`chi`), leaves every column as `BLOCK` values. A dotted
     /// table, which is now a block tall, gets its `lin` column from them and leaves the dots.
     fn fold_to_block(&mut self, chi: &[F192]) {
-        let f = partial_evals(self.cols, &eq_table(&chi[BLOCK_VARS..self.tau]));
+        let f = partial_evals(self.cols, &eq_table(&chi[BLOCK_VARS..self.tau]), self.rows.div_ceil(BLOCK));
         if self.dots.take().is_some() {
             let lin: Vec<F192> = (0..BLOCK)
                 .map(|x| dot_e(self.form.lin.iter().map(|&(c, w)| (w, f[c * BLOCK + x]))))
@@ -717,6 +733,7 @@ pub fn prove(
             let form = Form::extract(&air.eval, &pows[offsets[t]..][..air.n_constraints], cols.len());
             Table {
                 tau: air.tau,
+                rows: air.rows,
                 sigma,
                 weight: F192::ONE,
                 dots: blocks.get(t).and_then(|b| Dots::new(&form, b)),
@@ -988,6 +1005,7 @@ mod tests {
             .iter()
             .map(|&tau| Air {
                 tau,
+                rows: 1 << tau,
                 n_constraints: 3,
                 eval: Box::new(synth_eval),
             })

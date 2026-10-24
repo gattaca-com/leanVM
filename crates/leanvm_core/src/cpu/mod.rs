@@ -342,20 +342,22 @@ fn table_spans() -> TableSpans {
 /// coefficients once rather than multiplied onto every row's form value.
 fn airs(
     taus: &[usize; tables::N_TABLES],
+    rows: &[usize; tables::N_TABLES],
     forms: &[Vec<leaf::BusForm>; 3],
     form_pows: [F192; 3],
 ) -> Vec<constraints::Air<'static>> {
     tables::tables()
         .iter()
-        .zip(taus)
+        .zip(taus.iter().zip(rows))
         .enumerate()
-        .map(|(t, (&table, &tau))| {
+        .map(|(t, (&table, (&tau, &rows)))| {
             // One form, not three: the batch adds the three sides' evaluations
             // anyway, and summing them here is a setup cost against a dot product
             // and a product list per row per node.
             let bus = leaf::BusForm::sum((0..3).map(|s| forms[s][t].scaled(form_pows[s])));
             constraints::Air {
                 tau,
+                rows,
                 n_constraints: table.n_constraints(),
                 eval: Box::new(move |p, vals, quadratic| {
                     let air = F192Unreduced::from(table.eval_constraint(p, vals, quadratic));
@@ -516,7 +518,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
         let l = &w.layout;
         let cols = w.columns();
         let bus = crate::stage!("Prove bus", || {
-            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &mut ps)
+            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &l.rows, &mut ps)
         });
         let table_claims = crate::stage!("Prove constraints", || {
             // One sumcheck for all six tables (§constraints).
@@ -530,7 +532,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
             let form_pows = xi_form_pows(xi);
             let sigma = sigmas(&bus.sigmas, form_pows);
             constraints::prove(
-                &airs(&l.taus, &bus.forms, form_pows),
+                &airs(&l.taus, &l.rows, &bus.forms, form_pows),
                 &table_cols,
                 xi,
                 &bus.point,

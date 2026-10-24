@@ -1038,7 +1038,7 @@ fn aggregate_deferred_claims(
         .iter()
         .zip(&eq_hi)
         .map(|(point, eq_hi)| {
-            let per_slot = partial_evals(&columns, eq_hi);
+            let per_slot = partial_evals(&columns, eq_hi, eq_hi.len());
             let weights: Vec<F192> = slot_window.clone().map(|slot| slot_eq(point, kbc, slot)).collect();
             (0..BLOCK)
                 .map(|low| {
