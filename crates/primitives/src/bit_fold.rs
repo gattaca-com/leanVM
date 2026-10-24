@@ -518,17 +518,23 @@ pub mod gfni {
         /// Phases 1 and 2 of up to 64 rows: 24 registers of output bytes.
         #[inline(always)]
         fn accumulate_rows<const CHUNKS: usize>(&self, rows: &[[u8; CHUNKS]]) -> [__m512i; OUT_BYTES] {
+            // The block that follows, for the prefetch.
+            let next = rows.as_ptr().wrapping_add(BLOCK).cast();
             // A short block folds from a zero-padded copy.
             if rows.len() < BLOCK {
                 let mut padded = [[0u8; CHUNKS]; BLOCK];
                 padded[..rows.len()].copy_from_slice(rows);
-                return self.fold_full::<CHUNKS>(&padded);
+                return self.fold_full::<CHUNKS>(&padded, next);
             }
-            self.fold_full::<CHUNKS>(rows.try_into().expect("a full block"))
+            self.fold_full::<CHUNKS>(rows.try_into().expect("a full block"), next)
         }
 
         #[inline(always)]
-        fn fold_full<const CHUNKS: usize>(&self, rows: &[[u8; CHUNKS]; BLOCK]) -> [__m512i; OUT_BYTES] {
+        fn fold_full<const CHUNKS: usize>(
+            &self,
+            rows: &[[u8; CHUNKS]; BLOCK],
+            next: *const u8,
+        ) -> [__m512i; OUT_BYTES] {
             // Phase 1: CHUNKS registers of 64 bytes, row-major, then one register per input byte.
             let mut regs = MaybeUninit::<[__m512i; CHUNKS]>::uninit();
             let dst = regs.as_mut_ptr().cast::<__m512i>();
@@ -545,7 +551,7 @@ pub mod gfni {
                 from = dst;
             }
             // SAFETY: the first group wrote every register.
-            self.accumulate(unsafe { regs.assume_init_ref() })
+            self.accumulate::<CHUNKS, true>(unsafe { regs.assume_init_ref() }, next)
         }
 
         /// The stages `first..first + log2(TILE)`, one tile of `TILE` registers at a time, `from` to `dst`.
@@ -589,17 +595,29 @@ pub mod gfni {
             // SAFETY: each column is one 64-byte register.
             let regs: [__m512i; CHUNKS] =
                 std::array::from_fn(|r| unsafe { _mm512_loadu_si512(cols[byte_of_reg(r)].as_ptr().cast()) });
-            self.accumulate(&regs)
+            self.accumulate::<CHUNKS, false>(&regs, std::ptr::null())
         }
 
         /// Phase 2, from one register per input byte: every output byte accumulates one affine product per input register.
+        ///
+        /// With `PREFETCH`, `next` is the block that follows, and its cache lines load two per input register pair.
+        /// The pass is affine-bound, so the next block's fetch hides behind it, where a burst before the pass stalled.
         #[inline(always)]
-        fn accumulate<const CHUNKS: usize>(&self, regs: &[__m512i; CHUNKS]) -> [__m512i; OUT_BYTES] {
+        fn accumulate<const CHUNKS: usize, const PREFETCH: bool>(
+            &self,
+            regs: &[__m512i; CHUNKS],
+            next: *const u8,
+        ) -> [__m512i; OUT_BYTES] {
             // SAFETY: the module is compiled only with these target features enabled.
             unsafe {
                 let mut acc = [_mm512_setzero_si512(); OUT_BYTES];
                 let matrices: &[[u64; OUT_BYTES]] = self.matrices.as_chunks().0;
-                for (pair, m) in regs.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0) {
+                for (i, (pair, m)) in regs.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0).enumerate() {
+                    if PREFETCH {
+                        // A prefetch past the end of the data is harmless.
+                        _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i).cast());
+                        _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i + 64).cast());
+                    }
                     for o in 0..OUT_BYTES {
                         let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[0], _mm512_set1_epi64(m[0][o] as i64));
                         let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[1], _mm512_set1_epi64(m[1][o] as i64));
