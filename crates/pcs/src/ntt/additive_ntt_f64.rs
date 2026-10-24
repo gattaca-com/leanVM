@@ -603,7 +603,7 @@ impl AdditiveNttF64 {
     ///
     /// - The domain has `2^d` rows and splits into `2^o` equal sub-blocks.
     /// - The buffer is one of them; its index fixes the global block index, and so the twiddle, of each block.
-    /// - Three layers fuse into one radix-8 sweep where blocks are wide enough, then two, then one.
+    /// - Layers fuse into radix-8 sweeps, with radix-4 sweeps where a lone radix-2 would be left over.
     /// - `hook` runs once after each row group of each sweep.
     #[allow(clippy::too_many_arguments)]
     fn run_layers(
@@ -626,8 +626,9 @@ impl AdditiveNttF64 {
             // A block's index in the whole domain, which picks its twiddle.
             let global = |block_in_buf: usize| sub_idx * num_blocks_in_buf + block_in_buf;
 
-            if radix_layers(layer, end_layer, block_size) == 3 {
-                // Three layers to go and blocks of at least 8 rows: one radix-8 sweep.
+            let radix = radix_layers(end_layer - layer);
+            if radix == 3 {
+                // One radix-8 sweep.
                 let eighth = block_size >> 3;
                 for block_in_buf in 0..num_blocks_in_buf {
                     let t = self.twiddles_radix8(layer, global(block_in_buf));
@@ -641,20 +642,20 @@ impl AdditiveNttF64 {
                     );
                 }
                 layer += 3;
-            } else if radix_layers(layer, end_layer, block_size) == 2 {
-                // Two layers to go: one radix-4 sweep.
+            } else if radix == 2 {
+                // One radix-4 sweep.
                 let quarter = block_size >> 2;
                 for block_in_buf in 0..num_blocks_in_buf {
                     let global_block = global(block_in_buf);
-                    let t_outer = self.twiddle(layer, global_block);
-                    let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
-                    let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                    let t = [
+                        self.twiddle(layer, global_block),
+                        self.twiddle(layer + 1, 2 * global_block),
+                        self.twiddle(layer + 1, 2 * global_block + 1),
+                    ];
                     let start = block_in_buf * block_elems;
                     butterfly_interleaved_fused_2layer(
                         &mut buf[start..start + block_elems],
-                        t_outer,
-                        t_inner_a,
-                        t_inner_b,
+                        &t,
                         quarter,
                         num_ntts,
                         &mut hook,
@@ -708,7 +709,7 @@ fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usi
     let (mut layer, mut calls) = (first_layer, 0);
     while layer < end_layer {
         let block_size = 1usize << (log_d - layer);
-        let radix = radix_layers(layer, end_layer, block_size);
+        let radix = radix_layers(end_layer - layer);
         // Every block of the sweep calls once per row group, and a group takes `2^radix` rows.
         calls += (1usize << (layer - outer_log)) * (block_size >> radix);
         layer += radix;
@@ -774,15 +775,14 @@ impl Drain {
 /// One named function, so every such caller shares one instance of the sweeps.
 fn no_hook() {}
 
-/// How many layers the sweep starting at `layer` fuses, when the rows of its blocks number `block_size`.
-fn radix_layers(layer: usize, end_layer: usize, block_size: usize) -> usize {
-    if layer + 2 < end_layer && block_size >= 8 {
-        3
-    } else if layer + 1 < end_layer && block_size >= 4 {
-        2
-    } else {
-        1
-    }
+/// How many layers the next sweep fuses, with `left` layers still to run.
+///
+/// - Radix 8 while three or more remain, but never leave one layer for a lone radix-2 sweep.
+/// - A radix-2 sweep costs about twice a radix-8 layer, a radix-4 sweep about 1.4 times.
+/// - So when one layer would be left over, a radix-4 sweep goes first and another ends the run.
+/// - A block of the next sweep's first layer has `2^left` rows or more, so it always fits the radix.
+fn radix_layers(left: usize) -> usize {
+    if left >= 4 && left % 3 == 1 { 2 } else { left.min(3) }
 }
 
 /// Visit every row group of a fused multi-layer block.
@@ -1095,30 +1095,51 @@ fn replicate_rows(data: &mut [F64], msg: &[F64]) {
 }
 
 /// Layers L and L+1 fused into one sweep over a layer-L block, four rows at a time.
+///
+/// The three twiddles are breadth-first: one for layer L, two for L+1.
 fn butterfly_interleaved_fused_2layer(
     block: &mut [F64],
-    t_outer: F64,
-    t_inner_a: F64,
-    t_inner_b: F64,
+    t: &[F64; 3],
     quarter: usize,
     num_ntts: usize,
     hook: impl FnMut(),
 ) {
-    fused_rows::<4>(
-        block,
-        quarter,
-        num_ntts,
-        |rows| {
-            let [row_a, row_b, row_c, row_d] = rows;
+    fused_rows::<4>(block, quarter, num_ntts, |rows| radix4_butterflies(rows, t), hook);
+}
+
+/// The four butterflies of one radix-4 row group.
+///
+/// On AVX-512 they run on registers, like [`radix8_butterflies`].
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline(always)]
+fn radix4_butterflies(rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
+    #[allow(clippy::redundant_closure)] // the closure carries the inline attribute
+    fused_lanes_avx512(
+        rows,
+        t,
+        #[inline(always)]
+        |v, t| {
             // Layer L: rows 2 apart, one twiddle for the block.
-            butterfly_lanes(row_a, row_c, t_outer);
-            butterfly_lanes(row_b, row_d, t_outer);
+            butterfly_regs(v, 0, 2, t[0]);
+            butterfly_regs(v, 1, 3, t[0]);
             // Layer L+1: adjacent rows, one twiddle per half.
-            butterfly_lanes(row_a, row_b, t_inner_a);
-            butterfly_lanes(row_c, row_d, t_inner_b);
+            butterfly_regs(v, 0, 1, t[1]);
+            butterfly_regs(v, 2, 3, t[2]);
         },
-        hook,
     );
+}
+
+/// The four butterflies of one radix-4 row group.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[inline(always)]
+fn radix4_butterflies(rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
+    let [r0, r1, r2, r3] = rows;
+    // Layer L: rows 2 apart, one twiddle for the block.
+    butterfly_lanes(r0, r2, t[0]);
+    butterfly_lanes(r1, r3, t[0]);
+    // Layer L+1: adjacent rows, one twiddle per half.
+    butterfly_lanes(r0, r1, t[1]);
+    butterfly_lanes(r2, r3, t[2]);
 }
 
 #[inline]
