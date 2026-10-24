@@ -523,13 +523,16 @@ fn bit_round_store_kernel<const CHUNKS: usize>(
         (t, (s.weight * g1.reduce(), s.weight * ginf.reduce()))
     });
 
+    // `Tables` cuts a tail of blocks of at most 32 positions to its pattern, so it reads `TAIL_KEPT` positions past the live ones.
+    let short_tail = padding.k_log.saturating_sub(position_log) <= 5;
+    let n_out = if short_tail { (2 * n_live_pairs).saturating_add(TAIL_KEPT).min(n_pos) } else { n_pos };
     // SAFETY (x3): every slot is written below, padding included.
-    let mut out: [Vec<F192>; 3] = std::array::from_fn(|_| unsafe { primitives::uninit_vec(n_pos) });
+    let mut out: [Vec<F192>; 3] = std::array::from_fn(|_| unsafe { primitives::uninit_vec(n_out) });
     let [out_a, out_b, out_c] = &mut out;
     let chunks = [out_a, out_b, out_c].map(|o| parallel::Chunks::new(o, 2 * lo_size));
 
     let (g1, ginf) = parallel::map_reduce(
-        eq_hi.len(),
+        chunks[0].count(),
         || (F192::ZERO, F192::ZERO),
         |hi| {
             // SAFETY: task `hi` takes chunk `hi` of each output once, and the buffers outlive the dispatch.
@@ -669,6 +672,9 @@ fn fold_and_compute_round_into(ins: [&[F192]; 3], outs: [&mut [F192]; 3], r_fold
 
 /// Positions kept past the live ones: the kernel reads up to 62 beyond, so they carry the tail's pattern.
 const EXTENSION: usize = 64;
+
+/// Positions `bit_round_materialize` stores past the live ones: the rounding of the live count up to 32, then the extension.
+const TAIL_KEPT: usize = 32 + EXTENSION;
 
 /// The stored `a`, `b`, `c` tables during the table rounds, a tail of identical padding blocks cut to its template.
 ///
@@ -1093,7 +1099,7 @@ mod tests {
                 assert_eq!(pair_d, pair_p, "pair, m={m}, useful={useful}, t={t}");
                 assert_eq!(msg_d, msg_p, "store message, m={m}, useful={useful}, t={t}");
                 for (d, p) in tab_d.iter().zip(&tab_p) {
-                    assert_eq!(&d[..], &p[..], "stored table, m={m}, useful={useful}, t={t}");
+                    assert_eq!(&d[..p.len()], &p[..], "stored table, m={m}, useful={useful}, t={t}");
                 }
             }
         }
