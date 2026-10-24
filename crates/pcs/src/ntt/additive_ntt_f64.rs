@@ -402,50 +402,114 @@ impl AdditiveNttF64 {
                 let next = (sub_idx + 1) * sub_len;
                 prefetch_spread(&base, next, if next < total { sub_len } else { 0 }, hooks)
             };
-            parallel::chunks_mut(data, sub_len, |sub_idx, sub| match msg {
-                // A separate message: build the task's rows in scratch, then write them out once.
+            match msg {
+                // A separate message: build each sub-block in scratch, hash it, then write it out once.
                 //
                 // Streamed out whole, the codeword is written without ever being read.
-                Some(m) => with_scratch(sub_len, |scratch| {
-                    // A task sits at the same offset in every replica, or covers whole replicas.
-                    //
-                    //     task at offset off of its replica  <-  message words [off, off + sub_len)
-                    let off = (sub_idx * sub_len) % block_len;
-                    for part in scratch.chunks_mut(block_len) {
-                        // SAFETY:
-                        // - The external message is valid for one whole replica of words.
-                        // - It is disjoint from the codeword.
-                        // - Each part ends inside its replica, so the read stays in bounds.
-                        part.copy_from_slice(unsafe { std::slice::from_raw_parts(m.add(off), part.len()) });
-                    }
-                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, no_hook);
-                    if let Some(f) = deep_rows {
-                        f(sub_idx << log_sub, scratch);
-                    }
-                    if stream {
-                        Stream::new().copy(sub, scratch);
-                    } else {
-                        sub.copy_from_slice(scratch);
-                    }
-                }),
-                // The rows are hashed from scratch and the buffer keeps its pre-deep state.
-                None if defer_deep && deep_rows.is_some() => with_scratch(sub_len, |scratch| {
-                    scratch.copy_from_slice(sub);
-                    let hook = prefetch_next(sub_idx);
-                    self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
-                    if let Some(f) = deep_rows {
-                        f(sub_idx << log_sub, scratch);
-                    }
-                }),
-                // The replicas are already in place: run the layers where they are.
-                None => {
-                    let hook = prefetch_next(sub_idx);
-                    self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
-                    if let Some(f) = deep_rows {
-                        f(sub_idx << log_sub, sub);
-                    }
+                Some(m) => {
+                    // Whole cache lines in every row, so a finished sub-block can drain a line at a time.
+                    let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
+                    let deferred = stream && lines_ok;
+                    let drain_per_hook = (sub_len / 8).div_ceil(hooks);
+                    parallel::for_each_chunk(1 << outer, |lo, hi| {
+                        // A draining task has two scratches: one transforms while the other empties.
+                        with_scratch(sub_len * (1 + usize::from(deferred)), |both| {
+                            // One fence at the end of the task covers all its streaming stores.
+                            let stream = stream.then(Stream::new);
+                            let (mut scratch, mut idle) = both.split_at_mut(sub_len);
+                            let mut drain = Drain::default();
+                            for sub_idx in lo..hi {
+                                // A task sits at the same offset in every replica, or covers whole replicas.
+                                //
+                                //     task at offset off of its replica  <-  message words [off, off + sub_len)
+                                let off = (sub_idx * sub_len) % block_len;
+                                for part in scratch.chunks_mut(block_len) {
+                                    // SAFETY:
+                                    // - The external message is valid for one whole replica of words.
+                                    // - It is disjoint from the codeword.
+                                    // - Each part ends inside its replica, so the read stays in bounds.
+                                    let words = unsafe { std::slice::from_raw_parts(m.add(off), part.len()) };
+                                    part.copy_from_slice(words);
+                                }
+                                match &stream {
+                                    Some(s) if deferred => {
+                                        // The previous sub-block drains while this one transforms.
+                                        let hook = || drain.step(s, drain_per_hook);
+                                        self.run_layers(
+                                            scratch,
+                                            log_d,
+                                            num_ntts,
+                                            deep_start,
+                                            log_d,
+                                            outer,
+                                            sub_idx,
+                                            hook,
+                                        );
+                                        drain.step(s, usize::MAX);
+                                        if let Some(f) = deep_rows {
+                                            f(sub_idx << log_sub, scratch);
+                                        }
+                                        // This one drains during the next transform, while the other scratch is filled.
+                                        drain = Drain {
+                                            // SAFETY: the sub-block lies inside the codeword.
+                                            dst: unsafe { base.add(sub_idx * sub_len) },
+                                            src: scratch.as_ptr(),
+                                            row_len: num_ntts,
+                                            dst_stride: num_ntts,
+                                            rows: 1 << log_sub,
+                                            ..Drain::default()
+                                        };
+                                        std::mem::swap(&mut scratch, &mut idle);
+                                    }
+                                    _ => {
+                                        self.run_layers(
+                                            scratch,
+                                            log_d,
+                                            num_ntts,
+                                            deep_start,
+                                            log_d,
+                                            outer,
+                                            sub_idx,
+                                            no_hook,
+                                        );
+                                        if let Some(f) = deep_rows {
+                                            f(sub_idx << log_sub, scratch);
+                                        }
+                                        // SAFETY: this task alone owns the sub-block of the codeword.
+                                        let dst = unsafe { base.slice(sub_idx * sub_len, sub_len) };
+                                        match &stream {
+                                            Some(s) => s.copy(dst, scratch),
+                                            None => dst.copy_from_slice(scratch),
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(s) = &stream {
+                                drain.step(s, usize::MAX);
+                            }
+                        });
+                    });
                 }
-            });
+                None => parallel::chunks_mut(data, sub_len, |sub_idx, sub| {
+                    let hook = prefetch_next(sub_idx);
+                    if defer_deep && deep_rows.is_some() {
+                        // The rows are hashed from scratch and the buffer keeps its pre-deep state.
+                        with_scratch(sub_len, |scratch| {
+                            scratch.copy_from_slice(sub);
+                            self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
+                            if let Some(f) = deep_rows {
+                                f(sub_idx << log_sub, scratch);
+                            }
+                        });
+                    } else {
+                        // The replicas are already in place: run the layers where they are.
+                        self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
+                        if let Some(f) = deep_rows {
+                            f(sub_idx << log_sub, sub);
+                        }
+                    }
+                }),
+            }
         }
 
         if let Some(f) = on_rows.filter(|_| !fuse) {
