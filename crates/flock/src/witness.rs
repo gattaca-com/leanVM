@@ -2,7 +2,6 @@
 //! Bit-packing and R1CS-row helpers for the monolithic hash R1CS modules
 //! (only `hash` in this vendored subset).
 
-use primitives::bits::bit_transpose_64bytes;
 use primitives::stream::Stream;
 use std::ops::{BitAnd, BitOr, BitOrAssign, BitXor};
 
@@ -340,16 +339,9 @@ pub(crate) fn packed_bytes(words: &[u64]) -> &[u8] {
 /// Groups a task builds one after the other, each streaming while the next builds.
 const TASK_GROUPS: usize = 16;
 
-/// One group's output as the scratch holds it, ready to stream.
-struct Buf {
-    blocks: Vec<u64>,
-    stripe: Vec<u8>,
-}
-
 /// Drive the parallel chunked witness build for `n_blocks` instances padded
-/// to `2^n_blocks_log` slots. Returns `(z, a, b, z_lincheck)`: the three
-/// bit-packed `u64` tables (`WORDS` per instance) and the lincheck
-/// byte stripe. `a` and `b` may be shorter than `z`, see [`drive_witness_packed_and_lincheck_into`].
+/// to `2^n_blocks_log` slots. Returns `(z, a, b)`: the three bit-packed `u64` tables
+/// (`WORDS` per instance). `a` and `b` may be shorter than `z`, see [`drive_witness_packed_into`].
 ///
 /// `build_group(states, rows, progress)` builds eight blocks at once, one per lane, from `states`.
 /// `rows` is `3 · WORDS` rows, the `z`, `a` and `b` tables word-major: row `i` holds word `i` of
@@ -357,85 +349,67 @@ struct Buf {
 /// `initial_states.len()` may be less than `2^n_blocks_log`: `padding` builds a real block in
 /// every trailing slot, so that the constant column is all-ones across *every* batched instance
 /// (see `lincheck's `LincheckCircuit::const_pin_col``).
-pub(crate) fn drive_witness_packed_and_lincheck<const WORDS: usize, S: Sync, F>(
+pub(crate) fn drive_witness_packed<const WORDS: usize, S: Sync, F>(
     initial_states: &[S],
     padding: &S,
     n_blocks_log: usize,
-    stripe_groups: usize,
     build_group: F,
-) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u8>)
+) -> (Vec<u64>, Vec<u64>, Vec<u64>)
 where
     F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize)) + Sync,
 {
     let total_words = (1usize << n_blocks_log) * WORDS;
-    // SAFETY: `drive_witness_packed_and_lincheck_into` writes every word of `z`.
+    // SAFETY: `drive_witness_packed_into` writes every word of `z`.
     let mut z = unsafe { primitives::uninit_vec::<u64>(total_words) };
-    let (a, b, z_lincheck) = drive_witness_packed_and_lincheck_into::<WORDS, S, F>(
-        initial_states,
-        padding,
-        n_blocks_log,
-        stripe_groups,
-        &mut z,
-        build_group,
-    );
-    (z, a, b, z_lincheck)
+    let (a, b) = drive_witness_packed_into::<WORDS, S, F>(initial_states, padding, n_blocks_log, &mut z, build_group);
+    (z, a, b)
 }
 
-/// [`drive_witness_packed_and_lincheck`] with `z` written into the caller's buffer, which may
+/// [`drive_witness_packed`] with `z` written into the caller's buffer, which may
 /// be uninitialized: every word is written.
 ///
 /// The returned `a` and `b` stop after the group holding block `n_blocks`, the first all-padding block.
 /// The zerocheck reads that one padding block and none after it.
-///
-/// The returned stripe holds the first `stripe_groups` of the stripes (one per group of eight blocks).
-pub(crate) fn drive_witness_packed_and_lincheck_into<const WORDS: usize, S: Sync, F>(
+pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
     initial_states: &[S],
     padding: &S,
     n_blocks_log: usize,
-    stripe_groups: usize,
     z: &mut [u64],
     build_group: F,
-) -> (Vec<u64>, Vec<u64>, Vec<u8>)
+) -> (Vec<u64>, Vec<u64>)
 where
     F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize)) + Sync,
 {
-    let k = WORDS * 64;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = initial_states.len();
     assert!(
         n_blocks <= n_total,
         "{n_blocks} blocks > 2^{n_blocks_log} = {n_total} slots"
     );
-    // A group is one stripe's eight blocks; below eight, one group holds them all and its stripe's other bits stay zero.
+    // A group is eight blocks; below eight, one group holds them all.
     let group_blocks = n_total.min(LANES);
     let n_groups = n_total / group_blocks;
 
     let total_words = n_total * WORDS;
     assert_eq!(z.len(), total_words, "z holds every instance's packed words");
     // SAFETY (x3): group `g` publishes chunk `g` of every table in full below, `a` and `b` only for `g < ab_groups`.
-    // The z/a/b chunks are a group's blocks of packed words, and the stripe chunk is the transpose's k bytes.
+    // The chunks are a group's blocks of packed words.
     let ab_groups = (n_blocks / group_blocks + 1).min(n_groups);
     let mut a = unsafe { primitives::uninit_vec::<u64>(ab_groups * group_blocks * WORDS) };
     let mut b = unsafe { primitives::uninit_vec::<u64>(ab_groups * group_blocks * WORDS) };
-    let stripe_groups = stripe_groups.min(n_groups);
-    let mut z_lincheck = unsafe { primitives::uninit_vec::<u8>(stripe_groups * k) };
 
-    // Four output tables at two widths, indexed by the same group: `z`/`a`/`b`
-    // take the group's blocks' packed words, `z_lincheck` takes one byte stripe.
+    // Three output tables, indexed by the same group, each taking the group's blocks' packed words.
     let group_words = group_blocks * WORDS;
     let scratch_words = LANES * WORDS;
     let z_chunks = parallel::Chunks::new(z, group_words);
     let a_chunks = parallel::Chunks::new(&mut a, group_words);
     let b_chunks = parallel::Chunks::new(&mut b, group_words);
-    let stripe_chunks = parallel::Chunks::new(&mut z_lincheck, k);
-    debug_assert_eq!(stripe_chunks.count(), stripe_groups);
     debug_assert_eq!(a_chunks.count(), ab_groups);
 
     // Each group builds in its worker's scratch, which stays in cache, then streams out.
     //
     //     rows     z | a | b   word-major: row i is word i of the 8 blocks, one per lane
     //     buf      z | a | b   block-major: the rows transposed, the layout of the output
-    //              stripe      the bit transpose of the z rows
     //
     // Building in place instead would fetch every output line before writing it.
     //
@@ -448,10 +422,7 @@ where
     parallel::map_reduce_with_state(
         n_groups.div_ceil(TASK_GROUPS),
         || {
-            let buf = || Buf {
-                blocks: vec![0u64; 3 * scratch_words],
-                stripe: vec![0u8; k],
-            };
+            let buf = || vec![0u64; 3 * scratch_words];
             (vec![V64::ZERO; 3 * WORDS], [buf(), buf()], 0usize, false)
         },
         || (),
@@ -459,19 +430,15 @@ where
             let stream = Stream::new();
             // Stream the part `from..to` of `of` of group `g`'s tables out of `buf`, whole lines at a time.
             // SAFETY: each group `g` takes chunk `g` of each table, one slice at a time, and
-            // all four tables stay borrowed for the whole dispatch.
-            let emit = |g: usize, buf: &Buf, from: usize, to: usize, of: usize| unsafe {
+            // all three tables stay borrowed for the whole dispatch.
+            let emit = |g: usize, buf: &[u64], from: usize, to: usize, of: usize| unsafe {
                 let words = (group_words / 8 * from / of * 8)..(group_words / 8 * to / of * 8);
-                let (z, ab) = buf.blocks.split_at(scratch_words);
+                let (z, ab) = buf.split_at(scratch_words);
                 let (a, b) = ab.split_at(scratch_words);
                 stream.copy(&mut z_chunks.get(g)[words.clone()], &z[words.clone()]);
                 if g < ab_groups {
                     stream.copy(&mut a_chunks.get(g)[words.clone()], &a[words.clone()]);
                     stream.copy(&mut b_chunks.get(g)[words.clone()], &b[words]);
-                }
-                if g < stripe_groups {
-                    let bytes = (k / 64 * from / of * 64)..(k / 64 * to / of * 64);
-                    stream.copy(&mut stripe_chunks.get(g)[bytes.clone()], &buf.stripe[bytes]);
                 }
             };
             let mut pending = None;
@@ -498,18 +465,8 @@ where
                 if let Some(p) = prev {
                     emit(p, prev_buf, sent, of, of);
                 }
-                // Lanes past the group's blocks are not blocks: the stripe takes them as zero.
-                if group_blocks < LANES {
-                    for row in &mut rows[..WORDS] {
-                        row.0[group_blocks..].fill(0);
-                    }
-                }
-                for (row, out) in rows.iter().zip(cur_buf.stripe.as_chunks_mut::<64>().0) {
-                    let bytes = row.0.map(u64::to_le_bytes);
-                    bit_transpose_64bytes(bytes.as_flattened().try_into().expect("64 bytes"), out);
-                }
                 // Row `i` of table `t` is word `i` of block `l`: transpose into the block-major buf.
-                for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.blocks.chunks_mut(scratch_words)) {
+                for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.chunks_mut(scratch_words)) {
                     for (tile, i) in t_rows.chunks_exact(LANES).zip((0..).step_by(LANES)) {
                         let blocks = transpose_lanes(tile);
                         for (l, block) in blocks.iter().take(group_blocks).enumerate() {
@@ -527,5 +484,5 @@ where
         |(), ()| (),
     );
 
-    (a, b, z_lincheck)
+    (a, b)
 }

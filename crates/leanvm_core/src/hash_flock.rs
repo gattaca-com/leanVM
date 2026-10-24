@@ -52,7 +52,6 @@ pub(crate) struct PreparedReductionWitness {
     n_blocks: usize,
     a_packed: Vec<u64>,
     b_packed: Vec<u64>,
-    z_lincheck: Vec<u8>,
 }
 
 impl PreparedReductionWitness {
@@ -67,7 +66,6 @@ impl PreparedReductionWitness {
             packed_words(q_flock),
             &self.a_packed,
             &self.b_packed,
-            &self.z_lincheck,
             ps,
         )
     }
@@ -217,12 +215,11 @@ pub(crate) fn build_qflock_prepared(blocks: &[Compression], q_flock: &mut [F64])
     // The packed `z` is generated straight into the committed window: its words are `q_flock`.
     // SAFETY: `F64` is `repr(transparent)` over `u64`, so the two slices are the same bytes.
     let words: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(q_flock.as_mut_ptr().cast(), q_flock.len()) };
-    let (a_packed, b_packed, z_lincheck) = generate_witness_into_z(blocks, n_blocks_log(n_blocks), words);
+    let (a_packed, b_packed) = generate_witness_into_z(blocks, n_blocks_log(n_blocks), words);
     PreparedReductionWitness {
         n_blocks,
         a_packed,
         b_packed,
-        z_lincheck,
     }
 }
 

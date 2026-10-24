@@ -23,8 +23,8 @@ use bench::{Metric, Plan, Timing, bencher_json};
 use fiat_shamir::digest_words;
 use fiat_shamir::transcript::{Proof, ProverState};
 use flock::hash::{
-    Blake2sSetup, Compression, K_LOG, generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
-    pinned_compression, ring_switch_open,
+    Blake2sSetup, Compression, K_LOG, generate_witness_with_ab_packed, min_n_blocks_log, pinned_compression,
+    ring_switch_open,
 };
 use pcs::pack::LOG_PACKING;
 use pcs::stack_open::open_batch_mixed_whir_stacked;
@@ -42,9 +42,15 @@ fn main() {
         .ok()
         .map(|s| s.parse().expect("FLOCK_N_LOG must be an integer"))
         .unwrap_or(13);
-    let n = 1usize
-        .checked_shl(requested_n_log as u32)
-        .expect("FLOCK_N_LOG exceeds the platform usize width");
+    // `FLOCK_N` sets an exact count, so the instance tail is padding (a node holds ~17,900 in 2^15 slots).
+    let n = std::env::var("FLOCK_N").ok().map_or_else(
+        || {
+            1usize
+                .checked_shl(requested_n_log as u32)
+                .expect("FLOCK_N_LOG exceeds the platform usize width")
+        },
+        |s| s.parse().expect("FLOCK_N must be an integer"),
+    );
     let n_log = min_n_blocks_log(n);
     let mu = K_LOG + n_log - LOG_PACKING;
     assert!(
@@ -70,7 +76,7 @@ fn main() {
         let _span = tracing::info_span!("Flock prove", n_log).entered();
         let t_pass = Instant::now();
         let t = Instant::now();
-        let (z_packed, a_packed, b_packed, z_lincheck) = generate_witness_with_ab_packed_and_lincheck(&blocks, n_log);
+        let (z_packed, a_packed, b_packed) = generate_witness_with_ab_packed(&blocks, n_log);
         let witness_s = t.elapsed().as_secs_f64();
         // The committed column is the packed words themselves, viewed in place.
         // SAFETY: `F64` is `repr(transparent)` over `u64`.
@@ -90,9 +96,9 @@ fn main() {
         let zerocheck_s = t.elapsed().as_secs_f64();
 
         let t = Instant::now();
-        let reduced = setup.prove_lincheck(stage, &z_lincheck, &mut ps);
+        let reduced = setup.prove_lincheck(stage, &z_packed, &mut ps);
         let lincheck_s = t.elapsed().as_secs_f64();
-        drop((a_packed, b_packed, z_lincheck));
+        drop((a_packed, b_packed));
 
         let t = Instant::now();
         let ring = ring_switch_open(n, 0, &reduced);

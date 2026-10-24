@@ -89,8 +89,7 @@ use crate::gf2::{
 };
 use crate::witness::packed_bytes;
 use crate::witness::{
-    BitRecord, LANES, V32, V64, add_carry_parts, add3_fused_parts, drive_witness_packed_and_lincheck,
-    drive_witness_packed_and_lincheck_into,
+    BitRecord, LANES, V32, V64, add_carry_parts, add3_fused_parts, drive_witness_packed, drive_witness_packed_into,
 };
 use pcs::pack::{LOG_PACKING, PACKING_WIDTH};
 use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen};
@@ -675,41 +674,18 @@ fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: 
     }
 }
 
-/// Produce `(z, a, b, z_lincheck)` for `blocks.len()` compressions padded to
-/// `2^n_blocks_log` slots. Mirror of `blake2s`'s generator; see it for the
-/// buffer shapes and the lincheck stripe indexing.
+/// Produce `(z, a, b)` for `blocks.len()` compressions padded to `2^n_blocks_log` slots.
+/// `z` is instance-major: instance `i` is the `WORDS` words from `i * WORDS`.
 #[timed]
-pub fn generate_witness_with_ab_packed_and_lincheck(
-    blocks: &[Compression],
-    n_blocks_log: usize,
-) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u8>) {
-    let stripe_groups = 1usize << (n_blocks_log.max(3) - 3);
-    drive_witness_packed_and_lincheck::<WORDS, _, _>(
-        blocks,
-        &padding_block(),
-        n_blocks_log,
-        stripe_groups,
-        build_group_rows,
-    )
+pub fn generate_witness_with_ab_packed(blocks: &[Compression], n_blocks_log: usize) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    drive_witness_packed::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, build_group_rows)
 }
 
-/// [`generate_witness_with_ab_packed_and_lincheck`] with the packed `z` written into `z`,
-/// which may be uninitialized; returns `(a, b, z_lincheck)`.
+/// [`generate_witness_with_ab_packed`] with the packed `z` written into `z`,
+/// which may be uninitialized; returns `(a, b)`.
 #[timed]
-pub fn generate_witness_into_z(
-    blocks: &[Compression],
-    n_blocks_log: usize,
-    z: &mut [u64],
-) -> (Vec<u64>, Vec<u64>, Vec<u8>) {
-    let stripe_groups = crate::lincheck::stripes_read(K_LOG + n_blocks_log.max(3), K_LOG, blocks.len().max(1));
-    drive_witness_packed_and_lincheck_into::<WORDS, _, _>(
-        blocks,
-        &padding_block(),
-        n_blocks_log,
-        stripe_groups,
-        z,
-        build_group_rows,
-    )
+pub fn generate_witness_into_z(blocks: &[Compression], n_blocks_log: usize, z: &mut [u64]) -> (Vec<u64>, Vec<u64>) {
+    drive_witness_packed_into::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, z, build_group_rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -838,10 +814,9 @@ impl Blake2sSetup {
     /// statement is already transcript-bound: the embedding protocol seeds
     /// with the R1CS digest and announces the count.)
     ///
-    /// The embedder has already generated the packed `z`, `A·z`, `B·z`, and
-    /// lincheck-stripe buffers (`generate_witness_with_ab_packed_and_lincheck`)
-    /// before committing the flattened witness. It is [`Self::prove_zerocheck`]
-    /// then [`Self::prove_lincheck`], and returns the [`SliceClaim`] on
+    /// The embedder has already generated the packed `z`, `A·z` and `B·z`
+    /// (`generate_witness_with_ab_packed`) before committing the flattened witness.
+    /// It is [`Self::prove_zerocheck`] then [`Self::prove_lincheck`], and returns the [`SliceClaim`] on
     /// `q_flock`, with its ring-switch weights.
     ///
     /// Does NOT open the PCS; the caller discharges the returned claim in the
@@ -852,11 +827,10 @@ impl Blake2sSetup {
         z_packed: &[u64],
         a_packed_words: &[u64],
         b_packed_words: &[u64],
-        z_packed_lincheck: &[u8],
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> SliceClaim {
         let stage = self.prove_zerocheck(z_packed, a_packed_words, b_packed_words, ps);
-        self.prove_lincheck(stage, z_packed_lincheck, ps)
+        self.prove_lincheck(stage, z_packed, ps)
     }
 
     /// **Flock reduction, first stage (prover): the zerocheck.** Reduces
@@ -909,20 +883,15 @@ impl Blake2sSetup {
     pub fn prove_lincheck(
         &self,
         stage: ZerocheckStage,
-        z_packed_lincheck: &[u8],
+        z_packed: &[u64],
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> SliceClaim {
         let _span = tracing::info_span!("Lincheck").entered();
-        // Past the stripes the lincheck reads, the rest repeat the last one and need not be there.
-        assert!(
-            z_packed_lincheck.len()
-                >= crate::lincheck::stripes_read(K_LOG + self.n_blocks_log.max(3), K_LOG, self.n_blocks) * K,
-            "wrong lincheck stripe length"
-        );
+        assert_eq!(z_packed.len(), 1usize << (self.m() - 6), "wrong packed witness length");
 
         let ZerocheckStage { x_ab } = stage;
         let lc_claim = crate::lincheck::prove_padded_capture_s_hat_v(
-            z_packed_lincheck,
+            z_packed,
             self.m(),
             K_LOG,
             K_SKIP,
@@ -963,7 +932,7 @@ mod tests {
     }
 
     fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool> {
-        let z = generate_witness_with_ab_packed_and_lincheck(blocks, n_blocks_log).0;
+        let z = generate_witness_with_ab_packed(blocks, n_blocks_log).0;
         unpack_bits(&z, (1usize << n_blocks_log) * K)
     }
 
@@ -1049,8 +1018,7 @@ mod tests {
         }
     }
 
-    /// At every batch size, eight instances or fewer included, the witness
-    /// satisfies the R1CS and its lincheck stripes are its transpose.
+    /// At every batch size, eight instances or fewer included, the witness satisfies the R1CS.
     #[test]
     fn honest_witness_satisfies_r1cs() {
         let mut rng = Rng::new(0xB25A7157);
@@ -1067,17 +1035,11 @@ mod tests {
                 })
                 .collect();
             let n_blocks_log = min_n_blocks_log(n_blocks);
-            let (z_packed, _, _, z_lincheck) = generate_witness_with_ab_packed_and_lincheck(&blocks, n_blocks_log);
+            let (z_packed, _, _) = generate_witness_with_ab_packed(&blocks, n_blocks_log);
             let z = unpack_bits(&z_packed, K << n_blocks_log);
             assert!(
                 satisfies(&z, n_blocks_log),
                 "witness for {n_blocks} compressions fails R1CS"
-            );
-            let m = K_LOG + n_blocks_log;
-            assert_eq!(
-                z_lincheck,
-                crate::lincheck::pack_z_lincheck(&z, m, K_LOG),
-                "{n_blocks} compressions"
             );
         }
     }
@@ -1099,20 +1061,19 @@ mod tests {
                 )
             })
             .collect();
-        let (z, a, b, stripes) = generate_witness_with_ab_packed_and_lincheck(&blocks, 6);
+        let (z, a, b) = generate_witness_with_ab_packed(&blocks, 6);
         blocks.resize(64, padding_block());
-        let explicit = generate_witness_with_ab_packed_and_lincheck(&blocks, 6);
+        let explicit = generate_witness_with_ab_packed(&blocks, 6);
         // Blocks 0..16 are the two groups holding block 9, the first padding block.
         let ab_words = 16 * K / 64;
         assert_eq!(a.len(), ab_words);
         assert_eq!(b.len(), ab_words);
         assert!(z == explicit.0 && a[..] == explicit.1[..ab_words] && b[..] == explicit.2[..ab_words]);
-        assert!(stripes == explicit.3);
     }
 
-    /// `generate_witness_into_z` writes the same `z`, `a` and `b`, and the stripes the lincheck reads.
+    /// `generate_witness_into_z` writes the same `z`, `a` and `b`.
     #[test]
-    fn trimmed_stripes_are_a_prefix() {
+    fn into_z_matches_the_allocating_generator() {
         let mut rng = Rng::new(0x57121);
         for n_blocks in [3usize, 64, 1000, 1025] {
             let blocks: Vec<Compression> = (0..n_blocks)
@@ -1127,15 +1088,10 @@ mod tests {
                 })
                 .collect();
             let n_blocks_log = min_n_blocks_log(n_blocks);
-            let full = generate_witness_with_ab_packed_and_lincheck(&blocks, n_blocks_log);
+            let full = generate_witness_with_ab_packed(&blocks, n_blocks_log);
             let mut z = vec![0u64; full.0.len()];
-            let (a, b, stripes) = generate_witness_into_z(&blocks, n_blocks_log, &mut z);
+            let (a, b) = generate_witness_into_z(&blocks, n_blocks_log, &mut z);
             assert!(z == full.0 && a == full.1 && b == full.2, "{n_blocks} blocks");
-            assert_eq!(
-                stripes.len(),
-                crate::lincheck::stripes_read(K_LOG + n_blocks_log.max(3), K_LOG, n_blocks) * K
-            );
-            assert!(stripes[..] == full.3[..stripes.len()], "{n_blocks} blocks");
         }
     }
 

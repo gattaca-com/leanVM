@@ -61,7 +61,12 @@
 //!   to outer vars.
 //! - **Eq table layout.** `eq_table[i]` where `i = Σ b_j · 2^j` is
 //!   `Π_j eq(point[j], b_j) = Π_j (1 + point[j] + b_j)`.
-//! - **`z_packed` byte layout (specific to lincheck, enabling column-scan
+//! - **Witness input.** The prover takes `z` as the committed packed words: instance `i_outer` is
+//!   the `2^k_log / 64` words from `i_outer · 2^k_log / 64`, bit `i_inner` at position `i_inner % 64`
+//!   of word `i_inner / 64`. Below 8 instances the missing ones count as zero.
+//!   The GFNI fold reads these words directly. The table-driven folds read the *stripe* layout below,
+//!   which [`stripes_from_words`] builds for them.
+//! - **`z_packed` stripe layout (specific to lincheck, enabling column-scan
 //!   lookup tables without an explicit transpose).** Writing `i_outer = 8·byte_idx + r`
 //!   with `r ∈ {0,..,7}` and `byte_idx ∈ {0,..,n_outer/8 − 1}`, the bit
 //!   `z[i_inner, i_outer]` lives at:
@@ -608,14 +613,18 @@ const GFNI_TILE: usize = 8;
 
 /// The partial fold with GFNI, outer-partitioned like the tiled fold.
 ///
-/// Byte `i_inner` of a stripe carries eight outer bits, so the fold is GF(2)-linear per stripe:
+/// A byte of a *stripe* carries one bit of each of eight instances, so the fold is GF(2)-linear per stripe:
 ///
 /// ```text
-///     out[i_inner] += sum_{r : bit r of z[stripe][i_inner]} eq_outer[8 stripe + r]
+///     out[i_inner] += sum_{r : bit r of stripe[i_inner]} eq_outer[8 stripe + r]
 /// ```
 ///
 /// One register is 64 consecutive `i_inner` of a stripe, already byte-sliced.
 /// So a stripe costs 24 affine products per 64 outputs, into accumulators kept byte-sliced until the end.
+///
+/// The stripes are built here from `z`, eight words of each of a stripe's eight instances at a time:
+/// an 8x8 transpose of qwords gives, per word, the eight instances' copies in one register, and the bit transpose
+/// of those 64 bytes is the stripe's register. A tile's stripes for eight words wait in `stripes`, in L1.
 ///
 /// **Whole tiles of identical blocks fold once.** Every block from `live_blocks` on repeats block `live_blocks`.
 /// Tiles are folded up to the first one starting at or past `live_blocks`, which stands for the rest:
@@ -630,7 +639,7 @@ const GFNI_TILE: usize = 8;
     target_feature = "avx512vbmi"
 ))]
 fn partial_fold_packed_z_gfni(
-    z_packed: &[u8],
+    z: &[u64],
     m: usize,
     k_log: usize,
     useful_bits: usize,
@@ -639,13 +648,14 @@ fn partial_fold_packed_z_gfni(
 ) -> Vec<F192> {
     use crate::zerocheck::bit_fold::gfni::{OUT_BYTES, store_f192, weight_matrices};
     use core::arch::x86_64::*;
+    use primitives::bits::bit_transpose_64bytes_reg;
 
-    let (k, n_stripes) = (1usize << k_log, 1usize << (m - k_log - 3));
-    assert!(z_packed.len() >= stripes_read(m, k_log, live_blocks) * k);
+    let (k, words, n_stripes) = (1usize << k_log, 1usize << (k_log - 6), 1usize << (m - k_log - 3));
+    assert_eq!(z.len(), words << (m - k_log));
     assert_eq!(eq_outer.len(), 8 * n_stripes);
     assert!(
-        k >= 64 && n_stripes.is_multiple_of(GFNI_TILE),
-        "whole registers and whole tiles"
+        words.is_multiple_of(8) && n_stripes.is_multiple_of(GFNI_TILE),
+        "whole word blocks and whole tiles"
     );
     // Rows past `useful_bits` are honest zeros; a group straddling the boundary folds them in harmlessly.
     let groups = useful_bits.div_ceil(64);
@@ -659,15 +669,7 @@ fn partial_fold_packed_z_gfni(
         // SAFETY: an all-zero bit pattern is a valid register value.
         || vec![unsafe { core::mem::zeroed::<[__m512i; OUT_BYTES]>() }; groups],
         // SAFETY: the module is compiled only with these target features enabled.
-        |(), acc, tile| unsafe {
-            fold_tile(
-                z_packed,
-                k,
-                &eq_outer[8 * GFNI_TILE * tile..][..8 * GFNI_TILE],
-                tile,
-                acc,
-            )
-        },
+        |(), acc, tile| unsafe { fold_tile(z, words, &eq_outer[8 * GFNI_TILE * tile..][..8 * GFNI_TILE], tile, acc) },
         |mut x, y| {
             for (x, y) in x.iter_mut().flatten().zip(y.iter().flatten()) {
                 // SAFETY: as above.
@@ -682,22 +684,69 @@ fn partial_fold_packed_z_gfni(
         _mm512_xor_si512(x, y)
     }
 
+    /// Qword `l` of result `j` is qword `j` of `rows[l]`.
+    #[target_feature(enable = "avx512f")]
+    fn transpose_8x8_qwords(r: [__m512i; 8]) -> [__m512i; 8] {
+        let lo = |a, b| (_mm512_unpacklo_epi64(a, b), _mm512_unpackhi_epi64(a, b));
+        let (t0, t1) = lo(r[0], r[1]);
+        let (t2, t3) = lo(r[2], r[3]);
+        let (t4, t5) = lo(r[4], r[5]);
+        let (t6, t7) = lo(r[6], r[7]);
+        // Even or odd 128-bit lanes of both inputs, a's first.
+        let even = |a, b| _mm512_shuffle_i64x2::<0x88>(a, b);
+        let odd = |a, b| _mm512_shuffle_i64x2::<0xDD>(a, b);
+        let (p0, p2, p1, p3) = (even(t0, t2), odd(t0, t2), even(t1, t3), odd(t1, t3));
+        let (q0, q2, q1, q3) = (even(t4, t6), odd(t4, t6), even(t5, t7), odd(t5, t7));
+        [
+            even(p0, q0),
+            even(p1, q1),
+            even(p2, q2),
+            even(p3, q3),
+            odd(p0, q0),
+            odd(p1, q1),
+            odd(p2, q2),
+            odd(p3, q3),
+        ]
+    }
+
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "gfni")]
-    fn fold_tile(z_packed: &[u8], k: usize, eq: &[F192], tile: usize, acc: &mut [[__m512i; OUT_BYTES]]) {
+    fn fold_tile(z: &[u64], words: usize, eq: &[F192], tile: usize, acc: &mut [[__m512i; OUT_BYTES]]) {
         let eq: &[[F192; 8]] = eq.as_chunks().0;
         let matrices: [[u64; OUT_BYTES]; GFNI_TILE] = std::array::from_fn(|t| weight_matrices(&eq[t]));
-        let first = tile * GFNI_TILE;
-        for (g, acc) in acc.iter_mut().enumerate() {
-            let mut r = *acc;
-            for (t, m) in matrices.iter().enumerate() {
-                let row = &z_packed[(first + t) * k + 64 * g..][..64];
-                // SAFETY: the row is 64 bytes.
-                let x = unsafe { _mm512_loadu_si512(row.as_ptr().cast()) };
-                for (r, &m) in r.iter_mut().zip(m) {
-                    *r = _mm512_xor_si512(*r, _mm512_gf2p8affine_epi64_epi8::<0>(x, _mm512_set1_epi64(m as i64)));
+        // The tile's first instance; stripe `t` is the eight after `8 t`.
+        let first = tile * GFNI_TILE * 8;
+        // SAFETY: an all-zero bit pattern is a valid register value.
+        let mut stripes: [[__m512i; 8]; GFNI_TILE] = unsafe { core::mem::zeroed() };
+        for (block, acc) in acc.chunks_mut(8).enumerate() {
+            // The next block's line of each of the tile's 64 instances: too many streams for the hardware prefetcher.
+            if (block + 1) * 8 < words {
+                for instance in first..first + 8 * GFNI_TILE {
+                    let line = &z[instance * words + 8 * (block + 1)];
+                    _mm_prefetch::<_MM_HINT_T0>(core::ptr::from_ref(line).cast());
                 }
             }
-            *acc = r;
+            for (t, stripe) in stripes.iter_mut().enumerate() {
+                let rows = std::array::from_fn(|l| {
+                    let eight = &z[(first + 8 * t + l) * words + 8 * block..][..8];
+                    // SAFETY: the eight words are 64 bytes.
+                    unsafe { _mm512_loadu_si512(eight.as_ptr().cast()) }
+                });
+                for (s, word) in stripe.iter_mut().zip(transpose_8x8_qwords(rows)) {
+                    *s = bit_transpose_64bytes_reg(word);
+                }
+            }
+            for (j, acc) in acc.iter_mut().enumerate() {
+                let mut r = *acc;
+                for (stripe, m) in stripes.iter().zip(&matrices) {
+                    for (r, &m) in r.iter_mut().zip(m) {
+                        *r = _mm512_xor_si512(
+                            *r,
+                            _mm512_gf2p8affine_epi64_epi8::<0>(stripe[j], _mm512_set1_epi64(m as i64)),
+                        );
+                    }
+                }
+                *acc = r;
+            }
         }
     }
 
@@ -708,36 +757,40 @@ fn partial_fold_packed_z_gfni(
         unsafe { store_f192(acc, out) };
     }
     if live_tiles < n_tiles {
+        // Block `8 * GFNI_TILE * live_tiles` is the first of the repeats, which stand for the rest.
         let first = 8 * GFNI_TILE * live_tiles;
         let weight = eq_outer[first..].iter().fold(F192::ZERO, |sum, &e| sum + e);
-        // Bit 0 of a stripe byte is the first block's.
-        for (out, &byte) in out.iter_mut().zip(&z_packed[live_tiles * GFNI_TILE * k..][..k]) {
-            let mask = 0u64.wrapping_sub(u64::from(byte & 1));
+        let template = &z[first * words..][..words];
+        for (i, out) in out.iter_mut().enumerate() {
+            let mask = 0u64.wrapping_sub((template[i / 64] >> (i % 64)) & 1);
             *out += F192::new(weight.c0 & mask, weight.c1 & mask, weight.c2 & mask);
         }
     }
     out
 }
 
-/// The stripes at the front of `z_packed` that [`prove_padded_capture_s_hat_v`] reads, for blocks from
-/// `live_blocks` on repeating block `live_blocks`, in a witness of `m` variables.
-///
-/// The GFNI fold stops one stripe past its live tiles. The others read every stripe.
-/// A shorter `z_packed` is therefore enough, and the producer need not write the repeats.
-pub fn stripes_read(m: usize, k_log: usize, live_blocks: usize) -> usize {
-    let n_stripes = 1usize << (m - k_log - 3);
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi"
-    ))]
-    if k_log >= 6 && n_log_ok_for_tile(m, k_log, GFNI_TILE) {
-        let live_tiles = live_blocks.div_ceil(8 * GFNI_TILE).clamp(1, n_stripes / GFNI_TILE);
-        return (live_tiles * GFNI_TILE + 1).min(n_stripes);
+/// The stripes of `z`: the layout the table-driven folds read, one stripe per eight instances
+/// (see the module docs). Instances from `z.len() / words` up to the stripes' end count as zero.
+fn stripes_from_words(z: &[u64], m: usize, k_log: usize) -> Vec<u8> {
+    use primitives::bits::bit_transpose_64bytes;
+
+    let (k, words) = (1usize << k_log, 1usize << (k_log - 6));
+    let mut stripes = vec![0u8; (1usize << (m - k_log - 3)) * k];
+    for (stripe, instances) in stripes.chunks_exact_mut(k).zip(z.chunks(8 * words)) {
+        for (w, out) in stripe.as_chunks_mut::<64>().0.iter_mut().enumerate() {
+            let mut rows = [0u8; 64];
+            for (row, instance) in rows
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip(instances.chunks_exact(words))
+            {
+                *row = instance[w].to_le_bytes();
+            }
+            bit_transpose_64bytes(&rows, out);
+        }
     }
-    let _ = live_blocks;
-    n_stripes
+    stripes
 }
 
 /// Dispatch helper: pick the fastest single-matrix partial fold available
@@ -746,10 +799,10 @@ pub fn stripes_read(m: usize, k_log: usize, live_blocks: usize) -> usize {
 /// the dense path on honestly-padded witnesses).
 ///
 /// Blocks from `live_blocks` on repeat block `live_blocks`, which the GFNI fold uses to fold them once.
-/// The other folds read every block.
+/// The other folds read every block, from the stripes [`stripes_from_words`] builds.
 #[timed]
 fn partial_fold_packed_z_best(
-    z_packed: &[u8],
+    z: &[u64],
     m: usize,
     k_log: usize,
     useful_bits: usize,
@@ -762,9 +815,12 @@ fn partial_fold_packed_z_best(
         target_feature = "avx512bw",
         target_feature = "avx512vbmi"
     ))]
-    if k_log >= 6 && n_log_ok_for_tile(m, k_log, GFNI_TILE) {
-        return partial_fold_packed_z_gfni(z_packed, m, k_log, useful_bits, live_blocks, eq_outer);
+    if k_log >= 9 && n_log_ok_for_tile(m, k_log, GFNI_TILE) {
+        return partial_fold_packed_z_gfni(z, m, k_log, useful_bits, live_blocks, eq_outer);
     }
+    // Only the GFNI fold folds the padding tail once; the others read every block.
+    let _ = live_blocks;
+    let z_packed = &stripes_from_words(z, m, k_log);
     if n_log_ok_for_tile(m, k_log, NEON_TILE_T) {
         #[cfg(any(
             target_arch = "aarch64",
@@ -1043,11 +1099,13 @@ fn sumcheck_bind_both_and_eval_next(comb: &mut Vec<F192>, z: &mut Vec<F192>, r: 
 /// `z_partial`, which is exactly the AB claim's 64-entry ring-switch `s_hat_v`.
 /// The opening reuses it without a second witness scan or transmission.
 ///
+/// `z` is the packed witness words, instance-major (see the module docs).
+///
 /// Blocks from `live_blocks` on repeat block `live_blocks`, so the partial fold may read them once.
-/// Pass the block count when none repeat. `z_packed` may then stop after [`stripes_read`] stripes.
+/// Pass the block count when none repeat.
 #[timed]
 pub fn prove_padded_capture_s_hat_v(
-    z_packed: &[u8],
+    z: &[u64],
     m: usize,
     k_log: usize,
     k_skip: usize,
@@ -1060,6 +1118,7 @@ pub fn prove_padded_capture_s_hat_v(
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
+    assert!(k_log >= 6, "an instance is whole words");
     assert!(k_skip <= k_log, "k_skip must be ≤ k_log");
     assert!(useful_bits <= k, "useful_bits ({useful_bits}) > k ({k})");
     let inner_rest_len = k_log - k_skip;
@@ -1099,14 +1158,7 @@ pub fn prove_padded_capture_s_hat_v(
     let mut z_vec = tracing::info_span!("Partial fold").in_scope(|| {
         let mut eq_x_outer = build_eq(&x_ab.x_outer);
         eq_x_outer.resize(eq_x_outer.len().max(8), F192::ZERO);
-        partial_fold_packed_z_best(
-            z_packed,
-            k_log + n_log.max(3),
-            k_log,
-            useful_bits,
-            live_blocks,
-            &eq_x_outer,
-        )
+        partial_fold_packed_z_best(z, k_log + n_log.max(3), k_log, useful_bits, live_blocks, &eq_x_outer)
     });
 
     let span = tracing::info_span!("Sumcheck").entered();
@@ -1178,7 +1230,7 @@ mod tests {
     /// Test shim for the old dense-prove entry: the capture variant with a
     /// dense block and the captured `s_hat_v` discarded.
     fn prove(
-        z_packed: &[u8],
+        z: &[u64],
         m: usize,
         k_log: usize,
         k_skip: usize,
@@ -1186,7 +1238,7 @@ mod tests {
         x_ab: &QuirkyPoint,
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> LincheckClaim {
-        prove_padded_capture_s_hat_v(z_packed, m, k_log, k_skip, 1 << k_log, usize::MAX, circuit, x_ab, ps)
+        prove_padded_capture_s_hat_v(z, m, k_log, k_skip, 1 << k_log, usize::MAX, circuit, x_ab, ps)
     }
 
     /// Test shim: the padded fast fold with a dense (no-padding) block.
@@ -1197,6 +1249,14 @@ mod tests {
         eq_outer: &[F192],
     ) -> Vec<F192> {
         partial_fold_packed_z_fast_padded(z_packed, m, k_log, 1 << k_log, eq_outer)
+    }
+
+    /// The packed words of a logical Boolean witness: bit `i` of word `w` is `z_logical[64 w + i]`.
+    fn pack_z_words(z_logical: &[bool]) -> Vec<u64> {
+        z_logical
+            .chunks(64)
+            .map(|c| c.iter().rev().fold(0, |acc, &b| acc << 1 | b as u64))
+            .collect()
     }
 
     /// The constant-one column the protocol tests pin. Any column works; the
@@ -1336,9 +1396,12 @@ mod tests {
         // (m, k_log, useful_bits, live_blocks): small shapes on the untiled fallback, then tiled ones, padded included.
         // The blocks from `live_blocks` on repeat that block; `usize::MAX` repeats none.
         let cases: &[(usize, usize, usize, usize)] = &[
-            (10, 3, 1 << 3, usize::MAX),
-            (14, 5, 1 << 5, usize::MAX),
+            (10, 6, 1 << 6, usize::MAX),
+            (14, 7, 1 << 7, usize::MAX),
             (16, 8, 1 << 8, usize::MAX),
+            (17, 9, 500, usize::MAX),
+            // The GFNI fold's smallest word block, with a tail from the third tile on.
+            (17, 9, 500, 100),
             (18, 10, 1 << 10, usize::MAX),
             (20, 10, 597, usize::MAX),
             (20, 14, 15_409, usize::MAX),
@@ -1366,10 +1429,24 @@ mod tests {
             let z_packed = pack_z_lincheck(&z, m, k_log);
             let eq = build_eq(&rng.ext_vec(m - k_log));
             let serial = partial_fold_packed_z(&z_packed, m, k_log, &eq);
-            let best = partial_fold_packed_z_best(&z_packed, m, k_log, useful_bits, live_blocks, &eq);
+            let best = partial_fold_packed_z_best(&pack_z_words(&z), m, k_log, useful_bits, live_blocks, &eq);
             assert_eq!(
                 serial, best,
                 "m={m} k_log={k_log} useful={useful_bits} live={live_blocks}"
+            );
+        }
+    }
+
+    /// The stripes built from words are the stripes of the logical witness, below eight instances included.
+    #[test]
+    fn stripes_from_words_match_pack_z_lincheck() {
+        for &(m, k_log) in &[(8usize, 6usize), (9, 7), (9, 6), (12, 7), (14, 9)] {
+            let mut rng = Rng::new(0x57121 + m as u64);
+            let z = rng.bits(1 << m);
+            let m_stripes = k_log + (m - k_log).max(3);
+            assert_eq!(
+                stripes_from_words(&pack_z_words(&z), m_stripes, k_log),
+                pack_z_lincheck(&z, m, k_log)
             );
         }
     }
@@ -1502,11 +1579,11 @@ mod tests {
         for &(m, k_log, k_skip) in &[
             (8usize, 8, 6),
             (9, 8, 6),
-            (6, 4, 2),
-            (10, 4, 0),
-            (10, 4, 2),
-            (10, 4, 4),
-            (12, 5, 3),
+            (8, 6, 2),
+            (10, 6, 0),
+            (10, 6, 2),
+            (10, 6, 6),
+            (12, 6, 3),
             (14, 7, 6),
             (14, 7, 0),
         ] {
@@ -1518,7 +1595,7 @@ mod tests {
                 pin: PIN_COL,
             };
             let z = pinned_bits(&mut rng, 1 << m, k_log);
-            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let z_packed = pack_z_words(&z);
             let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
 
             let mut ps = fiat_shamir::transcript::ProverState::from_label(b"flock-test-v0");
