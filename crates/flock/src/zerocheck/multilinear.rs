@@ -34,6 +34,15 @@
 //! verifier reconstructs `G(0)` from the running claim via
 //! `current_claim = (1+r_now)·G(0) + r_now·G(1)`.
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+mod lanes;
+
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::bit_fold::{BLOCK, BitFold};
 #[cfg(test)]
@@ -290,6 +299,19 @@ impl RoundPair {
 ///
 /// The linear `c` term reaches `G(1)` only.
 pub fn bit_round_pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], padding: &PaddingSpec) -> RoundPair {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        let by_instance = if fold.n_chunks() == 8 { lanes::pair(bits, fold, r_eq, padding) } else { None };
+        if let Some(pair) = by_instance {
+            return pair;
+        }
+    }
     match fold.n_chunks() {
         8 => bit_round_pair_kernel::<8>(bits, fold, r_eq, padding),
         16 => bit_round_pair_kernel::<16>(bits, fold, r_eq, padding),
