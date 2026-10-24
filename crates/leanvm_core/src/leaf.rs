@@ -19,6 +19,7 @@ use primitives::field::{
 use primitives::multilinear::{eq_eval, eq_table, mle_eval};
 use primitives::stream::Stream;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// One tuple coordinate as a function of the block's row `z`.
@@ -345,13 +346,15 @@ pub fn build_leaves(
     // the proof. The `covered` test is what licenses skipping it, so a layout that
     // ever left a hole falls back to filling rather than reading uninitialized rows.
     // The leaves are GKR's blocks of 64, so the identity past `explicit` is written to
-    // the end of the last one, which is where GKR expects it.
+    // the end of the last one, which is where GKR expects it. The padding rows inside the layout
+    // are runs of identity that GKR skips (`Leaves::ones`), so their whole blocks stay unwritten.
     let covered: usize = blocks.iter().map(|blk| 1usize << blk.kappa).sum();
     let block_count = explicit.div_ceil(gkr::BLOCK_VALUES);
     let tiled = covered == explicit;
     let mut leaves: Vec<gkr::Block> = if tiled {
-        // SAFETY: the per-block fills below cover `0..explicit` exactly, each joins before
-        // this function returns, and the tail of the last block is written next.
+        // SAFETY: the per-block fills below cover `0..explicit` but for the identity blocks GKR
+        // never reads, each joins before this function returns, and the tail of the last block
+        // is written next.
         unsafe { primitives::uninit_vec(block_count) }
     } else {
         vec![[F192x8::ONE; 8]; block_count]
@@ -424,10 +427,26 @@ pub fn build_leaves(
             gkr::set_leaf(&mut leaves, off + z, row(z));
         }
         // A padding row's leaf is the identity, so it leaves the product alone.
-        fill_ones(&mut leaves, off + blk.rows, end);
+        if tiled {
+            fill_ones(&mut leaves, off + blk.rows, end, explicit);
+        }
     }
+    let mut ones: Vec<Range<usize>> = Vec::new();
     if tiled {
         finish_quads(&leaves, &mut quads, blocks, lay, &quads_done);
+        let mut runs: Vec<_> = blocks
+            .iter()
+            .enumerate()
+            .map(|(b, blk)| lay.offsets[b] + blk.rows..lay.offsets[b] + (1usize << blk.kappa))
+            .filter(|run| !run.is_empty())
+            .collect();
+        runs.sort_unstable_by_key(|run| run.start);
+        for run in runs {
+            match ones.last_mut() {
+                Some(last) if last.end == run.start => last.end = run.end,
+                _ => ones.push(run),
+            }
+        }
     } else {
         parallel::fill(&mut quads, |k| gkr::quad_at(&leaves, k));
     }
@@ -435,29 +454,31 @@ pub fn build_leaves(
         leaves,
         len: explicit,
         quads,
+        ones,
     }
 }
 
-/// Leaves `start..end` of a block table set to the identity, whole blocks streamed.
-fn fill_ones(leaves: &mut [gkr::Block], start: usize, end: usize) {
-    const BLOCK: usize = gkr::BLOCK_VALUES;
-    let (first, last) = (start.next_multiple_of(BLOCK).min(end), end / BLOCK * BLOCK);
-    if last < first || last - first < PAR_THRESHOLD {
-        for l in start..end {
-            gkr::set_leaf(leaves, l, F192::ONE);
-        }
-        return;
-    }
-    for l in (start..first).chain(last..end) {
+/// The values at `level`, of a table of `len`, that GKR never reads inside the run of identity
+/// leaves `run`: its whole blocks of 64.
+fn unread(run: Range<usize>, level: usize, len: usize) -> Range<usize> {
+    let blocks = gkr::identity_blocks(&[run], level, len).pop();
+    blocks.map_or(0..0, |run| run.start * gkr::BLOCK_VALUES..run.end * gkr::BLOCK_VALUES)
+}
+
+/// `range` less `skip`, which is empty or inside it.
+fn outside(range: Range<usize>, skip: Range<usize>) -> impl Iterator<Item = usize> {
+    let (start, end) = (
+        skip.start.clamp(range.start, range.end),
+        skip.end.clamp(range.start, range.end),
+    );
+    (range.start..start).chain(end..range.end)
+}
+
+/// Leaves `start..end` of a block table of `len` leaves set to the identity, but for whole blocks.
+fn fill_ones(leaves: &mut [gkr::Block], start: usize, end: usize, len: usize) {
+    for l in outside(start..end, unread(start..end, 0, len)) {
         gkr::set_leaf(leaves, l, F192::ONE);
     }
-    const ONES: [gkr::Block; 4] = [[F192x8::ONE; 8]; 4];
-    parallel::chunks_mut(&mut leaves[first / BLOCK..last / BLOCK], 1 << 8, |_, chunk| {
-        let stream = Stream::new();
-        for part in chunk.chunks_mut(ONES.len()) {
-            stream.copy(part, &ONES[..part.len()]);
-        }
-    });
 }
 
 /// Write every quad the staged groups did not: the rest of each block from its leaves, and
@@ -492,11 +513,9 @@ fn finish_quads(leaves: &[gkr::Block], quads: &mut [F192], blocks: &[Block], lay
                 *q = quad(start + i);
             }
         }
-        let ones = &mut quads[ones_from..end];
-        if ones.len() >= PAR_THRESHOLD {
-            parallel::fill(ones, |_| F192::ONE);
-        } else {
-            ones.fill(F192::ONE);
+        let run = lay.offsets[b] + blk.rows..lay.offsets[b] + (1usize << blk.kappa);
+        for k in outside(ones_from..end, unread(run, 2, quads.len())) {
+            quads[k] = F192::ONE;
         }
     }
     for k in small_from..quads.len() {
@@ -591,7 +610,9 @@ impl BusForm {
         self.coeffs
             .iter()
             .zip(evals)
-            .fold(F192Unreduced::from(self.constant), |acc, (&w, &v)| acc ^ w.mul_unreduced(v))
+            .fold(F192Unreduced::from(self.constant), |acc, (&w, &v)| {
+                acc ^ w.mul_unreduced(v)
+            })
     }
 
     /// What the form sums to over the table's rows against `eq(ζ, ·)`, the target the
@@ -866,7 +887,12 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
     let explicit = segments.iter().map(|segment| segment.1).max().unwrap_or(1);
     let block_count = explicit.div_ceil(gkr::BLOCK_VALUES);
     // The segment starting at or before leaf `l`, which holds it unless it is a hole.
-    let segment_of = |l: usize| segments.partition_point(|segment| segment.0 <= l).checked_sub(1).map(|i| segments[i]);
+    let segment_of = |l: usize| {
+        segments
+            .partition_point(|segment| segment.0 <= l)
+            .checked_sub(1)
+            .map(|i| segments[i])
+    };
     // SAFETY: the groups below write every block and every quad slot, and join before this function returns.
     let mut leaves: Vec<gkr::KBlock> = unsafe { primitives::uninit_vec(block_count) };
     let mut quads = unsafe { primitives::uninit_vec::<F64>(16 * block_count) };
@@ -891,6 +917,7 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
         leaves,
         len: explicit,
         quads,
+        ones: Vec::new(),
     }
 }
 

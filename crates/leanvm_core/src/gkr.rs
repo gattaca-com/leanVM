@@ -13,7 +13,7 @@ use crate::transcript::ProverState;
 use primitives::field::{F64, F64x8, F192, F192Unreduced, F192x8, Prod8, mul_unreduced4, mul2, mul4};
 use primitives::multilinear::{eq_table, interp, shrink_eq_low};
 use primitives::stream::Stream;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 
 /// Rows per parallel window: enough tasks to keep every thread fed, but not so few
 /// rows per task that dispatch dominates.
@@ -26,10 +26,15 @@ fn window_rows(total: usize) -> usize {
 /// leaves[4k + 3]` (absent leaves are the identity), built by whoever wrote the leaves.
 ///
 /// The leaves are blocks, covering `len` of them with the identity after.
+///
+/// `ones` are sorted, disjoint runs of leaves that are the identity. The GKR never reads a whole
+/// block of 64 inside a run, at the leaves or at any level above them (see [`identity_blocks`]),
+/// so the builder may leave those blocks of `leaves` and `quads` unwritten.
 pub struct Leaves<F: TreeField = F192> {
     pub leaves: Vec<F::Block>,
     pub len: usize,
     pub quads: Vec<F>,
+    pub ones: Vec<Range<usize>>,
 }
 
 impl<F: TreeField> Leaves<F> {
@@ -40,8 +45,54 @@ impl<F: TreeField> Leaves<F> {
             leaves,
             len: values.len(),
             quads,
+            ones: Vec::new(),
         }
     }
+}
+
+/// The blocks of 64 values of a level holding `len` values (the products of `2^level` leaves) that
+/// lie wholly inside `ones`, a run of leaves being the identity at every level. A level of one
+/// block or less is read as rows, so it has none.
+pub(crate) fn identity_blocks(ones: &[Range<usize>], level: usize, len: usize) -> Vec<Range<usize>> {
+    let shift = BLOCK_VALUES.ilog2() as usize + level;
+    let whole = |run: &Range<usize>| run.start.div_ceil(1 << shift)..run.end >> shift;
+    if len <= BLOCK_VALUES {
+        return Vec::new();
+    }
+    ones.iter().map(whole).filter(|run| !run.is_empty()).collect()
+}
+
+/// The runs of blocks after a fold: a folded block is the identity when both its sources are. A
+/// single block is always computed, since the last round reads it.
+fn halve(ones: &[Range<usize>], count: usize) -> Vec<Range<usize>> {
+    if count <= 1 {
+        return Vec::new();
+    }
+    ones.iter()
+        .map(|run| run.start.div_ceil(2)..run.end / 2)
+        .filter(|run| !run.is_empty())
+        .collect()
+}
+
+fn in_runs(ones: &[Range<usize>], b: usize) -> bool {
+    ones.get(ones.partition_point(|run| run.end <= b))
+        .is_some_and(|run| run.start <= b)
+}
+
+/// The blocks of `range` outside `ones`.
+fn live(ones: &[Range<usize>], range: Range<usize>) -> impl Iterator<Item = usize> + '_ {
+    let mut at = range.start;
+    let mut next = ones.partition_point(|run| run.end <= at);
+    std::iter::from_fn(move || {
+        while let Some(run) = ones.get(next).filter(|run| run.start <= at) {
+            at = run.end;
+            next += 1;
+        }
+        (at < range.end).then(|| {
+            at += 1;
+            at - 1
+        })
+    })
 }
 
 /// Sixty-four consecutive base-field table values, laid out as a [`Block`].
@@ -170,7 +221,9 @@ impl TreeField for F64 {
                 &padded
             }
         };
-        F64x8::transpose(std::array::from_fn(|j| F64x8::from_array(chunk[8 * j..8 * j + 8].try_into().unwrap())))
+        F64x8::transpose(std::array::from_fn(|j| {
+            F64x8::from_array(chunk[8 * j..8 * j + 8].try_into().unwrap())
+        }))
     }
 
     #[inline(always)]
@@ -200,6 +253,7 @@ struct Levels<F: TreeField> {
     layers: Vec<Vec<F>>,
     bottom: Vec<F::Block>,
     len: usize,
+    ones: Vec<Range<usize>>,
 }
 
 /// A tree as the proof reads it, whatever field its values are in.
@@ -224,17 +278,25 @@ impl<F: TreeField> Tree for Levels<F> {
     }
 
     fn state(&mut self, layer: usize, width: usize) -> QuaternaryLayerState {
-        if layer == 2 {
+        let level = layer - 2;
+        let mut state = if layer == 2 {
             F::state_from_blocks(std::mem::take(&mut self.bottom), self.len, width)
         } else {
-            QuaternaryLayerState::new(std::mem::take(&mut self.layers[layer - 2]), width)
-        }
+            QuaternaryLayerState::new(std::mem::take(&mut self.layers[level]), width)
+        };
+        state.ones = identity_blocks(&self.ones, level, self.len.div_ceil(1 << level));
+        state
     }
 }
 
 #[timed]
 fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
-    let Leaves { leaves, len, quads } = leaves;
+    let Leaves {
+        leaves,
+        len,
+        quads,
+        ones,
+    } = leaves;
     assert!(len > 0);
     assert!(len <= 1usize << mu);
     assert_eq!(quads.len(), len.div_ceil(4));
@@ -252,6 +314,8 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
     }
     while level + 2 <= mu {
         let current = &layers[level];
+        let skip_in = identity_blocks(&ones, level, current.len());
+        let skip_out = identity_blocks(&ones, level + 2, current.len().div_ceil(4));
         let full_rows = current.len() / 4;
         let product = |row: usize| F::product4(std::array::from_fn(|i| current[4 * row + i]));
         let mut next: Vec<F> = if current.len() == 1 {
@@ -263,9 +327,15 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
             let mut next: Vec<F> = unsafe { primitives::uninit_vec(full_rows) };
             let vector_rows = full_rows / 8 * 8;
             const CHUNK: usize = 512;
+            // Eight products come from 32 children, which lie in one block of 64 or none.
             let fill = |c: usize, out: &mut [F]| {
                 for (i, slots) in out.chunks_exact_mut(8).enumerate() {
-                    slots.copy_from_slice(&F::eight_products(&current[32 * (c * CHUNK / 8 + i)..][..32]));
+                    let g = c * CHUNK / 8 + i;
+                    if !in_runs(&skip_in, g / 2) {
+                        slots.copy_from_slice(&F::eight_products(&current[32 * g..][..32]));
+                    } else if !in_runs(&skip_out, g / 8) {
+                        slots.fill(F::ONE);
+                    }
                 }
             };
             if vector_rows >= PAR_THRESHOLD {
@@ -297,6 +367,7 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
         layers,
         bottom: leaves,
         len,
+        ones,
     }
 }
 
@@ -521,9 +592,15 @@ impl<F: TreeField> Source for Rows<F> {
 trait Table: Send + Sync {
     fn count(&self) -> usize;
 
-    fn message(&self, equality: &[F192]) -> [F192; 4];
+    fn message(&self, ones: &[Range<usize>], equality: &[F192]) -> [F192; 4];
 
-    fn fold(&self, next_blocks: &mut [Block], challenge: F192, equality: Option<&[F192]>) -> [F192; 4];
+    fn fold(
+        &self,
+        next_blocks: &mut [Block],
+        ones: &[Range<usize>],
+        challenge: F192,
+        equality: Option<&[F192]>,
+    ) -> [F192; 4];
 }
 
 impl<S: Source + Send> Table for S {
@@ -531,25 +608,34 @@ impl<S: Source + Send> Table for S {
         Source::count(self)
     }
 
-    fn message(&self, equality: &[F192]) -> [F192; 4] {
-        blocks_message(self, equality)
+    fn message(&self, ones: &[Range<usize>], equality: &[F192]) -> [F192; 4] {
+        blocks_message(self, ones, equality)
     }
 
-    fn fold(&self, next_blocks: &mut [Block], challenge: F192, equality: Option<&[F192]>) -> [F192; 4] {
-        fold_block_pairs(self, next_blocks, challenge, equality)
+    fn fold(
+        &self,
+        next_blocks: &mut [Block],
+        ones: &[Range<usize>],
+        challenge: F192,
+        equality: Option<&[F192]>,
+    ) -> [F192; 4] {
+        fold_block_pairs(self, next_blocks, ones, challenge, equality)
     }
 }
 
 /// Block `k` of the folded table: blocks `2k` and `2k + 1` folded by `challenge`, their even and
-/// odd lanes (the two rows of each pair) interleaved. A missing second block is all identity.
+/// odd lanes (the two rows of each pair) interleaved. A missing block, or one inside `ones`, is all
+/// identity, and folds to it.
 #[inline(always)]
-fn fold_block_pair<S: Source + ?Sized>(source: &S, k: usize, challenge: F192x8) -> Block {
-    let first = source.block(2 * k).fold(challenge);
-    let second = if 2 * k + 1 < source.count() {
-        source.block(2 * k + 1).fold(challenge)
-    } else {
-        [F192x8::ONE; 4]
+fn fold_block_pair<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], k: usize, challenge: F192x8) -> Block {
+    let fold = |b: usize| {
+        if b < source.count() && !in_runs(ones, b) {
+            source.block(b).fold(challenge)
+        } else {
+            [F192x8::ONE; 4]
+        }
     };
+    let (first, second) = (fold(2 * k), fold(2 * k + 1));
     let pairs: [(F192x8, F192x8); 4] = std::array::from_fn(|c| F192x8::even_odd(first[c], second[c]));
     std::array::from_fn(|p| if p < 4 { pairs[p].0 } else { pairs[p - 4].1 })
 }
@@ -561,12 +647,13 @@ fn xor_coefficients(mut left: [Prod8; 4], right: [Prod8; 4]) -> [Prod8; 4] {
     left
 }
 
-/// The round message of a table of blocks.
-fn blocks_message<S: Source + ?Sized>(source: &S, equality: &[F192]) -> [F192; 4] {
+/// The round message of a table of blocks. A block of identity rows adds nothing: its polynomial is
+/// the constant weight, which `q(0) + q(1)` cancels.
+fn blocks_message<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], equality: &[F192]) -> [F192; 4] {
     let count = source.count();
     let rows = window_blocks(count);
     let window = |index: usize| {
-        (index * rows..((index + 1) * rows).min(count)).fold([Prod8::ZERO; 4], |sum, b| {
+        live(ones, index * rows..((index + 1) * rows).min(count)).fold([Prod8::ZERO; 4], |sum, b| {
             source.prefetch(b + PREFETCH);
             xor_coefficients(sum, source.block(b).summand(equality_block(equality, b)))
         })
@@ -581,14 +668,16 @@ fn blocks_message<S: Source + ?Sized>(source: &S, equality: &[F192]) -> [F192; 4
 }
 
 /// Fold every pair of blocks of `source` by `challenge` into `E` blocks, and with an `equality` weigh the
-/// folded table's round message as it is produced.
+/// folded table's round message as it is produced. Folded blocks that are wholly identity are not written.
 fn fold_block_pairs<S: Source + ?Sized>(
     source: &S,
     next_blocks: &mut [Block],
+    ones: &[Range<usize>],
     challenge: F192,
     equality: Option<&[F192]>,
 ) -> [F192; 4] {
     let count = next_blocks.len();
+    let next_ones = halve(ones, count);
     let dst = parallel::SendPtr(next_blocks.as_mut_ptr());
     let challenge = F192x8::splat(challenge);
     let window = window_blocks(count);
@@ -596,10 +685,10 @@ fn fold_block_pairs<S: Source + ?Sized>(
         // The next round reads the destination; this round reads only the stage.
         let stream = Stream::new();
         let mut message = [Prod8::ZERO; 4];
-        for k in index * window..((index + 1) * window).min(count) {
+        for k in live(&next_ones, index * window..((index + 1) * window).min(count)) {
             source.prefetch(2 * (k + PREFETCH_FOLD));
             source.prefetch(2 * (k + PREFETCH_FOLD) + 1);
-            let block = fold_block_pair(source, k, challenge);
+            let block = fold_block_pair(source, ones, k, challenge);
             // The stores go before the summand, so they overlap its products.
             // SAFETY: tasks own disjoint blocks of the output, which covers every one.
             unsafe { stream.copy_lines(dst.add(k), &block) };
@@ -634,6 +723,8 @@ pub struct QuaternaryLayerState {
     /// Logical row count after identity padding. `values` stores an arbitrary
     /// prefix; every omitted row is the constant four-tuple one.
     logical_rows: usize,
+    /// Runs of blocks that are wholly identity, which the table does not store.
+    ones: Vec<Range<usize>>,
 }
 
 impl QuaternaryLayerState {
@@ -657,6 +748,7 @@ impl QuaternaryLayerState {
             blocks,
             first: None,
             logical_rows: width,
+            ones: Vec::new(),
         }
     }
 
@@ -678,6 +770,7 @@ impl QuaternaryLayerState {
             blocks: Vec::new(),
             first: Some(table),
             logical_rows: width,
+            ones: Vec::new(),
         }
     }
 
@@ -704,6 +797,7 @@ impl QuaternaryLayerState {
             next_blocks: Vec::new(),
             first: None,
             logical_rows: width,
+            ones: Vec::new(),
         }
     }
 
@@ -711,10 +805,10 @@ impl QuaternaryLayerState {
     #[timed]
     fn round_message(&self, equality: &[F192]) -> [F192; 4] {
         if let Some(first) = &self.first {
-            return first.message(equality);
+            return first.message(&self.ones, equality);
         }
         if self.blocked() {
-            return blocks_message(&self.blocks, equality);
+            return blocks_message(&self.blocks, &self.ones, equality);
         }
         let stored_rows = self.values.len() / 4;
         let full_pairs = stored_rows / 2;
@@ -762,9 +856,10 @@ impl QuaternaryLayerState {
         self.next_blocks.truncate(count);
         let first = self.first.take();
         let message = match &first {
-            Some(first) => first.fold(&mut self.next_blocks, challenge, equality),
-            None => fold_block_pairs(&self.blocks, &mut self.next_blocks, challenge, equality),
+            Some(first) => first.fold(&mut self.next_blocks, &self.ones, challenge, equality),
+            None => fold_block_pairs(&self.blocks, &mut self.next_blocks, &self.ones, challenge, equality),
         };
+        self.ones = halve(&self.ones, count);
         std::mem::swap(&mut self.blocks, &mut self.next_blocks);
         if first.is_some() {
             // SAFETY: the next fold writes every slot of `next_blocks` before any read.
@@ -1308,6 +1403,57 @@ mod tests {
             assert_eq!(dense_proved.point, proved.point);
             assert_eq!(dense_proved.values, proved.values);
             assert_eq!(dense_ps.into_proof().stream, proof.stream);
+        }
+    }
+
+    /// Runs of identity leaves in the middle of the tree, whose whole blocks hold garbage at the leaves
+    /// and at the quads, give the proof of the dense tree.
+    #[test]
+    fn interior_identity_runs_match_dense_padding() {
+        for mu in 10..=14 {
+            let len = (1usize << mu) - 5;
+            let runs = vec![
+                len / 8 + 5..len / 4 - 3,
+                len / 4 + 70..len / 2 + 7,
+                5 * len / 8..len - 70,
+            ];
+            let tree = |lane: usize| -> Vec<F192> {
+                (0..len)
+                    .map(|row| {
+                        if runs.iter().any(|run| run.contains(&row)) {
+                            F192::ONE
+                        } else {
+                            F192::new((3 + row + lane * 10_007) as u64, row as u64, lane as u64)
+                        }
+                    })
+                    .collect()
+            };
+            let garbage = F192::new(0xDEAD, 0xBEEF, 0xF00D);
+            let sparse = |lane: usize| {
+                let mut leaves = Leaves::new(tree(lane));
+                for b in identity_blocks(&runs, 0, leaves.len).into_iter().flatten() {
+                    leaves.leaves[b] = [F192x8::splat(garbage); 8];
+                }
+                for b in identity_blocks(&runs, 2, leaves.quads.len()).into_iter().flatten() {
+                    leaves.quads[BLOCK_VALUES * b..BLOCK_VALUES * (b + 1)].fill(garbage);
+                }
+                leaves.ones = runs.clone();
+                leaves
+            };
+            let mut sparse_ps = ProverState::from_label(b"interior-identity-gkr-test");
+            let proved = prove_product_triple_from(
+                sparse(0),
+                sparse(1),
+                Leaves::new(tree(2)),
+                &mut sparse_ps,
+                RootShape::Distinct,
+            );
+            let mut dense_ps = ProverState::from_label(b"interior-identity-gkr-test");
+            let dense = prove_product_triple([tree(0), tree(1), tree(2)], &mut dense_ps, RootShape::Distinct);
+            assert_eq!(dense.roots, proved.roots, "mu={mu}");
+            assert_eq!(dense.point, proved.point, "mu={mu}");
+            assert_eq!(dense.values, proved.values, "mu={mu}");
+            assert_eq!(dense_ps.into_proof().stream, sparse_ps.into_proof().stream, "mu={mu}");
         }
     }
 }
