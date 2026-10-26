@@ -19,7 +19,41 @@ use primitives::stream::Stream;
 pub struct DeepRows {
     log_d: usize,
     num_ntts: usize,
+    /// The first layer of the encode, where the cosets split.
+    start: usize,
     deep_start: usize,
+}
+
+impl DeepRows {
+    /// Words of the buffer the encode left.
+    pub fn words(&self) -> usize {
+        self.num_ntts << self.log_d
+    }
+
+    /// Words of one deep sub-block.
+    fn sub_len(&self) -> usize {
+        self.num_ntts << (self.log_d - self.deep_start)
+    }
+
+    /// The sorted, distinct deep sub-blocks that hold `positions`.
+    fn sub_blocks(&self, positions: &[usize]) -> Vec<usize> {
+        let mut subs: Vec<usize> = positions.iter().map(|&q| q >> (self.log_d - self.deep_start)).collect();
+        subs.sort_unstable();
+        subs.dedup();
+        subs
+    }
+
+    /// The rows at `positions`, out of the finished sub-blocks `subs`, held back to back in `built`.
+    fn pick(&self, subs: &[usize], built: &[F64], positions: &[usize]) -> Vec<Vec<F64>> {
+        let log_sub = self.log_d - self.deep_start;
+        positions
+            .iter()
+            .map(|&q| {
+                let sub = subs.binary_search(&(q >> log_sub)).expect("every queried sub-block is finished");
+                built[sub * self.sub_len() + (q & ((1 << log_sub) - 1)) * self.num_ntts..][..self.num_ntts].to_vec()
+            })
+            .collect()
+    }
 }
 
 /// Table of the normalized subspace polynomials at the basis.
@@ -325,26 +359,82 @@ impl AdditiveNttF64 {
 
     /// Codeword rows `positions` of a buffer left by [`Self::encode_interleaved_in_place_without_deep`].
     pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
-        let DeepRows { log_d, num_ntts, deep_start } = *deep;
-        let log_sub = log_d - deep_start;
-        let sub_len = num_ntts << log_sub;
-        let mut subs: Vec<usize> = positions.iter().map(|&q| q >> log_sub).collect();
-        subs.sort_unstable();
-        subs.dedup();
-        let finished: Vec<Vec<F64>> = parallel::map_collect(subs.len(), |i| {
-            let sub_idx = subs[i];
-            let mut sub = data[sub_idx * sub_len..][..sub_len].to_vec();
-            self.run_layers(&mut sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, no_hook);
-            sub
+        let (subs, sub_len) = (deep.sub_blocks(positions), deep.sub_len());
+        let mut built = vec![F64::ZERO; subs.len() * sub_len];
+        parallel::chunks_mut(&mut built, sub_len, |i, sub| {
+            sub.copy_from_slice(&data[subs[i] * sub_len..][..sub_len]);
+            self.finish_sub_block(sub, deep, subs[i]);
         });
-        positions
-            .iter()
-            .map(|&q| {
-                let sub = &finished[subs.binary_search(&(q >> log_sub)).expect("every queried sub-block is finished")];
-                let row = q & ((1 << log_sub) - 1);
-                sub[row * num_ntts..][..num_ntts].to_vec()
+        deep.pick(&subs, &built, positions)
+    }
+
+    /// Codeword rows `positions` of an encode that kept no buffer, recomputed from its lane-major message.
+    pub fn rebuild_rows(&self, msg: &[F64], n_lanes: usize, deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
+        let subs = deep.sub_blocks(positions);
+        let built = self.rebuild_sub_blocks(msg, n_lanes, deep, &subs);
+        deep.pick(&subs, &built, positions)
+    }
+
+    /// The deep layers over sub-block `sub_idx` of the codeword, which `sub` holds as the gathered pass left it.
+    fn finish_sub_block(&self, sub: &mut [F64], deep: &DeepRows, sub_idx: usize) {
+        let DeepRows { log_d, num_ntts, deep_start, .. } = *deep;
+        self.run_layers(sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, no_hook);
+    }
+
+    /// The finished deep sub-blocks `subs` (sorted, distinct) of an encode that kept no buffer, back to back.
+    ///
+    /// - The encode ran one gathered pass over its lane-major message: a group is one residue of one coset,
+    ///   and its transform leaves row `i` of the group as row `r` of sub-block `coset << g | i`, `g` layers deep.
+    /// - So each group transforms again here, and keeps only the rows that fall in a sub-block of `subs`.
+    /// - Those rows are every word of the sub-blocks before their deep layers, which then run in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the encode had the plan this reads back: one lane-major gathered pass.
+    #[timed]
+    pub fn rebuild_sub_blocks(&self, msg: &[F64], n_lanes: usize, deep: &DeepRows, subs: &[usize]) -> Vec<F64> {
+        let DeepRows { log_d, num_ntts, start, deep_start } = *deep;
+        let g = deep_start - start;
+        let (rows, log_step) = (1usize << g, log_d - deep_start);
+        let (sub_len, msg_rows) = (deep.sub_len(), 1usize << (log_d - start));
+        assert!(0 < g && g <= (L2_WORDS / num_ntts).max(1).ilog2() as usize, "one gathered pass");
+        assert!(num_ntts % 8 == 0 && log_step >= LOG_BATCH, "the gathered pass is lane-major");
+        assert_eq!(msg.len(), n_lanes * msg_rows);
+        // The queried sub-blocks of each coset, as ranges of `subs`.
+        let mut next = 0;
+        let cosets: Vec<(usize, std::ops::Range<usize>)> = subs
+            .chunk_by(|a, b| a >> g == b >> g)
+            .map(|run| {
+                next += run.len();
+                (run[0] >> g, next - run.len()..next)
             })
-            .collect()
+            .collect();
+        // SAFETY: a group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
+        let mut built = unsafe { primitives::uninit_vec::<F64>(subs.len() * sub_len) };
+        let (out, msg) = (parallel::SendPtr(built.as_mut_ptr()), parallel::SendPtr(msg.as_ptr().cast_mut()));
+        parallel::for_each_chunk((1usize << log_step) / BATCH, |lo, hi| {
+            let stage_len = BATCH * rows * num_ntts;
+            with_scratch(stage_len + rows * num_ntts, |all| {
+                let (stage, scratch) = all.split_at_mut(stage_len);
+                for t in lo..hi {
+                    fill_stage(stage, unsafe { msg.add(0) }.cast_const(), t * BATCH, log_step, msg_rows, n_lanes, num_ntts);
+                    for (s, staged) in stage.chunks_exact(rows * num_ntts).enumerate() {
+                        for (coset, run) in &cosets {
+                            scratch.copy_from_slice(staged);
+                            self.run_layers(scratch, deep_start, num_ntts, start, deep_start, start, *coset, no_hook);
+                            for pos in run.clone() {
+                                let i = subs[pos] & (rows - 1);
+                                // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block.
+                                let dst = unsafe { out.slice(pos * sub_len + (t * BATCH + s) * num_ntts, num_ntts) };
+                                dst.copy_from_slice(&scratch[i * num_ntts..][..num_ntts]);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        parallel::chunks_mut(&mut built, sub_len, |i, sub| self.finish_sub_block(sub, deep, subs[i]));
+        built
     }
 
     /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.
@@ -476,6 +566,7 @@ impl AdditiveNttF64 {
         //
         // Only the first one reads the message.
         let mut msg = msg;
+        let from_lane_major = lane_major.is_some();
         // A lane-major message is read by the first gathered pass, a batch of residues at a time.
         // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
         if let (Some(n_lanes), Some(m)) = (lane_major, msg) {
@@ -489,6 +580,8 @@ impl AdditiveNttF64 {
                 lane_major = None;
             }
         }
+        // An opening rebuilds the deep sub-blocks of a lane-major encode from its message: one gathered pass over it.
+        let defer_deep = defer_deep && (!from_lane_major || (lane_major.is_some() && deep_start - start <= fit2));
         let mut layer = start;
         while layer < deep_start {
             let g = (deep_start - layer).min(fit2);
@@ -642,6 +735,7 @@ impl AdditiveNttF64 {
         (defer_deep && deep_rows.is_some() && msg.is_none()).then_some(DeepRows {
             log_d,
             num_ntts,
+            start,
             deep_start,
         })
     }
@@ -2295,7 +2389,11 @@ mod tests {
                 assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, {context}");
                 let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
                 let rows = match deep {
-                    Some(deep) => ntt.finish_rows(&got, &deep, &positions),
+                    // A lane-major deferral leaves a codeword the message rebuilds.
+                    Some(deep) => {
+                        assert_eq!(ntt.finish_rows(&got, &deep, &positions), ntt.rebuild_rows(&msg, n_lanes, &deep, &positions));
+                        ntt.rebuild_rows(&msg, n_lanes, &deep, &positions)
+                    }
                     None => {
                         assert_eq!(got, want, "codeword, {context}");
                         positions
