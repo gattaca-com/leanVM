@@ -56,6 +56,14 @@ impl DeepRows {
     }
 }
 
+/// What [`AdditiveNttF64::encode_lane_major`] kept of its codeword.
+pub enum Encoded {
+    /// Nothing: the rows come back from the message, see [`DeepRows`].
+    Deep(DeepRows),
+    /// The whole codeword.
+    Whole(Vec<F64>),
+}
+
 /// Table of the normalized subspace polynomials at the basis.
 ///
 /// - Row `i` holds `s_i(b_j)` for every basis element `b_j` with `j >= i`.
@@ -254,41 +262,53 @@ impl AdditiveNttF64 {
         self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true, None)
     }
 
-    /// Encode a lane-major message into a codeword that starts uninitialized, handing `on_rows` every finished block.
+    /// Encode a lane-major message, handing `on_rows` every finished block, and keep what the opening needs.
     ///
     /// - The result equals [`transpose_lane_major`] into block 0 followed by the in-place encode.
     /// - With a gathered first pass, that pass reads the message itself and writes every block.
     /// - So no transposed copy of the message is written and read back.
-    /// - With `defer_deep`, the deep pass goes to `on_rows` only, as in [`Self::encode_interleaved_in_place_without_deep`].
-    #[allow(clippy::too_many_arguments)]
+    /// - If a single such pass covers the layers before the deep pass, the codeword is never whole:
+    ///   it runs once per half of the cosets, in one half-size buffer, and the deep pass goes to `on_rows` only.
+    ///   [`Self::rebuild_rows`] then recomputes any row from the message.
+    /// - Otherwise the codeword is whole and the encode is as the in-place one.
     pub fn encode_lane_major(
         &self,
-        data: &mut [F64],
         msg: &[F64],
         n_lanes: usize,
         num_ntts: usize,
         log_inv_rate: usize,
         on_rows: &RowSink<'_>,
-        defer_deep: bool,
-    ) -> Option<DeepRows> {
+    ) -> Encoded {
         assert!(0 < n_lanes && n_lanes <= num_ntts, "a row holds its lanes");
-        assert_eq!(data.len() % num_ntts, 0);
-        assert_eq!(
-            msg.len() * num_ntts,
-            n_lanes * (data.len() >> log_inv_rate),
-            "the message is n_lanes lane blocks"
-        );
+        assert!(log_inv_rate >= 1, "a codeword has at least two cosets");
+        let msg_rows = msg.len() / n_lanes;
+        assert_eq!(msg.len(), n_lanes * msg_rows, "the message is n_lanes lane blocks");
+        let log_d = log2_strict_usize(msg_rows) + log_inv_rate;
+        let rebuildable = lane_major_deep_start(log_d, num_ntts, log_inv_rate)
+            .is_some_and(|deep_start| deep_start - log_inv_rate <= fit(L2_WORDS, num_ntts));
+        // The cosets one pass holds: half of them when the opening rebuilds the rows.
+        let held = (1usize << log_inv_rate) >> usize::from(rebuildable);
+        // SAFETY: every word is written by the gathered pass before the deep pass reads it.
+        let mut data = unsafe { primitives::uninit_vec::<F64>((held * msg_rows) * num_ntts) };
         // Read-only from here on: the pointer only feeds the first pass's reads.
         let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
-        self.transform_deferring_deep(
-            data,
-            num_ntts,
-            log_inv_rate,
-            Some(msg),
-            Some(on_rows),
-            defer_deep,
-            Some(n_lanes),
-        )
+        let mut deep = None;
+        for first in (0..1usize << log_inv_rate).step_by(held).rev() {
+            let cosets = (n_lanes, first..first + held);
+            deep = self.transform_deferring_deep(
+                &mut data,
+                num_ntts,
+                log_inv_rate,
+                Some(msg),
+                Some(on_rows),
+                rebuildable,
+                Some(cosets),
+            );
+        }
+        match deep {
+            Some(deep) => Encoded::Deep(deep),
+            None => Encoded::Whole(data),
+        }
     }
 
     /// RS-encode a message coset by coset, handing `on_rows` every finished block of rows and writing no codeword.
@@ -516,6 +536,8 @@ impl AdditiveNttF64 {
     ///
     /// With `lane_major` lanes, `msg` is a separate lane-major message, which the first gathered pass reads.
     /// A plan with no such pass transposes it into block 0 of the buffer and encodes in place.
+    /// Its `cosets` are the layer-`start` blocks the buffer holds, which need that one pass and no more.
+    /// Twiddles and rows handed to `on_rows` stay global.
     #[allow(clippy::too_many_arguments)]
     fn transform_deferring_deep(
         &self,
@@ -525,40 +547,21 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         on_rows: Option<&RowSink<'_>>,
         defer_deep: bool,
-        mut lane_major: Option<usize>,
+        lane_major: Option<(usize, std::ops::Range<usize>)>,
     ) -> Option<DeepRows> {
-        // The buffer is 2^log_d rows of `num_ntts` words.
+        // The buffer is 2^log_d rows of `num_ntts` words, or the layer-`start` blocks `cosets` of them.
+        let (mut lane_major, cosets) = match lane_major {
+            Some((n_lanes, cosets)) => (Some(n_lanes), cosets),
+            None => (None, 0..1 << start),
+        };
         assert!(num_ntts > 0);
         assert_eq!(data.len() % num_ntts, 0);
-        let log_d = log2_strict_usize(data.len() / num_ntts);
+        let log_d = log2_strict_usize(data.len() / num_ntts / cosets.len()) + start;
         assert!(log_d <= self.log_domain_size());
         assert!(start <= log_d);
 
-        /// Below this domain the transform is too small to split across the pool.
-        const PARALLEL_FLOOR_LOG_D: usize = 12;
-        /// Fewest rows a deep sub-block takes when splitting for parallelism.
-        const MIN_SUB_LOG: usize = 8;
-
-        // How many rows, as a log, each cache budget holds.
-        //
-        //     51 lanes:  2^17 / 51 -> 2^11 rows in L2,  2^18 / 51 -> 2^12 rows in L3
-        let fit = |words: usize| (words / num_ntts).max(1).ilog2() as usize;
-        let (fit2, fit3) = (fit(L2_WORDS), fit(L3_WORDS));
-
-        // From 2^12 rows on, cut at least 2^LOG_SUBS_PER_WORKER deep sub-blocks per worker.
-        let par_log = if log_d >= PARALLEL_FLOOR_LOG_D {
-            (log2_strict_usize(parallel::num_threads().next_power_of_two()) + LOG_SUBS_PER_WORKER)
-                .min(log_d - MIN_SUB_LOG)
-        } else {
-            0
-        };
-
-        // Where the deep pass starts.
-        //
-        //     every layer fits one L3 sub-block  ->  deep pass only, one sweep
-        //     otherwise                          ->  the deep pass keeps one L2 sub-block of layers
-        let deep = if log_d - start <= fit3 { fit3 } else { fit2 };
-        let deep_start = log_d.saturating_sub(deep).max(par_log).max(start);
+        let (par_log, deep_start) = (par_log(log_d), deep_start(log_d, num_ntts, start));
+        let fit2 = fit(L2_WORDS, num_ntts);
 
         // A buffer this large is evicted before the next pass reads it back.
         let stream = data.len() >= STREAM_MIN_WORDS;
@@ -567,12 +570,11 @@ impl AdditiveNttF64 {
         //
         // Only the first one reads the message.
         let mut msg = msg;
-        let from_lane_major = lane_major.is_some();
         // A lane-major message is read by the first gathered pass, a batch of residues at a time.
         // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
         if let (Some(n_lanes), Some(m)) = (lane_major, msg) {
-            let g = (deep_start - start).min(fit2);
-            if start == deep_start || num_ntts % 8 != 0 || log_d - start - g < LOG_BATCH {
+            if lane_major_deep_start(log_d, num_ntts, start).is_none() {
+                assert_eq!(cosets.len(), 1 << start, "a partial buffer needs the gathered pass");
                 let log_rows = log_d - start;
                 // SAFETY: the message is `n_lanes` lane blocks of `2^log_rows` words, disjoint from the buffer.
                 let words = unsafe { std::slice::from_raw_parts(m.0.cast_const(), n_lanes << log_rows) };
@@ -581,12 +583,10 @@ impl AdditiveNttF64 {
                 lane_major = None;
             }
         }
-        // An opening rebuilds the deep sub-blocks of a lane-major encode from its message: one gathered pass over it.
-        let defer_deep = defer_deep && (!from_lane_major || (lane_major.is_some() && deep_start - start <= fit2));
         let mut layer = start;
         while layer < deep_start {
             let g = (deep_start - layer).min(fit2);
-            self.gathered_pass(data, log_d, num_ntts, layer, g, msg.take(), lane_major.take(), stream);
+            self.gathered_pass(data, log_d, num_ntts, layer, g, msg.take(), lane_major.take(), stream, cosets.start);
             layer += g;
         }
 
@@ -705,8 +705,10 @@ impl AdditiveNttF64 {
                         });
                     });
                 }
-                None => parallel::chunks_mut(data, sub_len, |sub_idx, sub| {
-                    let hook = prefetch_next(sub_idx);
+                None => parallel::chunks_mut(data, sub_len, |local, sub| {
+                    // The buffer's first sub-block, in the whole domain.
+                    let sub_idx = local + (cosets.start << (log_d - start - log_sub));
+                    let hook = prefetch_next(local);
                     if defer_deep && deep_rows.is_some() {
                         // The rows are hashed from scratch and the buffer keeps its pre-deep state.
                         with_scratch(sub_len, |scratch| {
@@ -794,6 +796,7 @@ impl AdditiveNttF64 {
     /// - It first transposes their rows into a stage of `BATCH` contiguous row groups.
     /// - The groups then gather from the stage as they would from a row-major message.
     /// - Every block, block 0 too, is written from the stage, so the message is never overwritten.
+    /// - The buffer may hold only the blocks from `first_block` on, as many as it fits.
     #[allow(clippy::too_many_arguments)]
     #[timed]
     fn gathered_pass(
@@ -806,6 +809,7 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         lane_major: Option<usize>,
         stream: bool,
+        first_block: usize,
     ) {
         // A group is 2^g rows, `step` rows apart.
         let log_step = log_d - layer - g;
@@ -814,6 +818,8 @@ impl AdditiveNttF64 {
         // Without one, a task is one (block, residue) pair.
         let batch = if lane_major.is_some() { BATCH } else { 1 };
         let n_tasks = if msg.is_some() { step / batch } else { step << layer };
+        // The blocks of `layer` the buffer holds, from `first_block` on.
+        let blocks_held = data.len() / num_ntts >> (log_d - layer);
         // The message's rows, and the stage that holds a batch of residues' row groups.
         let msg_rows = 1usize << (log_d - layer);
         let stage_len = if lane_major.is_some() {
@@ -844,7 +850,7 @@ impl AdditiveNttF64 {
                     |block: usize, r: usize, next: Option<(*const F64, std::ops::Range<usize>)>, staged: &[F64]| {
                         // Row `i` of the group, as a word offset inside its block.
                         let row = |i: usize| (r + (i << log_step)) * num_ntts;
-                        let block_off = (block << (log_d - layer)) * num_ntts;
+                        let block_off = ((block - first_block) << (log_d - layer)) * num_ntts;
                         // Gather: the scattered rows become one contiguous 2^g-row buffer.
                         for (i, dst) in scratch.chunks_exact_mut(num_ntts).enumerate() {
                             // SAFETY:
@@ -907,7 +913,7 @@ impl AdditiveNttF64 {
                         // No fetch-ahead: a batch's lines sit 16 KB apart in blocks 16 MB apart, so they share
                         // a few L2 and L3 sets. Lines fetched a batch early are evicted before the fill reads them.
                         for (s, staged) in stage.chunks_exact(rows * num_ntts).enumerate() {
-                            for block in (0..1usize << layer).rev() {
+                            for block in (first_block..first_block + blocks_held).rev() {
                                 group(block, t0 + s, None, staged);
                             }
                         }
@@ -1061,6 +1067,47 @@ impl AdditiveNttF64 {
             }
         }
     }
+}
+
+/// How many rows, as a log, a cache budget of `words` holds.
+///
+/// At 51 lanes: 2^17 / 51 -> 2^11 rows in L2,  2^18 / 51 -> 2^12 rows in L3.
+fn fit(words: usize, num_ntts: usize) -> usize {
+    (words / num_ntts).max(1).ilog2() as usize
+}
+
+/// From 2^12 rows on, a deep pass cuts at least 2^LOG_SUBS_PER_WORKER sub-blocks per worker: this log of them.
+fn par_log(log_d: usize) -> usize {
+    /// Below this domain the transform is too small to split across the pool.
+    const PARALLEL_FLOOR_LOG_D: usize = 12;
+    /// Fewest rows a deep sub-block takes when splitting for parallelism.
+    const MIN_SUB_LOG: usize = 8;
+    if log_d >= PARALLEL_FLOOR_LOG_D {
+        (log2_strict_usize(parallel::num_threads().next_power_of_two()) + LOG_SUBS_PER_WORKER).min(log_d - MIN_SUB_LOG)
+    } else {
+        0
+    }
+}
+
+/// Where the deep pass of a `2^log_d`-row transform from layer `start` starts.
+///
+/// - If every layer fits one L3 sub-block, the deep pass is the whole transform: one sweep.
+/// - Otherwise the deep pass keeps one L2 sub-block of layers.
+fn deep_start(log_d: usize, num_ntts: usize, start: usize) -> usize {
+    let deep = if log_d - start <= fit(L3_WORDS, num_ntts) {
+        fit(L3_WORDS, num_ntts)
+    } else {
+        fit(L2_WORDS, num_ntts)
+    };
+    log_d.saturating_sub(deep).max(par_log(log_d)).max(start)
+}
+
+/// The deep pass start of a lane-major encode, if its first gathered pass can read the message:
+/// a layer for it to run, whole cache lines in a row, and enough residues to batch.
+fn lane_major_deep_start(log_d: usize, num_ntts: usize, start: usize) -> Option<usize> {
+    let deep_start = deep_start(log_d, num_ntts, start);
+    let g = (deep_start - start).min(fit(L2_WORDS, num_ntts));
+    (start < deep_start && num_ntts % 8 == 0 && log_d - start - g >= LOG_BATCH).then_some(deep_start)
 }
 
 /// Call `f` with each block of `1 << log_rows` rows that holds a row of `live` (sorted), or with every block of `num_blocks`.
@@ -2405,35 +2452,23 @@ mod tests {
             transpose_lane_major(&mut want[..row_words << log_rows], &msg, n_lanes, row_words, log_rows);
             ntt.encode_interleaved_in_place(&mut want, row_words, log_inv_rate);
 
-            for defer_deep in [false, true] {
-                let mut got = vec![F64(0xBAD); want.len()];
-                let handed = std::sync::Mutex::new(vec![F64::ZERO; got.len()]);
-                let on_rows = |row: usize, rows: &[F64]| {
-                    handed.lock().unwrap()[row * row_words..][..rows.len()].copy_from_slice(rows)
-                };
-                let deep =
-                    ntt.encode_lane_major(&mut got, &msg, n_lanes, row_words, log_inv_rate, &on_rows, defer_deep);
-                let context =
-                    format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}, defer_deep={defer_deep}");
-                assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, {context}");
-                let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
-                let rows = match deep {
-                    // A lane-major deferral leaves a codeword the message rebuilds.
-                    Some(deep) => {
-                        assert_eq!(ntt.finish_rows(&got, &deep, &positions), ntt.rebuild_rows(&msg, n_lanes, &deep, &positions));
-                        ntt.rebuild_rows(&msg, n_lanes, &deep, &positions)
-                    }
-                    None => {
-                        assert_eq!(got, want, "codeword, {context}");
-                        positions
-                            .iter()
-                            .map(|&q| got[q * row_words..][..row_words].to_vec())
-                            .collect()
-                    }
-                };
-                for (&q, row) in positions.iter().zip(&rows) {
-                    assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
+            let mut handed = vec![F64::ZERO; want.len()];
+            let sink = std::sync::Mutex::new(&mut handed);
+            let on_rows =
+                |row: usize, rows: &[F64]| sink.lock().unwrap()[row * row_words..][..rows.len()].copy_from_slice(rows);
+            let encoded = ntt.encode_lane_major(&msg, n_lanes, row_words, log_inv_rate, &on_rows);
+            let context = format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}");
+            assert_eq!(handed, want, "handed-over rows, {context}");
+            let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+            let rows = match encoded {
+                Encoded::Deep(deep) => ntt.rebuild_rows(&msg, n_lanes, &deep, &positions),
+                Encoded::Whole(got) => {
+                    assert_eq!(got, want, "codeword, {context}");
+                    positions.iter().map(|&q| got[q * row_words..][..row_words].to_vec()).collect()
                 }
+            };
+            for (&q, row) in positions.iter().zip(&rows) {
+                assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
             }
         }
     }

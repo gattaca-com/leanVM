@@ -22,7 +22,7 @@
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
 use crate::merkle::{self, Hash};
-use crate::ntt::{AdditiveNttF64, DeepRows};
+use crate::ntt::{AdditiveNttF64, DeepRows, Encoded};
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use flux_profiler::timed;
@@ -203,27 +203,19 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
     let k_code = log_rows + log_inv_rate;
     let n_positions = 1usize << k_code;
     let row_words = n_lanes.next_multiple_of(8).min(1usize << log_batch_size);
-    let codeword_len = n_positions * row_words;
-
-    // SAFETY: every codeword element is written before it is read.
-    // `encode_lane_major` writes every block from the message.
-    // `transpose_lane_major` covers every word of the message region (its tiles are
-    // asserted to), and `encode_interleaved_in_place` writes every other replica from
-    // it before transforming that region in place.
-    let mut codeword = unsafe { primitives::uninit_vec::<F64>(codeword_len) };
 
     // Leaves are hashed as the encode finishes each block of rows.
     let tree = merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size);
-    let deep = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = row_words).in_scope(|| {
-        let ntt = AdditiveNttF64::standard(k_code);
-        let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
-        ntt.encode_lane_major(&mut codeword, message, n_lanes, row_words, log_inv_rate, &on_rows, true)
-            .map(|rows| (ntt, rows))
-    });
-    // The opening recomputes the rows it reads from the message, so the codeword goes now.
-    if deep.is_some() {
-        drop(std::mem::take(&mut codeword));
-    }
+    let (codeword, deep) = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = row_words)
+        .in_scope(|| {
+            let ntt = AdditiveNttF64::standard(k_code);
+            let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
+            // The opening recomputes the rows it reads from the message, when the encode kept no codeword.
+            match ntt.encode_lane_major(message, n_lanes, row_words, log_inv_rate, &on_rows) {
+                Encoded::Deep(rows) => (Vec::new(), Some((ntt, rows))),
+                Encoded::Whole(codeword) => (codeword, None),
+            }
+        });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
     let root = merkle_tree.root();
 
