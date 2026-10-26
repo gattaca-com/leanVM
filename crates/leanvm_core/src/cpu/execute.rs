@@ -42,11 +42,9 @@ impl Execution {
     }
 }
 
-/// `log2` of the cells a [`Memory`] page holds.
-const PAGE_LOG: usize = 16;
-const PAGE: usize = 1 << PAGE_LOG;
-// The padded image is a whole number of pages.
-const _: () = assert!(PAGE_LOG <= MIN_LOG_MEM);
+/// Cells of address space a run reserves: a frame base or `DEREF` base below `MAX_CELLS`
+/// plus an operand offset below `MAX_CELLS` (checked at the start of a run).
+const LIMIT: usize = 2 * MAX_CELLS as usize;
 
 /// A cell's write state. A cell not `Written` holds ZERO; a `DEREF` between two
 /// unwritten cells links them, and a write to either reaches the other at once.
@@ -69,11 +67,49 @@ pub(crate) struct Cell {
     state: State,
 }
 
-/// The write-once data memory: `len` cells, a power of two, in pages, so that the
-/// image grows without moving what it holds. Cells past the last page are unwritten
-/// and never accessed.
+/// The cells of a run: one reserved, lazily faulted array of `LIMIT` cells, so that
+/// an access is one address computation and the image never moves. All zero is the
+/// unwritten cell, which is what untouched pages hold.
+struct Cells(*mut Cell);
+
+// SAFETY: the array is plain memory owned by this value, as a `Box<[Cell]>` would be.
+unsafe impl Send for Cells {}
+unsafe impl Sync for Cells {}
+
+impl Cells {
+    fn reserve() -> Option<Self> {
+        let bytes = LIMIT * std::mem::size_of::<Cell>();
+        // SAFETY: an anonymous private mapping; failure is checked.
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            (p != libc::MAP_FAILED).then(|| {
+                // Huge pages are a hint: a failure only costs speed.
+                libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+                Self(p.cast())
+            })
+        }
+    }
+}
+
+impl Drop for Cells {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `reserve` made, unmapped once.
+        unsafe { libc::munmap(self.0.cast(), LIMIT * std::mem::size_of::<Cell>()) };
+    }
+}
+
+/// The write-once data memory: `len` cells, a power of two, of which the first `used`
+/// can be written; the rest are unwritten and never accessed.
 pub struct Memory {
-    pages: Vec<Box<[Cell]>>,
+    cells: Cells,
+    used: usize,
     len: usize,
 }
 
@@ -89,16 +125,14 @@ impl Memory {
 
     /// The word in cell `i`.
     pub fn word(&self, i: usize) -> F192 {
-        self.page(i >> PAGE_LOG).map_or(F192::ZERO, |p| p[i & (PAGE - 1)].word)
+        // SAFETY: `i < used <= LIMIT`, inside the mapping.
+        if i < self.used { unsafe { (*self.cells.0.add(i)).word } } else { F192::ZERO }
     }
 
-    /// Page `p`'s cells, `None` past the last one.
-    pub(crate) fn page(&self, p: usize) -> Option<&[Cell]> {
-        self.pages.get(p).map(|p| &p[..])
-    }
-
-    pub(crate) fn page_log() -> usize {
-        PAGE_LOG
+    /// The cells up to the last one used, rounded up to a multiple of `to`.
+    pub(crate) fn cells(&self, to: usize) -> &[Cell] {
+        // SAFETY: the mapping holds `LIMIT` cells, zero where untouched.
+        unsafe { std::slice::from_raw_parts(self.cells.0, self.used.next_multiple_of(to).min(LIMIT)) }
     }
 }
 
@@ -276,10 +310,28 @@ impl Program {
             .max(1 << MIN_LOG_MEM);
         let mut g = Kept::take(seed);
 
+        // The largest operand offset, so that every instruction access is in `LIMIT`.
+        let max_off = self
+            .prog
+            .iter()
+            .map(|op| match *op {
+                Op::Xor { a, b, c } | Op::Mul { a, b, c } => a.max(b).max(c),
+                Op::Set { o, .. } => o,
+                Op::Deref { o1, o2, o3, .. } => o1.max(o2).max(o3),
+                Op::Jump { oc, od, of } => oc.max(od).max(of),
+                Op::Blake2s { ins, cv, out, md } => ins.into_iter().chain([cv, out, md]).max().unwrap_or(0),
+            })
+            .max()
+            .unwrap_or(0) as usize
+            + 1;
+        if max_off >= MAX_CELLS as usize - 2 || seed >= MAX_CELLS as usize {
+            return Err(ExecError::new(self, 0, Fault::OutOfMemory));
+        }
+
         // The write-once data memory, each cell's access count and write state with its word.
         let n0 = self.main_frame.max(2) as usize;
         let mut m = Mem {
-            pages: Vec::new(),
+            cells: Cells::reserve().ok_or_else(|| ExecError::new(self, 0, Fault::OutOfMemory))?,
             used: 0,
             counts: 0,
             links: HashMap::new(),
@@ -342,12 +394,13 @@ impl Program {
         let mut jump: Rows<Jrow> = Rows::new();
         let mut blake2s: Rows<Brow> = Rows::new();
 
-        // The memory's pages, grown as the run reaches them. Every method on the hot
-        // path is `#[inline(always)]`: they sit in the interpreter's opcode loop.
+        // The memory's cells. Every method on the hot path is `#[inline(always)]`: they
+        // sit in the interpreter's opcode loop. The instructions' accesses are unchecked:
+        // a base is below `MAX_CELLS` and an offset is below the bound checked above.
         struct Mem<'a> {
-            pages: Vec<Box<[Cell]>>,
-            /// One past the highest cell accessed or reserved: every cell below it is
-            /// in a page.
+            cells: Cells,
+            /// One past the highest cell a hint or a store reached or the run reserved.
+            /// Instruction reads and counts do not move it: the end of the run scans for those.
             used: usize,
             /// The highest access count any cell reached.
             counts: u32,
@@ -366,42 +419,25 @@ impl Program {
             dbg_hint: Option<&'static str>,
         }
         impl Mem<'_> {
-            // Cover cell `idx`. All accessed cells satisfy cell < next_free after
-            // their frame's allocation, so this only ever extends.
+            // Cover cell `idx` for a store.
             #[inline(always)]
             fn ensure(&mut self, idx: usize) {
                 if idx >= self.used {
-                    self.grow(idx);
+                    assert!(idx < LIMIT, "address space overflow (program too large)");
+                    self.used = idx + 1;
                 }
             }
-            #[cold]
-            #[inline(never)]
-            fn grow(&mut self, idx: usize) {
-                self.used = idx + 1;
-                while self.pages.len() <= idx >> PAGE_LOG {
-                    // SAFETY: all zero is a valid `Cell`, the unwritten one.
-                    self.pages
-                        .push(unsafe { Box::<[Cell]>::new_zeroed_slice(PAGE).assume_init() });
-                }
-            }
-            /// Cell `c`, which `ensure` has covered.
+            /// Cell `c`, below `LIMIT`.
             #[inline(always)]
             fn at(&mut self, c: u32) -> &mut Cell {
-                let c = c as usize;
-                debug_assert!(c < self.used);
-                // SAFETY: `ensure` put `c` below `used`, and every page below it exists.
-                unsafe {
-                    self.pages
-                        .get_unchecked_mut(c >> PAGE_LOG)
-                        .get_unchecked_mut(c & (PAGE - 1))
-                }
+                debug_assert!((c as usize) < LIMIT);
+                // SAFETY: the callers keep `c` below `LIMIT`.
+                unsafe { &mut *self.cells.0.add(c as usize) }
             }
             #[inline(always)]
             fn covered(&self, c: u32) -> Option<&Cell> {
-                let c = c as usize;
-                // SAFETY: `c < used`, so its page exists.
-                (c < self.used)
-                    .then(|| unsafe { self.pages.get_unchecked(c >> PAGE_LOG).get_unchecked(c & (PAGE - 1)) })
+                // SAFETY: `c < LIMIT`, inside the mapping.
+                ((c as usize) < LIMIT).then(|| unsafe { &*self.cells.0.add(c as usize) })
             }
             #[inline(always)]
             fn written(&self, cell: u32) -> bool {
@@ -417,7 +453,6 @@ impl Program {
             // there: the row is filled from the final image, which has to agree.
             #[inline(always)]
             fn read(&mut self, cell: u32) -> F192 {
-                self.ensure(cell as usize);
                 let c = self.at(cell);
                 let word = c.word;
                 if c.state != State::Written {
@@ -429,15 +464,15 @@ impl Program {
             // Write-once store, carried to every cell linked to this one.
             #[inline(always)]
             fn put(&mut self, cell: u32, v: F192) -> Result<(), ExecError> {
+                self.ensure(cell as usize);
                 if self.store(cell, v)? {
                     self.spread(cell, v)?;
                 }
                 Ok(())
             }
-            // `put` on one cell; whether it was linked.
+            // `put` on one cell, which is covered; whether it was linked.
             #[inline(always)]
             fn store(&mut self, cell: u32, v: F192) -> Result<bool, ExecError> {
-                self.ensure(cell as usize);
                 let c = self.at(cell);
                 let s = c.state;
                 if s == State::Written && c.word != v {
@@ -483,12 +518,6 @@ impl Program {
             // exponent. A run makes fewer than `2^32` accesses in all, so it cannot wrap.
             #[inline(always)]
             fn bump_access_count(&mut self, cell: u32) -> u32 {
-                self.ensure(cell as usize);
-                self.bump_covered(cell)
-            }
-            // [`Self::bump_access_count`] on a cell `ensure` has covered.
-            #[inline(always)]
-            fn bump_covered(&mut self, cell: u32) -> u32 {
                 let c = self.at(cell);
                 let count = c.count;
                 c.count = count + 1;
@@ -500,13 +529,13 @@ impl Program {
             #[inline(always)]
             fn read_counted(&mut self, cell: u32) -> (F192, u32) {
                 let word = self.read(cell);
-                (word, self.bump_covered(cell))
+                (word, self.bump_access_count(cell))
             }
             // `put`, then the cell's access count.
             #[inline(always)]
             fn put_counted(&mut self, cell: u32, v: F192) -> Result<u32, ExecError> {
                 let linked = self.store(cell, v)?;
-                let count = self.bump_covered(cell);
+                let count = self.bump_access_count(cell);
                 if linked {
                     self.spread(cell, v)?;
                 }
@@ -1026,7 +1055,14 @@ impl Program {
         // Pad memory to a power of two (the boundary tables read a dense image), at
         // least 2^MIN_LOG_MEM cells (doc §Memory), doubled until the stacked witness
         // reaches `min_log_committed`.
-        let mem_used = m.used;
+        // Instruction reads and counts left `used` behind: the highest cell with a state or
+        // a count, within an offset of the highest base, is the true end.
+        let top = (m.used.max(seed) + max_off + 1).min(LIMIT);
+        let touched = (m.used..top).rev().find(|&c| {
+            let cell = m.at(c as u32);
+            cell.state != State::Unwritten || cell.count != 0
+        });
+        let mem_used = touched.map_or(m.used, |c| m.used.max(c + 1));
         let mut cells = mem_used.next_power_of_two().max(1 << MIN_LOG_MEM);
         let taus = super::layout::table_logs(trace.row_counts());
         let log_bytecode = crate::log2_strict_usize(self.prog.len());
@@ -1039,7 +1075,8 @@ impl Program {
         g.grow_to(mem_used.max(self.prog.len()).max(trace.counts) - 1);
         Ok(Execution {
             mem: Memory {
-                pages: m.pages,
+                cells: m.cells,
+                used: mem_used,
                 len: cells,
             },
             cycles: steps,

@@ -1774,6 +1774,7 @@ dependencies = [
  "flock",
  "flux-profiler",
  "lean_compiler",
+ "libc",
  "parallel",
  "pcs",
  "primitives",

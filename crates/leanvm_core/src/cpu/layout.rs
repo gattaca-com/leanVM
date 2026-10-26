@@ -480,22 +480,21 @@ impl Program {
             // cache line of each at a time: nothing reads them before the commitment.
             const LINE: usize = 8;
             const BLOCK: usize = 1 << 10;
-            let page_log = Memory::page_log();
+            let written = exec.mem.cells(BLOCK);
             let image = [MEM_LO, MEM_HI, MEM_TOP, MFCNT].map(|c| {
                 assert_eq!(windows[c].len(), cells, "a memory column spans the image");
                 parallel::SendPtr(windows[c].as_mut_ptr())
             });
             parallel::for_each_chunk(cells / BLOCK, |first, end| {
                 let stream = primitives::stream::Stream::new();
-                // Cells past the last page are unwritten and never accessed.
+                // Cells past the written ones are unwritten and never accessed.
                 let unwritten = [F64::ZERO, F64::ZERO, F64::ZERO, gpow[0]].map(|v| [v; LINE]);
                 for b in first..end {
                     let at = b * BLOCK;
-                    let page = exec.mem.page(at >> page_log);
                     for line in (at..at + BLOCK).step_by(LINE) {
                         let mut buf = unwritten;
-                        if let Some(page) = page {
-                            for (j, cell) in page[line & ((1 << page_log) - 1)..][..LINE].iter().enumerate() {
+                        if let Some(cells) = written.get(line..line + LINE) {
+                            for (j, cell) in cells.iter().enumerate() {
                                 // counts ended at g^{A[i]}
                                 buf[0][j] = F64(cell.word.c0);
                                 buf[1][j] = F64(cell.word.c1);

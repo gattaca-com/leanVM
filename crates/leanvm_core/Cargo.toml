@@ -16,6 +16,7 @@ pcs.workspace = true
 flock.workspace = true
 verifier.workspace = true
 tracing.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 lean_compiler.workspace = true
