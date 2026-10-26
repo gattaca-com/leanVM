@@ -302,6 +302,41 @@ pub fn mle_eval_par(table: &[F64], point: &[F192]) -> F192 {
     parallel::map_reduce(high.len(), || F192::ZERO, eval, |a, b| a + b)
 }
 
+/// Rows of one task of [`mle_eval_many`].
+const MANY_ROWS: usize = 32;
+
+/// Several MLE evaluations in one dispatch, `(table, point)` each, with every large table cut into equal tasks
+/// so that a few tables still fill the pool. A caller already inside a dispatch must use [`mle_eval`].
+pub fn mle_eval_many(jobs: &[(&[F64], &[F192])]) -> Vec<F192> {
+    let split: Vec<Option<(Vec<Weights8>, Vec<F192>)>> = jobs
+        .iter()
+        .map(|(table, point)| {
+            (table.len() >= PAR_THRESHOLD)
+                .then(|| (packed_eq(&point[..MLE_LOW_VARS]), eq_table(&point[MLE_LOW_VARS..])))
+        })
+        .collect();
+    let tasks: Vec<(usize, usize)> = split
+        .iter()
+        .enumerate()
+        .flat_map(|(j, s)| (0..s.as_ref().map_or(1, |(_, high)| high.len().div_ceil(MANY_ROWS))).map(move |g| (j, g)))
+        .collect();
+    let parts = parallel::map_collect(tasks.len(), |t| {
+        let (j, g) = tasks[t];
+        let (table, point) = jobs[j];
+        let Some((low, high)) = &split[j] else {
+            return mle_eval(table, point);
+        };
+        (g * MANY_ROWS..((g + 1) * MANY_ROWS).min(high.len())).fold(F192::ZERO, |acc, row| {
+            acc + high[row] * dot_base(low, &table[row << MLE_LOW_VARS..(row + 1) << MLE_LOW_VARS]).reduce()
+        })
+    });
+    let mut out = vec![F192::ZERO; jobs.len()];
+    for (&(j, _), v) in tasks.iter().zip(parts) {
+        out[j] += v;
+    }
+    out
+}
+
 /// The variables of the L1-resident low `eq` table of an MLE evaluation.
 const MLE_LOW_VARS: usize = 10;
 
@@ -333,6 +368,30 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F192) -> Vec<F192> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_mles_match_one_by_one() {
+        let sizes = [2, 3, 11, 12, 16, 17];
+        let tables: Vec<Vec<F64>> = sizes
+            .iter()
+            .map(|&n| {
+                (0..1u64 << n)
+                    .map(|i| F64((i + n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+                    .collect()
+            })
+            .collect();
+        let points: Vec<Vec<F192>> = sizes
+            .iter()
+            .map(|&n| {
+                (0..n as u64)
+                    .map(|i| F192::new(17 + i, 231 + 3 * i, 97 + 7 * i))
+                    .collect()
+            })
+            .collect();
+        let jobs: Vec<(&[F64], &[F192])> = tables.iter().zip(&points).map(|(t, p)| (&t[..], &p[..])).collect();
+        let want: Vec<F192> = jobs.iter().map(|&(t, p)| mle_eval(t, p)).collect();
+        assert_eq!(mle_eval_many(&jobs), want);
+    }
 
     #[test]
     fn parallel_mle_matches_folding() {

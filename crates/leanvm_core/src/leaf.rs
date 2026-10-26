@@ -16,7 +16,7 @@ use primitives::field::{
     Acc8, F64, F64x8, F192, F192Unreduced, F192x8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
     mul_slices,
 };
-use primitives::multilinear::{eq_eval, eq_table, mle_eval};
+use primitives::multilinear::{eq_eval, eq_table, mle_eval_many};
 use primitives::stream::Stream;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -758,22 +758,48 @@ fn public_eval(vals: &Arc<Vec<F64>>, point: &[F192], cache: &mut PublicEvals) ->
         .or_insert_with(|| primitives::multilinear::mle_eval_par(vals, point))
 }
 
-/// Prover-side decomposition: reads the real columns, writing each FRESH
-/// committed value onto the stream and recording the matching claim
-/// (block/coord order); duplicates reuse the recorded value.
+/// The FRESH committed coords of one side, as `decompose_formula` visits them (blocks in order, coords
+/// in order, `Col`/`GCol` only, first occurrence per `(col, point)`, the same dedup as `known_claim`),
+/// and the public columns it evaluates, each once per `(column, point length)`.
+fn fresh_coords<'a>(
+    blocks: &'a [Block],
+    owners: &[Option<(usize, usize)>],
+    claims: &[ColumnClaim],
+    zeta: &[F192],
+    jobs: &mut Vec<(usize, usize)>,
+    publics: &mut Vec<(&'a Arc<Vec<F64>>, usize)>,
+) {
+    for (blk, _) in blocks.iter().zip(owners).filter(|(_, o)| o.is_none()) {
+        for c in &blk.coords {
+            match c {
+                Coord::Col(i) | Coord::GCol(i, _) => {
+                    let job = (*i, blk.kappa);
+                    if known_claim(claims, *i, &zeta[..blk.kappa]).is_none() && !jobs.contains(&job) {
+                        jobs.push(job);
+                    }
+                }
+                Coord::Public(vals) => {
+                    if !publics.iter().any(|&(v, k)| Arc::ptr_eq(v, vals) && k == blk.kappa) {
+                        publics.push((vals, blk.kappa));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Prover-side decomposition: writes each FRESH committed value onto the stream and records the
+/// matching claim (block/coord order); duplicates reuse the recorded value.
 ///
-/// The fresh column MLE evaluations run in a parallel first pass: within one
-/// `decompose_formula` call no challenge is sampled between claims (`zeta`,
-/// `alpha`, `beta` are fixed arguments and each claim's point is
-/// `zeta[..kappa]` of its block), so the values are independent of the
-/// transcript and only their `add_scalar` ORDER matters. The second pass
-/// replays them through the transcript in the original block/coord order,
-/// keeping the stream byte-identical to the serial form.
-#[timed]
-fn decompose_prove(
+/// Within one `decompose_formula` call no challenge is sampled between claims (`zeta`, `alpha`, `beta`
+/// are fixed arguments and each claim's point is `zeta[..kappa]` of its block), so the values are
+/// independent of the transcript and only their `add_scalar` ORDER matters. The caller evaluates them
+/// for every side at once, in the order of `fresh_coords`; this replays them through the transcript in
+/// the original block/coord order, keeping the stream byte-identical to the serial form.
+fn decompose_prove<'a>(
     blocks: &[Block],
     lay: &Layout,
-    cols: &[&[F64]],
     zeta: &[F192],
     w: &[F192],
     beta: F192,
@@ -781,33 +807,9 @@ fn decompose_prove(
     forms: &mut [BusForm],
     claims: &mut Vec<ColumnClaim>,
     public: &mut PublicEvals,
+    fresh: &mut impl Iterator<Item = (&'a (usize, usize), &'a F192)>,
     ps: &mut ProverState,
 ) -> F192 {
-    // Pass 1: enumerate the FRESH committed coords exactly as `decompose_formula`
-    // visits them (blocks in order, coords in order, Col/GCol only, first
-    // occurrence per `(col, point)`, the same dedup as `known_claim`), then
-    // evaluate the column MLEs in parallel.
-    let mut jobs: Vec<(usize, usize)> = Vec::new();
-    for (b, blk) in blocks.iter().enumerate() {
-        if owners[b].is_some() {
-            continue;
-        }
-        for c in &blk.coords {
-            if let Coord::Col(i) | Coord::GCol(i, _) = c {
-                let fresh = known_claim(claims, *i, &zeta[..blk.kappa]).is_none() && !jobs.contains(&(*i, blk.kappa));
-                if fresh {
-                    jobs.push((*i, blk.kappa));
-                }
-            }
-        }
-    }
-    let vals: Vec<F192> = parallel::map_collect(jobs.len(), |i| {
-        let (col, kappa) = jobs[i];
-        mle_eval(cols[col], &zeta[..kappa])
-    });
-
-    // Pass 2: replay in the original order; duplicates reuse the recorded claim.
-    let mut fresh_iter = jobs.iter().zip(vals.iter());
     decompose_formula(
         blocks,
         lay,
@@ -819,11 +821,10 @@ fn decompose_prove(
         claims,
         public,
         |col, zeta_lo| {
-            let (&(jc, jk), &v) = fresh_iter
+            let (&(jc, jk), &v) = fresh
                 .next()
                 .expect("job enumeration matches decompose_formula's col_val order");
             debug_assert_eq!((jc, jk), (col, zeta_lo.len()), "job/coord order drift");
-            debug_assert_eq!(v, mle_eval(cols[col], zeta_lo), "job/coord order drift");
             ps.add_scalar(v);
             v
         },
@@ -1027,11 +1028,26 @@ pub fn prove_balance(
     let mut frameworks = [F192::ZERO; 3];
     let mut public = PublicEvals::new();
     crate::stage!("Bus decompose", || {
+        // Every value the three sides take fresh, and every public column they evaluate, in one dispatch.
+        let (mut jobs, mut publics) = (Vec::new(), Vec::new());
+        for (s, &(blocks, ..)) in sides.iter().enumerate() {
+            fresh_coords(blocks, &owners[s], &claims, &bus_gkr.point, &mut jobs, &mut publics);
+        }
+        let tasks: Vec<(&[F64], &[F192])> = jobs
+            .iter()
+            .map(|&(col, kappa)| (cols[col], &bus_gkr.point[..kappa]))
+            .chain(publics.iter().map(|&(vals, kappa)| (&vals[..], &bus_gkr.point[..kappa])))
+            .collect();
+        let values = mle_eval_many(&tasks);
+        let (fresh, public_values) = values.split_at(jobs.len());
+        for (&(vals, kappa), &v) in publics.iter().zip(public_values) {
+            public.insert((Arc::as_ptr(vals) as usize, kappa), v);
+        }
+        let mut fresh = jobs.iter().zip(fresh);
         for (s, &(blocks, lay, a, g)) in sides.iter().enumerate() {
             frameworks[s] = decompose_prove(
                 blocks,
                 lay,
-                cols,
                 &bus_gkr.point,
                 a,
                 g,
@@ -1039,6 +1055,7 @@ pub fn prove_balance(
                 &mut forms[s],
                 &mut claims,
                 &mut public,
+                &mut fresh,
                 ps,
             );
         }
