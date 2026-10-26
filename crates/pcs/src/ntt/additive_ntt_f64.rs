@@ -375,7 +375,7 @@ impl AdditiveNttF64 {
 
     /// The log of the codeword's rows, for a message of `msg_words` words.
     fn coset_log_d(&self, msg_words: usize, num_ntts: usize, log_inv_rate: usize) -> usize {
-        assert!(num_ntts > 0 && msg_words % num_ntts == 0);
+        assert!(num_ntts > 0 && msg_words.is_multiple_of(num_ntts));
         let log_d = log2_strict_usize(msg_words / num_ntts) + log_inv_rate;
         assert!(log_d <= self.log_domain_size());
         log_d
@@ -429,7 +429,7 @@ impl AdditiveNttF64 {
         let (rows, log_step) = (1usize << g, log_d - deep_start);
         let (sub_len, msg_rows) = (deep.sub_len(), 1usize << (log_d - start));
         assert!(0 < g && g <= (L2_WORDS / num_ntts).max(1).ilog2() as usize, "one gathered pass");
-        assert!(num_ntts % 8 == 0 && log_step >= LOG_BATCH, "the gathered pass is lane-major");
+        assert!(num_ntts.is_multiple_of(8) && log_step >= LOG_BATCH, "the gathered pass is lane-major");
         assert_eq!(msg.len(), n_lanes * msg_rows);
         // Each coset with queried sub-blocks: its index, those sub-blocks' places in `subs`, and their group rows.
         let mut next = 0;
@@ -582,16 +582,14 @@ impl AdditiveNttF64 {
         let mut msg = msg;
         // A lane-major message is read by the first gathered pass, a batch of residues at a time.
         // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
-        if let (Some(n_lanes), Some(m)) = (lane_major, msg) {
-            if lane_major_deep_start(log_d, num_ntts, start).is_none() {
-                assert_eq!(cosets.len(), 1 << start, "a partial buffer needs the gathered pass");
-                let log_rows = log_d - start;
-                // SAFETY: the message is `n_lanes` lane blocks of `2^log_rows` words, disjoint from the buffer.
-                let words = unsafe { std::slice::from_raw_parts(m.0.cast_const(), n_lanes << log_rows) };
-                transpose_lane_major(&mut data[..num_ntts << log_rows], words, n_lanes, num_ntts, log_rows);
-                msg = Some(parallel::SendPtr(data.as_mut_ptr()));
-                lane_major = None;
-            }
+        if let (Some(n_lanes), Some(m)) = (lane_major, msg) && lane_major_deep_start(log_d, num_ntts, start).is_none() {
+            assert_eq!(cosets.len(), 1 << start, "a partial buffer needs the gathered pass");
+            let log_rows = log_d - start;
+            // SAFETY: the message is `n_lanes` lane blocks of `2^log_rows` words, disjoint from the buffer.
+            let words = unsafe { std::slice::from_raw_parts(m.0.cast_const(), n_lanes << log_rows) };
+            transpose_lane_major(&mut data[..num_ntts << log_rows], words, n_lanes, num_ntts, log_rows);
+            msg = Some(parallel::SendPtr(data.as_mut_ptr()));
+            lane_major = None;
         }
         let mut layer = start;
         while layer < deep_start {
@@ -829,7 +827,7 @@ impl AdditiveNttF64 {
         let batch = if lane_major.is_some() { BATCH } else { 1 };
         let n_tasks = if msg.is_some() { step / batch } else { step << layer };
         // The blocks of `layer` the buffer holds, from `first_block` on.
-        let blocks_held = data.len() / num_ntts >> (log_d - layer);
+        let blocks_held = (data.len() / num_ntts) >> (log_d - layer);
         // The message's rows, and the stage that holds a batch of residues' row groups.
         let msg_rows = 1usize << (log_d - layer);
         let stage_len = if lane_major.is_some() {
@@ -1117,7 +1115,7 @@ fn deep_start(log_d: usize, num_ntts: usize, start: usize) -> usize {
 fn lane_major_deep_start(log_d: usize, num_ntts: usize, start: usize) -> Option<usize> {
     let deep_start = deep_start(log_d, num_ntts, start);
     let g = (deep_start - start).min(fit(L2_WORDS, num_ntts));
-    (start < deep_start && num_ntts % 8 == 0 && log_d - start - g >= LOG_BATCH).then_some(deep_start)
+    (start < deep_start && num_ntts.is_multiple_of(8) && log_d - start - g >= LOG_BATCH).then_some(deep_start)
 }
 
 /// Call `f` with each block of `1 << log_rows` rows that holds a row of `live` (sorted), or with every block of `num_blocks`.

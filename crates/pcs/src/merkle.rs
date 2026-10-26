@@ -124,6 +124,7 @@ impl MerkleBuilder {
     }
 
     /// Absorb all rows, in parallel blocks.
+    #[cfg(test)]
     fn absorb_all(&self, data: &[u8]) {
         let num_leaves = self.nodes.width(0);
         assert_eq!(data.len(), num_leaves * self.leaves.row_bytes(), "one row per leaf");
@@ -165,7 +166,7 @@ struct Nodes {
 
 impl Nodes {
     fn new(num_leaves: usize, cut: usize) -> Self {
-        let mut tree = Box::new_uninit_slice((2 * num_leaves >> cut) - 1).into_vec();
+        let mut tree = Box::new_uninit_slice(((2 * num_leaves) >> cut) - 1).into_vec();
         let base = SendPtr(tree.as_mut_ptr());
         Self {
             tree,
