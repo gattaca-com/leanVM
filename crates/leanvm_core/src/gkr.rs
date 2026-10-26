@@ -1271,13 +1271,12 @@ mod tests {
                 let point: Vec<F192> = (0..width.ilog2() - 1)
                     .map(|i| F192::new(31 + u64::from(i), 7, 11))
                     .collect();
-                let mut equality = Equality::new(&point);
                 let mut dropped = 1;
                 while reference.logical_rows > 2 {
                     let challenge = F192::new(reference.logical_rows as u64, 13, 19);
                     reference.fold(challenge);
                     separate.fold(challenge);
-                    equality = Equality::new(&point[dropped..]);
+                    let equality = Equality::new(&point[dropped..]);
                     dropped += 1;
                     let message = fused.fold_and_message(challenge, &equality);
                     assert_eq!(message, reference.round_message(&equality), "{context}");

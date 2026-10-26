@@ -842,10 +842,8 @@ fn fresh_coords<'a>(
                         jobs.push(job);
                     }
                 }
-                Coord::Public(vals) => {
-                    if !publics.iter().any(|&(v, k)| Arc::ptr_eq(v, vals) && k == blk.kappa) {
-                        publics.push((vals, blk.kappa));
-                    }
+                Coord::Public(vals) if !publics.iter().any(|&(v, k)| Arc::ptr_eq(v, vals) && k == blk.kappa) => {
+                    publics.push((vals, blk.kappa));
                 }
                 _ => {}
             }

@@ -227,6 +227,8 @@ pub(crate) struct Kept(GPow);
 impl Kept {
     /// The kept table, grown to cover `seed`.
     pub(crate) fn take(seed: usize) -> Self {
+        // `GPow::new` seeds `g^0`, unlike the derived `Default`.
+        #[allow(clippy::unwrap_or_default)]
         let mut g = KEPT.lock().unwrap().take().unwrap_or_else(GPow::new);
         g.grow_to(seed);
         Self(g)
