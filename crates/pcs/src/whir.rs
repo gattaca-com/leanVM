@@ -22,7 +22,7 @@
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
 use crate::merkle::{self, Hash};
-use crate::ntt::{AdditiveNttF64, DeepRows, Encoded};
+use crate::ntt::{AdditiveNttF64, DeepRows, Encoded, Keep};
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use flux_profiler::timed;
@@ -112,8 +112,9 @@ pub struct Commitment {
 /// Prover-side state retained after commit for the opening phase. The message
 /// itself is not stored; the caller retains it for opening.
 ///
-/// With `deep` set, `codeword` is empty: the encode kept no rows, and the opening
-/// recomputes the sub-blocks a query reads from the message, see [`ProverData::l0`].
+/// With `deep` set, `codeword` holds the rows before the encode's deep layers, which the opening finishes.
+/// If it is empty too, the encode kept no rows, and the opening recomputes the sub-blocks a query reads
+/// from the message, see [`ProverData::l0`].
 pub struct ProverData {
     pub codeword: Vec<F64>,
     /// Words per codeword row: the committed lanes, with zero lanes in front up to the vector width.
@@ -128,6 +129,11 @@ impl ProverData {
         self.deep.as_ref().map_or(self.codeword.len(), |(_, deep)| deep.words())
     }
 
+    /// Whether the opening needs the message to recompute the rows.
+    pub(crate) fn rebuilds(&self) -> bool {
+        self.deep.is_some() && self.codeword.is_empty()
+    }
+
     /// The codeword as the opening reads it. `stack` is the committed message, `n_lanes` its lanes.
     pub(crate) fn l0<'a>(&'a self, stack: &'a [F64], n_lanes: usize) -> L0Codeword<'a> {
         L0Codeword {
@@ -140,7 +146,7 @@ impl ProverData {
     }
 }
 
-/// The L0 codeword as the opening reads it: kept whole, or recomputed from the message.
+/// The L0 codeword as the opening reads it: kept whole or before its deep layers, or recomputed from the message.
 pub(crate) struct L0Codeword<'a> {
     words: &'a [F64],
     row_words: usize,
@@ -153,7 +159,8 @@ impl L0Codeword<'_> {
     /// The rows at `positions`, `row_words` words each.
     fn rows(&self, positions: &[usize]) -> Vec<Vec<F64>> {
         match self.deep {
-            Some((ntt, deep)) => ntt.rebuild_rows(self.stack, self.n_lanes, deep, positions),
+            Some((ntt, deep)) if self.words.is_empty() => ntt.rebuild_rows(self.stack, self.n_lanes, deep, positions),
+            Some((ntt, deep)) => ntt.finish_rows(self.words, deep, positions),
             None => positions
                 .iter()
                 .map(|&q| self.words[q * self.row_words..(q + 1) * self.row_words].to_vec())
@@ -162,13 +169,19 @@ impl L0Codeword<'_> {
     }
 }
 
-/// Pool size from which the extension encodes leave their deep pass out of the codeword,
+/// Pool size from which the encodes leave their deep pass out of the codeword,
 /// and an opening finishes the queried sub-blocks again: a DRAM write of the codeword saved
-/// against a transform per opened sub-block. The L0 encode always does, and keeps no codeword at all.
+/// against a transform per opened sub-block.
 ///
 /// - One worker alone is ALU-bound, and deferring costs it 2.5 %.
 /// - From two workers on, nodes share DRAM: 4 concurrent 8:1 nodes on 2 threads each go 3.5-3.7 s -> 3.0 s.
 const DEFER_DEEP_MIN_THREADS: usize = 2;
+
+/// Largest L0 codeword the commit keeps, in bytes.
+///
+/// - Up to it, memory is not the limit, and the codeword saves the opening a rebuild from the stack and the encode a second stage fill.
+/// - Above it (8:1 and up), the codeword dominates the peak: the commit encodes two cosets at a time and keeps none.
+const KEEP_CODEWORD_MAX_BYTES: usize = 1 << 30;
 
 /// Commit to the `F64` message of a `2^log_n`-word witness: the message is its
 /// leading `n_lanes` lane blocks of `2^(log_n - log_batch_size)` words each, one
@@ -210,11 +223,15 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
         .in_scope(|| {
             let ntt = AdditiveNttF64::standard(k_code);
             let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
-            // The opening recomputes the rows it reads from the message, when the encode kept no codeword.
-            match ntt.encode_lane_major(message, n_lanes, row_words, log_inv_rate, &on_rows) {
-                Encoded::Deep(rows) => (Vec::new(), Some((ntt, rows))),
-                Encoded::Whole(codeword) => (codeword, None),
-            }
+            let keep = if n_positions * row_words * size_of::<F64>() > KEEP_CODEWORD_MAX_BYTES {
+                Keep::Nothing
+            } else if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
+                Keep::BeforeDeep
+            } else {
+                Keep::Whole
+            };
+            let Encoded { words, deep } = ntt.encode_lane_major(message, n_lanes, row_words, log_inv_rate, keep, &on_rows);
+            (words, deep.map(|deep| (ntt, deep)))
         });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
     let root = merkle_tree.root();
@@ -970,10 +987,11 @@ impl SumcheckProver {
         msg
     }
 
-    /// The committed lanes, once the lane rounds have read them for the last time.
-    fn take_stack(&mut self) -> Vec<F64> {
+    /// The committed lanes if `keep`, once the lane rounds have read them for the last time. Otherwise they go now.
+    fn take_stack(&mut self, keep: bool) -> Vec<F64> {
         assert!(self.lift.is_none(), "the lane rounds are over");
-        std::mem::take(&mut self.base)
+        let base = std::mem::take(&mut self.base);
+        if keep { base } else { Vec::new() }
     }
 
     #[timed]
@@ -1120,8 +1138,8 @@ fn opened_row<'a>(queries: &'a [usize], rows: &'a [Vec<F64>]) -> impl Fn(usize) 
 /// produced by [`commit`] (with `log_batch_size = config.initial_k` and
 /// `log_inv_rate = config.log_inv_rates[0]`).
 ///
-/// `witness` is owned: the L0 open recomputes the codeword rows it reads from it,
-/// and it is dropped right after.
+/// `witness` is owned: where the L0 open recomputes the codeword rows it reads, it keeps it until then.
+/// Otherwise the lane rounds read it last, and the large committed stack is gone before the level-1 commit allocates.
 ///
 /// PRECONDITION, and the reason `witness` may be shorter than `2^log_n`: it is a
 /// whole number of lane blocks, and `b_initial` must stand for the weight restricted to
@@ -1212,8 +1230,8 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         r_lane_fold.push(r_j);
     }
     drop(sumcheck_span);
-    // The L0 open recomputes its rows from the stack, so it lives until then.
-    let stack = sc_prover.take_stack();
+    // A rebuilding L0 open recomputes its rows from the stack, so that lives until then. Otherwise it goes now.
+    let stack = sc_prover.take_stack(prover_data.rebuilds());
 
     // Commit f^1 = folded (now E-valued) witness as wtns_1.
     let n1 = log_n - initial_k;

@@ -56,12 +56,23 @@ impl DeepRows {
     }
 }
 
+/// What [`AdditiveNttF64::encode_lane_major`] is asked to keep of its codeword.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    /// All of it: the deep pass is written back.
+    Whole,
+    /// The buffer as the gathered passes leave it: [`AdditiveNttF64::finish_rows`] runs the deep pass again on a row read.
+    BeforeDeep,
+    /// None of it, if the plan allows: [`AdditiveNttF64::rebuild_rows`] recomputes a row from the message.
+    Nothing,
+}
+
 /// What [`AdditiveNttF64::encode_lane_major`] kept of its codeword.
-pub enum Encoded {
-    /// Nothing: the rows come back from the message, see [`DeepRows`].
-    Deep(DeepRows),
-    /// The whole codeword.
-    Whole(Vec<F64>),
+pub struct Encoded {
+    /// The buffer kept, or empty when nothing was.
+    pub words: Vec<F64>,
+    /// Set if the deep pass is left to run on a row read, from `words` or, when empty, from the message.
+    pub deep: Option<DeepRows>,
 }
 
 /// Table of the normalized subspace polynomials at the basis.
@@ -262,14 +273,13 @@ impl AdditiveNttF64 {
         self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true, None)
     }
 
-    /// Encode a lane-major message, handing `on_rows` every finished block, and keep what the opening needs.
+    /// Encode a lane-major message, handing `on_rows` every finished block, and keep what `keep` asks for.
     ///
     /// - The result equals [`transpose_lane_major`] into block 0 followed by the in-place encode.
     /// - With a gathered first pass, that pass reads the message itself and writes every block.
     /// - So no transposed copy of the message is written and read back.
-    /// - If a single such pass covers the layers before the deep pass, the codeword is never whole:
-    ///   it runs once per half of the cosets, in one half-size buffer, and the deep pass goes to `on_rows` only.
-    ///   [`Self::rebuild_rows`] then recomputes any row from the message.
+    /// - With [`Keep::Nothing`], if a single such pass covers the layers before the deep pass, the codeword is never whole:
+    ///   the encode runs once per half of the cosets, in one half-size buffer, and the deep pass goes to `on_rows` only.
     /// - Otherwise the codeword is whole and the encode is as the in-place one.
     pub fn encode_lane_major(
         &self,
@@ -277,6 +287,7 @@ impl AdditiveNttF64 {
         n_lanes: usize,
         num_ntts: usize,
         log_inv_rate: usize,
+        keep: Keep,
         on_rows: &RowSink<'_>,
     ) -> Encoded {
         assert!(0 < n_lanes && n_lanes <= num_ntts, "a row holds its lanes");
@@ -286,8 +297,10 @@ impl AdditiveNttF64 {
         let log_d = log2_strict_usize(msg_rows) + log_inv_rate;
         let rebuildable = lane_major_deep_start(log_d, num_ntts, log_inv_rate)
             .is_some_and(|deep_start| deep_start - log_inv_rate <= fit(L2_WORDS, num_ntts));
+        let by_halves = keep == Keep::Nothing && rebuildable;
+        let defer_deep = by_halves || keep == Keep::BeforeDeep;
         // The cosets one pass holds: half of them when the opening rebuilds the rows.
-        let held = (1usize << log_inv_rate) >> usize::from(rebuildable);
+        let held = (1usize << log_inv_rate) >> usize::from(by_halves);
         // SAFETY: every word is written by the gathered pass before the deep pass reads it.
         let mut data = unsafe { primitives::uninit_vec::<F64>((held * msg_rows) * num_ntts) };
         // Read-only from here on: the pointer only feeds the first pass's reads.
@@ -301,14 +314,11 @@ impl AdditiveNttF64 {
                 log_inv_rate,
                 Some(msg),
                 Some(on_rows),
-                rebuildable,
+                defer_deep,
                 Some(cosets),
             );
         }
-        match deep {
-            Some(deep) => Encoded::Deep(deep),
-            None => Encoded::Whole(data),
-        }
+        Encoded { words: if by_halves { Vec::new() } else { data }, deep }
     }
 
     /// RS-encode a message coset by coset, handing `on_rows` every finished block of rows and writing no codeword.
@@ -2452,23 +2462,27 @@ mod tests {
             transpose_lane_major(&mut want[..row_words << log_rows], &msg, n_lanes, row_words, log_rows);
             ntt.encode_interleaved_in_place(&mut want, row_words, log_inv_rate);
 
-            let mut handed = vec![F64::ZERO; want.len()];
-            let sink = std::sync::Mutex::new(&mut handed);
-            let on_rows =
-                |row: usize, rows: &[F64]| sink.lock().unwrap()[row * row_words..][..rows.len()].copy_from_slice(rows);
-            let encoded = ntt.encode_lane_major(&msg, n_lanes, row_words, log_inv_rate, &on_rows);
-            let context = format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}");
-            assert_eq!(handed, want, "handed-over rows, {context}");
-            let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
-            let rows = match encoded {
-                Encoded::Deep(deep) => ntt.rebuild_rows(&msg, n_lanes, &deep, &positions),
-                Encoded::Whole(got) => {
-                    assert_eq!(got, want, "codeword, {context}");
-                    positions.iter().map(|&q| got[q * row_words..][..row_words].to_vec()).collect()
+            for keep in [Keep::Whole, Keep::BeforeDeep, Keep::Nothing] {
+                let mut handed = vec![F64::ZERO; want.len()];
+                let sink = std::sync::Mutex::new(&mut handed);
+                let on_rows = |row: usize, rows: &[F64]| {
+                    sink.lock().unwrap()[row * row_words..][..rows.len()].copy_from_slice(rows)
+                };
+                let Encoded { words, deep } = ntt.encode_lane_major(&msg, n_lanes, row_words, log_inv_rate, keep, &on_rows);
+                let context = format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}, keep_nothing={}", keep == Keep::Nothing);
+                assert_eq!(handed, want, "handed-over rows, {context}");
+                let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+                let rows = match deep {
+                    Some(deep) if words.is_empty() => ntt.rebuild_rows(&msg, n_lanes, &deep, &positions),
+                    Some(deep) => ntt.finish_rows(&words, &deep, &positions),
+                    None => {
+                        assert_eq!(words, want, "codeword, {context}");
+                        positions.iter().map(|&q| words[q * row_words..][..row_words].to_vec()).collect()
+                    }
+                };
+                for (&q, row) in positions.iter().zip(&rows) {
+                    assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
                 }
-            };
-            for (&q, row) in positions.iter().zip(&rows) {
-                assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
             }
         }
     }
