@@ -444,20 +444,24 @@ impl AdditiveNttF64 {
         let mut built = unsafe { primitives::uninit_vec::<F64>(subs.len() * sub_len) };
         let (out, msg) = (parallel::SendPtr(built.as_mut_ptr()), parallel::SendPtr(msg.as_ptr().cast_mut()));
         parallel::for_each_chunk((1usize << log_step) / BATCH, |lo, hi| {
-            let stage_len = BATCH * rows * num_ntts;
-            with_scratch(stage_len + rows * num_ntts, |all| {
+            // One octet of lanes of a batch of residues is 64 lanes of one transform.
+            let stage_len = rows * BATCH * 8;
+            with_scratch(2 * stage_len, |all| {
                 let (stage, scratch) = all.split_at_mut(stage_len);
                 for t in lo..hi {
-                    fill_stage(stage, unsafe { msg.add(0) }.cast_const(), t * BATCH, log_step, msg_rows, n_lanes, num_ntts);
-                    for (s, staged) in stage.chunks_exact(rows * num_ntts).enumerate() {
+                    for octet in 0..num_ntts / 8 {
+                        let msg = unsafe { msg.add(0) }.cast_const();
+                        fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet);
                         for (coset, run, live) in &cosets {
-                            scratch.copy_from_slice(staged);
+                            scratch.copy_from_slice(stage);
                             let live_rows = Some(&live[..]);
-                            self.run_layers_to(scratch, deep_start, num_ntts, start, deep_start, start, *coset, live_rows, no_hook);
+                            self.run_layers_to(scratch, deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
                             for (pos, &i) in run.clone().zip(live) {
-                                // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block.
-                                let dst = unsafe { out.slice(pos * sub_len + (t * BATCH + s) * num_ntts, num_ntts) };
-                                dst.copy_from_slice(&scratch[i * num_ntts..][..num_ntts]);
+                                for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8].chunks_exact(8).enumerate() {
+                                    // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block.
+                                    let dst = unsafe { out.slice(pos * sub_len + (t * BATCH + s) * num_ntts + 8 * octet, 8) };
+                                    dst.copy_from_slice(line);
+                                }
                             }
                         }
                     }
@@ -801,8 +805,10 @@ impl AdditiveNttF64 {
     ///
     /// - Word `w` of message row `j` is word `j` of lane block `num_ntts - 1 - w`, and zero below the padding.
     /// - A lane block's cache line holds [`BATCH`] consecutive rows, so a task takes that many residues.
-    /// - It first transposes their rows into a stage of `BATCH` contiguous row groups.
-    /// - The groups then gather from the stage as they would from a row-major message.
+    /// - It goes one octet of lanes at a time, and the octet of the residues is 64 lanes of one transform.
+    /// - It transposes those lanes into a stage of `2^g` rows of 64 words, one line per residue.
+    /// - Each block gathers a copy of the stage, transforms it, and scatters line by line.
+    /// - The footprint is a few `2^g * 64` word buffers, however many lanes the message has.
     /// - Every block, block 0 too, is written from the stage, so the message is never overwritten.
     /// - The buffer may hold only the blocks from `first_block` on, as many as it fits.
     #[allow(clippy::too_many_arguments)]
@@ -828,82 +834,87 @@ impl AdditiveNttF64 {
         let n_tasks = if msg.is_some() { step / batch } else { step << layer };
         // The blocks of `layer` the buffer holds, from `first_block` on.
         let blocks_held = (data.len() / num_ntts) >> (log_d - layer);
-        // The message's rows, and the stage that holds a batch of residues' row groups.
+        // The message's rows. A lane-major group is an octet of lanes of a batch of residues, held in a stage.
         let msg_rows = 1usize << (log_d - layer);
-        let stage_len = if lane_major.is_some() {
-            BATCH * rows * num_ntts
-        } else {
-            0
-        };
+        let width = if lane_major.is_some() { BATCH * 8 } else { num_ntts };
+        let stage_len = if lane_major.is_some() { rows * width } else { 0 };
         let base = parallel::SendPtr(data.as_mut_ptr());
         // Whole cache lines in every row, so a finished group can drain a line at a time.
         let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
         let hooks = hook_calls(layer + g, layer, layer + g, layer);
         // A small group's rows arrive without help, and its bookkeeping would cost more than it saves.
         let fetch_ahead = rows * num_ntts >= FETCH_AHEAD_MIN_WORDS;
-        let drain_per_hook = (rows * num_ntts / 8).div_ceil(hooks);
+        let drain_per_hook = (rows * width / 8).div_ceil(hooks);
         parallel::for_each_chunk(n_tasks, |lo, hi| {
             // One L2-resident scratch of 2^g rows serves every group of the task.
             // A draining task has two: one transforms while the other empties.
             let deferred = stream && lines_ok;
-            with_scratch(stage_len + rows * num_ntts * (1 + usize::from(deferred)), |all| {
+            with_scratch(stage_len + rows * width * (1 + usize::from(deferred)), |all| {
                 // One fence at the end of the task covers all its streaming stores.
                 let stream = stream.then(Stream::new);
                 let (stage, both) = all.split_at_mut(stage_len);
-                let (mut scratch, mut idle) = both.split_at_mut(rows * num_ntts);
+                let (mut scratch, mut idle) = both.split_at_mut(rows * width);
                 let mut drain = Drain::default();
                 // `next`: the first row of the group after this one, and which share of its lines this group fetches.
                 // `staged`: the group's rows, when a stage holds them.
-                let mut group =
-                    |block: usize, r: usize, next: Option<(*const F64, std::ops::Range<usize>)>, staged: &[F64]| {
-                        // Row `i` of the group, as a word offset inside its block.
-                        let row = |i: usize| (r + (i << log_step)) * num_ntts;
-                        let block_off = ((block - first_block) << (log_d - layer)) * num_ntts;
-                        // Gather: the scattered rows become one contiguous 2^g-row buffer.
-                        for (i, dst) in scratch.chunks_exact_mut(num_ntts).enumerate() {
-                            // SAFETY:
-                            // - The message and the codeword both cover every row addressed here.
-                            // - Tasks own disjoint residues, so no other task writes these rows.
-                            // - Block 0 is written last, after every read of the message in it.
-                            let src = unsafe {
-                                match msg {
-                                    _ if !staged.is_empty() => &staged[i * num_ntts..][..num_ntts],
-                                    Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
-                                    None => base.slice(block_off + row(i), num_ntts),
-                                }
-                            };
-                            dst.copy_from_slice(src);
-                        }
-                        // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
-                        let (log_n, outer) = (layer + g, layer);
-                        match &stream {
-                            Some(s) if deferred => {
-                                // The previous group drains while this one transforms; the rest drains now.
-                                let (first, lines) = next.unwrap_or((std::ptr::null(), 0..0));
-                                let mut fetch = prefetch_rows(first, num_ntts, step * num_ntts, lines, hooks);
-                                self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, || {
-                                    drain.step(s, drain_per_hook);
-                                    fetch();
-                                });
-                                drain.step(s, usize::MAX);
-                                // This group drains during the next transform, while the other scratch is gathered into.
-                                drain = Drain {
-                                    // SAFETY: the group's first row lies inside the codeword.
-                                    dst: unsafe { base.0.add(block_off + row(0)) },
-                                    src: scratch.as_ptr(),
-                                    row_len: num_ntts,
-                                    dst_stride: step * num_ntts,
-                                    rows,
-                                    ..Drain::default()
-                                };
-                                std::mem::swap(&mut scratch, &mut idle);
+                // `col`: the first word of the group's lanes in a codeword row, which is nonzero for an octet.
+                let mut group = |block: usize,
+                                 r: usize,
+                                 next: Option<(*const F64, std::ops::Range<usize>)>,
+                                 staged: &[F64],
+                                 col: usize| {
+                    // Row `i` of the group, as a word offset inside its block.
+                    let row = |i: usize| (r + (i << log_step)) * num_ntts;
+                    let block_off = ((block - first_block) << (log_d - layer)) * num_ntts;
+                    // Gather: the scattered rows become one contiguous 2^g-row buffer.
+                    for (i, dst) in scratch.chunks_exact_mut(width).enumerate() {
+                        // SAFETY:
+                        // - The message and the codeword both cover every row addressed here.
+                        // - Tasks own disjoint residues, so no other task writes these rows.
+                        // - Block 0 is written last, after every read of the message in it.
+                        let src = unsafe {
+                            match msg {
+                                _ if !staged.is_empty() => &staged[i * width..][..width],
+                                Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
+                                None => base.slice(block_off + row(i), num_ntts),
                             }
-                            _ => {
-                                self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, no_hook);
-                                // Scatter: every row returns to its place.
-                                for (i, src) in scratch.chunks_exact(num_ntts).enumerate() {
-                                    // SAFETY: this group alone owns these rows of the codeword.
-                                    let dst = unsafe { base.slice(block_off + row(i), num_ntts) };
+                        };
+                        dst.copy_from_slice(src);
+                    }
+                    // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
+                    let (log_n, outer) = (layer + g, layer);
+                    match &stream {
+                        Some(s) if deferred => {
+                            // The previous group drains while this one transforms; the rest drains now.
+                            let (first, lines) = next.unwrap_or((std::ptr::null(), 0..0));
+                            let mut fetch = prefetch_rows(first, num_ntts, step * num_ntts, lines, hooks);
+                            self.run_layers(scratch, log_n, width, layer, log_n, outer, block, || {
+                                drain.step(s, drain_per_hook);
+                                fetch();
+                            });
+                            drain.step(s, usize::MAX);
+                            // This group drains during the next transform, while the other scratch is gathered into.
+                            drain = Drain {
+                                // SAFETY: the group's first row lies inside the codeword.
+                                dst: unsafe { base.0.add(block_off + row(0) + col) },
+                                src: scratch.as_ptr(),
+                                row_len: width,
+                                dst_stride: step * num_ntts,
+                                // The lines of a staged row are consecutive residues, so whole codeword rows apart.
+                                line_stride: if staged.is_empty() { 8 } else { num_ntts },
+                                rows,
+                                ..Drain::default()
+                            };
+                            std::mem::swap(&mut scratch, &mut idle);
+                        }
+                        _ => {
+                            self.run_layers(scratch, log_n, width, layer, log_n, outer, block, no_hook);
+                            // Scatter: every row returns to its place, a staged row as one line per residue.
+                            let piece = if staged.is_empty() { num_ntts } else { 8 };
+                            for (i, row_src) in scratch.chunks_exact(width).enumerate() {
+                                for (l, src) in row_src.chunks_exact(piece).enumerate() {
+                                    // SAFETY: this group alone owns these words of the codeword.
+                                    let dst = unsafe { base.slice(block_off + row(i) + l * num_ntts + col, piece) };
                                     match &stream {
                                         Some(s) => s.copy(dst, src),
                                         None => dst.copy_from_slice(src),
@@ -911,18 +922,28 @@ impl AdditiveNttF64 {
                                 }
                             }
                         }
-                    };
+                    }
+                };
                 let lines = rows * num_ntts / 8;
                 for t in lo..hi {
                     if let (Some(m), Some(n_lanes)) = (msg, lane_major) {
-                        // A task is a batch of residues: transpose their row groups into the stage, then run each.
+                        // A task is a batch of residues: transpose an octet of lanes into the stage, then run each block.
                         let t0 = t * BATCH;
-                        fill_stage(stage, m.0.cast_const(), t0, log_step, msg_rows, n_lanes, num_ntts);
                         // No fetch-ahead: a batch's lines sit 16 KB apart in blocks 16 MB apart, so they share
                         // a few L2 and L3 sets. Lines fetched a batch early are evicted before the fill reads them.
-                        for (s, staged) in stage.chunks_exact(rows * num_ntts).enumerate() {
+                        for octet in 0..num_ntts / 8 {
+                            fill_stage(
+                                stage,
+                                m.0.cast_const(),
+                                t0,
+                                log_step,
+                                msg_rows,
+                                n_lanes,
+                                num_ntts,
+                                octet,
+                            );
                             for block in (first_block..first_block + blocks_held).rev() {
-                                group(block, t0 + s, None, staged);
+                                group(block, t0, None, stage, 8 * octet);
                             }
                         }
                     } else if let Some(m) = msg {
@@ -934,7 +955,7 @@ impl AdditiveNttF64 {
                                 let first = m.0.cast_const().wrapping_add((t + 1) * num_ntts);
                                 (first, (k * lines) >> layer..((k + 1) * lines) >> layer)
                             });
-                            group(block, t, next, &[]);
+                            group(block, t, next, &[], 0);
                         }
                     } else {
                         // Task index = block * step + residue; the next task reads its own, disjoint rows.
@@ -942,7 +963,7 @@ impl AdditiveNttF64 {
                             let (block, r) = ((t + 1) >> log_step, (t + 1) & (step - 1));
                             (base.0.cast_const().wrapping_add(((block << (log_d - layer)) + r) * num_ntts), 0..lines)
                         });
-                        group(t >> log_step, t & (step - 1), next, &[]);
+                        group(t >> log_step, t & (step - 1), next, &[], 0);
                     }
                 }
                 if let Some(s) = &stream {
@@ -1142,6 +1163,7 @@ fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usi
 /// A finished row group of a gathered pass, leaving its scratch for the codeword a few lines at a time.
 ///
 /// - `dst` is the group's first row in the codeword, `dst_stride` words before its next.
+/// - Line `l` of a row lands `l * line_stride` words after the row: 8 for a row that stays whole.
 /// - `src` is the group's contiguous scratch.
 /// - `row`, `line` are the next cache line to move.
 /// - Both sides are whole, aligned cache lines: the caller checks the codeword's alignment and `row_len % 8 == 0`.
@@ -1150,6 +1172,7 @@ struct Drain {
     src: *const F64,
     row_len: usize,
     dst_stride: usize,
+    line_stride: usize,
     rows: usize,
     row: usize,
     line: usize,
@@ -1163,6 +1186,7 @@ impl Default for Drain {
             src: std::ptr::null(),
             row_len: 0,
             dst_stride: 0,
+            line_stride: 8,
             rows: 0,
             row: 0,
             line: 0,
@@ -1180,7 +1204,7 @@ impl Drain {
             // - Only this group's owner writes these rows of the codeword.
             // - The scratch half is neither written nor gathered into until its group has drained.
             unsafe {
-                let dst = self.dst.add(self.row * self.dst_stride + self.line * 8);
+                let dst = self.dst.add(self.row * self.dst_stride + self.line * self.line_stride);
                 let src = self.src.add(self.row * self.row_len + self.line * 8);
                 stream.copy_lines(dst.cast::<Line>(), &*src.cast::<Line>());
             }
@@ -1554,12 +1578,13 @@ fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
     })
 }
 
-/// Transpose the row groups of [`BATCH`] consecutive residues of a lane-major message into `stage`.
+/// Transpose one octet of lanes of [`BATCH`] consecutive residues of a lane-major message into `stage`.
 ///
 /// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
 ///   is lane block `row_words - 1 - w` of the message, or zero while `w` is below the padding.
 /// - Residue `t0 + s` takes rows `t0 + s + i * step` for `i < rows`, `step = 2^log_step`.
-/// - `stage` holds the residues' groups back to back: row `i` of residue `s` is at `(s * rows + i) * row_words`.
+/// - The octet is lanes `8 * octet..8 * octet + 8`. Together with the residues, they are 64 lanes of one transform.
+/// - `stage` has `rows` rows of 64 words: lane `8 * octet + k` of row `t0 + s + i * step` is word `(i * BATCH + s) * 8 + k`.
 /// - One tile is 8 words of 8 lane blocks, so each 64 byte line of a lane block is read once, whole.
 fn fill_stage(
     stage: &mut [F64],
@@ -1569,39 +1594,37 @@ fn fill_stage(
     msg_rows: usize,
     n_lanes: usize,
     row_words: usize,
+    octet: usize,
 ) {
-    let rows = stage.len() / (BATCH * row_words);
+    let rows = stage.len() / (BATCH * 8);
     let pad = row_words - n_lanes;
     let out = stage.as_mut_ptr();
-    // Octet by octet, so the hardware prefetcher follows 8 lane streams, not a row's 48 lines in one L2 set.
-    for octet in 0..row_words / 8 {
-        // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
-        let block = |k: usize| row_words - 1 - (8 * octet + k);
-        if 8 * octet >= pad {
-            // No padding lane: the tile needs no null check.
-            for i in 0..rows {
-                let j = t0 + (i << log_step);
-                let src: [*const F64; 8] = std::array::from_fn(|k| msg.wrapping_add(block(k) * msg_rows + j));
-                // SAFETY: as in the padded case below, and no source is null.
-                unsafe { transpose_tile::<false>(&src, |s| out.add((s * rows + i) * row_words + 8 * octet)) };
-            }
-            continue;
-        }
+    // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
+    let block = |k: usize| row_words - 1 - (8 * octet + k);
+    if 8 * octet >= pad {
+        // No padding lane: the tile needs no null check.
         for i in 0..rows {
             let j = t0 + (i << log_step);
-            // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane.
-            let src: [*const F64; 8] = std::array::from_fn(|k| {
-                if 8 * octet + k < pad {
-                    std::ptr::null()
-                } else {
-                    msg.wrapping_add(block(k) * msg_rows + j)
-                }
-            });
-            // SAFETY:
-            // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
-            // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`, `octet < row_words / 8`.
-            unsafe { transpose_tile::<true>(&src, |s| out.add((s * rows + i) * row_words + 8 * octet)) };
+            let src: [*const F64; 8] = std::array::from_fn(|k| msg.wrapping_add(block(k) * msg_rows + j));
+            // SAFETY: as in the padded case below, and no source is null.
+            unsafe { transpose_tile::<false>(&src, |s| out.add((i * BATCH + s) * 8)) };
         }
+        return;
+    }
+    for i in 0..rows {
+        let j = t0 + (i << log_step);
+        // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane.
+        let src: [*const F64; 8] = std::array::from_fn(|k| {
+            if 8 * octet + k < pad {
+                std::ptr::null()
+            } else {
+                msg.wrapping_add(block(k) * msg_rows + j)
+            }
+        });
+        // SAFETY:
+        // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
+        // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`.
+        unsafe { transpose_tile::<true>(&src, |s| out.add((i * BATCH + s) * 8)) };
     }
 }
 
