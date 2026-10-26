@@ -206,6 +206,7 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
     let codeword_len = n_positions * row_words;
 
     // SAFETY: every codeword element is written before it is read.
+    // `encode_lane_major` writes every block from the message.
     // `transpose_lane_major` covers every word of the message region (its tiles are
     // asserted to), and `encode_interleaved_in_place` writes every other replica from
     // it before transforming that region in place.
@@ -214,14 +215,14 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
     // Leaves are hashed as the encode finishes each block of rows.
     let tree = merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size);
     let deep = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = row_words).in_scope(|| {
-        let message_region = &mut codeword[..row_words << log_rows];
-        crate::ntt::transpose_lane_major(message_region, message, n_lanes, row_words, log_rows);
         let ntt = AdditiveNttF64::standard(k_code);
         let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
         if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
-            ntt.encode_interleaved_in_place_without_deep(&mut codeword, row_words, log_inv_rate, &on_rows)
+            ntt.encode_lane_major(&mut codeword, message, n_lanes, row_words, log_inv_rate, &on_rows, true)
                 .map(|rows| (ntt, rows))
         } else {
+            let message_region = &mut codeword[..row_words << log_rows];
+            crate::ntt::transpose_lane_major(message_region, message, n_lanes, row_words, log_rows);
             ntt.encode_interleaved_in_place_with(&mut codeword, row_words, log_inv_rate, &on_rows);
             None
         }

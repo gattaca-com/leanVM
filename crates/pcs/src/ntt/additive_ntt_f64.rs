@@ -198,7 +198,7 @@ impl AdditiveNttF64 {
         on_rows: &RowSink<'_>,
     ) -> Option<DeepRows> {
         let msg = parallel::SendPtr(data.as_mut_ptr());
-        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
+        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true, None)
     }
 
     /// [`Self::encode_interleaved_with`] without writing the deep pass back, as
@@ -217,7 +217,44 @@ impl AdditiveNttF64 {
             "the codeword is 2^log_inv_rate messages"
         );
         let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
-        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
+        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true, None)
+    }
+
+    /// Encode a lane-major message into a codeword that starts uninitialized, handing `on_rows` every finished block.
+    ///
+    /// - The result equals [`transpose_lane_major`] into block 0 followed by the in-place encode.
+    /// - With a gathered first pass, that pass reads the message itself and writes every block.
+    /// - So no transposed copy of the message is written and read back.
+    /// - With `defer_deep`, the deep pass goes to `on_rows` only, as in [`Self::encode_interleaved_in_place_without_deep`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_lane_major(
+        &self,
+        data: &mut [F64],
+        msg: &[F64],
+        n_lanes: usize,
+        num_ntts: usize,
+        log_inv_rate: usize,
+        on_rows: &RowSink<'_>,
+        defer_deep: bool,
+    ) -> Option<DeepRows> {
+        assert!(0 < n_lanes && n_lanes <= num_ntts, "a row holds its lanes");
+        assert_eq!(data.len() % num_ntts, 0);
+        assert_eq!(
+            msg.len() * num_ntts,
+            n_lanes * (data.len() >> log_inv_rate),
+            "the message is n_lanes lane blocks"
+        );
+        // Read-only from here on: the pointer only feeds the first pass's reads.
+        let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
+        self.transform_deferring_deep(
+            data,
+            num_ntts,
+            log_inv_rate,
+            Some(msg),
+            Some(on_rows),
+            defer_deep,
+            Some(n_lanes),
+        )
     }
 
     /// RS-encode a message coset by coset, handing `on_rows` every finished block of rows and writing no codeword.
@@ -381,10 +418,14 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         on_rows: Option<&RowSink<'_>>,
     ) {
-        self.transform_deferring_deep(data, num_ntts, start, msg, on_rows, false);
+        self.transform_deferring_deep(data, num_ntts, start, msg, on_rows, false, None);
     }
 
     /// [`Self::transform`]; with `defer_deep`, the deep pass's results go only to `on_rows`, not back into the buffer.
+    ///
+    /// With `lane_major` lanes, `msg` is a separate lane-major message, which the first gathered pass reads.
+    /// A plan with no such pass transposes it into block 0 of the buffer and encodes in place.
+    #[allow(clippy::too_many_arguments)]
     fn transform_deferring_deep(
         &self,
         data: &mut [F64],
@@ -393,6 +434,7 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         on_rows: Option<&RowSink<'_>>,
         defer_deep: bool,
+        mut lane_major: Option<usize>,
     ) -> Option<DeepRows> {
         // The buffer is 2^log_d rows of `num_ntts` words.
         assert!(num_ntts > 0);
@@ -434,10 +476,23 @@ impl AdditiveNttF64 {
         //
         // Only the first one reads the message.
         let mut msg = msg;
+        // A lane-major message is read by the first gathered pass, a batch of residues at a time.
+        // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
+        if let (Some(n_lanes), Some(m)) = (lane_major, msg) {
+            let g = (deep_start - start).min(fit2);
+            if start == deep_start || num_ntts % 8 != 0 || log_d - start - g < LOG_BATCH {
+                let log_rows = log_d - start;
+                // SAFETY: the message is `n_lanes` lane blocks of `2^log_rows` words, disjoint from the buffer.
+                let words = unsafe { std::slice::from_raw_parts(m.0.cast_const(), n_lanes << log_rows) };
+                transpose_lane_major(&mut data[..num_ntts << log_rows], words, n_lanes, num_ntts, log_rows);
+                msg = Some(parallel::SendPtr(data.as_mut_ptr()));
+                lane_major = None;
+            }
+        }
         let mut layer = start;
         while layer < deep_start {
             let g = (deep_start - layer).min(fit2);
-            self.gathered_pass(data, log_d, num_ntts, layer, g, msg.take(), stream);
+            self.gathered_pass(data, log_d, num_ntts, layer, g, msg.take(), lane_major.take(), stream);
             layer += g;
         }
 
@@ -636,6 +691,14 @@ impl AdditiveNttF64 {
     /// - Group k+2 gathers into the scratch group k drained, and that drain ended with group k+1's transform.
     ///
     /// Without whole cache lines (rows or codeword start off 64 bytes), a group scatters at once.
+    ///
+    /// # With a lane-major message
+    ///
+    /// - Word `w` of message row `j` is word `j` of lane block `num_ntts - 1 - w`, and zero below the padding.
+    /// - A lane block's cache line holds [`BATCH`] consecutive rows, so a task takes that many residues.
+    /// - It first transposes their rows into a stage of `BATCH` contiguous row groups.
+    /// - The groups then gather from the stage as they would from a row-major message.
+    /// - Every block, block 0 too, is written from the stage, so the message is never overwritten.
     #[allow(clippy::too_many_arguments)]
     #[timed]
     fn gathered_pass(
@@ -646,14 +709,23 @@ impl AdditiveNttF64 {
         layer: usize,
         g: usize,
         msg: Option<parallel::SendPtr<F64>>,
+        lane_major: Option<usize>,
         stream: bool,
     ) {
         // A group is 2^g rows, `step` rows apart.
         let log_step = log_d - layer - g;
         let (rows, step) = (1usize << g, 1usize << log_step);
-        // With a message, a task is one residue across every block.
+        // With a message, a task is one residue across every block, or a batch of residues when it is lane-major.
         // Without one, a task is one (block, residue) pair.
-        let n_tasks = if msg.is_some() { step } else { step << layer };
+        let batch = if lane_major.is_some() { BATCH } else { 1 };
+        let n_tasks = if msg.is_some() { step / batch } else { step << layer };
+        // The message's rows, and the stage that holds a batch of residues' row groups.
+        let msg_rows = 1usize << (log_d - layer);
+        let stage_len = if lane_major.is_some() {
+            BATCH * rows * num_ntts
+        } else {
+            0
+        };
         let base = parallel::SendPtr(data.as_mut_ptr());
         // Whole cache lines in every row, so a finished group can drain a line at a time.
         let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
@@ -665,71 +737,86 @@ impl AdditiveNttF64 {
             // One L2-resident scratch of 2^g rows serves every group of the task.
             // A draining task has two: one transforms while the other empties.
             let deferred = stream && lines_ok;
-            with_scratch(rows * num_ntts * (1 + usize::from(deferred)), |both| {
+            with_scratch(stage_len + rows * num_ntts * (1 + usize::from(deferred)), |all| {
                 // One fence at the end of the task covers all its streaming stores.
                 let stream = stream.then(Stream::new);
+                let (stage, both) = all.split_at_mut(stage_len);
                 let (mut scratch, mut idle) = both.split_at_mut(rows * num_ntts);
                 let mut drain = Drain::default();
                 // `next`: the first row of the group after this one, and which share of its lines this group fetches.
-                let mut group = |block: usize, r: usize, next: Option<(*const F64, std::ops::Range<usize>)>| {
-                    // Row `i` of the group, as a word offset inside its block.
-                    let row = |i: usize| (r + (i << log_step)) * num_ntts;
-                    let block_off = (block << (log_d - layer)) * num_ntts;
-                    // Gather: the scattered rows become one contiguous 2^g-row buffer.
-                    for (i, dst) in scratch.chunks_exact_mut(num_ntts).enumerate() {
-                        // SAFETY:
-                        // - The message and the codeword both cover every row addressed here.
-                        // - Tasks own disjoint residues, so no other task writes these rows.
-                        // - Block 0 is written last, after every read of the message in it.
-                        let src = unsafe {
-                            match msg {
-                                Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
-                                None => base.slice(block_off + row(i), num_ntts),
-                            }
-                        };
-                        dst.copy_from_slice(src);
-                    }
-                    // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
-                    let (log_n, outer) = (layer + g, layer);
-                    match &stream {
-                        Some(s) if deferred => {
-                            // The previous group drains while this one transforms; the rest drains now.
-                            let (first, lines) = next.unwrap_or((std::ptr::null(), 0..0));
-                            let mut fetch = prefetch_rows(first, num_ntts, step * num_ntts, lines, hooks);
-                            self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, || {
-                                drain.step(s, drain_per_hook);
-                                fetch();
-                            });
-                            drain.step(s, usize::MAX);
-                            // This group drains during the next transform, while the other scratch is gathered into.
-                            drain = Drain {
-                                // SAFETY: the group's first row lies inside the codeword.
-                                dst: unsafe { base.0.add(block_off + row(0)) },
-                                src: scratch.as_ptr(),
-                                row_len: num_ntts,
-                                dst_stride: step * num_ntts,
-                                rows,
-                                ..Drain::default()
+                // `staged`: the group's rows, when a stage holds them.
+                let mut group =
+                    |block: usize, r: usize, next: Option<(*const F64, std::ops::Range<usize>)>, staged: &[F64]| {
+                        // Row `i` of the group, as a word offset inside its block.
+                        let row = |i: usize| (r + (i << log_step)) * num_ntts;
+                        let block_off = (block << (log_d - layer)) * num_ntts;
+                        // Gather: the scattered rows become one contiguous 2^g-row buffer.
+                        for (i, dst) in scratch.chunks_exact_mut(num_ntts).enumerate() {
+                            // SAFETY:
+                            // - The message and the codeword both cover every row addressed here.
+                            // - Tasks own disjoint residues, so no other task writes these rows.
+                            // - Block 0 is written last, after every read of the message in it.
+                            let src = unsafe {
+                                match msg {
+                                    _ if !staged.is_empty() => &staged[i * num_ntts..][..num_ntts],
+                                    Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
+                                    None => base.slice(block_off + row(i), num_ntts),
+                                }
                             };
-                            std::mem::swap(&mut scratch, &mut idle);
+                            dst.copy_from_slice(src);
                         }
-                        _ => {
-                            self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, no_hook);
-                            // Scatter: every row returns to its place.
-                            for (i, src) in scratch.chunks_exact(num_ntts).enumerate() {
-                                // SAFETY: this group alone owns these rows of the codeword.
-                                let dst = unsafe { base.slice(block_off + row(i), num_ntts) };
-                                match &stream {
-                                    Some(s) => s.copy(dst, src),
-                                    None => dst.copy_from_slice(src),
+                        // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
+                        let (log_n, outer) = (layer + g, layer);
+                        match &stream {
+                            Some(s) if deferred => {
+                                // The previous group drains while this one transforms; the rest drains now.
+                                let (first, lines) = next.unwrap_or((std::ptr::null(), 0..0));
+                                let mut fetch = prefetch_rows(first, num_ntts, step * num_ntts, lines, hooks);
+                                self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, || {
+                                    drain.step(s, drain_per_hook);
+                                    fetch();
+                                });
+                                drain.step(s, usize::MAX);
+                                // This group drains during the next transform, while the other scratch is gathered into.
+                                drain = Drain {
+                                    // SAFETY: the group's first row lies inside the codeword.
+                                    dst: unsafe { base.0.add(block_off + row(0)) },
+                                    src: scratch.as_ptr(),
+                                    row_len: num_ntts,
+                                    dst_stride: step * num_ntts,
+                                    rows,
+                                    ..Drain::default()
+                                };
+                                std::mem::swap(&mut scratch, &mut idle);
+                            }
+                            _ => {
+                                self.run_layers(scratch, log_n, num_ntts, layer, log_n, outer, block, no_hook);
+                                // Scatter: every row returns to its place.
+                                for (i, src) in scratch.chunks_exact(num_ntts).enumerate() {
+                                    // SAFETY: this group alone owns these rows of the codeword.
+                                    let dst = unsafe { base.slice(block_off + row(i), num_ntts) };
+                                    match &stream {
+                                        Some(s) => s.copy(dst, src),
+                                        None => dst.copy_from_slice(src),
+                                    }
                                 }
                             }
                         }
-                    }
-                };
+                    };
                 let lines = rows * num_ntts / 8;
                 for t in lo..hi {
-                    if let Some(m) = msg {
+                    if let (Some(m), Some(n_lanes)) = (msg, lane_major) {
+                        // A task is a batch of residues: transpose their row groups into the stage, then run each.
+                        let t0 = t * BATCH;
+                        fill_stage(stage, m.0.cast_const(), t0, log_step, msg_rows, n_lanes, num_ntts);
+                        // No fetch-ahead: a batch's lines sit 16 KB apart in blocks 16 MB apart, so they share
+                        // a few L2 and L3 sets. Lines fetched a batch early are evicted before the fill reads them.
+                        for (s, staged) in stage.chunks_exact(rows * num_ntts).enumerate() {
+                            for block in (0..1usize << layer).rev() {
+                                group(block, t0 + s, None, staged);
+                            }
+                        }
+                    } else if let Some(m) = msg {
                         // Block 0 may be the message itself, so it is transformed last.
                         // The residue after this one reads fresh rows: its lines are fetched over this one's groups.
                         let blocks = 1usize << layer;
@@ -738,7 +825,7 @@ impl AdditiveNttF64 {
                                 let first = m.0.cast_const().wrapping_add((t + 1) * num_ntts);
                                 (first, (k * lines) >> layer..((k + 1) * lines) >> layer)
                             });
-                            group(block, t, next);
+                            group(block, t, next, &[]);
                         }
                     } else {
                         // Task index = block * step + residue; the next task reads its own, disjoint rows.
@@ -746,7 +833,7 @@ impl AdditiveNttF64 {
                             let (block, r) = ((t + 1) >> log_step, (t + 1) & (step - 1));
                             (base.0.cast_const().wrapping_add(((block << (log_d - layer)) + r) * num_ntts), 0..lines)
                         });
-                        group(t >> log_step, t & (step - 1), next);
+                        group(t >> log_step, t & (step - 1), next, &[]);
                     }
                 }
                 if let Some(s) = &stream {
@@ -1257,6 +1344,10 @@ const COSET_WORDS: usize = 1 << 19;
 /// - A smaller buffer stays in L3 for the next pass, which a streaming store would give up.
 const STREAM_MIN_WORDS: usize = 1 << 23;
 
+/// Residues a lane-major first pass takes at once, as a log: one cache line of a lane block.
+const LOG_BATCH: usize = 3;
+const BATCH: usize = 1 << LOG_BATCH;
+
 /// Gathered groups of at least this many words fetch the next group's source rows while they transform.
 const FETCH_AHEAD_MIN_WORDS: usize = 1 << 13;
 
@@ -1283,6 +1374,108 @@ fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
         // - The buffer holds at least the requested words, all initialized.
         f(unsafe { std::slice::from_raw_parts_mut(lines.as_mut_ptr().cast::<F64>(), len) })
     })
+}
+
+/// Transpose the row groups of [`BATCH`] consecutive residues of a lane-major message into `stage`.
+///
+/// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
+///   is lane block `row_words - 1 - w` of the message, or zero while `w` is below the padding.
+/// - Residue `t0 + s` takes rows `t0 + s + i * step` for `i < rows`, `step = 2^log_step`.
+/// - `stage` holds the residues' groups back to back: row `i` of residue `s` is at `(s * rows + i) * row_words`.
+/// - One tile is 8 words of 8 lane blocks, so each 64 byte line of a lane block is read once, whole.
+fn fill_stage(
+    stage: &mut [F64],
+    msg: *const F64,
+    t0: usize,
+    log_step: usize,
+    msg_rows: usize,
+    n_lanes: usize,
+    row_words: usize,
+) {
+    let rows = stage.len() / (BATCH * row_words);
+    let pad = row_words - n_lanes;
+    let out = stage.as_mut_ptr();
+    for i in 0..rows {
+        let j = t0 + (i << log_step);
+        for octet in 0..row_words / 8 {
+            // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane.
+            let src: [*const F64; 8] = std::array::from_fn(|k| {
+                let w = 8 * octet + k;
+                if w < pad {
+                    std::ptr::null()
+                } else {
+                    msg.wrapping_add((row_words - 1 - w) * msg_rows + j)
+                }
+            });
+            // SAFETY:
+            // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
+            // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`, `octet < row_words / 8`.
+            unsafe { transpose_tile(&src, |s| out.add((s * rows + i) * row_words + 8 * octet)) };
+        }
+    }
+}
+
+/// Write `dst(s)[k] = src[k][s]` for the 8 x 8 words of eight lines, a null line being zeros.
+///
+/// # Safety
+///
+/// Every non-null `src[k]` is valid for 8 reads, and every `dst(s)` for 8 writes, apart from the sources.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+unsafe fn transpose_tile(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller's bounds; AVX-512F is enabled at compile time.
+    unsafe {
+        let r: [__m512i; 8] = std::array::from_fn(|k| {
+            if src[k].is_null() {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(src[k].cast())
+            }
+        });
+        // Pairs of columns: lanes `[(r0, r1), (r2, r3)]`, then 128-bit lane picks to finish.
+        let (a0, a1) = (_mm512_unpacklo_epi64(r[0], r[1]), _mm512_unpackhi_epi64(r[0], r[1]));
+        let (a2, a3) = (_mm512_unpacklo_epi64(r[2], r[3]), _mm512_unpackhi_epi64(r[2], r[3]));
+        let (a4, a5) = (_mm512_unpacklo_epi64(r[4], r[5]), _mm512_unpackhi_epi64(r[4], r[5]));
+        let (a6, a7) = (_mm512_unpacklo_epi64(r[6], r[7]), _mm512_unpackhi_epi64(r[6], r[7]));
+        let b0 = _mm512_shuffle_i64x2::<0x88>(a0, a2);
+        let b1 = _mm512_shuffle_i64x2::<0x88>(a1, a3);
+        let b2 = _mm512_shuffle_i64x2::<0xDD>(a0, a2);
+        let b3 = _mm512_shuffle_i64x2::<0xDD>(a1, a3);
+        let b4 = _mm512_shuffle_i64x2::<0x88>(a4, a6);
+        let b5 = _mm512_shuffle_i64x2::<0x88>(a5, a7);
+        let b6 = _mm512_shuffle_i64x2::<0xDD>(a4, a6);
+        let b7 = _mm512_shuffle_i64x2::<0xDD>(a5, a7);
+        let cols = [
+            _mm512_shuffle_i64x2::<0x88>(b0, b4),
+            _mm512_shuffle_i64x2::<0x88>(b1, b5),
+            _mm512_shuffle_i64x2::<0x88>(b2, b6),
+            _mm512_shuffle_i64x2::<0x88>(b3, b7),
+            _mm512_shuffle_i64x2::<0xDD>(b0, b4),
+            _mm512_shuffle_i64x2::<0xDD>(b1, b5),
+            _mm512_shuffle_i64x2::<0xDD>(b2, b6),
+            _mm512_shuffle_i64x2::<0xDD>(b3, b7),
+        ];
+        for (s, col) in cols.into_iter().enumerate() {
+            _mm512_storeu_si512(dst(s).cast(), col);
+        }
+    }
+}
+
+/// [`transpose_tile`] word by word.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+unsafe fn transpose_tile(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
+    for s in 0..8 {
+        for (k, line) in src.iter().enumerate() {
+            // SAFETY: the caller's bounds.
+            unsafe {
+                dst(s)
+                    .add(k)
+                    .write(if line.is_null() { F64::ZERO } else { line.add(s).read() })
+            };
+        }
+    }
 }
 
 /// Fill every replica of the buffer with a copy of the message.
@@ -2061,6 +2254,57 @@ mod tests {
                         want[pos],
                         "lane {lane} pos {pos} at log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The lane-major encode reads the message in its first gathered pass, so it must equal the
+    /// transpose into block 0 followed by the in-place encode: rows handed over and rows opened.
+    /// The shapes cover a fused first pass (with and without padding lanes, at both rates),
+    /// a deep-only plan, and a domain too small for any gathered pass.
+    #[test]
+    fn lane_major_encode_matches_transpose_then_in_place() {
+        let mut rng = Rng::new(0x7A5E);
+        for (log_rows, log_inv_rate, n_lanes) in [
+            (13usize, 2usize, 47usize),
+            (14, 1, 40),
+            (13, 1, 17),
+            (12, 2, 64),
+            (5, 2, 7),
+        ] {
+            let log_d = log_rows + log_inv_rate;
+            let ntt = AdditiveNttF64::standard(log_d);
+            let msg: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
+            let row_words = n_lanes.next_multiple_of(8);
+            let mut want = vec![F64::ZERO; (row_words << log_rows) << log_inv_rate];
+            transpose_lane_major(&mut want[..row_words << log_rows], &msg, n_lanes, row_words, log_rows);
+            ntt.encode_interleaved_in_place(&mut want, row_words, log_inv_rate);
+
+            for defer_deep in [false, true] {
+                let mut got = vec![F64(0xBAD); want.len()];
+                let handed = std::sync::Mutex::new(vec![F64::ZERO; got.len()]);
+                let on_rows = |row: usize, rows: &[F64]| {
+                    handed.lock().unwrap()[row * row_words..][..rows.len()].copy_from_slice(rows)
+                };
+                let deep =
+                    ntt.encode_lane_major(&mut got, &msg, n_lanes, row_words, log_inv_rate, &on_rows, defer_deep);
+                let context =
+                    format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}, defer_deep={defer_deep}");
+                assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, {context}");
+                let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+                let rows = match deep {
+                    Some(deep) => ntt.finish_rows(&got, &deep, &positions),
+                    None => {
+                        assert_eq!(got, want, "codeword, {context}");
+                        positions
+                            .iter()
+                            .map(|&q| got[q * row_words..][..row_words].to_vec())
+                            .collect()
+                    }
+                };
+                for (&q, row) in positions.iter().zip(&rows) {
+                    assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
                 }
             }
         }
