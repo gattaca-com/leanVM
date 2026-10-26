@@ -319,143 +319,207 @@ unsafe fn publish_task<G: Lanes>(
     }
 }
 
-/// Build one side's leaf vector: block `b` row `z` holds `β − Σ_i w_i c_i(z)` for
+/// One leaf of a block at row `z`: the α-weighted coordinate sum defers its reductions. Each mixed
+/// product contributes its three raw limb products (3 PMULL, no reduction tail) and one combined
+/// reduction ends the row, bit-identical to summing reduced `mul_base` terms.
+fn leaf_row((constant, terms): &(F192, Terms), z: usize) -> F192 {
+    let mut acc = F192Unreduced::ZERO;
+    for (k, c) in &terms.lins {
+        acc ^= c.mul_base_unreduced(k[z]);
+    }
+    for (a, b, c) in &terms.prods {
+        acc ^= c.mul_base_unreduced(a[z] * b[z]);
+    }
+    *constant + acc.reduce()
+}
+
+/// Eight leaves of a block from row `z`: every mixed product of a term is one wide kernel call,
+/// and the reduction happens once per eight rows.
+fn leaf_rows8((constant, terms): &(F192, Terms), z: usize) -> F192x8 {
+    fn eight(k: &[F64], z: usize) -> &[F64; 8] {
+        k[z..z + 8].try_into().expect("eight words")
+    }
+    let mut acc = Acc8::ZERO;
+    for (k, c) in &terms.lins {
+        acc ^= mul_base_splat8(*c, eight(k, z));
+    }
+    for (a, b, c) in &terms.prods {
+        acc ^= mul_base_splat8(*c, &mul_f64x8(eight(a, z), eight(b, z)));
+    }
+    acc.reduce_lanes() + F192x8::splat(*constant)
+}
+
+/// One side's leaf vector while it is built, with the leaf terms of each block.
+struct Side<'a> {
+    blocks: &'a [Block],
+    lay: &'a Layout,
+    explicit: usize,
+    tiled: bool,
+    leaves: Vec<gkr::Block>,
+    quads: Vec<F192>,
+    quads_done: Vec<usize>,
+    terms: Vec<(F192, Terms<'a>)>,
+}
+
+impl Side<'_> {
+    /// Whole GKR blocks of block `b`'s leaves, built in parallel. Blocks off the GKR block
+    /// boundary or too few for the pool go row by row.
+    fn bulk(&self, b: usize) -> usize {
+        let blk = &self.blocks[b];
+        let aligned = self.lay.offsets[b].is_multiple_of(gkr::BLOCK_VALUES);
+        if blk.rows >= PAR_THRESHOLD && aligned { blk.rows / gkr::BLOCK_VALUES } else { 0 }
+    }
+}
+
+/// Build the leaf vectors of several sides: block `b` row `z` holds `β − Σ_i w_i c_i(z)` for
 /// the fingerprint weights `w = eq(α⃗, ·)`, followed implicitly by the identity `1`
 /// up to `2^μ`. The row-invariant weights and constant coordinates are folded once
 /// per block into `const_part`. `gpow` supplies `g^z` for [`Coord::Index`] and is
-/// the caller's, shared by the three sides.
+/// the caller's, shared by the sides.
+///
+/// The blocks of all sides with the same number of rows read the same table, so one pass runs
+/// them together over each chunk of rows: the table's columns come from DRAM once for all of them,
+/// and every block publishes exactly what its own pass would.
 #[timed]
 pub fn build_leaves(
-    blocks: &[Block],
-    lay: &Layout,
+    sides: &[(&[Block], &Layout)],
     cols: &[&[F64]],
     w: &[F192],
     beta: F192,
     gpow: &[F64],
-) -> gkr::Leaves {
-    let explicit = blocks
+) -> Vec<gkr::Leaves> {
+    let mut sides: Vec<Side> = sides
         .iter()
-        .enumerate()
-        .map(|(b, block)| lay.offsets[b] + (1usize << block.kappa))
-        .max()
-        .unwrap_or(1);
-    debug_assert!(explicit <= 1usize << lay.mu);
-    // `stack_offsets` packs the power-of-two blocks contiguously from zero, so the
-    // blocks tile `0..explicit` and every slot below is written by one of them: the
-    // identity fill would be overwritten in full, and this is the largest buffer in
-    // the proof. The `covered` test is what licenses skipping it, so a layout that
-    // ever left a hole falls back to filling rather than reading uninitialized rows.
-    // The leaves are GKR's blocks of 64, so the identity past `explicit` is written to
-    // the end of the last one, which is where GKR expects it. The padding rows inside the layout
-    // are runs of identity that GKR skips (`Leaves::ones`), so their whole blocks stay unwritten.
-    let covered: usize = blocks.iter().map(|blk| 1usize << blk.kappa).sum();
-    let block_count = explicit.div_ceil(gkr::BLOCK_VALUES);
-    let tiled = covered == explicit;
-    let mut leaves: Vec<gkr::Block> = if tiled {
-        // SAFETY: the per-block fills below cover `0..explicit` but for the identity blocks GKR
-        // never reads, each joins before this function returns, and the tail of the last block
-        // is written next.
-        unsafe { primitives::uninit_vec(block_count) }
-    } else {
-        vec![[F192x8::ONE; 8]; block_count]
-    };
-    for l in explicit..gkr::BLOCK_VALUES * block_count {
-        gkr::set_leaf(&mut leaves, l, F192::ONE);
-    }
-    // The first radix-four layer, `quads[k] = leaves[4k] · … · leaves[4k + 3]`, built from the
-    // staged rows while they are in L1, so GKR never reads the leaves to build it.
-    //
-    // SAFETY: every slot is written before this function returns: the staged groups write
-    // theirs, and `finish_quads` writes every slot past them.
-    let mut quads = unsafe { primitives::uninit_vec::<F192>(explicit.div_ceil(4)) };
-    let quads_ptr = parallel::SendPtr(quads.as_mut_ptr());
-    let mut quads_done = vec![0usize; blocks.len()];
-    for (b, blk) in blocks.iter().enumerate() {
-        let mut const_part = beta;
-        let mut terms = Terms::default();
-        for (i, c) in blk.coords.iter().enumerate() {
-            push_terms(c, w[i], cols, gpow, &mut terms, &mut const_part);
-        }
-        let row = |z: usize| -> F192 {
-            // The α-weighted coordinate sum defers its reductions: each mixed
-            // product contributes its three raw limb products (3 PMULL, no
-            // reduction tail), one combined reduction per row at the end,
-            // bit-identical to summing reduced `mul_base` terms.
-            let mut acc = F192Unreduced::ZERO;
-            for (k, c) in &terms.lins {
-                acc ^= c.mul_base_unreduced(k[z]);
+        .map(|&(blocks, lay)| {
+            let explicit = blocks
+                .iter()
+                .enumerate()
+                .map(|(b, block)| lay.offsets[b] + (1usize << block.kappa))
+                .max()
+                .unwrap_or(1);
+            debug_assert!(explicit <= 1usize << lay.mu);
+            // `stack_offsets` packs the power-of-two blocks contiguously from zero, so the
+            // blocks tile `0..explicit` and every slot below is written by one of them: the
+            // identity fill would be overwritten in full, and this is the largest buffer in
+            // the proof. The `covered` test is what licenses skipping it, so a layout that
+            // ever left a hole falls back to filling rather than reading uninitialized rows.
+            // The leaves are GKR's blocks of 64, so the identity past `explicit` is written to
+            // the end of the last one, which is where GKR expects it. The padding rows inside the layout
+            // are runs of identity that GKR skips (`Leaves::ones`), so their whole blocks stay unwritten.
+            let covered: usize = blocks.iter().map(|blk| 1usize << blk.kappa).sum();
+            let block_count = explicit.div_ceil(gkr::BLOCK_VALUES);
+            let tiled = covered == explicit;
+            let mut leaves: Vec<gkr::Block> = if tiled {
+                // SAFETY: the per-block fills below cover `0..explicit` but for the identity blocks GKR
+                // never reads, each joins before this function returns, and the tail of the last block
+                // is written next.
+                unsafe { primitives::uninit_vec(block_count) }
+            } else {
+                vec![[F192x8::ONE; 8]; block_count]
+            };
+            for l in explicit..gkr::BLOCK_VALUES * block_count {
+                gkr::set_leaf(&mut leaves, l, F192::ONE);
             }
-            for (a, b, c) in &terms.prods {
-                acc ^= c.mul_base_unreduced(a[z] * b[z]);
+            // The first radix-four layer, `quads[k] = leaves[4k] · … · leaves[4k + 3]`, built from the
+            // staged rows while they are in L1, so GKR never reads the leaves to build it.
+            //
+            // SAFETY: every slot is written before this function returns: the staged groups write
+            // theirs, and `finish_quads` writes every slot past them.
+            let quads = unsafe { primitives::uninit_vec::<F192>(explicit.div_ceil(4)) };
+            let terms = blocks
+                .iter()
+                .map(|blk| {
+                    let mut const_part = beta;
+                    let mut terms = Terms::default();
+                    for (i, c) in blk.coords.iter().enumerate() {
+                        push_terms(c, w[i], cols, gpow, &mut terms, &mut const_part);
+                    }
+                    (const_part, terms)
+                })
+                .collect();
+            Side {
+                blocks,
+                lay,
+                explicit,
+                tiled,
+                leaves,
+                quads,
+                quads_done: lay.offsets[..blocks.len()].to_vec(),
+                terms,
             }
-            const_part + acc.reduce()
-        };
-        // Eight rows at a time: every mixed product of a term is one wide kernel call, and the
-        // row's reduction happens once per eight rows.
-        let rows8 = |z: usize| -> F192x8 {
-            fn eight(k: &[F64], z: usize) -> &[F64; 8] {
-                k[z..z + 8].try_into().expect("eight words")
-            }
-            let mut acc = Acc8::ZERO;
-            for (k, c) in &terms.lins {
-                acc ^= mul_base_splat8(*c, eight(k, z));
-            }
-            for (a, b, c) in &terms.prods {
-                acc ^= mul_base_splat8(*c, &mul_f64x8(eight(a, z), eight(b, z)));
-            }
-            acc.reduce_lanes() + F192x8::splat(const_part)
-        };
-        let off = lay.offsets[b];
-        quads_done[b] = off;
-        let end = off + (1usize << blk.kappa);
-        // Whole blocks of leaves, off the block boundary or too few for the pool, go one by one.
-        let bulk = if blk.rows >= PAR_THRESHOLD && off.is_multiple_of(gkr::BLOCK_VALUES) {
-            blk.rows / gkr::BLOCK_VALUES
-        } else {
-            0
-        };
-        if bulk > 0 {
-            const BLOCKS: usize = 128;
-            let first = off / gkr::BLOCK_VALUES;
-            parallel::chunks_mut(&mut leaves[first..first + bulk], BLOCKS, |c, task| {
-                // SAFETY: task `c` owns the quads of its blocks, which no other task touches.
-                unsafe { publish_task(task, quads_ptr, first + c * BLOCKS, |l| rows8(l - off)) };
-            });
-            quads_done[b] = off + gkr::BLOCK_VALUES * bulk;
-        }
-        for z in gkr::BLOCK_VALUES * bulk..blk.rows {
-            gkr::set_leaf(&mut leaves, off + z, row(z));
-        }
-        // A padding row's leaf is the identity, so it leaves the product alone.
-        if tiled {
-            fill_ones(&mut leaves, off + blk.rows, end, explicit);
-        }
-    }
-    let mut ones: Vec<Range<usize>> = Vec::new();
-    if tiled {
-        finish_quads(&leaves, &mut quads, blocks, lay, &quads_done);
-        let mut runs: Vec<_> = blocks
-            .iter()
-            .enumerate()
-            .map(|(b, blk)| lay.offsets[b] + blk.rows..lay.offsets[b] + (1usize << blk.kappa))
-            .filter(|run| !run.is_empty())
+        })
+        .collect();
+    const BLOCKS: usize = 128;
+    let mut jobs: Vec<(usize, usize, usize)> = (0..sides.len())
+        .flat_map(|s| (0..sides[s].blocks.len()).map(move |b| (s, b)))
+        .filter(|&(s, b)| sides[s].bulk(b) > 0)
+        .map(|(s, b)| (sides[s].blocks[b].rows, s, b))
+        .collect();
+    jobs.sort_by_key(|&(rows, ..)| rows);
+    for group in jobs.chunk_by(|x, y| x.0 == y.0) {
+        let bulk = group[0].0 / gkr::BLOCK_VALUES;
+        let ptrs: Vec<_> = sides
+            .iter_mut()
+            .map(|s| (parallel::SendPtr(s.leaves.as_mut_ptr()), parallel::SendPtr(s.quads.as_mut_ptr())))
             .collect();
-        runs.sort_unstable_by_key(|run| run.start);
-        for run in runs {
-            match ones.last_mut() {
-                Some(last) if last.end == run.start => last.end = run.end,
-                _ => ones.push(run),
+        parallel::for_each(bulk.div_ceil(BLOCKS), |c| {
+            for &(_, s, b) in group {
+                let side = &sides[s];
+                let off = side.lay.offsets[b];
+                let first = off / gkr::BLOCK_VALUES + c * BLOCKS;
+                // SAFETY: task `c` owns these blocks of the leaves and their quads, which no other
+                // task or block of the group touches.
+                unsafe {
+                    let task = ptrs[s].0.slice(first, BLOCKS.min(bulk - c * BLOCKS));
+                    publish_task(task, ptrs[s].1, first, |l| leaf_rows8(&side.terms[b], l - off));
+                }
             }
-        }
-    } else {
-        parallel::fill(&mut quads, |k| gkr::quad_at(&leaves, k));
+        });
     }
-    gkr::Leaves {
-        leaves,
-        len: explicit,
-        quads,
-        ones,
-    }
+    sides
+        .into_iter()
+        .map(|mut side| {
+            let (blocks, lay, explicit, tiled) = (side.blocks, side.lay, side.explicit, side.tiled);
+            for b in 0..blocks.len() {
+                let (blk, off) = (&blocks[b], lay.offsets[b]);
+                let bulk = side.bulk(b);
+                side.quads_done[b] = off + gkr::BLOCK_VALUES * bulk;
+                for z in gkr::BLOCK_VALUES * bulk..blk.rows {
+                    gkr::set_leaf(&mut side.leaves, off + z, leaf_row(&side.terms[b], z));
+                }
+                // A padding row's leaf is the identity, so it leaves the product alone.
+                if tiled {
+                    fill_ones(&mut side.leaves, off + blk.rows, off + (1usize << blk.kappa), explicit);
+                }
+            }
+            let Side { leaves, mut quads, quads_done, .. } = side;
+            let mut ones: Vec<Range<usize>> = Vec::new();
+            if tiled {
+                finish_quads(&leaves, &mut quads, blocks, lay, &quads_done);
+                let mut runs: Vec<_> = blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(b, blk)| lay.offsets[b] + blk.rows..lay.offsets[b] + (1usize << blk.kappa))
+                    .filter(|run| !run.is_empty())
+                    .collect();
+                runs.sort_unstable_by_key(|run| run.start);
+                for run in runs {
+                    match ones.last_mut() {
+                        Some(last) if last.end == run.start => last.end = run.end,
+                        _ => ones.push(run),
+                    }
+                }
+            } else {
+                parallel::fill(&mut quads, |k| gkr::quad_at(&leaves, k));
+            }
+            gkr::Leaves {
+                leaves,
+                len: explicit,
+                quads,
+                ones,
+            }
+        })
+        .collect()
 }
 
 /// The values at `level`, of a table of `len`, that GKR never reads inside the run of identity
@@ -990,15 +1054,14 @@ pub fn prove_balance(
         .map(|b| b.kappa)
         .max();
     let gpow = index_k.map_or_else(Vec::new, |k| primitives::field::g_powers(1usize << k));
-    // Three independent leaf vectors, built one after another: each `build_leaves`
-    // already fans its own blocks out across the whole pool, so nesting a
-    // three-way outer split on top would only add a barrier.
+    // Push and pull are built together, so a table's columns are read once for both sides.
     let (push_leaves, pull_leaves, count_leaves) = crate::stage!("Bus leaves", || {
-        (
-            build_leaves(push, &push_lay, cols, &w, beta, &gpow),
-            build_leaves(pull, &pull_lay, cols, &w, beta, &gpow),
-            build_count_leaves(count, &count_lay, cols),
-        )
+        let [push_leaves, pull_leaves]: [_; 2] =
+            build_leaves(&[(push, &push_lay), (pull, &pull_lay)], cols, &w, beta, &gpow)
+                .try_into()
+                .ok()
+                .expect("two sides");
+        (push_leaves, pull_leaves, build_count_leaves(count, &count_lay, cols))
     });
     // Leaf construction keeps the all-one padding implicit; decomposition uses the full logical depth.
     count_lay.mu = push_lay.mu;
