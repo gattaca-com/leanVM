@@ -145,6 +145,8 @@ pub struct Plan {
     /// Idle time before each measured pass, to let a thermally-limited host
     /// recover its clocks (see the module docs).
     pub cooldown: Duration,
+    /// Skip the warmup pass, to time a fresh process's first pass.
+    pub cold: bool,
 }
 
 impl Default for Plan {
@@ -152,6 +154,7 @@ impl Default for Plan {
         Self {
             repeat: 1,
             cooldown: Duration::ZERO,
+            cold: false,
         }
     }
 }
@@ -164,7 +167,14 @@ impl Plan {
         Self {
             repeat,
             cooldown: Duration::from_secs(cooldown_secs),
+            cold: false,
         }
+    }
+
+    /// The same plan with the warmup pass skipped when `cold` is set.
+    #[must_use]
+    pub fn cold(self, cold: bool) -> Self {
+        Self { cold, ..self }
     }
 
     /// Read the plan from the environment: `BENCH_REPEAT` and `BENCH_COOLDOWN`
@@ -187,8 +197,7 @@ impl Plan {
         progress.status("[warming]");
         // Free the warmup's result before the first measured pass allocates, so
         // every measured pass sees the same steady-state footprint.
-        // `LEANVM_COLD` skips it, to time a fresh process's first pass.
-        if std::env::var_os("LEANVM_COLD").is_none() {
+        if !self.cold {
             drop(f(false));
         }
         self.run(f, progress, true)

@@ -203,6 +203,7 @@ pub fn run_recursion(
     blobs_per_leaf: usize,
     log_inv_rate: usize,
     enable_tracing: bool,
+    proof_out: Option<&std::path::Path>,
     plan: Plan,
 ) {
     assert!(
@@ -252,7 +253,7 @@ pub fn run_recursion(
         let _quiet = (!last).then(bench::suppress_tracing);
         aggregate_with_stats(&children, vec![], vec![], &[], None, log_inv_rate).expect("node aggregates")
     });
-    if let Ok(out) = std::env::var("LEANVM_PROOF_OUT") {
+    if let Some(out) = proof_out {
         std::fs::write(out, sig.to_bytes()).expect("write proof");
     }
     let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|last| {

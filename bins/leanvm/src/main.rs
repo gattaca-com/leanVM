@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 2)]
     cooldown: u64,
 
+    /// Skip the warmup pass, to time a fresh process's first pass.
+    #[arg(long, global = true)]
+    cold: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -80,6 +84,9 @@ enum Command {
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=lean_da::DA_MAX_ROWS as u64)
         )]
         blobs_per_leaf: usize,
+        /// Write the serialized aggregate proof to this file.
+        #[arg(long)]
+        proof_out: Option<std::path::PathBuf>,
     },
     /// Prove and verify Fibonacci in the exponent (demo).
     Fibonacci {
@@ -93,7 +100,7 @@ fn main() {
     let cli = Cli::parse();
     leanvm_core::init_prover();
     let flux = flux_bridge::init();
-    let plan = bench::Plan::new(cli.repeat, cli.cooldown);
+    let plan = bench::Plan::new(cli.repeat, cli.cooldown).cold(cli.cold);
     if !flux && cli.tracing && !matches!(&cli.command, Command::Recursion { .. }) {
         bench::init_tracing();
     }
@@ -106,6 +113,7 @@ fn main() {
             xmss_per_leaf,
             sphincs_per_leaf,
             blobs_per_leaf,
+            proof_out,
         } => {
             benchmark::run_recursion(
                 n,
@@ -114,6 +122,7 @@ fn main() {
                 blobs_per_leaf,
                 cli.log_inv_rate,
                 cli.tracing,
+                proof_out.as_deref(),
                 plan,
             );
         }
