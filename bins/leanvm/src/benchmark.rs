@@ -4,6 +4,7 @@
 
 use flux_profiler::timed;
 use bench::{Plan, Timing};
+use leanvm_core::cpu::GPow;
 use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rec_aggregation::{EthereumProof, aggregate, aggregate_with_stats, signers_cache};
@@ -96,6 +97,7 @@ pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize
     let blobs = blobs(n_blobs, 0);
     // Only the final measured pass of each stage is traced: the tree describes the
     // proof the reported timings are about, instead of repeating itself per pass.
+    let mut gpow = GPow::new();
     let ((sig, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
         aggregate_with_stats(
@@ -105,6 +107,7 @@ pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize
             &blobs,
             None,
             log_inv_rate,
+            &mut gpow,
         )
         .expect("leaf aggregates")
     });
@@ -249,9 +252,10 @@ pub fn run_recursion(
     if enable_tracing {
         bench::init_tracing();
     }
+    let mut gpow = GPow::new();
     let ((sig, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
-        aggregate_with_stats(&children, vec![], vec![], &[], None, log_inv_rate).expect("node aggregates")
+        aggregate_with_stats(&children, vec![], vec![], &[], None, log_inv_rate, &mut gpow).expect("node aggregates")
     });
     if let Some(out) = proof_out {
         std::fs::write(out, sig.to_bytes()).expect("write proof");
