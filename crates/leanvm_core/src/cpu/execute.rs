@@ -267,8 +267,8 @@ impl Program {
 
         let ending_pc = (self.prog.len() - 1) as u32; // last bytecode slot, g^{B-1}
 
-        // g^j and its reverse index g^j ↦ j, seeded for the pcs and return targets,
-        // the main frame and the range-check floor, then grown by each reservation.
+        // g^j and its reverse index g^j ↦ j, covering the pcs and return targets, the
+        // main frame and the range-check floor, then grown by each reservation.
         // A frame base is itself an exponent read from this table, so a step needs
         // no coverage check of its own.
         let seed = (self.prog.len() + 2)
@@ -521,7 +521,7 @@ impl Program {
             const LOG_BABY: u32 = 17;
             static TABLE: OnceLock<(GPow, F64)> = OnceLock::new();
             let (baby, giant) = TABLE.get_or_init(|| {
-                let baby = GPow::new((1usize << LOG_BABY) - 1);
+                let baby = GPow::dense((1usize << LOG_BABY) - 1);
                 // g^(2^17), one past the table; its inverse is the giant step.
                 let giant = mul_by_g(baby.pow((1usize << LOG_BABY) - 1)).inv();
                 (baby, giant)

@@ -2,7 +2,7 @@
 //! resolved hint ops a [`super::Program`] carries ([`RHint`]), and the g-power
 //! table + reverse index the hint interpreter grows on demand.
 
-use primitives::field::F64;
+use primitives::field::{F64, mul_by_g};
 use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 
@@ -17,7 +17,7 @@ pub(crate) const MAX_CELLS: u32 = 1 << 28;
 ///
 /// The interpreter needs both directions: a cell index becomes the address `g^k`,
 /// and a pointer word read back out of memory must be inverted to the index it
-/// addresses. Two things keep this cheap.
+/// addresses. Three things keep this cheap.
 ///
 /// The reverse index holds nothing but the exponent, confirming a candidate slot
 /// against the forward table, so a slot is four bytes where a `HashMap` bucket is
@@ -25,12 +25,16 @@ pub(crate) const MAX_CELLS: u32 = 1 << 28;
 /// uniform, which is all the placement asks for: one multiplicative mix, then
 /// linear probing. The table stays at most half full to keep probing short.
 ///
-/// And it indexes only the exponents [`Self::note`] announces: a run addresses
-/// millions of cells but stores only the few thousand bases of its frames and
-/// buffers, and one random write per addressable cell into a table far too large
-/// for cache is what building the whole inverse costs. A lookup that misses the
-/// announced set indexes everything and retries, so an address arriving by a
-/// route the interpreter cannot label is slow, never wrong.
+/// It indexes only the exponents [`Self::note`] announces, or a lookup resolved:
+/// a run addresses millions of cells but stores only the few thousand bases of
+/// its frames and buffers, and one random write per addressable cell into a table
+/// far too large for cache is what building the whole inverse costs.
+///
+/// A lookup that misses falls back on a coarse index of every [`STRIDE`]th
+/// exponent: it divides the address by `g` up to `STRIDE - 1` times until a
+/// multiple of `STRIDE` appears, then announces the result. An address that
+/// arrives by a route the interpreter cannot label, a pointer into the middle of
+/// a buffer, costs a few probes once and is a plain hit afterwards.
 #[derive(Default)]
 pub struct GPow {
     pow: Vec<F64>,
@@ -40,31 +44,35 @@ pub struct GPow {
     /// `k + 1` at the slot `g^k` mixes to; 0 marks an empty slot. Power-of-two
     /// length.
     index: Vec<u32>,
-    /// Set once a lookup missed: every exponent is announced from then on.
-    dense: bool,
-    /// Every exponent below this is announced.
-    announced: usize,
+    /// `k / STRIDE + 1` at the slot `g^k` mixes to, for the `coarsed` multiples
+    /// `k` of `STRIDE`. Power-of-two length, at most half full.
+    coarse: Vec<u32>,
+    coarsed: usize,
 }
 
+/// Spacing of the coarse index, and so the most probes a missed lookup costs.
+const STRIDE: usize = 16;
+
 impl GPow {
-    /// Seeded with `g^0 = 1`, grown to cover index `upto`, every exponent up to
-    /// there announced.
-    pub fn new(upto: usize) -> Self {
-        let mut g = Self::default();
-        g.pow.push(F64::ONE);
-        g.grow_to(upto);
-        g.index = vec![0; (2 * (upto + 1)).next_power_of_two().max(1 << 13)];
-        g.noted.reserve((upto + 1).next_power_of_two());
-        g.seed(upto);
-        g
+    /// Seeded with `g^0 = 1`, nothing announced.
+    pub fn new() -> Self {
+        Self {
+            pow: vec![F64::ONE],
+            index: vec![0; 1 << 13],
+            ..Self::default()
+        }
     }
 
-    /// Announce every exponent up to `upto`.
-    fn seed(&mut self, upto: usize) {
-        for k in self.announced..=upto {
-            self.note(k);
+    /// Covering index `upto`, every exponent up to there announced, so that
+    /// [`Self::lookup`] alone finds any of them.
+    pub fn dense(upto: usize) -> Self {
+        let mut g = Self::new();
+        g.grow_to(upto);
+        g.noted.reserve(upto + 1);
+        for k in 0..=upto {
+            g.note(k);
         }
-        self.announced = self.announced.max(upto + 1);
+        g
     }
 
     /// `g^k`. Panics past the grown range, which is the honest outcome: every
@@ -80,16 +88,37 @@ impl GPow {
     }
 
     /// Extend the forward table to cover index `upto`.
+    #[inline]
     pub fn grow_to(&mut self, upto: usize) {
-        assert!(upto < MAX_CELLS as usize, "address space overflow (program too large)");
-        while self.pow.len() <= upto {
-            // ×g is ×x = `mul_by_g` (shift+fold), not a PMULL.
-            let next = primitives::field::mul_by_g(*self.pow.last().unwrap());
-            self.pow.push(next);
-            if self.dense {
-                self.note(self.pow.len() - 1);
-            }
+        if upto >= self.pow.len() {
+            self.extend(upto);
         }
+    }
+
+    #[cold]
+    fn extend(&mut self, upto: usize) {
+        assert!(upto < MAX_CELLS as usize, "address space overflow (program too large)");
+        // ×g is ×x = `mul_by_g` (shift+fold), not a PMULL.
+        let mut p = *self.pow.last().unwrap();
+        let n = self.pow.len();
+        self.pow.extend((n..=upto).map(|_| {
+            p = mul_by_g(p);
+            p
+        }));
+        let want = self.pow.len().div_ceil(STRIDE);
+        if want * 2 > self.coarse.len() {
+            self.coarse = vec![0; (want * 2).next_power_of_two().max(1 << 12)];
+            self.coarsed = 0;
+        }
+        let mask = self.coarse.len() - 1;
+        for j in self.coarsed..want {
+            let mut i = slot_of(self.pow[j * STRIDE].0, mask);
+            while self.coarse[i] != 0 {
+                i = (i + 1) & mask;
+            }
+            self.coarse[i] = j as u32 + 1;
+        }
+        self.coarsed = want;
     }
 
     /// Announce that `g^k` may come back for inversion, because the interpreter
@@ -120,24 +149,34 @@ impl GPow {
     /// The discrete log of `x`, if it is a covered g-power.
     #[inline]
     pub fn log(&mut self, x: F64) -> Option<u32> {
-        if let Some(k) = self.lookup(x) {
-            return Some(k);
-        }
-        // Announced exponents are distinct and below `pow.len()`, so an equal
-        // count means the whole range is already announced and there is nothing
-        // a dense pass could add.
-        if self.dense || self.noted.len() == self.pow.len() {
-            return None;
-        }
-        // An address the interpreter never announced: index the lot and retry.
-        self.dense = true;
-        self.noted = (0..self.pow.len() as u32).collect();
-        self.widen();
-        self.lookup(x)
+        self.lookup(x).or_else(|| self.resolve(x))
     }
 
-    /// The exponent of `x` if announced, without the dense retry: all of a table
-    /// built by [`Self::new`].
+    /// `log` for an address that is not announced: divide by `g` down to a
+    /// multiple of `STRIDE`, then announce the exponent.
+    #[cold]
+    fn resolve(&mut self, x: F64) -> Option<u32> {
+        let mask = self.coarse.len() - 1;
+        let mut y = x;
+        for j in 0..STRIDE {
+            let mut i = slot_of(y.0, mask);
+            while self.coarse[i] != 0 {
+                let k = (self.coarse[i] as usize - 1) * STRIDE;
+                if self.pow[k] == y {
+                    let k = k + j;
+                    return (k < self.pow.len()).then(|| {
+                        self.note(k);
+                        k as u32
+                    });
+                }
+                i = (i + 1) & mask;
+            }
+            y = div_by_g(y);
+        }
+        None
+    }
+
+    /// The exponent of `x` if announced.
     #[inline]
     pub fn lookup(&self, x: F64) -> Option<u32> {
         let mask = self.index.len() - 1;
@@ -170,9 +209,15 @@ impl GPow {
     }
 }
 
+/// The inverse of [`mul_by_g`]: bit 0 of its output says whether it folded.
+#[inline(always)]
+fn div_by_g(a: F64) -> F64 {
+    F64(if a.0 & 1 == 1 { (a.0 ^ 0x1B) >> 1 | 1 << 63 } else { a.0 >> 1 })
+}
+
 /// The table a run leaves for the next. It is a function of the exponent alone, and
 /// announcing more only widens the index, so a run starts from what the last one
-/// announced instead of announcing every pc again.
+/// grew and announced instead of growing both again.
 static KEPT: Mutex<Option<GPow>> = Mutex::new(None);
 
 /// A [`GPow`] taken from [`KEPT`], put back when dropped. A run that finds none
@@ -180,13 +225,10 @@ static KEPT: Mutex<Option<GPow>> = Mutex::new(None);
 pub(crate) struct Kept(GPow);
 
 impl Kept {
-    /// The kept table with every exponent up to `seed` announced.
+    /// The kept table, grown to cover `seed`.
     pub(crate) fn take(seed: usize) -> Self {
-        let mut g = match KEPT.lock().unwrap().take() {
-            Some(g) => g,
-            None => return Self(GPow::new(seed)),
-        };
-        g.seed(seed);
+        let mut g = KEPT.lock().unwrap().take().unwrap_or_else(GPow::new);
+        g.grow_to(seed);
         Self(g)
     }
 }
