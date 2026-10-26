@@ -622,6 +622,9 @@ pub fn fold_in_place_pair(a: &mut Vec<F192>, b: &mut Vec<F192>, challenge: F192)
     b.truncate(half);
 }
 
+/// A fold whose output is at least this large streams it out: below, the next round finds it in cache.
+const STREAM_OUT_BYTES: usize = 1 << 24;
+
 /// Steps ahead that the fold prefetches its inputs: the hardware prefetcher alone left the first round slow and erratic.
 const PREFETCH_STEPS: usize = 8;
 
@@ -652,6 +655,7 @@ fn fold_and_compute_round_into(ins: [&[F192]; 3], outs: [&mut [F192]; 3], r_fold
     let (eq_lo, eq_hi, lo_size) = split_eq(r_eq);
     let chunks = outs.map(|o| parallel::Chunks::new(o, 2 * lo_size));
     let r = F192x8::splat(r_fold);
+    let stream_out = 3 * chunks[0].count() * 2 * lo_size * size_of::<F192>() >= STREAM_OUT_BYTES;
 
     parallel::map_reduce(
         chunks[0].count(),
@@ -664,6 +668,7 @@ fn fold_and_compute_round_into(ins: [&[F192]; 3], outs: [&mut [F192]; 3], r_fold
             // Eight pairs of folded positions: thirty-two input positions and sixteen output ones per table.
             let [mut sa, mut sb, mut sc] = ins.map(|t| t[hi * 4 * lo_size..][..32 * steps].chunks_exact(32));
             let [mut oa, mut ob, mut oc] = outs.map(|o| o.chunks_exact_mut(16));
+            let stream = Stream::new();
             let heads = ins.map(|t| t[hi * 4 * lo_size..].as_ptr());
             for (step, eq) in eq_lo[..steps].iter().enumerate() {
                 for h in heads {
@@ -674,7 +679,11 @@ fn fold_and_compute_round_into(ins: [&[F192]; 3], outs: [&mut [F192]; 3], r_fold
                     let ((e0, o0), (e1, o1)) = (F192x8::even_odd(v(0), v(1)), F192x8::even_odd(v(2), v(3)));
                     let f = [e0 + (e0 + o0) * r, e1 + (e1 + o1) * r];
                     for (f, d) in f.iter().zip(out.chunks_exact_mut(8)) {
-                        d.copy_from_slice(&f.to_array());
+                        if stream_out {
+                            stream.copy(d, &f.to_array());
+                        } else {
+                            d.copy_from_slice(&f.to_array());
+                        }
                     }
                     F192x8::even_odd(f[0], f[1])
                 };
