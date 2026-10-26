@@ -1395,9 +1395,10 @@ fn fill_stage(
     let rows = stage.len() / (BATCH * row_words);
     let pad = row_words - n_lanes;
     let out = stage.as_mut_ptr();
-    for i in 0..rows {
-        let j = t0 + (i << log_step);
-        for octet in 0..row_words / 8 {
+    // Octet by octet, so the hardware prefetcher follows 8 lane streams, not a row's 48 lines in one L2 set.
+    for octet in 0..row_words / 8 {
+        for i in 0..rows {
+            let j = t0 + (i << log_step);
             // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane.
             let src: [*const F64; 8] = std::array::from_fn(|k| {
                 let w = 8 * octet + k;
