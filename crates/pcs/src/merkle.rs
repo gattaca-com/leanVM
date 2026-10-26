@@ -582,14 +582,11 @@ mod tests {
 
     /// The node's Merkle trees alone, hashed from one L2-resident block of rows reused for every
     /// block, as the encode hands over rows it just wrote. Shapes are `(log leaves, row words, leaf words)`:
-    /// L0, then the four extension levels. `MERKLE_REPS` sets the passes.
+    /// L0, then the four extension levels. 5 passes each.
     #[test]
     #[ignore]
     fn merkle_shapes_report() {
-        let reps = std::env::var("MERKLE_REPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5usize);
+        let reps = 5usize;
         let log_block = 7;
         let rows: Vec<F64> = (0..48usize << log_block)
             .map(|i| F64((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1))

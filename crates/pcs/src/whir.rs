@@ -1567,12 +1567,12 @@ mod tests {
     }
 
     /// The L0 induce at the shapes of a 2:1 and an 8:1 recursion node, with 112 queries each.
-    /// `INDUCE_REPS` sets the passes.
+    /// 5 passes each.
     #[test]
     #[ignore]
     fn induce_shapes_report() {
         // The test binary runs under the CLI's allocator (see `encode_shapes_report`).
-        let reps = std::env::var("INDUCE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5usize);
+        let reps = 5usize;
         let mut rng = Rng::new(11);
         let (lanes_log, n_queries) = (5usize, 112usize);
         for (name, log_msg_cols, log_inv_rate) in [("n2", 19usize, 2usize), ("n8", 21, 2)] {
@@ -1593,22 +1593,28 @@ mod tests {
         }
     }
 
-    /// The encode shapes of a 2:1 recursion node, timed one at a time: the base commit, then each
-    /// extension level as `(log_msg_cols, log_inv_rate)` over 16 lanes. `ENCODE_REPS` sets the passes.
-    /// `ENCODE_N8=1` runs the shapes of an 8:1 node instead, and `ENCODE_ROOTS=1` prints every root.
+    /// The encode shapes of a recursion node, timed one at a time: the base commit, then each
+    /// extension level as `(log_msg_cols, log_inv_rate)` over 16 lanes. 5 passes each.
+    /// `encode_shapes_report` runs the 2:1 shapes and `encode_shapes_n8_report` the 8:1 shapes.
     #[test]
     #[ignore]
     fn encode_shapes_report() {
+        encode_shapes(false);
+    }
+
+    #[test]
+    #[ignore]
+    fn encode_shapes_n8_report() {
+        encode_shapes(true);
+    }
+
+    fn encode_shapes(n8: bool) {
         // The CLI's allocator: a freed codeword is served again without faulting its pages in.
         #[global_allocator]
         static ALLOCATOR: bench::Jemalloc = bench::Jemalloc;
-        let reps = std::env::var("ENCODE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5usize);
+        let reps = 5usize;
         let mut rng = Rng::new(7);
-        let only = std::env::var("ENCODE_ONLY").unwrap_or_default();
         let time = |name: &str, f: &mut dyn FnMut()| {
-            if !name.contains(only.as_str()) {
-                return;
-            }
             f();
             let t = std::time::Instant::now();
             for _ in 0..reps {
@@ -1616,15 +1622,10 @@ mod tests {
             }
             println!("{name}: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
         };
-        let roots = std::env::var("ENCODE_ROOTS").is_ok();
-        let n8 = std::env::var("ENCODE_N8").is_ok();
         let (log_rows, n_lanes, log_batch) = (if n8 { 21usize } else { 19 }, 47usize, 6usize);
         let message: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
         time("base encode", &mut || {
             let (c, _) = commit(&message, log_rows + log_batch, log_batch, 2);
-            if roots {
-                println!("root {:?}", c.root);
-            }
             std::hint::black_box(c);
         });
         let ext_shapes = if n8 { [(17usize, 5usize), (13, 8), (9, 11), (5, 14)] } else { [(15, 5), (11, 8), (7, 11), (3, 14)] };
@@ -1635,9 +1636,6 @@ mod tests {
                 &format!("ext encode log_domain {}", log_msg_cols + log_inv_rate),
                 &mut || {
                     let w = ligero_commit_ext(&poly, log_msg_cols, 4, log_inv_rate, &ntt);
-                    if roots {
-                        println!("root {:?}", &w.root()[..8]);
-                    }
                     std::hint::black_box(w);
                 },
             );
