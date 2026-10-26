@@ -187,7 +187,10 @@ impl Plan {
         progress.status("[warming]");
         // Free the warmup's result before the first measured pass allocates, so
         // every measured pass sees the same steady-state footprint.
-        drop(f(false));
+        // `LEANVM_COLD` skips it, to time a fresh process's first pass.
+        if std::env::var_os("LEANVM_COLD").is_none() {
+            drop(f(false));
+        }
         self.run(f, progress, true)
     }
 
