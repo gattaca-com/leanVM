@@ -383,8 +383,7 @@ impl AdditiveNttF64 {
 
     /// Coset `coset` of the codeword, built into `buf` (one message long) from the message.
     fn build_coset(&self, buf: &mut [F64], msg: &[F64], num_ntts: usize, log_d: usize, log_inv_rate: usize, coset: usize) {
-        buf.copy_from_slice(msg);
-        self.run_layers(buf, log_d, num_ntts, log_inv_rate, log_d, log_inv_rate, coset, no_hook);
+        self.run_layers_from(msg, buf, log_d, num_ntts, log_inv_rate, log_d, log_inv_rate, coset, no_hook);
     }
 
     /// Codeword rows `positions` of a buffer left by [`Self::encode_interleaved_in_place_without_deep`].
@@ -392,8 +391,7 @@ impl AdditiveNttF64 {
         let (subs, sub_len) = (deep.sub_blocks(positions), deep.sub_len());
         let mut built = vec![F64::ZERO; subs.len() * sub_len];
         parallel::chunks_mut(&mut built, sub_len, |i, sub| {
-            sub.copy_from_slice(&data[subs[i] * sub_len..][..sub_len]);
-            self.finish_sub_block(sub, deep, subs[i]);
+            self.finish_sub_block(Some(&data[subs[i] * sub_len..][..sub_len]), sub, deep, subs[i]);
         });
         deep.pick(&subs, &built, positions)
     }
@@ -405,10 +403,12 @@ impl AdditiveNttF64 {
         deep.pick(&subs, &built, positions)
     }
 
-    /// The deep layers over sub-block `sub_idx` of the codeword, which `sub` holds as the gathered pass left it.
-    fn finish_sub_block(&self, sub: &mut [F64], deep: &DeepRows, sub_idx: usize) {
+    /// The deep layers over sub-block `sub_idx` of the codeword, which `src` holds as the gathered pass left it.
+    ///
+    /// With no `src`, `sub` holds it and the layers run in place.
+    fn finish_sub_block(&self, src: Option<&[F64]>, sub: &mut [F64], deep: &DeepRows, sub_idx: usize) {
         let DeepRows { log_d, num_ntts, deep_start, .. } = *deep;
-        self.run_layers(sub, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, no_hook);
+        self.run_layers_to(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
     }
 
     /// The finished deep sub-blocks `subs` (sorted, distinct) of an encode that kept no buffer, back to back.
@@ -453,9 +453,8 @@ impl AdditiveNttF64 {
                         let msg = unsafe { msg.add(0) }.cast_const();
                         fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet);
                         for (coset, run, live) in &cosets {
-                            scratch.copy_from_slice(stage);
                             let live_rows = Some(&live[..]);
-                            self.run_layers_to(scratch, deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
+                            self.run_layers_to(scratch, Some(stage), deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
                             for (pos, &i) in run.clone().zip(live) {
                                 for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8].chunks_exact(8).enumerate() {
                                     // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block.
@@ -468,7 +467,7 @@ impl AdditiveNttF64 {
                 }
             });
         });
-        parallel::chunks_mut(&mut built, sub_len, |i, sub| self.finish_sub_block(sub, deep, subs[i]));
+        parallel::chunks_mut(&mut built, sub_len, |i, sub| self.finish_sub_block(None, sub, deep, subs[i]));
         built
     }
 
@@ -650,26 +649,34 @@ impl AdditiveNttF64 {
                                 //
                                 //     task at offset off of its replica  <-  message words [off, off + sub_len)
                                 let off = (sub_idx * sub_len) % block_len;
+                                // Inside one replica the first sweep reads the message itself; across several it is copied in.
+                                let mut from = None;
                                 for part in scratch.chunks_mut(block_len) {
                                     // SAFETY:
                                     // - The external message is valid for one whole replica of words.
                                     // - It is disjoint from the codeword.
                                     // - Each part ends inside its replica, so the read stays in bounds.
                                     let words = unsafe { std::slice::from_raw_parts(m.add(off), part.len()) };
-                                    part.copy_from_slice(words);
+                                    if sub_len <= block_len {
+                                        from = Some(words);
+                                    } else {
+                                        part.copy_from_slice(words);
+                                    }
                                 }
                                 match &stream {
                                     Some(s) if deferred => {
                                         // The previous sub-block drains while this one transforms.
                                         let hook = || drain.step(s, drain_per_hook);
-                                        self.run_layers(
+                                        self.run_layers_to(
                                             scratch,
+                                            from,
                                             log_d,
                                             num_ntts,
                                             deep_start,
                                             log_d,
                                             outer,
                                             sub_idx,
+                                            None,
                                             hook,
                                         );
                                         drain.step(s, usize::MAX);
@@ -689,14 +696,16 @@ impl AdditiveNttF64 {
                                         std::mem::swap(&mut scratch, &mut idle);
                                     }
                                     _ => {
-                                        self.run_layers(
+                                        self.run_layers_to(
                                             scratch,
+                                            from,
                                             log_d,
                                             num_ntts,
                                             deep_start,
                                             log_d,
                                             outer,
                                             sub_idx,
+                                            None,
                                             no_hook,
                                         );
                                         if let Some(f) = deep_rows {
@@ -724,8 +733,7 @@ impl AdditiveNttF64 {
                     if defer_deep && deep_rows.is_some() {
                         // The rows are hashed from scratch and the buffer keeps its pre-deep state.
                         with_scratch(sub_len, |scratch| {
-                            scratch.copy_from_slice(sub);
-                            self.run_layers(scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
+                            self.run_layers_from(sub, scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
                             if let Some(f) = deep_rows {
                                 f(sub_idx << log_sub, scratch);
                             }
@@ -867,19 +875,22 @@ impl AdditiveNttF64 {
                     let row = |i: usize| (r + (i << log_step)) * num_ntts;
                     let block_off = ((block - first_block) << (log_d - layer)) * num_ntts;
                     // Gather: the scattered rows become one contiguous 2^g-row buffer.
-                    for (i, dst) in scratch.chunks_exact_mut(width).enumerate() {
-                        // SAFETY:
-                        // - The message and the codeword both cover every row addressed here.
-                        // - Tasks own disjoint residues, so no other task writes these rows.
-                        // - Block 0 is written last, after every read of the message in it.
-                        let src = unsafe {
-                            match msg {
-                                _ if !staged.is_empty() => &staged[i * width..][..width],
-                                Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
-                                None => base.slice(block_off + row(i), num_ntts),
-                            }
-                        };
-                        dst.copy_from_slice(src);
+                    // A stage already is one: the first sweep reads it.
+                    let from = Some(staged).filter(|s| !s.is_empty());
+                    if from.is_none() {
+                        for (i, dst) in scratch.chunks_exact_mut(width).enumerate() {
+                            // SAFETY:
+                            // - The message and the codeword both cover every row addressed here.
+                            // - Tasks own disjoint residues, so no other task writes these rows.
+                            // - Block 0 is written last, after every read of the message in it.
+                            let src = unsafe {
+                                match msg {
+                                    Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
+                                    None => base.slice(block_off + row(i), num_ntts),
+                                }
+                            };
+                            dst.copy_from_slice(src);
+                        }
                     }
                     // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
                     let (log_n, outer) = (layer + g, layer);
@@ -888,7 +899,7 @@ impl AdditiveNttF64 {
                             // The previous group drains while this one transforms; the rest drains now.
                             let (first, lines) = next.unwrap_or((std::ptr::null(), 0..0));
                             let mut fetch = prefetch_rows(first, num_ntts, step * num_ntts, lines, hooks);
-                            self.run_layers(scratch, log_n, width, layer, log_n, outer, block, || {
+                            self.run_layers_to(scratch, from, log_n, width, layer, log_n, outer, block, None, || {
                                 drain.step(s, drain_per_hook);
                                 fetch();
                             });
@@ -908,7 +919,7 @@ impl AdditiveNttF64 {
                             std::mem::swap(&mut scratch, &mut idle);
                         }
                         _ => {
-                            self.run_layers(scratch, log_n, width, layer, log_n, outer, block, no_hook);
+                            self.run_layers_to(scratch, from, log_n, width, layer, log_n, outer, block, None, no_hook);
                             // Scatter: every row returns to its place, a staged row as one line per residue.
                             let piece = if staged.is_empty() { num_ntts } else { 8 };
                             for (i, row_src) in scratch.chunks_exact(width).enumerate() {
@@ -991,17 +1002,39 @@ impl AdditiveNttF64 {
         sub_idx: usize,
         hook: impl FnMut(),
     ) {
-        self.run_layers_to(buf, log_d, num_ntts, first_layer, end_layer, outer_log, sub_idx, None, hook);
+        self.run_layers_to(buf, None, log_d, num_ntts, first_layer, end_layer, outer_log, sub_idx, None, hook);
+    }
+
+    /// [`Self::run_layers`] over a copy of `src` that lands in `buf`: the first sweep reads `src` and writes `buf`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers_from(
+        &self,
+        src: &[F64],
+        buf: &mut [F64],
+        log_d: usize,
+        num_ntts: usize,
+        first_layer: usize,
+        end_layer: usize,
+        outer_log: usize,
+        sub_idx: usize,
+        hook: impl FnMut(),
+    ) {
+        self.run_layers_to(buf, Some(src), log_d, num_ntts, first_layer, end_layer, outer_log, sub_idx, None, hook);
     }
 
     /// [`Self::run_layers`] that leaves the blocks alone which hold none of the buffer rows `live` (sorted).
     ///
     /// - Only those rows come out right: a block feeds only the rows inside it, in every later layer.
     /// - A fused sweep skips whole blocks of its first layer, so a sparse `live` prunes coarsely.
+    ///
+    /// With a `src` as long as `buf`, the layers run over a copy of it, which the first sweep makes.
+    /// That sweep loads from `src` and stores to `buf`, and the blocks it skips are not copied.
+    /// Later sweeps work inside the blocks of the first, so they never read a word that was not copied.
     #[allow(clippy::too_many_arguments)]
     fn run_layers_to(
         &self,
         buf: &mut [F64],
+        mut src: Option<&[F64]>,
         log_d: usize,
         num_ntts: usize,
         first_layer: usize,
@@ -1011,6 +1044,9 @@ impl AdditiveNttF64 {
         live: Option<&[usize]>,
         mut hook: impl FnMut(),
     ) {
+        if let Some(src) = src.filter(|_| first_layer >= end_layer) {
+            buf.copy_from_slice(src);
+        }
         let mut layer = first_layer;
         while layer < end_layer {
             // This layer's blocks inside the buffer: how many, and their size in rows and words.
@@ -1029,6 +1065,7 @@ impl AdditiveNttF64 {
                     let start = block_in_buf * block_elems;
                     butterfly_interleaved_fused_3layer(
                         &mut buf[start..start + block_elems],
+                        src.map(|s| &s[start..start + block_elems]),
                         &t,
                         eighth,
                         num_ntts,
@@ -1049,6 +1086,7 @@ impl AdditiveNttF64 {
                     let start = block_in_buf * block_elems;
                     butterfly_interleaved_fused_2layer(
                         &mut buf[start..start + block_elems],
+                        src.map(|s| &s[start..start + block_elems]),
                         &t,
                         quarter,
                         num_ntts,
@@ -1062,6 +1100,10 @@ impl AdditiveNttF64 {
                 for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
                     let twiddle = self.twiddle(layer, global(block_in_buf));
                     let start = block_in_buf * block_elems;
+                    // A lone layer is rare: its block is copied before it runs, not fused with it.
+                    if let Some(src) = src {
+                        buf[start..start + block_elems].copy_from_slice(&src[start..start + block_elems]);
+                    }
                     butterfly_interleaved_block(
                         &mut buf[start..start + block_elems],
                         twiddle,
@@ -1072,6 +1114,7 @@ impl AdditiveNttF64 {
                 });
                 layer += 1;
             }
+            src = None;
         }
     }
 
@@ -1308,17 +1351,24 @@ fn radix_layers(left: usize) -> usize {
 /// - Distinct groups take distinct rows inside each slab.
 /// - The slabs do not overlap.
 /// - So the groups are pairwise disjoint, and one base pointer can stand in for N nested splits.
+/// - A source, when given, is a separate buffer of the block's length: its rows never overlap the block's.
 fn fused_rows<const N: usize>(
     block: &mut [F64],
+    src: Option<&[F64]>,
     stride_rows: usize,
     num_ntts: usize,
-    do_one: impl Fn(&mut [&mut [F64]; N]),
+    do_one: impl Fn(&[*const F64; N], &mut [&mut [F64]; N]),
     mut hook: impl FnMut(),
 ) {
     // Words from one slab to the next.
     let stride = stride_rows * num_ntts;
     debug_assert_eq!(block.len(), N * stride);
     let base = block.as_mut_ptr();
+    // With a source, the group is read from there and written to the block; with none, it is read in place.
+    let from = src.map_or(base.cast_const(), |src| {
+        debug_assert_eq!(src.len(), block.len());
+        src.as_ptr()
+    });
     for r in 0..stride_rows {
         // Row `r` of each slab starts this many words into it.
         let off = r * num_ntts;
@@ -1327,7 +1377,9 @@ fn fused_rows<const N: usize>(
         // - The row ends inside its slab, since the row index is below the slab height.
         let mut rows: [&mut [F64]; N] =
             std::array::from_fn(|i| unsafe { std::slice::from_raw_parts_mut(base.add(i * stride + off), num_ntts) });
-        do_one(&mut rows);
+        // SAFETY: the source row lies inside its slab, like the block's row.
+        let srcs: [*const F64; N] = std::array::from_fn(|i| unsafe { from.add(i * stride + off) });
+        do_one(&srcs, &mut rows);
         hook();
     }
 }
@@ -1346,12 +1398,13 @@ fn fused_rows<const N: usize>(
 /// - The seven twiddles are breadth-first: one for layer L, two for L+1, four for L+2.
 fn butterfly_interleaved_fused_3layer(
     block: &mut [F64],
+    src: Option<&[F64]>,
     t: &[F64; 7],
     eighth: usize,
     num_ntts: usize,
     hook: impl FnMut(),
 ) {
-    fused_rows::<8>(block, eighth, num_ntts, |rows| radix8_butterflies(rows, t), hook);
+    fused_rows::<8>(block, src, eighth, num_ntts, |src, rows| radix8_butterflies(src, rows, t), hook);
 }
 
 /// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
@@ -1359,10 +1412,11 @@ fn butterfly_interleaved_fused_3layer(
 /// On AVX-512 they run on registers: each row's vectors are loaded and stored once per group.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline(always)]
-fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
+fn radix8_butterflies(src: &[*const F64; 8], rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
     // Inlined into the sweep: a call would pass the vectors through memory.
     #[allow(clippy::redundant_closure)] // the closure carries the inline attribute
     fused_lanes_avx512(
+        src,
         rows,
         t,
         #[inline(always)]
@@ -1391,10 +1445,23 @@ fn radix8_regs(v: &mut RowVectors<8>, t: &[Twiddle; 7]) {
     butterfly_regs(v, 6, 7, t[6]);
 }
 
+/// Copy the rows that are read from a source into the rows that are written, where the two differ.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[inline(always)]
+fn copy_rows<const N: usize>(src: &[*const F64; N], rows: &mut [&mut [F64]; N]) {
+    for (&from, row) in src.iter().zip(rows.iter_mut()) {
+        if from != row.as_ptr() {
+            // SAFETY: a source row is as long as the row and does not overlap it.
+            row.copy_from_slice(unsafe { std::slice::from_raw_parts(from, row.len()) });
+        }
+    }
+}
+
 /// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[inline(always)]
-fn radix8_butterflies(rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
+fn radix8_butterflies(src: &[*const F64; 8], rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
+    copy_rows(src, rows);
     let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
     // Layer L: rows 4 apart, one twiddle for the whole block.
     butterfly_lanes(r0, r4, t[0]);
@@ -1734,12 +1801,13 @@ fn replicate_rows(data: &mut [F64], msg: &[F64]) {
 /// The three twiddles are breadth-first: one for layer L, two for L+1.
 fn butterfly_interleaved_fused_2layer(
     block: &mut [F64],
+    src: Option<&[F64]>,
     t: &[F64; 3],
     quarter: usize,
     num_ntts: usize,
     hook: impl FnMut(),
 ) {
-    fused_rows::<4>(block, quarter, num_ntts, |rows| radix4_butterflies(rows, t), hook);
+    fused_rows::<4>(block, src, quarter, num_ntts, |src, rows| radix4_butterflies(src, rows, t), hook);
 }
 
 /// The four butterflies of one radix-4 row group.
@@ -1747,9 +1815,10 @@ fn butterfly_interleaved_fused_2layer(
 /// On AVX-512 they run on registers, like [`radix8_butterflies`].
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline(always)]
-fn radix4_butterflies(rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
+fn radix4_butterflies(src: &[*const F64; 4], rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
     #[allow(clippy::redundant_closure)] // the closure carries the inline attribute
     fused_lanes_avx512(
+        src,
         rows,
         t,
         #[inline(always)]
@@ -1767,7 +1836,8 @@ fn radix4_butterflies(rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
 /// The four butterflies of one radix-4 row group.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[inline(always)]
-fn radix4_butterflies(rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
+fn radix4_butterflies(src: &[*const F64; 4], rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
+    copy_rows(src, rows);
     let [r0, r1, r2, r3] = rows;
     // Layer L: rows 2 apart, one twiddle for the block.
     butterfly_lanes(r0, r2, t[0]);
@@ -2163,12 +2233,14 @@ fn butterfly_regs<const N: usize>(v: &mut RowVectors<N>, top: usize, bot: usize,
 
 /// Runs `kernel` on `N` equal-length rows held in registers, [`LANE_VECTORS`] eight-lane vectors of every row at a time.
 ///
+/// - The vectors load from `src` and store to `rows`; in place, `src` holds the addresses of `rows`.
 /// - A vector is loaded and stored once, however many butterflies `kernel` applies to it.
 /// - The kernel orders its butterflies breadth-first, so the vectors in flight hide each other's latency.
 /// - The last chunk may be short: its vectors past the row's end load as zeros and are not stored.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline(always)]
 fn fused_lanes_avx512<const N: usize, const T: usize>(
+    src: &[*const F64; N],
     rows: &mut [&mut [F64]; N],
     twiddles: &[F64; T],
     kernel: impl Fn(&mut RowVectors<N>, &[Twiddle; T]),
@@ -2186,7 +2258,7 @@ fn fused_lanes_avx512<const N: usize, const T: usize>(
         let mut lane = 0;
         while lane + CHUNK <= len {
             let mut v: RowVectors<N> =
-                std::array::from_fn(|i| std::array::from_fn(|k| _mm512_loadu_si512(ptrs[i].add(lane + 8 * k).cast())));
+                std::array::from_fn(|i| std::array::from_fn(|k| _mm512_loadu_si512(src[i].add(lane + 8 * k).cast())));
             kernel(&mut v, &tw);
             for i in 0..N {
                 for k in 0..LANE_VECTORS {
@@ -2199,7 +2271,7 @@ fn fused_lanes_avx512<const N: usize, const T: usize>(
             // The lanes of vector `k` of the short chunk: all eight, the row's last few, or none.
             let mask = |k: usize| ((1u16 << len.saturating_sub(lane + 8 * k).min(8)) - 1) as u8;
             let mut v: RowVectors<N> = std::array::from_fn(|i| {
-                std::array::from_fn(|k| _mm512_maskz_loadu_epi64(mask(k), ptrs[i].add(lane + 8 * k).cast()))
+                std::array::from_fn(|k| _mm512_maskz_loadu_epi64(mask(k), src[i].add(lane + 8 * k).cast()))
             });
             kernel(&mut v, &tw);
             for i in 0..N {
