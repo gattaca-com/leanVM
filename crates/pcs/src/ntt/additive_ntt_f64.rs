@@ -2344,6 +2344,20 @@ unsafe fn butterfly_lane_pair_neon(top: *mut F64, bot: *mut F64, twiddle: u64) {
 mod tests {
     use super::*;
     use primitives::test_rng::Rng;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A row sink that copies each handed-over block into `dst` at its row, without locking.
+    /// Every row is handed over exactly once, so the blocks written from pool tasks are disjoint.
+    fn sink_into(dst: &mut [F64], row_words: usize) -> impl Fn(usize, &[F64]) + Sync + '_ {
+        let len = dst.len();
+        let base = parallel::SendPtr(dst.as_mut_ptr());
+        move |row, rows| {
+            assert!((row * row_words).checked_add(rows.len()).is_some_and(|end| end <= len));
+            // SAFETY: in bounds, and the sink contract hands each row over once, so no
+            // other task writes this range. `dst` is borrowed for as long as the sink lives.
+            unsafe { base.slice(row * row_words, rows.len()) }.copy_from_slice(rows);
+        }
+    }
 
     /// Scalar reference: one butterfly at a time over `num_ntts` interleaved lanes.
     fn forward_scalar_from_layer(ntt: &AdditiveNttF64, data: &mut [F64], num_ntts: usize, start_layer: usize) {
@@ -2476,25 +2490,20 @@ mod tests {
             // Under test: only the first replica holds the message, the rest is zero.
             let mut got = vec![F64::ZERO; msg_len << log_inv_rate];
             got[..msg_len].copy_from_slice(&msg);
-            let blocks = std::sync::Mutex::new(Vec::new());
+            let mut handed = vec![F64::ZERO; got.len()];
+            let hits: Vec<AtomicUsize> = (0..1usize << log_d).map(|_| AtomicUsize::new(0)).collect();
+            let write = sink_into(&mut handed, lanes);
             ntt.encode_interleaved_in_place_with(&mut got, lanes, log_inv_rate, &|row, rows| {
-                blocks.lock().unwrap().push((row, rows.to_vec()))
+                for hit in &hits[row..row + rows.len() / lanes] {
+                    hit.fetch_add(1, Ordering::Relaxed);
+                }
+                write(row, rows)
             });
+            drop(write);
             assert_eq!(got, want, "log_d={log_d}, lanes={lanes}, rate={log_inv_rate}");
-
-            let mut blocks = blocks.into_inner().unwrap();
-            blocks.sort_by_key(|b| b.0);
-            let mut next = 0;
-            for (row, rows) in blocks {
-                assert_eq!(row, next, "blocks tile the rows, log_d={log_d}");
-                assert_eq!(
-                    rows[..],
-                    want[row * lanes..][..rows.len()],
-                    "a handed-over block is final"
-                );
-                next += rows.len() / lanes;
-            }
-            assert_eq!(next, 1 << log_d, "every row handed over, log_d={log_d}");
+            // Every row handed over exactly once, so the blocks tile the rows, and each is final.
+            assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1), "blocks tile the rows, log_d={log_d}");
+            assert_eq!(handed, want, "a handed-over block is final, log_d={log_d}");
         }
     }
 
@@ -2568,11 +2577,9 @@ mod tests {
 
             for keep in [Keep::Whole, Keep::BeforeDeep, Keep::Nothing] {
                 let mut handed = vec![F64::ZERO; want.len()];
-                let sink = std::sync::Mutex::new(&mut handed);
-                let on_rows = |row: usize, rows: &[F64]| {
-                    sink.lock().unwrap()[row * row_words..][..rows.len()].copy_from_slice(rows)
-                };
+                let on_rows = sink_into(&mut handed, row_words);
                 let Encoded { words, deep } = ntt.encode_lane_major(&msg, n_lanes, row_words, log_inv_rate, keep, &on_rows);
+                drop(on_rows);
                 let context = format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}, keep_nothing={}", keep == Keep::Nothing);
                 assert_eq!(handed, want, "handed-over rows, {context}");
                 let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
@@ -2606,11 +2613,9 @@ mod tests {
 
             let mut got = vec![F64::ZERO; msg_len << log_inv_rate];
             got[..msg_len].copy_from_slice(&msg);
-            let handed = std::sync::Mutex::new(vec![F64::ZERO; got.len()]);
-            let deep = ntt.encode_interleaved_in_place_without_deep(&mut got, lanes, log_inv_rate, &|row, rows| {
-                handed.lock().unwrap()[row * lanes..][..rows.len()].copy_from_slice(rows)
-            });
-            assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, log_d={log_d}, lanes={lanes}");
+            let mut handed = vec![F64::ZERO; got.len()];
+            let deep = ntt.encode_interleaved_in_place_without_deep(&mut got, lanes, log_inv_rate, &sink_into(&mut handed, lanes));
+            assert_eq!(handed, want, "handed-over rows, log_d={log_d}, lanes={lanes}");
             assert_eq!(deep.is_some(), split, "plan, log_d={log_d}, lanes={lanes}");
             let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
             let rows = match deep {
@@ -2637,11 +2642,9 @@ mod tests {
             want[..msg_len].copy_from_slice(&msg);
             ntt.encode_interleaved_in_place(&mut want, lanes, log_inv_rate);
 
-            let handed = std::sync::Mutex::new(vec![F64::ZERO; want.len()]);
-            ntt.encode_cosets(&msg, lanes, log_inv_rate, &|row, rows| {
-                handed.lock().unwrap()[row * lanes..][..rows.len()].copy_from_slice(rows)
-            });
-            assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, log_rows={log_rows}, lanes={lanes}");
+            let mut handed = vec![F64::ZERO; want.len()];
+            ntt.encode_cosets(&msg, lanes, log_inv_rate, &sink_into(&mut handed, lanes));
+            assert_eq!(handed, want, "handed-over rows, log_rows={log_rows}, lanes={lanes}");
 
             // Repeats and unsorted positions included.
             let mut positions: Vec<usize> = (0..60).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
