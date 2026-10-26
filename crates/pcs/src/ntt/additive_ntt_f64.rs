@@ -1577,38 +1577,49 @@ fn fill_stage(
     let out = stage.as_mut_ptr();
     // Octet by octet, so the hardware prefetcher follows 8 lane streams, not a row's 48 lines in one L2 set.
     for octet in 0..row_words / 8 {
+        // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
+        let block = |k: usize| row_words - 1 - (8 * octet + k);
+        if 8 * octet >= pad {
+            // No padding lane: the tile needs no null check.
+            for i in 0..rows {
+                let j = t0 + (i << log_step);
+                let src: [*const F64; 8] = std::array::from_fn(|k| msg.wrapping_add(block(k) * msg_rows + j));
+                // SAFETY: as in the padded case below, and no source is null.
+                unsafe { transpose_tile::<false>(&src, |s| out.add((s * rows + i) * row_words + 8 * octet)) };
+            }
+            continue;
+        }
         for i in 0..rows {
             let j = t0 + (i << log_step);
             // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane.
             let src: [*const F64; 8] = std::array::from_fn(|k| {
-                let w = 8 * octet + k;
-                if w < pad {
+                if 8 * octet + k < pad {
                     std::ptr::null()
                 } else {
-                    msg.wrapping_add((row_words - 1 - w) * msg_rows + j)
+                    msg.wrapping_add(block(k) * msg_rows + j)
                 }
             });
             // SAFETY:
             // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
             // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`, `octet < row_words / 8`.
-            unsafe { transpose_tile(&src, |s| out.add((s * rows + i) * row_words + 8 * octet)) };
+            unsafe { transpose_tile::<true>(&src, |s| out.add((s * rows + i) * row_words + 8 * octet)) };
         }
     }
 }
 
-/// Write `dst(s)[k] = src[k][s]` for the 8 x 8 words of eight lines, a null line being zeros.
+/// Write `dst(s)[k] = src[k][s]` for the 8 x 8 words of eight lines, a null line being zeros when `PAD`.
 ///
 /// # Safety
 ///
 /// Every non-null `src[k]` is valid for 8 reads, and every `dst(s)` for 8 writes, apart from the sources.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 #[inline(always)]
-unsafe fn transpose_tile(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
+unsafe fn transpose_tile<const PAD: bool>(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
     use core::arch::x86_64::*;
     // SAFETY: the caller's bounds; AVX-512F is enabled at compile time.
     unsafe {
         let r: [__m512i; 8] = std::array::from_fn(|k| {
-            if src[k].is_null() {
+            if PAD && src[k].is_null() {
                 _mm512_setzero_si512()
             } else {
                 _mm512_loadu_si512(src[k].cast())
@@ -1646,14 +1657,14 @@ unsafe fn transpose_tile(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64)
 /// [`transpose_tile`] word by word.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 #[inline(always)]
-unsafe fn transpose_tile(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
+unsafe fn transpose_tile<const PAD: bool>(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
     for s in 0..8 {
         for (k, line) in src.iter().enumerate() {
             // SAFETY: the caller's bounds.
             unsafe {
                 dst(s)
                     .add(k)
-                    .write(if line.is_null() { F64::ZERO } else { line.add(s).read() })
+                    .write(if PAD && line.is_null() { F64::ZERO } else { line.add(s).read() })
             };
         }
     }
