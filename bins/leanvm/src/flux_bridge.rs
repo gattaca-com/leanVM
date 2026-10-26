@@ -1,4 +1,4 @@
-//! `LEANVM_FLUX=1`: publish flux-profiler rings and mirror every `tracing` span
+//! `--flux`: publish flux-profiler rings and mirror every `tracing` span
 //! as a flux frame, so the existing stage spans and `#[timed]` share one trace.
 
 use std::cell::RefCell;
@@ -26,14 +26,16 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for FluxLayer {
     }
 }
 
-pub fn init() -> bool {
-    if std::env::var_os("LEANVM_FLUX").is_none() {
+/// Seconds to wait after enabling, for the flux collector to attach.
+const ATTACH_WAIT_S: u64 = 2;
+
+pub fn init(enabled: bool) -> bool {
+    if !enabled {
         return false;
     }
     flux_profiler::enable_profiler("leanvm");
     tracing_subscriber::registry().with(FluxLayer).init();
     eprintln!("flux-profiler enabled, pid {}", std::process::id());
-    let wait = std::env::var("LEANVM_FLUX_WAIT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-    std::thread::sleep(std::time::Duration::from_secs(wait));
+    std::thread::sleep(std::time::Duration::from_secs(ATTACH_WAIT_S));
     true
 }

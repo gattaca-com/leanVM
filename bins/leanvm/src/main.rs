@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long, global = true)]
     cold: bool,
 
+    /// Publish flux-profiler rings, for scripts/flux-trace.sh.
+    #[arg(long, global = true)]
+    flux: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -99,7 +103,7 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     leanvm_core::init_prover();
-    let flux = flux_bridge::init();
+    let flux = flux_bridge::init(cli.flux);
     let plan = bench::Plan::new(cli.repeat, cli.cooldown).cold(cli.cold);
     if !flux && cli.tracing && !matches!(&cli.command, Command::Recursion { .. }) {
         bench::init_tracing();

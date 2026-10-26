@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/target/release/leanvm
 CLI=${FLUX_CLI:-/arch/home/alexey/development/flux/target/release/flux-profiler}
 cargo build --release -p leanvm-cli --manifest-path "$ROOT/Cargo.toml"
-LEANVM_FLUX=1 LEANVM_FLUX_WAIT_S=2 ${TASKSET:+taskset -c $TASKSET} "$BIN" "$@" &
+${TASKSET:+taskset -c $TASKSET} "$BIN" --flux "$@" &
 APP=$!
 sleep 1
 "$CLI" --pid $APP --out "$OUT" --max-mem 8GB > "$OUT.cli.log" 2>&1 &
