@@ -28,6 +28,7 @@ mod isa;
 pub mod layout;
 mod trace;
 pub use execute::{ExecError, Execution, Fault, Memory};
+pub use hints::GPow;
 pub use isa::{DerefMode, Op};
 pub use layout::*;
 pub(crate) use trace::{Brow, Drow, Jrow, Rows, Srow, Trace, Xrow};
@@ -469,13 +470,26 @@ impl Stats {
 /// run [`Stats`], or why no proof was made ([`ProveError`]). `log_inv_rate`
 /// selects the PCS rate and is announced in the Fiat-Shamir transcript before
 /// the commitment.
+pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
+    prove_with(program, public_input, log_inv_rate, &mut GPow::new())
+}
+
+/// [`prove`] with the g-power table the run needs owned by the caller. A run starts from
+/// `gpow` and leaves it grown, so a caller that proves again, even another program, passes
+/// the same table back and skips growing it. On an error `gpow` is left as a fresh table.
 #[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
 #[timed]
-pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
+pub fn prove_with(
+    program: &Program,
+    public_input: [F192; 2],
+    log_inv_rate: usize,
+    gpow: &mut GPow,
+) -> Result<(Proof, Stats), ProveError> {
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
-    let exec = crate::stage!("Execute program", || program.execute(public_input)).map_err(ProveError::Execution)?;
+    let execution = crate::stage!("Execute program", || program.execute_with(public_input, std::mem::take(gpow)));
+    let mut exec = execution.map_err(ProveError::Execution)?;
     // A live value that came from outside the constraint system would make the proof
     // about a weaker statement than the program text, so it is refused here, on the one
     // path every proof takes, rather than left to whichever test happens to look.
@@ -484,6 +498,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     }
     let cycles = exec.cycles;
     let w = crate::stage!("Build witness", || program.build(&exec));
+    *gpow = std::mem::take(&mut exec.gpow);
     if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&w.layout.shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
             log_committed: w.layout.shape.mu,

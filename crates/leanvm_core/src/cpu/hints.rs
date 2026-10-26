@@ -3,8 +3,6 @@
 //! table + reverse index the hint interpreter grows on demand.
 
 use primitives::field::{F64, mul_by_g};
-use std::ops::{Deref, DerefMut};
-use std::sync::Mutex;
 
 /// Frame-relative offset operand (matches the compiler's `ir::Off`).
 pub type Off = u32;
@@ -35,7 +33,6 @@ pub(crate) const MAX_CELLS: u32 = 1 << 28;
 /// multiple of `STRIDE` appears, then announces the result. An address that
 /// arrives by a route the interpreter cannot label, a pointer into the middle of
 /// a buffer, costs a few probes once and is a plain hit afterwards.
-#[derive(Default)]
 pub struct GPow {
     pow: Vec<F64>,
     /// The announced exponents, so widening rebuilds from them rather than
@@ -53,13 +50,21 @@ pub struct GPow {
 /// Spacing of the coarse index, and so the most probes a missed lookup costs.
 const STRIDE: usize = 16;
 
+impl Default for GPow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GPow {
     /// Seeded with `g^0 = 1`, nothing announced.
     pub fn new() -> Self {
         Self {
             pow: vec![F64::ONE],
+            noted: Vec::new(),
             index: vec![0; 1 << 13],
-            ..Self::default()
+            coarse: Vec::new(),
+            coarsed: 0,
         }
     }
 
@@ -213,45 +218,6 @@ impl GPow {
 #[inline(always)]
 fn div_by_g(a: F64) -> F64 {
     F64(if a.0 & 1 == 1 { (a.0 ^ 0x1B) >> 1 | 1 << 63 } else { a.0 >> 1 })
-}
-
-/// The table a run leaves for the next. It is a function of the exponent alone, and
-/// announcing more only widens the index, so a run starts from what the last one
-/// grew and announced instead of growing both again.
-static KEPT: Mutex<Option<GPow>> = Mutex::new(None);
-
-/// A [`GPow`] taken from [`KEPT`], put back when dropped. A run that finds none
-/// (another holds it) builds its own.
-pub(crate) struct Kept(GPow);
-
-impl Kept {
-    /// The kept table, grown to cover `seed`.
-    pub(crate) fn take(seed: usize) -> Self {
-        // `GPow::new` seeds `g^0`, unlike the derived `Default`.
-        #[allow(clippy::unwrap_or_default)]
-        let mut g = KEPT.lock().unwrap().take().unwrap_or_else(GPow::new);
-        g.grow_to(seed);
-        Self(g)
-    }
-}
-
-impl Deref for Kept {
-    type Target = GPow;
-    fn deref(&self) -> &GPow {
-        &self.0
-    }
-}
-
-impl DerefMut for Kept {
-    fn deref_mut(&mut self) -> &mut GPow {
-        &mut self.0
-    }
-}
-
-impl Drop for Kept {
-    fn drop(&mut self) {
-        *KEPT.lock().unwrap() = Some(std::mem::take(&mut self.0));
-    }
 }
 
 /// Bits 32..64 of the mix are the well-distributed ones; the mask keeps as many

@@ -5,7 +5,7 @@ use flux_profiler::timed;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use super::hints::{Kept, MAX_CELLS};
+use super::hints::{GPow, MAX_CELLS};
 use super::*;
 use primitives::{
     field::{F64, F192, mul_by_g},
@@ -31,8 +31,8 @@ pub struct Execution {
     pub unconstrained_reads: Vec<u32>,
     pub(crate) trace: Trace, // rows + final access-count columns, emitted in the same walk
     /// `g^0, g^1, ..` as far as the run indexed them: every pc, frame base and cell it
-    /// reached, and the counts. The fill reads it; dropped, it is kept for the next run.
-    pub(crate) gpow: Kept,
+    /// reached, and the counts. The fill reads it, and [`prove_with`](super::prove_with) hands it back for the next run.
+    pub(crate) gpow: GPow,
 }
 
 impl Execution {
@@ -295,9 +295,16 @@ impl Program {
     /// input seeds the first two memory cells `m[0], m[1]` (§sec:e2e-pi).
     /// Compilation yields the `Program`; executing it (here) and proving it are
     /// separate later phases.
-    #[timed]
     pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
-        use super::hints::{BitsDest, GPow, RHint};
+        self.execute_with(public_input, GPow::new())
+    }
+
+    /// [`Self::execute`] starting from `gpow`, a table an earlier run left. The table
+    /// is a function of the exponent alone and announcing more only widens its index,
+    /// so a run that starts from one skips growing and announcing it again.
+    #[timed]
+    pub(crate) fn execute_with(&self, public_input: [F192; 2], gpow: GPow) -> Result<Execution, ExecError> {
+        use super::hints::{BitsDest, RHint};
 
         let ending_pc = (self.prog.len() - 1) as u32; // last bytecode slot, g^{B-1}
 
@@ -308,7 +315,8 @@ impl Program {
         let seed = (self.prog.len() + 2)
             .max(self.main_frame as usize)
             .max(1 << MIN_LOG_MEM);
-        let mut g = Kept::take(seed);
+        let mut g = gpow;
+        g.grow_to(seed);
 
         // The largest operand offset, so that every instruction access is in `LIMIT`.
         let max_off = self
