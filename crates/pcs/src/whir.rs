@@ -118,7 +118,7 @@ pub struct ProverData {
     pub codeword: Vec<F64>,
     /// Words per codeword row: the committed lanes, with zero lanes in front up to the vector width.
     row_words: usize,
-    pub merkle_tree: Vec<Hash>,
+    pub merkle_tree: merkle::CutTree,
     deep: Option<(AdditiveNttF64, DeepRows)>,
 }
 
@@ -228,7 +228,7 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
         }
     });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
-    let root = *merkle_tree.last().expect("merkle tree non-empty");
+    let root = merkle_tree.root();
 
     (
         Commitment { root },
@@ -257,7 +257,7 @@ enum Deferred {
 /// [`LigeroWitness::opened_words`] finishes the rows a query opens.
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F192>,
-    pub tree: Vec<Hash>,
+    pub tree: merkle::CutTree,
     pub block_len: usize,
     pub num_interleaved: usize,
     deferred: Option<Deferred>,
@@ -278,9 +278,21 @@ impl LigeroWitness {
         }
     }
 
+    /// The rows at `queries`, in order, and the octopus over them.
+    fn open(&self, queries: &[usize]) -> (Vec<Vec<F64>>, PrunedMerklePaths) {
+        let group = self.tree.group_positions(queries);
+        let group_rows = self.opened_words(&group);
+        let rows = pick_rows(&group, &group_rows, queries, 0);
+        let row_words = 3 * self.num_interleaved;
+        let paths = self
+            .tree
+            .prune(queries, row_words, row_words, &group_rows, opened_row(queries, &rows));
+        (rows, paths)
+    }
+
     #[inline]
     pub fn root(&self) -> Hash {
-        self.tree[self.tree.len() - 1]
+        self.tree.root()
     }
 }
 
@@ -1100,6 +1112,12 @@ fn ext_row(words: &[F64]) -> Vec<F192> {
 }
 
 /// The opened row at a queried position, for the Merkle pruning: `rows[i]` is the row at `queries[i]`.
+/// The rows at `queries`, in order and without their first `skip` words, out of `rows` at the sorted `positions`.
+fn pick_rows(positions: &[usize], rows: &[Vec<F64>], queries: &[usize], skip: usize) -> Vec<Vec<F64>> {
+    let at = |q| &rows[positions.binary_search(&q).expect("a fetched row")];
+    queries.iter().map(|&q| at(q)[skip..].to_vec()).collect()
+}
+
 fn opened_row<'a>(queries: &'a [usize], rows: &'a [Vec<F64>]) -> impl Fn(usize) -> Vec<F64> + 'a {
     move |q| rows[queries.iter().position(|&p| p == q).expect("a queried row")].clone()
 }
@@ -1133,7 +1151,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     prover_data: ProverData,
     ps: &mut ProverState,
 ) {
-    let (l0_codeword, l0_tree) = (prover_data.l0(), &prover_data.merkle_tree[..]);
+    let (l0_codeword, l0_tree) = (prover_data.l0(), &prover_data.merkle_tree);
     let r = config.level_steps;
     let initial_k = config.initial_k;
 
@@ -1162,7 +1180,6 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     );
     assert_eq!(l0_codeword.len(), block_len_0 * l0_codeword.row_words);
     assert!((n_lanes..=num_interleaved_0).contains(&l0_codeword.row_words));
-    assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
     // Nothing is absorbed on entry. The commitment was bound by the `add_root` that
     // transmitted it, and the target is `sum_i lambda^i * claim_i` over claim values bound by their
@@ -1238,14 +1255,19 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     let weights_0 = powers(lambda_0, num_queries_0);
     let span = tracing::info_span!("Open", level = 0).entered();
     // Ordered (dup-possible) rows for the local induce math ...
-    let images_0 = l0_codeword.rows(&queries_0, n_lanes);
+    // The tree keeps no leaves: the rows of whole leaf groups are read back and rehashed.
+    let row_words = l0_codeword.row_words;
+    let group_0 = l0_tree.group_positions(&queries_0);
+    let group_rows_0 = l0_codeword.rows(&group_0, row_words);
+    let images_0 = pick_rows(&group_0, &group_rows_0, &queries_0, row_words - n_lanes);
     let opened_rows_0: Vec<Vec<F64>> = images_0.iter().map(|image| l0_fold_row(image)).collect();
     // ... but the stored proof carries the sorted-unique rows + one octopus over
     // the sorted-unique positions (the verifier re-fans them to ordered).
-    ps.hint_merkle(PrunedMerklePaths::prune(
-        l0_tree,
-        block_len_0,
+    ps.hint_merkle(l0_tree.prune(
         &queries_0,
+        row_words,
+        num_interleaved_0,
+        &group_rows_0,
         opened_row(&queries_0, &images_0),
     ));
     // Nothing reads the L0 codeword or its tree again, and the next levels' buffers can be served
@@ -1304,13 +1326,8 @@ pub(crate) fn recursive_prover_with_prepared_basis(
             let span = tracing::info_span!("Final level").entered();
             // Final level: stored (sorted-unique) only, no local induce; the
             // verifier fans these to ordered for its last-level induce.
-            let words_last = wtns_prev.opened_words(&queries_last);
-            ps.hint_merkle(PrunedMerklePaths::prune(
-                &wtns_prev.tree,
-                wtns_prev.block_len,
-                &queries_last,
-                opened_row(&queries_last, &words_last),
-            ));
+            let (words_last, paths) = wtns_prev.open(&queries_last);
+            ps.hint_merkle(paths);
             // Tie the last commitment into the running claim through the same
             // intro/glue step as every other level, then finish the remaining
             // sumcheck rounds. This closes on one weight evaluation instead of
@@ -1369,14 +1386,9 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         let weights_i = powers(lambda_i, num_queries_i);
         let span = tracing::info_span!("Open", level = i + 1).entered();
         // Ordered rows for the local induce; sorted-unique rows + octopus stored.
-        let words_i = wtns_prev.opened_words(&queries_i);
+        let (words_i, paths) = wtns_prev.open(&queries_i);
         let opened_rows_i: Vec<Vec<F192>> = words_i.iter().map(|words| ext_row(words)).collect();
-        ps.hint_merkle(PrunedMerklePaths::prune(
-            &wtns_prev.tree,
-            wtns_prev.block_len,
-            &queries_i,
-            opened_row(&queries_i, &words_i),
-        ));
+        ps.hint_merkle(paths);
         drop(span);
 
         let sks_vks_i = eval_sk_at_vks(n_next);
