@@ -69,7 +69,7 @@ fn main() {
         let mut ch = fiat_shamir::transcript::ProverState::from_label(b"pcs-throughput");
         let t = Instant::now();
         tracing::info_span!("PCS open").in_scope(|| {
-            open_batch_mixed_whir_stacked(&mut ch, log_n, &witness, pd, &pc, &claims, &ring);
+            open_batch_mixed_whir_stacked(&mut ch, log_n, witness.clone(), pd, &pc, &claims, &ring);
         });
         open_t.push(t.elapsed().as_secs_f64());
         black_box((cm, ch.into_proof()));

@@ -864,9 +864,9 @@ fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run
 }
 
 /// Running sumcheck: the lane rounds on the tables of the initial basis, then extension-field folds.
-pub(crate) struct SumcheckProver<'a> {
-    /// The committed lanes, kept for the lift after the lane rounds.
-    base: &'a [F64],
+pub(crate) struct SumcheckProver {
+    /// The committed lanes, owned until the lift after the lane rounds reads them last.
+    base: Vec<F64>,
     /// The table `P` during the lane rounds, then the folded witness.
     f: Vec<F192>,
     /// The table `A` during the lane rounds, then the single combined basis poly:
@@ -892,11 +892,11 @@ pub(crate) struct SumcheckProver<'a> {
     pending: Vec<(Vec<F192>, F192, RoundQuad)>,
 }
 
-impl<'a> SumcheckProver<'a> {
+impl SumcheckProver {
     /// `lane_block` is the lane block size `2^(log_n - initial_k)` of the committed lanes `f`: the
     /// first `initial_k` rounds are the lane fold, so round 0's message already pairs whole
     /// blocks of the tables rather than adjacent words.
-    pub(crate) fn new(f: &'a [F64], b1: InitialBasis, h1: F192, lane_block: usize) -> (Self, SumcheckMessage) {
+    pub(crate) fn new(f: Vec<F64>, b1: InitialBasis, h1: F192, lane_block: usize) -> (Self, SumcheckMessage) {
         let _span = tracing::info_span!("Sumcheck round", round = 0, log_size = f.len().ilog2()).entered();
         assert!(lane_block > 0 && f.len().is_multiple_of(lane_block));
         let InitialBasis {
@@ -953,12 +953,13 @@ impl<'a> SumcheckProver<'a> {
         let msg = if last {
             let lift = self.lift.take().expect("the lift is taken by the last lane round only");
             self.f = fold_all_lanes(
-                self.base,
+                &self.base,
                 self.lane_block,
                 &self.lane_rs,
                 &self.repeats,
                 self.repeat_len,
             );
+            drop(std::mem::take(&mut self.base));
             let (b, msg) = lift.lift(&self.combined_basis, &self.f);
             self.combined_basis = b;
             msg
@@ -1076,7 +1077,7 @@ fn sample_queries_ordered(ch: &mut ProverState, block_len: usize, count: usize) 
 /// `glue_pending` then folds every claim of the level in with its own power.
 /// A verifier replays it operation for operation.
 #[timed]
-fn send_ood(sc: &mut SumcheckProver<'_>, ps: &mut ProverState, n_vars: usize, count: usize) {
+fn send_ood(sc: &mut SumcheckProver, ps: &mut ProverState, n_vars: usize, count: usize) {
     for _ in 0..count {
         let z = ps.sample_vec(n_vars);
         let (intro, y) = sc.introduce_new_with_eval(build_eq_table_ext_parallel(&z));
@@ -1107,9 +1108,9 @@ fn opened_row<'a>(queries: &'a [usize], rows: &'a [Vec<F64>]) -> impl Fn(usize) 
 /// produced by [`commit`] (with `log_batch_size = config.initial_k` and
 /// `log_inv_rate = config.log_inv_rates[0]`).
 ///
-/// `witness` is borrowed: it is only READ (by the lift after the lane rounds,
-/// which folds it into an owned E-vector), so callers with a large committed
-/// stack pass the slice directly instead of paying a full copy.
+/// `witness` is owned: the lift after the lane rounds reads it last, folding it
+/// into an owned E-vector, and drops it there. The large committed stack is
+/// therefore gone before the level-1 commit allocates.
 ///
 /// PRECONDITION, and the reason `witness` may be shorter than `2^log_n`: it is a
 /// whole number of lane blocks, and `b_initial` must stand for the weight restricted to
@@ -1126,7 +1127,7 @@ fn opened_row<'a>(queries: &'a [usize], rows: &'a [Vec<F64>]) -> impl Fn(usize) 
 pub(crate) fn recursive_prover_with_prepared_basis(
     config: &ProverConfig,
     log_n: usize,
-    witness: &[F64],
+    witness: Vec<F64>,
     b_initial: InitialBasis,
     target: F192,
     prover_data: ProverData,
@@ -1495,7 +1496,7 @@ mod tests {
                 let prove = |msg: &[F64]| {
                     let (cm, pd) = commit(msg, log_n, pc.initial_k, pc.log_inv_rates[0]);
                     let mut ps = fiat_shamir::transcript::ProverState::from_label(b"whir-test");
-                    open_batch_mixed_whir_stacked(&mut ps, log_n, msg, pd, &pc, &claims, &ring);
+                    open_batch_mixed_whir_stacked(&mut ps, log_n, msg.to_vec(), pd, &pc, &claims, &ring);
                     (cm.root, ps.into_proof())
                 };
                 let (root_trunc, fs_trunc) = prove(&witness[..used]);

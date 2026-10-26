@@ -155,8 +155,8 @@ fn claim_range(claim: &StackClaim) -> (usize, usize) {
 /// evaluation AND the ring-switched q_flock claims (`ring`) in ONE WHIR
 /// run, reusing the caller's [`super::whir::commit`] output as L0.
 ///
-/// `stack` is the committed message (the caller retains it; it is not stored in
-/// [`ProverData`]): the `2^log_n`-word stack truncated to the lane blocks that
+/// `stack` is the committed message (not stored in [`ProverData`]), consumed: the
+/// lane rounds drop it before the level-1 commit. It is the `2^log_n`-word stack truncated to the lane blocks that
 /// carry data, so every claim must live inside it and the padding past it is
 /// exactly the weight's zero region. `config.initial_k` / `config.log_inv_rates[0]`
 /// must match the commit's `log_batch_size` / `log_inv_rate` (enforced by shape
@@ -165,7 +165,7 @@ fn claim_range(claim: &StackClaim) -> (usize, usize) {
 pub fn open_batch_mixed_whir_stacked(
     ps: &mut ProverState,
     log_n: usize,
-    stack: &[F64],
+    stack: Vec<F64>,
     prover_data: ProverData,
     config: &ProverConfig,
     point_claims: &[StackClaim],
@@ -234,10 +234,10 @@ pub fn open_batch_mixed_whir_stacked(
     let lane_vars = log_n - config.initial_k;
     let rings: Vec<_> = rs_outputs.into_iter().map(|output| output.weight).collect();
     let initial_basis = tracing::info_span!("Basis")
-        .in_scope(|| basis::project(stack, lane_vars, point_claims, lambdas_pd, ring, &rings));
+        .in_scope(|| basis::project(&stack, lane_vars, point_claims, lambdas_pd, ring, &rings));
 
     // 4. One WHIR over the full stack against the combined claim (the
-    //    stack is borrowed by the prover; no copy).
+    //    prover takes the stack; no copy).
     super::whir::recursive_prover_with_prepared_basis(
         config,
         log_n,
@@ -404,7 +404,7 @@ mod tests {
                 let rings: Vec<_> = rs_outputs.iter().map(|output| output.weight.clone()).collect();
                 let projected = basis::project(&stack, lane_vars, &claims, &lambdas, &ring, &rings);
                 let target = rng.ext();
-                let (mut prover, msg) = SumcheckProver::new(&stack, projected, target, lane_block);
+                let (mut prover, msg) = SumcheckProver::new(stack.clone(), projected, target, lane_block);
                 let context =
                     format!("lane_vars={lane_vars}, lanes={lanes}, qflock_vars={qflock_vars}, offset={offset}");
                 let mut f: Vec<F192> = stack.iter().map(|&word| F192::from(word)).collect();

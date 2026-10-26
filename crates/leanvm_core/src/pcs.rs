@@ -146,7 +146,7 @@ pub fn reserve_level1(mu: usize, log_inv_rate: usize) {
 ///
 /// The opening consumes the commitment: it frees the codeword and tree once the L0 queries are answered.
 #[timed]
-pub fn open(ps: &mut ProverState, c: Committed, q: &[F64], points: &[SlotClaim], ring: &RingSwitchOpen) {
+pub fn open(ps: &mut ProverState, c: Committed, q: Vec<F64>, points: &[SlotClaim], ring: &RingSwitchOpen) {
     let lane_block = 1usize << (c.mu - LOG_BATCH);
     assert_eq!(q.len() % lane_block, 0, "witness must be whole committed lanes");
     assert!(q.len() <= 1usize << c.mu, "witness must fit the announced size");
