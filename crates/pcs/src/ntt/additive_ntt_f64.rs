@@ -220,6 +220,72 @@ impl AdditiveNttF64 {
         self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true)
     }
 
+    /// RS-encode a message coset by coset, handing `on_rows` every finished block of rows and writing no codeword.
+    ///
+    /// - The codeword is `2^r` cosets, each an independent transform of one copy of the message, from layer `r` on.
+    /// - A task builds each of its cosets in scratch and hashes it there, so no codeword is ever written.
+    /// - Several cosets that are small share a scratch, so the blocks are all one size and reach the hasher in batches.
+    /// - [`Self::coset_rows`] recomputes any row from the message.
+    ///
+    /// Use it when [`Self::encodes_by_coset`] holds: the scratch is then cache-resident.
+    pub fn encode_cosets(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, on_rows: &RowSink<'_>) {
+        let log_d = self.coset_log_d(msg.len(), num_ntts, log_inv_rate);
+        let rows = msg.len() / num_ntts;
+        let group = 1usize << (L2_WORDS / msg.len()).max(1).ilog2().min(log_inv_rate as u32);
+        parallel::for_each_chunk((1 << log_inv_rate) / group, |lo, hi| {
+            with_scratch(group * msg.len(), |scratch| {
+                for g in lo..hi {
+                    for (i, coset) in scratch.chunks_exact_mut(msg.len()).enumerate() {
+                        self.build_coset(coset, msg, num_ntts, log_d, log_inv_rate, g * group + i);
+                    }
+                    on_rows(g * group * rows, scratch);
+                }
+            });
+        });
+    }
+
+    /// Codeword rows `positions` of the encode [`Self::encode_cosets`] ran, one transform per coset they touch.
+    pub fn coset_rows(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, positions: &[usize]) -> Vec<Vec<F64>> {
+        let log_d = self.coset_log_d(msg.len(), num_ntts, log_inv_rate);
+        let rows = msg.len() / num_ntts;
+        // Positions grouped by coset, in runs.
+        let mut order: Vec<usize> = (0..positions.len()).collect();
+        order.sort_unstable_by_key(|&i| positions[i]);
+        let runs: Vec<&[usize]> = order.chunk_by(|&a, &b| positions[a] / rows == positions[b] / rows).collect();
+        let found = parallel::map_collect(runs.len(), |r| {
+            with_scratch(msg.len(), |coset| {
+                self.build_coset(coset, msg, num_ntts, log_d, log_inv_rate, positions[runs[r][0]] / rows);
+                runs[r].iter().map(|&i| coset[(positions[i] % rows) * num_ntts..][..num_ntts].to_vec()).collect::<Vec<_>>()
+            })
+        });
+        let mut out = vec![Vec::new(); positions.len()];
+        for (run, rows) in runs.iter().zip(found) {
+            for (&i, row) in run.iter().zip(rows) {
+                out[i] = row;
+            }
+        }
+        out
+    }
+
+    /// Whether a message of `msg_words` words encodes coset by coset: one coset fits the cache budget [`COSET_WORDS`].
+    pub fn encodes_by_coset(msg_words: usize) -> bool {
+        msg_words <= COSET_WORDS
+    }
+
+    /// The log of the codeword's rows, for a message of `msg_words` words.
+    fn coset_log_d(&self, msg_words: usize, num_ntts: usize, log_inv_rate: usize) -> usize {
+        assert!(num_ntts > 0 && msg_words % num_ntts == 0);
+        let log_d = log2_strict_usize(msg_words / num_ntts) + log_inv_rate;
+        assert!(log_d <= self.log_domain_size());
+        log_d
+    }
+
+    /// Coset `coset` of the codeword, built into `buf` (one message long) from the message.
+    fn build_coset(&self, buf: &mut [F64], msg: &[F64], num_ntts: usize, log_d: usize, log_inv_rate: usize, coset: usize) {
+        buf.copy_from_slice(msg);
+        self.run_layers(buf, log_d, num_ntts, log_inv_rate, log_d, log_inv_rate, coset, no_hook);
+    }
+
     /// Codeword rows `positions` of a buffer left by [`Self::encode_interleaved_in_place_without_deep`].
     pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
         let DeepRows { log_d, num_ntts, deep_start } = *deep;
@@ -1172,6 +1238,16 @@ const LOG_SUBS_PER_WORKER: usize = 2;
 /// - That costs extra L3 traffic, but saves a whole sweep of DRAM.
 const L3_WORDS: usize = 1 << 18;
 
+/// Words of one coset a coset-major encode may span.
+///
+/// # Why this value
+///
+/// - 2^19 words is 4 MiB: the largest coset it admits is 2^13 rows of 48 words, 3 MiB.
+/// - A coset runs in a scratch that lives in L2 and L3, and never reaches DRAM.
+/// - Four nodes of two threads each share one 32 MiB L3, so a worker's share is 4 MiB.
+/// - A larger coset spills to DRAM, and then the codeword's write pass is the cheaper plan.
+const COSET_WORDS: usize = 1 << 19;
+
 /// Buffers of at least this many words get streaming stores for data a pass does not read back.
 ///
 /// # Why this value
@@ -2018,6 +2094,36 @@ mod tests {
             };
             for (&q, row) in positions.iter().zip(&rows) {
                 assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_d={log_d}, lanes={lanes}");
+            }
+        }
+    }
+
+    /// The cosets' handed-over rows, and the rows recomputed from the message, equal the full encode's.
+    #[test]
+    fn coset_rows_match_the_full_encode() {
+        let mut rng = Rng::new(0xC05E7);
+        // Small cosets group in one scratch; the last shape is a single coset.
+        for (log_rows, lanes, log_inv_rate) in [(5usize, 48usize, 6usize), (9, 24, 4), (7, 3, 3), (6, 8, 1)] {
+            let log_d = log_rows + log_inv_rate;
+            let ntt = AdditiveNttF64::standard(log_d + 1);
+            let msg_len = lanes << log_rows;
+            let msg: Vec<F64> = (0..msg_len).map(|_| F64(rng.next_u64())).collect();
+            let mut want = vec![F64::ZERO; msg_len << log_inv_rate];
+            want[..msg_len].copy_from_slice(&msg);
+            ntt.encode_interleaved_in_place(&mut want, lanes, log_inv_rate);
+
+            let handed = std::sync::Mutex::new(vec![F64::ZERO; want.len()]);
+            ntt.encode_cosets(&msg, lanes, log_inv_rate, &|row, rows| {
+                handed.lock().unwrap()[row * lanes..][..rows.len()].copy_from_slice(rows)
+            });
+            assert_eq!(handed.into_inner().unwrap(), want, "handed-over rows, log_rows={log_rows}, lanes={lanes}");
+
+            // Repeats and unsorted positions included.
+            let mut positions: Vec<usize> = (0..60).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+            positions.extend_from_within(..5);
+            let rows = ntt.coset_rows(&msg, lanes, log_inv_rate, &positions);
+            for (&q, row) in positions.iter().zip(&rows) {
+                assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_rows={log_rows}, lanes={lanes}");
             }
         }
     }

@@ -240,28 +240,35 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
     )
 }
 
+/// What a [`LigeroWitness`] keeps of its codeword when an encode left rows out of it.
+enum Deferred {
+    /// The rows before the deep layers, which `finish_rows` completes.
+    Deep(AdditiveNttF64, DeepRows),
+    /// No codeword at all: `mat` is the message, and the encode's log inverse rate is here.
+    Cosets(AdditiveNttF64, usize),
+}
+
 /// Codeword + Merkle tree for one deeper WHIR commitment level.
 /// `mat[pos * num_interleaved + lane]`; each row (one `pos` across all lanes)
 /// is one Merkle leaf of `num_interleaved * 16` bytes.
 ///
-/// With `deep` set, `mat` holds the rows before the encode's deep layers, which
-/// [`LigeroWitness::opened_words`] finishes for the rows a query opens.
+/// With `deferred` set, `mat` is not the codeword: see [`Deferred`].
+/// [`LigeroWitness::opened_words`] finishes the rows a query opens.
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F192>,
     pub tree: Vec<Hash>,
     pub block_len: usize,
     pub num_interleaved: usize,
-    deep: Option<(AdditiveNttF64, DeepRows)>,
+    deferred: Option<Deferred>,
 }
 
 impl LigeroWitness {
     /// The rows at `positions`, each as the K words its Merkle leaf is hashed from.
     fn opened_words(&self, positions: &[usize]) -> Vec<Vec<F64>> {
-        match &self.deep {
-            Some((ntt, deep)) => {
-                // SAFETY: an E element is laid out as three K words, so the view covers exactly `mat`.
-                let words = unsafe { std::slice::from_raw_parts(self.mat.as_ptr().cast::<F64>(), 3 * self.mat.len()) };
-                ntt.finish_rows(words, deep, positions)
+        match &self.deferred {
+            Some(Deferred::Deep(ntt, deep)) => ntt.finish_rows(words(&self.mat), deep, positions),
+            Some(Deferred::Cosets(ntt, log_inv_rate)) => {
+                ntt.coset_rows(words(&self.mat), 3 * self.num_interleaved, *log_inv_rate, positions)
             }
             None => positions
                 .iter()
@@ -302,16 +309,18 @@ pub(crate) fn ligero_commit_ext(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    let codeword_len = block_len * num_interleaved;
-    // The encode builds the replicas itself, so the codeword starts uninitialized.
-    //
-    // SAFETY: the encode writes every matrix element before reading it.
-    let mut mat = unsafe { primitives::uninit_vec::<F192>(codeword_len) };
-
     // One leaf per row, its F192s as K words: hashed as the encode finishes each block.
     let row_words = 3 * num_interleaved;
     let builder = merkle::MerkleBuilder::new(block_len, row_words, row_words);
-    let deep = tracing::info_span!(
+    let by_cosets = parallel::num_threads() >= DEFER_DEEP_MIN_THREADS && AdditiveNttF64::encodes_by_coset(3 * poly.len());
+    // Without a codeword, `mat` is the message, kept for the openings.
+    let mut mat = if by_cosets {
+        poly.to_vec()
+    } else {
+        // SAFETY: the encode writes every matrix element before reading it.
+        unsafe { primitives::uninit_vec::<F192>(block_len * num_interleaved) }
+    };
+    let deferred = tracing::info_span!(
         "NTT",
         kind = "extension encode",
         log_domain = log_block_len,
@@ -319,9 +328,12 @@ pub(crate) fn ligero_commit_ext(
     )
     .in_scope(|| {
         let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
-        if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
+        if by_cosets {
+            encode_cosets_ext(ntt, &mat, num_interleaved, log_inv_rate, &on_rows);
+            Some(Deferred::Cosets(ntt.clone(), log_inv_rate))
+        } else if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
             encode_interleaved_ext_without_deep(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows)
-                .map(|rows| (ntt.clone(), rows))
+                .map(|rows| Deferred::Deep(ntt.clone(), rows))
         } else {
             encode_interleaved_ext(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows);
             None
@@ -334,7 +346,7 @@ pub(crate) fn ligero_commit_ext(
         tree,
         block_len,
         num_interleaved,
-        deep,
+        deferred,
     }
 }
 

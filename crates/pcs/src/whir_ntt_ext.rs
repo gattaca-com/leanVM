@@ -66,12 +66,27 @@ pub(crate) fn encode_interleaved_ext_without_deep(
     ntt.encode_interleaved_without_deep(mat, msg, 3 * num_ntts, log_inv_rate, on_rows)
 }
 
+/// [`encode_interleaved_ext`] coset by coset, with no codeword: see [`AdditiveNttF64::encode_cosets`].
+pub(crate) fn encode_cosets_ext(
+    ntt: &AdditiveNttF64,
+    msg: &[F192],
+    num_ntts: usize,
+    log_inv_rate: usize,
+    on_rows: &RowSink<'_>,
+) {
+    ntt.encode_cosets(words(msg), 3 * num_ntts, log_inv_rate, on_rows);
+}
+
 /// Both buffers as K words: each row of n E lanes becomes 3n K lanes.
 fn k_words<'a>(mat: &'a mut [F192], msg: &'a [F192], num_ntts: usize) -> (&'a mut [F64], &'a [F64]) {
     assert!(num_ntts.is_power_of_two());
+    (words_mut(mat), words(msg))
+}
+
+/// A slice of E elements as its K words, shared.
+pub(crate) fn words(v: &[F192]) -> &[F64] {
     // SAFETY: as in `words_mut`, for the shared view.
-    let msg = unsafe { std::slice::from_raw_parts(msg.as_ptr().cast::<F64>(), 3 * msg.len()) };
-    (words_mut(mat), msg)
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<F64>(), 3 * v.len()) }
 }
 
 /// A slice of E elements as its K words.
