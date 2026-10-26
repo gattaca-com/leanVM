@@ -23,13 +23,10 @@ pub mod lean_da {
 }
 
 pub mod lean_xmss {
-    /// The SSZ traits [`LeanXmssPublicKey`] and [`LeanXmssSignature`] implement: import
-    /// them to call `as_ssz_bytes` and `from_ssz_bytes`.
-    pub use signatures::lean_xmss::{Decode, DecodeError, Encode};
     pub use signatures::lean_xmss::{
         Digest, LOG_LIFETIME, LayerSignature, LeafIndex, LeanXmssPublicKey, LeanXmssSecretKey, LeanXmssSignError,
-        LeanXmssSignature, LeanXmssVerifyError, MESSAGE_LEN, Message, PUB_KEY_SIZE, PUB_KEY_SSZ_LEN, PublicParam,
-        SEED_LEN, SIG_SIZE, SIGNATURE_SSZ_LEN, Seed, key_gen, key_gen_from_seed, sign, verify,
+        LeanXmssSignature, LeanXmssVerifyError, MESSAGE_LEN, Message, PUB_KEY_SIZE, PublicParam, SEED_LEN, SIG_SIZE,
+        Seed, key_gen, key_gen_from_seed, sign, verify,
     };
 }
 

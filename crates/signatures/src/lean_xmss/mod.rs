@@ -17,8 +17,6 @@ mod tree;
 use tree::*;
 mod scheme;
 pub use scheme::*;
-mod ssz_serialization;
-pub use ssz_serialization::*;
 #[cfg(feature = "mock")]
 pub mod mock;
 

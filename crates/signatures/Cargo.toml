@@ -14,7 +14,6 @@ mock = []
 [dependencies]
 primitives.workspace = true
 parallel.workspace = true
-ethereum_ssz.workspace = true
 rand.workspace = true
 serde.workspace = true
 

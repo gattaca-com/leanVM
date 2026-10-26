@@ -19,11 +19,19 @@ pub struct LeanXmssPublicKey {
 }
 
 impl LeanXmssPublicKey {
+    /// The specification's serialization, exactly [`PUB_KEY_SIZE`] bytes.
     pub fn flatten(&self) -> [u8; PUB_KEY_SIZE] {
         let mut out = [0u8; PUB_KEY_SIZE];
         out[..N].copy_from_slice(&self.merkle_root);
         out[N..].copy_from_slice(&self.public_param);
         out
+    }
+
+    pub fn from_bytes(bytes: &[u8; PUB_KEY_SIZE]) -> Self {
+        Self {
+            merkle_root: bytes[..N].try_into().unwrap(),
+            public_param: bytes[N..].try_into().unwrap(),
+        }
     }
 }
 
@@ -44,6 +52,47 @@ pub struct LeanXmssSignature {
     pub leaf_index: LeafIndex,
     pub bottom: LayerSignature,
     pub top: LayerSignature,
+}
+
+impl LeanXmssSignature {
+    /// The specification's serialization, exactly [`SIG_SIZE`] bytes.
+    pub fn to_bytes(&self) -> [u8; SIG_SIZE] {
+        let mut out = [0; SIG_SIZE];
+        let mut at = 0;
+        let mut put = |bytes: &[u8]| {
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        };
+        put(&self.leaf_index.to_le_bytes());
+        for layer in [&self.bottom, &self.top] {
+            put(&layer.randomizer);
+            put(layer.chain_values.as_flattened());
+            put(layer.path.as_flattened());
+        }
+        debug_assert_eq!(at, SIG_SIZE);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8; SIG_SIZE]) -> Self {
+        let mut at = 0;
+        let mut take = |len: usize| {
+            at += len;
+            &bytes[at - len..at]
+        };
+        let leaf_index = LeafIndex::from_le_bytes(take(LEAF_INDEX_SIZE).try_into().unwrap());
+        let mut layer = || LayerSignature {
+            randomizer: take(RANDOMIZER_LEN).try_into().unwrap(),
+            chain_values: std::array::from_fn(|_| take(N).try_into().unwrap()),
+            path: std::array::from_fn(|_| take(N).try_into().unwrap()),
+        };
+        let (bottom, top) = (layer(), layer());
+        debug_assert_eq!(at, SIG_SIZE);
+        Self {
+            leaf_index,
+            bottom,
+            top,
+        }
+    }
 }
 
 pub struct LeanXmssSecretKey {

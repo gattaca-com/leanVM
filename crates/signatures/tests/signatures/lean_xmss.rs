@@ -31,11 +31,11 @@ fn known_answer() {
     let message: Message = std::array::from_fn(|i| (i * 7 + 3) as u8);
     let signature = sign(&sk, &message, 0xA5C3_7E19).unwrap();
     assert_eq!(
-        hex(&pk.as_ssz_bytes()),
+        hex(&pk.flatten()),
         "4066673001949b6ff8b9299fd4ea17d28787ad501aafe4b64e2488107b5e3ec3"
     );
     assert_eq!(
-        hex(&primitives::hash::hash(&signature.as_ssz_bytes())),
+        hex(&primitives::hash::hash(&signature.to_bytes())),
         "f10d62beec95e64e1477028252c2c8683695eab9d8787ad8fa722f47b5fd5234"
     );
 }
@@ -104,16 +104,16 @@ fn secret_key_survives_a_round_trip() {
     assert_eq!(sign(&reloaded, &message, 43).unwrap(), sign(&sk, &message, 43).unwrap());
 }
 
-/// The SSZ encoding is the container's fields concatenated, in declaration order.
-/// Assembled independently here, so a reordered or resized field cannot be
-/// mirrored by the impl.
+/// The encoding is the fields concatenated, in declaration order. Assembled
+/// independently here, so a reordered or resized field cannot be mirrored by the
+/// impl.
 #[test]
-fn ssz_layout_is_exact() {
+fn serialization_layout_is_exact() {
     let (sk, pk) = mock::key_gen_from_seed([7; SEED_LEN], 290, 310);
     let message = test_message();
     let sig = mock::sign(&sk, &message, 300).unwrap();
 
-    assert_eq!(pk.as_ssz_bytes(), [pk.merkle_root, pk.public_param].concat());
+    assert_eq!(pk.flatten().as_slice(), [pk.merkle_root, pk.public_param].concat());
 
     let mut expected = sig.leaf_index.to_le_bytes().to_vec();
     for layer in [&sig.bottom, &sig.top] {
@@ -122,28 +122,10 @@ fn ssz_layout_is_exact() {
             expected.extend_from_slice(value);
         }
     }
-    assert_eq!(expected.len(), SIGNATURE_SSZ_LEN);
-    assert_eq!(sig.as_ssz_bytes(), expected);
-    assert_eq!(LeanXmssSignature::from_ssz_bytes(&expected).unwrap(), sig);
-    assert_eq!(LeanXmssPublicKey::from_ssz_bytes(&pk.as_ssz_bytes()).unwrap(), pk);
-}
-
-/// A fixed-length container rejects any other length, and only that.
-#[test]
-fn ssz_rejects_wrong_lengths() {
-    for len in [0, PUB_KEY_SSZ_LEN - 1, PUB_KEY_SSZ_LEN + 1] {
-        assert!(matches!(
-            LeanXmssPublicKey::from_ssz_bytes(&vec![0u8; len]),
-            Err(DecodeError::InvalidByteLength { .. })
-        ));
-    }
-    for len in [0, SIGNATURE_SSZ_LEN - 1, SIGNATURE_SSZ_LEN + 1] {
-        assert!(matches!(
-            LeanXmssSignature::from_ssz_bytes(&vec![0u8; len]),
-            Err(DecodeError::InvalidByteLength { .. })
-        ));
-    }
-    LeanXmssSignature::from_ssz_bytes(&[0xcd; SIGNATURE_SSZ_LEN]).unwrap();
+    assert_eq!(expected.len(), SIG_SIZE);
+    assert_eq!(sig.to_bytes().as_slice(), expected);
+    assert_eq!(LeanXmssSignature::from_bytes(&sig.to_bytes()), sig);
+    assert_eq!(LeanXmssPublicKey::from_bytes(&pk.flatten()), pk);
 }
 
 /// The address layout is leanSPHINCS's, and `Th` is the leanVM hash of `P | A | M`.
