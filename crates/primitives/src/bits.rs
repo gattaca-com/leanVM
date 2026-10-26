@@ -75,6 +75,10 @@ fn bit_transpose_64bytes_portable(input: &[u8; 64], output: &mut [u8; 64]) {
 /// ```
 ///
 /// With constant byte `j = 1 << j`, that is bit `j` of `A`'s byte `7 - i`: the reversal undoes it.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`, `avx512vbmi` and `gfni`. The cfg gate guarantees it at compile time.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]

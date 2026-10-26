@@ -587,6 +587,12 @@ pub mod gfni {
     /// each lane.
     pub struct LineRegs([__m512i; 64]);
 
+    impl Default for LineRegs {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl LineRegs {
         /// Registers to be [`load`](Self::load)ed.
         pub fn new() -> Self {
@@ -950,7 +956,7 @@ mod tests {
     /// Two runs of bytes against the sum of their folds, full and short blocks.
     #[test]
     fn fold_block_pair_adds_both_runs() {
-        let mut rng = Rng::new(0x9A1_2B);
+        let mut rng = Rng::new(0x9_A12B);
         let weights: Vec<F192> = (0..192).map(|_| rng.ext()).collect();
         let (head, tail) = (BitFold::new(&weights[..128]), BitFold::new(&weights[128..]));
         for len in [BLOCK, 5] {
