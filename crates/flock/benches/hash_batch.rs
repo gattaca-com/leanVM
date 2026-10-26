@@ -42,15 +42,9 @@ fn main() {
         .ok()
         .map(|s| s.parse().expect("FLOCK_N_LOG must be an integer"))
         .unwrap_or(13);
-    // `FLOCK_N` sets an exact count, so the instance tail is padding (a node holds ~17,900 in 2^15 slots).
-    let n = std::env::var("FLOCK_N").ok().map_or_else(
-        || {
-            1usize
-                .checked_shl(requested_n_log as u32)
-                .expect("FLOCK_N_LOG exceeds the platform usize width")
-        },
-        |s| s.parse().expect("FLOCK_N must be an integer"),
-    );
+    let n = 1usize
+        .checked_shl(requested_n_log as u32)
+        .expect("FLOCK_N_LOG exceeds the platform usize width");
     let n_log = min_n_blocks_log(n);
     let mu = K_LOG + n_log - LOG_PACKING;
     assert!(
