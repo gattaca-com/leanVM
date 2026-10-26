@@ -11,7 +11,7 @@ use flux_profiler::timed;
 use crate::PAR_THRESHOLD;
 use crate::transcript::ProverState;
 use primitives::field::{F64, F64x8, F192, F192Unreduced, F192x8, Prod8, mul_unreduced4, mul2, mul4};
-use primitives::multilinear::{eq_table, interp, shrink_eq_low};
+use primitives::multilinear::{eq_table, interp};
 use primitives::stream::Stream;
 use std::ops::{Deref, Range};
 
@@ -428,16 +428,49 @@ pub(crate) fn blocks_from_values<F: TreeField>(values: &[F]) -> Vec<F::Block> {
     blocks
 }
 
-/// The equality weights of block `b`'s eight row pairs; pairs past the table weigh nothing.
-fn equality_block(equality: &[F192], b: usize) -> F192x8 {
-    let start = BLOCK_PAIRS * b;
-    match equality.get(start..start + BLOCK_PAIRS) {
-        Some(weights) => F192x8::from_array(weights.try_into().unwrap()),
-        None => {
-            let tail = equality.get(start..).unwrap_or_default();
+/// The weights `eq(r, x)` of a sumcheck round, split as `hi[x >> k] * lo[x & (2^k - 1)]`.
+///
+/// Two tables of about the square root of the size stay in cache, where one table of every weight
+/// is streamed from memory by each of the three trees in every round.
+struct Equality {
+    lo: Vec<F192>,
+    hi: Vec<F192>,
+}
+
+impl Equality {
+    /// The weights of `eq(point, .)`, least significant variable first. A block of eight weights must
+    /// sit inside one `lo`, so a table of fewer than eight entries is all `lo`.
+    fn new(point: &[F192]) -> Self {
+        let k = (point.len() / 2).max(3).min(point.len());
+        Self {
+            lo: eq_table(&point[..k]),
+            hi: eq_table(&point[k..]),
+        }
+    }
+
+    /// The weight of row pair `i`.
+    fn at(&self, i: usize) -> F192 {
+        self.hi[i >> self.lo.len().ilog2()] * self.lo[i & (self.lo.len() - 1)]
+    }
+
+    /// The weights of block `b`'s eight row pairs; pairs past the table weigh nothing.
+    fn block(&self, b: usize) -> F192x8 {
+        let start = BLOCK_PAIRS * b;
+        if self.lo.len() < BLOCK_PAIRS {
+            let tail = self.lo.get(start..).unwrap_or_default();
             let mut padded = [F192::ZERO; BLOCK_PAIRS];
             padded[..tail.len()].copy_from_slice(tail);
-            F192x8::from_array(&padded)
+            return F192x8::from_array(&padded);
+        }
+        let Some(&high) = self.hi.get(start / self.lo.len()) else {
+            return F192x8::ZERO;
+        };
+        let low = start % self.lo.len();
+        let weights = F192x8::from_array(self.lo[low..low + BLOCK_PAIRS].try_into().unwrap());
+        if self.hi.len() == 1 {
+            weights
+        } else {
+            F192x8::splat(high) * weights
         }
     }
 }
@@ -592,14 +625,14 @@ impl<F: TreeField> Source for Rows<F> {
 trait Table: Send + Sync {
     fn count(&self) -> usize;
 
-    fn message(&self, ones: &[Range<usize>], equality: &[F192]) -> [F192; 4];
+    fn message(&self, ones: &[Range<usize>], equality: &Equality) -> [F192; 4];
 
     fn fold(
         &self,
         next_blocks: &mut [Block],
         ones: &[Range<usize>],
         challenge: F192,
-        equality: Option<&[F192]>,
+        equality: Option<&Equality>,
     ) -> [F192; 4];
 }
 
@@ -608,7 +641,7 @@ impl<S: Source + Send> Table for S {
         Source::count(self)
     }
 
-    fn message(&self, ones: &[Range<usize>], equality: &[F192]) -> [F192; 4] {
+    fn message(&self, ones: &[Range<usize>], equality: &Equality) -> [F192; 4] {
         blocks_message(self, ones, equality)
     }
 
@@ -617,7 +650,7 @@ impl<S: Source + Send> Table for S {
         next_blocks: &mut [Block],
         ones: &[Range<usize>],
         challenge: F192,
-        equality: Option<&[F192]>,
+        equality: Option<&Equality>,
     ) -> [F192; 4] {
         fold_block_pairs(self, next_blocks, ones, challenge, equality)
     }
@@ -649,13 +682,13 @@ fn xor_coefficients(mut left: [Prod8; 4], right: [Prod8; 4]) -> [Prod8; 4] {
 
 /// The round message of a table of blocks. A block of identity rows adds nothing: its polynomial is
 /// the constant weight, which `q(0) + q(1)` cancels.
-fn blocks_message<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], equality: &[F192]) -> [F192; 4] {
+fn blocks_message<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], equality: &Equality) -> [F192; 4] {
     let count = source.count();
     let rows = window_blocks(count);
     let window = |index: usize| {
         live(ones, index * rows..((index + 1) * rows).min(count)).fold([Prod8::ZERO; 4], |sum, b| {
             source.prefetch(b + PREFETCH);
-            xor_coefficients(sum, source.block(b).summand(equality_block(equality, b)))
+            xor_coefficients(sum, source.block(b).summand(equality.block(b)))
         })
     };
     let windows = count.div_ceil(rows);
@@ -674,7 +707,7 @@ fn fold_block_pairs<S: Source + ?Sized>(
     next_blocks: &mut [Block],
     ones: &[Range<usize>],
     challenge: F192,
-    equality: Option<&[F192]>,
+    equality: Option<&Equality>,
 ) -> [F192; 4] {
     let count = next_blocks.len();
     let next_ones = halve(ones, count);
@@ -693,7 +726,7 @@ fn fold_block_pairs<S: Source + ?Sized>(
             // SAFETY: tasks own disjoint blocks of the output, which covers every one.
             unsafe { stream.copy_lines(dst.add(k), &block) };
             if let Some(equality) = equality {
-                message = xor_coefficients(message, block.summand(equality_block(equality, k)));
+                message = xor_coefficients(message, block.summand(equality.block(k)));
             }
         }
         message
@@ -803,7 +836,7 @@ impl QuaternaryLayerState {
 
     /// `(q(0)+q(1), [X²]q, [X³]q, [X⁴]q)`.
     #[timed]
-    fn round_message(&self, equality: &[F192]) -> [F192; 4] {
+    fn round_message(&self, equality: &Equality) -> [F192; 4] {
         if let Some(first) = &self.first {
             return first.message(&self.ones, equality);
         }
@@ -818,7 +851,7 @@ impl QuaternaryLayerState {
                 let at_zero = self.values[lo + child];
                 [at_zero, at_zero + self.values[hi + child]]
             });
-            quartic_summand(lines, equality[row])
+            quartic_summand(lines, equality.at(row))
         };
         let xor = |mut left: [F192Unreduced; 4], right: [F192Unreduced; 4]| {
             for coefficient in 0..4 {
@@ -843,14 +876,14 @@ impl QuaternaryLayerState {
                 let at_zero = self.values[lo + child];
                 [at_zero, at_zero + F192::ONE]
             });
-            message = xor(message, quartic_summand(lines, equality[full_pairs]));
+            message = xor(message, quartic_summand(lines, equality.at(full_pairs)));
         }
         message.map(F192Unreduced::reduce)
     }
 
     /// Fold every pair of blocks by `challenge` into `next_blocks`, and with an `equality` weigh the
     /// folded table's round message as it is produced.
-    fn fold_blocks(&mut self, challenge: F192, equality: Option<&[F192]>) -> [F192; 4] {
+    fn fold_blocks(&mut self, challenge: F192, equality: Option<&Equality>) -> [F192; 4] {
         let blocks = self.first.as_ref().map_or(self.blocks.len(), |first| first.count());
         let count = blocks.div_ceil(2);
         self.next_blocks.truncate(count);
@@ -936,7 +969,7 @@ impl QuaternaryLayerState {
     }
 
     #[timed]
-    fn fold_and_message(&mut self, challenge: F192, equality: &[F192]) -> [F192; 4] {
+    fn fold_and_message(&mut self, challenge: F192, equality: &Equality) -> [F192; 4] {
         if self.blocked() {
             return self.fold_blocks(challenge, Some(equality));
         }
@@ -972,7 +1005,7 @@ impl QuaternaryLayerState {
                     &[F192::ONE; 4]
                 };
                 let lines = std::array::from_fn(|i| [left[i], left[i] + right[i]]);
-                let terms = quartic_summand(lines, equality[pair]);
+                let terms = quartic_summand(lines, equality.at(pair));
                 for i in 0..4 {
                     message[i] ^= terms[i];
                 }
@@ -1110,11 +1143,7 @@ pub fn prove_product_triple_from<C: TreeField>(
 
         let width = 1usize << round_count;
         let mut trees = levels.each_mut().map(|tree| tree.state(layer, width));
-        let mut equality = if round_count > 0 {
-            eq_table(&point[1..])
-        } else {
-            Vec::new()
-        };
+        let mut equality = Equality::new(point.get(1..).unwrap_or_default());
         let mut round_point = Vec::with_capacity(round_count);
         let mut messages = if round_count > 0 {
             trees.each_ref().map(|tree| tree.round_message(&equality))
@@ -1132,13 +1161,12 @@ pub fn prove_product_triple_from<C: TreeField>(
             ps.add_scalars(&coeffs);
             let challenge = ps.sample();
             round_point.push(challenge);
-            shrink_eq_low(&mut equality);
             if round + 1 < round_count {
+                equality = Equality::new(&point[round + 2..]);
                 messages = trees.each_mut().map(|tree| tree.fold_and_message(challenge, &equality));
             } else {
-                // The last shrink exhausts `equality`, so the final round has no
-                // table to weight a message by and needs the fold alone. Both
-                // kernels stay for that reason; `fold` is not dead.
+                // The last round has no weights left to weight a message by and needs
+                // the fold alone. Both kernels stay for that reason; `fold` is not dead.
                 for tree in &mut trees {
                     tree.fold(challenge);
                 }
@@ -1191,15 +1219,18 @@ mod tests {
                 .collect();
             let table = below.clone();
             let state = QuaternaryLayerState::new(below, width);
-            let equality: Vec<F192> = (0..width / 2)
-                .map(|i| F192::new((31 * i + 5) as u64, (7 * i + 1) as u64, (11 * i + 9) as u64))
-                .collect();
+            let equality = Equality {
+                lo: (0..width / 2)
+                    .map(|i| F192::new((31 * i + 5) as u64, (7 * i + 1) as u64, (11 * i + 9) as u64))
+                    .collect(),
+                hi: vec![F192::ONE],
+            };
             let [difference, c2, c3, c4] = state.round_message(&equality);
             let direct = |point: F192| {
                 (0..width / 2).fold(F192::ZERO, |sum, row| {
                     let values =
                         [0, 1, 2, 3].map(|child| interp(table[8 * row + child], table[8 * row + 4 + child], point));
-                    sum + equality[row] * values[0] * values[1] * values[2] * values[3]
+                    sum + equality.at(row) * values[0] * values[1] * values[2] * values[3]
                 })
             };
             let c0 = direct(F192::ZERO);
@@ -1240,12 +1271,14 @@ mod tests {
                 let point: Vec<F192> = (0..width.ilog2() - 1)
                     .map(|i| F192::new(31 + u64::from(i), 7, 11))
                     .collect();
-                let mut equality = eq_table(&point);
+                let mut equality = Equality::new(&point);
+                let mut dropped = 1;
                 while reference.logical_rows > 2 {
                     let challenge = F192::new(reference.logical_rows as u64, 13, 19);
                     reference.fold(challenge);
                     separate.fold(challenge);
-                    shrink_eq_low(&mut equality);
+                    equality = Equality::new(&point[dropped..]);
+                    dropped += 1;
                     let message = fused.fold_and_message(challenge, &equality);
                     assert_eq!(message, reference.round_message(&equality), "{context}");
                     assert_eq!(message, separate.round_message(&equality), "{context}");
@@ -1285,13 +1318,15 @@ mod tests {
                 let point: Vec<F192> = (0..width.ilog2() - 1)
                     .map(|i| F192::new(31 + u64::from(i), 7, 11))
                     .collect();
-                let mut equality = eq_table(&point);
+                let mut equality = Equality::new(&point);
+                let mut dropped = 1;
                 assert_eq!(fused.round_message(&equality), reference.round_message(&equality), "{context}");
                 while reference.logical_rows > 2 {
                     let challenge = F192::new(reference.logical_rows as u64, 13, 19);
                     reference.fold(challenge);
                     separate.fold(challenge);
-                    shrink_eq_low(&mut equality);
+                    equality = Equality::new(&point[dropped..]);
+                    dropped += 1;
                     let message = fused.fold_and_message(challenge, &equality);
                     assert_eq!(message, reference.round_message(&equality), "{context}");
                     assert_eq!(message, separate.round_message(&equality), "{context}");
