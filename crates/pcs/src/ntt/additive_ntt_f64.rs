@@ -385,7 +385,8 @@ impl AdditiveNttF64 {
     ///
     /// - The encode ran one gathered pass over its lane-major message: a group is one residue of one coset,
     ///   and its transform leaves row `i` of the group as row `r` of sub-block `coset << g | i`, `g` layers deep.
-    /// - So each group transforms again here, and keeps only the rows that fall in a sub-block of `subs`.
+    /// - So each group transforms again here, skipping the blocks that feed no row of `subs`,
+    ///   and keeps only the rows that fall in a sub-block of `subs`.
     /// - Those rows are every word of the sub-blocks before their deep layers, which then run in place.
     ///
     /// # Panics
@@ -400,13 +401,13 @@ impl AdditiveNttF64 {
         assert!(0 < g && g <= (L2_WORDS / num_ntts).max(1).ilog2() as usize, "one gathered pass");
         assert!(num_ntts % 8 == 0 && log_step >= LOG_BATCH, "the gathered pass is lane-major");
         assert_eq!(msg.len(), n_lanes * msg_rows);
-        // The queried sub-blocks of each coset, as ranges of `subs`.
+        // Each coset with queried sub-blocks: its index, those sub-blocks' places in `subs`, and their group rows.
         let mut next = 0;
-        let cosets: Vec<(usize, std::ops::Range<usize>)> = subs
+        let cosets: Vec<(usize, std::ops::Range<usize>, Vec<usize>)> = subs
             .chunk_by(|a, b| a >> g == b >> g)
             .map(|run| {
                 next += run.len();
-                (run[0] >> g, next - run.len()..next)
+                (run[0] >> g, next - run.len()..next, run.iter().map(|sub| sub & (rows - 1)).collect())
             })
             .collect();
         // SAFETY: a group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
@@ -419,11 +420,11 @@ impl AdditiveNttF64 {
                 for t in lo..hi {
                     fill_stage(stage, unsafe { msg.add(0) }.cast_const(), t * BATCH, log_step, msg_rows, n_lanes, num_ntts);
                     for (s, staged) in stage.chunks_exact(rows * num_ntts).enumerate() {
-                        for (coset, run) in &cosets {
+                        for (coset, run, live) in &cosets {
                             scratch.copy_from_slice(staged);
-                            self.run_layers(scratch, deep_start, num_ntts, start, deep_start, start, *coset, no_hook);
-                            for pos in run.clone() {
-                                let i = subs[pos] & (rows - 1);
+                            let live_rows = Some(&live[..]);
+                            self.run_layers_to(scratch, deep_start, num_ntts, start, deep_start, start, *coset, live_rows, no_hook);
+                            for (pos, &i) in run.clone().zip(live) {
                                 // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block.
                                 let dst = unsafe { out.slice(pos * sub_len + (t * BATCH + s) * num_ntts, num_ntts) };
                                 dst.copy_from_slice(&scratch[i * num_ntts..][..num_ntts]);
@@ -953,6 +954,26 @@ impl AdditiveNttF64 {
         end_layer: usize,
         outer_log: usize,
         sub_idx: usize,
+        hook: impl FnMut(),
+    ) {
+        self.run_layers_to(buf, log_d, num_ntts, first_layer, end_layer, outer_log, sub_idx, None, hook);
+    }
+
+    /// [`Self::run_layers`] that leaves the blocks alone which hold none of the buffer rows `live` (sorted).
+    ///
+    /// - Only those rows come out right: a block feeds only the rows inside it, in every later layer.
+    /// - A fused sweep skips whole blocks of its first layer, so a sparse `live` prunes coarsely.
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers_to(
+        &self,
+        buf: &mut [F64],
+        log_d: usize,
+        num_ntts: usize,
+        first_layer: usize,
+        end_layer: usize,
+        outer_log: usize,
+        sub_idx: usize,
+        live: Option<&[usize]>,
         mut hook: impl FnMut(),
     ) {
         let mut layer = first_layer;
@@ -968,7 +989,7 @@ impl AdditiveNttF64 {
             if radix == 3 {
                 // One radix-8 sweep.
                 let eighth = block_size >> 3;
-                for block_in_buf in 0..num_blocks_in_buf {
+                for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
                     let t = self.twiddles_radix8(layer, global(block_in_buf));
                     let start = block_in_buf * block_elems;
                     butterfly_interleaved_fused_3layer(
@@ -978,12 +999,12 @@ impl AdditiveNttF64 {
                         num_ntts,
                         &mut hook,
                     );
-                }
+                });
                 layer += 3;
             } else if radix == 2 {
                 // One radix-4 sweep.
                 let quarter = block_size >> 2;
-                for block_in_buf in 0..num_blocks_in_buf {
+                for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
                     let global_block = global(block_in_buf);
                     let t = [
                         self.twiddle(layer, global_block),
@@ -998,12 +1019,12 @@ impl AdditiveNttF64 {
                         num_ntts,
                         &mut hook,
                     );
-                }
+                });
                 layer += 2;
             } else {
                 // One layer: a plain butterfly sweep.
                 let block_size_half = block_size >> 1;
-                for block_in_buf in 0..num_blocks_in_buf {
+                for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
                     let twiddle = self.twiddle(layer, global(block_in_buf));
                     let start = block_in_buf * block_elems;
                     butterfly_interleaved_block(
@@ -1013,7 +1034,7 @@ impl AdditiveNttF64 {
                         num_ntts,
                         &mut hook,
                     );
-                }
+                });
                 layer += 1;
             }
         }
@@ -1039,6 +1060,14 @@ impl AdditiveNttF64 {
                 }
             }
         }
+    }
+}
+
+/// Call `f` with each block of `1 << log_rows` rows that holds a row of `live` (sorted), or with every block of `num_blocks`.
+fn for_each_block(num_blocks: usize, log_rows: usize, live: Option<&[usize]>, mut f: impl FnMut(usize)) {
+    match live {
+        None => (0..num_blocks).for_each(f),
+        Some(rows) => rows.chunk_by(|a, b| a >> log_rows == b >> log_rows).for_each(|run| f(run[0] >> log_rows)),
     }
 }
 
