@@ -162,11 +162,13 @@ impl L0Codeword<'_> {
     }
 }
 
-/// Pool size from which the L0 encode leaves its deep pass out of the codeword and an
-/// opening finishes the queried sub-blocks again: a DRAM write of the codeword saved
-/// against a transform per opened sub-block. 1,290 signatures on a 16-core Zen 5:
-/// 1 worker +2.5%, 2 +0.4%, 4 +0.5%, 8 -0.4%, 16 -1 to -4% (node -3.8%).
-const DEFER_DEEP_MIN_THREADS: usize = 8;
+/// Pool size from which the L0 and extension encodes leave their deep pass out of the codeword,
+/// and an opening finishes the queried sub-blocks again: a DRAM write of the codeword saved
+/// against a transform per opened sub-block.
+///
+/// - One worker alone is ALU-bound, and deferring costs it 2.5 %.
+/// - From two workers on, nodes share DRAM: 4 concurrent 8:1 nodes on 2 threads each go 3.5-3.7 s -> 3.0 s.
+const DEFER_DEEP_MIN_THREADS: usize = 2;
 
 /// Commit to the `F64` message of a `2^log_n`-word witness: the message is its
 /// leading `n_lanes` lane blocks of `2^(log_n - log_batch_size)` words each, one
