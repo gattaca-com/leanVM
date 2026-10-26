@@ -593,6 +593,20 @@ impl Program {
             }
         }
 
+        // The compression of the seven cells a `BLAKE2s` reads, kept out of the step loop
+        // so that its ten unrolled rounds do not compete with the loop for registers.
+        #[inline(never)]
+        fn compress_cells(w: &[F192; 7]) -> [F192; 2] {
+            // Cell `k`'s two low lanes are the 32-bit words `4k..4k + 4` of the block.
+            let word = |k: usize, i: usize| ([w[k].c0, w[k].c1][i / 2 % 2] >> (32 * (i % 2))) as u32;
+            let m: [u32; 16] = std::array::from_fn(|i| word(i / 4, i));
+            let cv: [u32; 8] = std::array::from_fn(|i| word(4 + i / 4, i));
+            let md = w[6];
+            let h = primitives::hash::compress_with_flags(&cv, &m, md.c0, md.c1 as u32, (md.c1 >> 32) as u32);
+            let pair = |k: usize| u64::from(h[2 * k]) | u64::from(h[2 * k + 1]) << 32;
+            [F192::new(pair(0), pair(1), 0), F192::new(pair(2), pair(3), 0)]
+        }
+
         loop {
             if pc == ending_pc {
                 if fp != 0 {
@@ -963,17 +977,12 @@ impl Program {
                             value,
                         }));
                     }
-                    let va = [F64(words[0].c0), F64(words[0].c1), F64(words[1].c0), F64(words[1].c1)];
-                    let vb = [F64(words[2].c0), F64(words[2].c1), F64(words[3].c0), F64(words[3].c1)];
-                    let vcv = [F64(words[4].c0), F64(words[4].c1), F64(words[5].c0), F64(words[5].c1)];
-                    let metadata = words[6];
                     // Compress the 64 message bytes to the 32-byte result, then
                     // write it to c's two cells. No table constraint covers the
                     // digest (the relation is proven by flock, §hash_flock); the
                     // interpreter still computes the definite digest so the output
                     // cells are consistent for any later read.
-                    let vc = blake2s_compress(va, vb, vcv, metadata);
-                    let outputs = [F192::new(vc[0].0, vc[1].0, 0), F192::new(vc[2].0, vc[3].0, 0)];
+                    let outputs = compress_cells(&words);
                     m.put(ac, outputs[0])?;
                     m.put(ac + 1, outputs[1])?;
                     let ra = [m.bump_access_count(aa0), m.bump_access_count(aa1)];

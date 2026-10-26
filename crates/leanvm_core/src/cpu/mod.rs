@@ -37,6 +37,7 @@ pub(crate) use trace::{Brow, Drow, Jrow, Rows, Srow, Trace, Xrow};
 /// chaining value and metadata, and the 32-byte result is split back into the
 /// four output words `c`. Flock proves this same compression relation
 /// ([`crate::hash_flock`]).
+#[cfg(test)]
 fn blake2s_compress(va: [F64; 4], vb: [F64; 4], vcv: [F64; 4], metadata: F192) -> [F64; 4] {
     crate::hash_flock::digest(&crate::hash_flock::compression(va, vb, vcv, metadata))
 }
