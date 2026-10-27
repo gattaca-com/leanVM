@@ -466,6 +466,8 @@ impl AdditiveNttF64 {
         parallel::for_each_chunk((1usize << log_step) / BATCH, |lo, hi| {
             // One octet of lanes of a batch of residues is 64 lanes of one transform.
             let stage_len = rows * BATCH * 8;
+            // `built` is far larger than a node's L3 share and is read only after every task: its lines stream.
+            let stream = primitives::stream::Stream::new();
             with_scratch(2 * stage_len, |all| {
                 let (stage, scratch) = all.split_at_mut(stage_len);
                 for t in lo..hi {
@@ -479,7 +481,7 @@ impl AdditiveNttF64 {
                                 for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8].chunks_exact(8).enumerate() {
                                     // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block.
                                     let dst = unsafe { out.slice(pos * sub_len + (t * BATCH + s) * num_ntts + 8 * octet, 8) };
-                                    dst.copy_from_slice(line);
+                                    stream.copy(dst, line);
                                 }
                             }
                         }
