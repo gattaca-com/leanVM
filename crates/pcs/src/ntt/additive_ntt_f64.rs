@@ -632,8 +632,9 @@ impl AdditiveNttF64 {
         assert!(log_d <= self.log_domain_size());
         assert!(start <= log_d);
 
-        let (par_log, deep_start) = (par_log(log_d), deep_start(log_d, num_ntts, start));
-        let fit2 = fit(L2_WORDS, num_ntts);
+        let l2_words = l2_words(lane_major.is_some());
+        let (par_log, deep_start) = (par_log(log_d), deep_start(log_d, num_ntts, start, l2_words));
+        let fit2 = fit(l2_words, num_ntts);
 
         // A buffer this large is evicted before the next pass reads it back.
         let stream = data.len() >= STREAM_MIN_WORDS;
@@ -1230,11 +1231,11 @@ fn par_log(log_d: usize) -> usize {
 ///
 /// - If every layer fits one L3 sub-block, the deep pass is the whole transform: one sweep.
 /// - Otherwise the deep pass keeps one L2 sub-block of layers.
-fn deep_start(log_d: usize, num_ntts: usize, start: usize) -> usize {
+fn deep_start(log_d: usize, num_ntts: usize, start: usize, l2_words: usize) -> usize {
     let deep = if log_d - start <= fit(L3_WORDS, num_ntts) {
         fit(L3_WORDS, num_ntts)
     } else {
-        fit(L2_WORDS, num_ntts)
+        fit(l2_words, num_ntts)
     };
     log_d.saturating_sub(deep).max(par_log(log_d)).max(start)
 }
@@ -1242,7 +1243,7 @@ fn deep_start(log_d: usize, num_ntts: usize, start: usize) -> usize {
 /// The deep pass start of a lane-major encode, if its first gathered pass can read the message:
 /// a layer for it to run, whole cache lines in a row, and enough residues to batch.
 fn lane_major_deep_start(log_d: usize, num_ntts: usize, start: usize) -> Option<usize> {
-    let deep_start = deep_start(log_d, num_ntts, start);
+    let deep_start = deep_start(log_d, num_ntts, start, L2_WORDS);
     let g = (deep_start - start).min(fit(L2_WORDS, num_ntts));
     (start < deep_start && num_ntts.is_multiple_of(8) && log_d - start - g >= LOG_BATCH).then_some(deep_start)
 }
@@ -1639,6 +1640,26 @@ pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, row_wo
 const L2_WORDS: usize = 1 << 17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const L2_WORDS: usize = 1 << 21;
+
+/// [`L2_WORDS`] for an encode that has no lane-major message, on a pool of at most 4 threads.
+///
+/// # Why this value
+///
+/// - 2^15 words is 256 KiB: a deep sub-block of 2^9 rows of 48 words is 192 KiB.
+/// - One thread per core owns its whole 1 MiB L2, and the sub-block leaves room for the twiddles and the prefetched next sub-block.
+/// - The plan then has one more gathered layer and fewer deep ones.
+/// - Measured on the 8:1 extension encode of 2^22 words at 4 threads: 130 -> 123 ms.
+/// - 2^14 words plans a second gathered pass and costs 184 ms.
+/// - The lane-major base encode keeps [`L2_WORDS`]: 2^16 words plans a second gathered pass there and costs 40 %.
+/// - Larger pools keep [`L2_WORDS`]: their nodes share the L3 and the SMT threads share an L2.
+fn l2_words(lane_major: bool) -> usize {
+    /// Apple silicon keeps [`L2_WORDS`] whatever the plan.
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    const FEW_THREADS_L2_WORDS: usize = 1 << 15;
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    const FEW_THREADS_L2_WORDS: usize = L2_WORDS;
+    if lane_major || parallel::num_threads() > 4 { L2_WORDS } else { FEW_THREADS_L2_WORDS }
+}
 
 /// Deep sub-blocks cut per worker, as a log.
 ///
