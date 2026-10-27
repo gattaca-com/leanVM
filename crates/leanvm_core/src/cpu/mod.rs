@@ -586,7 +586,7 @@ pub fn prove_with(
     let n_blocks = flock_reduction.n_blocks();
     drop(flock_reduction);
     let ring = crate::hash_flock::ring_switch_open(n_blocks, offset, &reduced);
-    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, &slots, &ring) });
+    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, w.repeats, &slots, &ring) });
     Ok((
         ps.into_proof(),
         Stats {
@@ -908,5 +908,50 @@ mod tests {
         let pi = [w(1), w(2)];
         let exec = program.execute(pi).unwrap();
         assert_eq!(exec.mem.word(4), x * y, "MUL computes the E product");
+    }
+
+    /// The producer's repeat map of the stack tags real repeats only, and finds the padding: a program whose
+    /// tables and q_flock end in whole padded blocks, each tagged, with the proof still valid.
+    #[test]
+    fn witness_repeat_map_tags_real_repeats() {
+        let blocks = 17usize;
+        let mut prog = vec![
+            Op::Set { o: 2, k: w(1) },
+            Op::Set { o: 3, k: w(2) },
+            Op::Set { o: 4, k: w(3) },
+            Op::Set { o: 5, k: w(4) },
+            Op::Set { o: 8, k: md() },
+        ];
+        for j in 0..blocks {
+            prog.push(Op::Blake2s {
+                ins: [2, 3, 4, 5],
+                cv: 0,
+                out: 20_000 + 2 * j as u32,
+                md: 8,
+            });
+        }
+        // 4150 SETs in all, so the SET table pads from row 4150 to 8192: past 4 blocks.
+        let n_set = 4150;
+        while prog.len() < n_set + blocks {
+            prog.push(Op::Set { o: 16 + prog.len() as u32, k: w(prog.len() as u64) });
+        }
+        while prog.len() < 8191 {
+            prog.push(Op::Xor { a: 2, b: 3, c: 16 + prog.len() as u32 });
+        }
+        prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
+        let program = Program::from_bytecode(prog, 20_100);
+        let pi = [w(3), w(5)];
+        let exec = program.execute(pi).unwrap();
+        let witness = program.build(&exec);
+        let real = ::pcs::stack_open::equal_blocks(&witness.q);
+        assert_eq!(witness.repeats.len(), real.len());
+        assert!(
+            witness.repeats.iter().zip(&real).all(|(&tagged, &real)| real || !tagged),
+            "a tagged block is a repeat"
+        );
+        let tagged = witness.repeats.iter().filter(|&&t| t).count();
+        assert!(tagged >= 6, "the padding is found: {tagged} blocks tagged");
+        let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &proof).expect("the proof verifies");
     }
 }

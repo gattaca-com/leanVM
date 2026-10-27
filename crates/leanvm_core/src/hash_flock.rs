@@ -33,6 +33,7 @@
 use flux_profiler::timed;
 use crate::transcript::ProverState;
 use ::pcs::pack::LOG_PACKING;
+use ::pcs::stack_open::EQUAL_BLOCK_LOG;
 use flock::hash::{Blake2sSetup, Compression, K_LOG, blake2s_compress, generate_witness_into_z};
 use primitives::field::{F64, F192};
 
@@ -209,8 +210,18 @@ fn packed_words(q_flock: &[F64]) -> &[u64] {
 /// reduction does not regenerate them later. Deterministic, so it matches what the
 /// reduction regenerates. An empty `blocks` yields one padding cube (all instances are
 /// padding).
+///
+/// Every padding instance is the same `2^SLOT_STRIDE_LOG` words, so a block of the column whose predecessor
+/// holds only padding repeats it, and is tagged so in `repeats`, the column's slice of the stack's repeat map.
 #[timed]
-pub(crate) fn build_qflock_prepared(blocks: &[Compression], q_flock: &mut [F64]) -> PreparedReductionWitness {
+pub(crate) fn build_qflock_prepared(
+    blocks: &[Compression],
+    q_flock: &mut [F64],
+    repeats: &mut [bool],
+) -> PreparedReductionWitness {
+    for (b, repeat) in repeats.iter_mut().enumerate() {
+        *repeat = b > 0 && (b - 1) << EQUAL_BLOCK_LOG >= blocks.len() << SLOT_STRIDE_LOG;
+    }
     let n_blocks = blocks.len().max(1);
     // The packed `z` is generated straight into the committed window: its words are `q_flock`.
     // SAFETY: `F64` is `repr(transparent)` over `u64`, so the two slices are the same bytes.
@@ -234,7 +245,7 @@ pub const SLOT_STRIDE_LOG: usize = K_LOG - LOG_PACKING;
 #[timed]
 fn build_qflock(blocks: &[Compression]) -> Vec<F64> {
     let mut q_flock = vec![F64::ZERO; 1 << qflock_kappa(blocks.len())];
-    build_qflock_prepared(blocks, &mut q_flock);
+    build_qflock_prepared(blocks, &mut q_flock, &mut []);
     q_flock
 }
 

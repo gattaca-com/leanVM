@@ -59,6 +59,16 @@ use super::whir::{ProverConfig, ProverData};
 
 mod basis;
 
+/// Bits of the block the repeat map tags: it holds `2^EQUAL_BLOCK_LOG` words.
+pub const EQUAL_BLOCK_LOG: usize = basis::LOW_VARS;
+
+/// The exact repeat map of `stack`: for each block of `2^EQUAL_BLOCK_LOG` words, whether it equals the block
+/// before it. The reference a producer's map is checked against.
+pub fn equal_blocks(stack: &[F64]) -> Vec<bool> {
+    let blocks: Vec<_> = stack.chunks_exact(1 << EQUAL_BLOCK_LOG).collect();
+    (0..blocks.len()).map(|b| b > 0 && blocks[b] == blocks[b - 1]).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Claim types
 // ---------------------------------------------------------------------------
@@ -155,6 +165,10 @@ fn claim_range(claim: &StackClaim) -> (usize, usize) {
 /// evaluation AND the ring-switched q_flock claims (`ring`) in ONE WHIR
 /// run, reusing the caller's [`super::whir::commit`] output as L0.
 ///
+/// `repeats` is the producer's map of the stack: for each block of `2^EQUAL_BLOCK_LOG` words, `true` only if
+/// the block equals the block before it. A missing repeat costs a read and a false one is a bug, so the map is
+/// conservative. It may be empty, which claims no repeats.
+///
 /// `stack` is the committed message (not stored in [`ProverData`]), consumed: the
 /// lane rounds drop it before the level-1 commit. It is the `2^log_n`-word stack truncated to the lane blocks that
 /// carry data, so every claim must live inside it and the padding past it is
@@ -166,6 +180,7 @@ pub fn open_batch_mixed_whir_stacked(
     ps: &mut ProverState,
     log_n: usize,
     stack: Vec<F64>,
+    repeats: Vec<bool>,
     prover_data: ProverData,
     config: &ProverConfig,
     point_claims: &[StackClaim],
@@ -183,6 +198,10 @@ pub fn open_batch_mixed_whir_stacked(
     assert!(
         point_claims.iter().all(|c| claim_range(c).1 <= stack.len()),
         "every claim must live inside the committed lanes"
+    );
+    assert!(
+        repeats.is_empty() || repeats.len() == stack.len() >> EQUAL_BLOCK_LOG,
+        "the repeat map tags every block of the stack"
     );
     let span = tracing::info_span!("Ring switch").entered();
 
@@ -234,7 +253,7 @@ pub fn open_batch_mixed_whir_stacked(
     let lane_vars = log_n - config.initial_k;
     let rings: Vec<_> = rs_outputs.into_iter().map(|output| output.weight).collect();
     let initial_basis = tracing::info_span!("Basis")
-        .in_scope(|| basis::project(&stack, lane_vars, point_claims, lambdas_pd, ring, &rings));
+        .in_scope(|| basis::project(&stack, repeats, lane_vars, point_claims, lambdas_pd, ring, &rings));
 
     // 4. One WHIR over the full stack against the combined claim (the
     //    prover takes the stack; no copy).
@@ -314,7 +333,14 @@ mod tests {
             (12, 5, 13),
         ] {
             let lane_block = 1usize << lane_vars;
-            let stack: Vec<F64> = (0..lanes * lane_block).map(|_| F64(rng.next_u64())).collect();
+            let mut stack: Vec<F64> = (0..lanes * lane_block).map(|_| F64(rng.next_u64())).collect();
+            // Runs of equal blocks, which the map hands to the projection.
+            for lane in stack.chunks_mut(lane_block).filter(|_| lane_vars >= EQUAL_BLOCK_LOG) {
+                for b in [1, 2, 6, 7].into_iter().filter(|&b| b << EQUAL_BLOCK_LOG < lane_block) {
+                    lane.copy_within((b - 1) << EQUAL_BLOCK_LOG..b << EQUAL_BLOCK_LOG, b << EQUAL_BLOCK_LOG);
+                }
+            }
+            let repeats = equal_blocks(&stack);
             let qflock_len = 1usize << qflock_vars;
             for offset in [0, qflock_len] {
                 if offset + qflock_len > stack.len() {
@@ -402,7 +428,7 @@ mod tests {
                 }
 
                 let rings: Vec<_> = rs_outputs.iter().map(|output| output.weight.clone()).collect();
-                let projected = basis::project(&stack, lane_vars, &claims, &lambdas, &ring, &rings);
+                let projected = basis::project(&stack, repeats.clone(), lane_vars, &claims, &lambdas, &ring, &rings);
                 let target = rng.ext();
                 let (mut prover, msg) = SumcheckProver::new(stack.clone(), projected, target, lane_block);
                 let context =

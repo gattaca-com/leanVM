@@ -96,7 +96,7 @@ fn main() {
 
         let t = Instant::now();
         let ring = ring_switch_open(n, 0, &reduced);
-        open_batch_mixed_whir_stacked(&mut ps, mu, q_flock.to_vec(), prover_data, &config, &[], &ring);
+        open_batch_mixed_whir_stacked(&mut ps, mu, q_flock.to_vec(), Vec::new(), prover_data, &config, &[], &ring);
         let open_s = t.elapsed().as_secs_f64();
         let prove_s = t_prove.elapsed().as_secs_f64();
 

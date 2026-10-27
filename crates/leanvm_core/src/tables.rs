@@ -16,6 +16,7 @@
 
 use crate::cpu::{Brow, Drow, Jrow, Memory, Op, Rows, Srow, Trace};
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
+use ::pcs::stack_open::EQUAL_BLOCK_LOG;
 use primitives::field::{F64, F192, mul_by_g};
 use primitives::stream::Stream;
 
@@ -194,8 +195,12 @@ pub struct FillCtx<'a> {
 }
 
 /// Where one column's values go: its window in the stacked witness, or a private
-/// buffer if the column is virtual.
-pub type ColumnOut<'a> = &'a mut [F64];
+/// buffer if the column is virtual, and the window's slice of the stack's repeat map
+/// ([`crate::witness::split_stack`]), which is empty for a virtual column or a window under one block.
+pub struct ColumnOut<'a> {
+    pub words: &'a mut [F64],
+    pub repeats: &'a mut [bool],
+}
 
 impl<'a> FillCtx<'a> {
     pub(crate) fn new(
@@ -257,7 +262,7 @@ impl<'a> FillCtx<'a> {
     ) {
         let n = self.height;
         for k in 0..N {
-            assert_eq!(out[at + k].len(), n, "column {} has the wrong window length", at + k);
+            assert_eq!(out[at + k].words.len(), n, "column {} has the wrong window length", at + k);
             self.written
                 .fetch_or(1 << (at + k), std::sync::atomic::Ordering::Relaxed);
         }
@@ -283,16 +288,23 @@ const FILL_TASK: usize = 1 << 12;
 /// Rows are gathered into line-sized runs per column and streamed out: the windows are the stacked
 /// witness, which nothing reads until the commit, so a fetch of a line before its write is wasted.
 /// The windows are equal and a power of two long.
+///
+/// A padded block whose predecessor is also padded repeats it, and is tagged so in the window's `repeats`.
 pub(crate) fn fill_columns<const N: usize>(
     windows: &mut [ColumnOut; N],
     n_rows: usize,
     padding: [F64; N],
     f: impl Fn(usize) -> [F64; N] + Sync,
 ) {
-    let n = windows[0].len();
-    assert!(n.is_power_of_two() && windows.iter().all(|w| w.len() == n));
+    let n = windows[0].words.len();
+    assert!(n.is_power_of_two() && windows.iter().all(|w| w.words.len() == n));
     assert!(n_rows <= n);
-    let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| parallel::SendPtr(windows[k].as_mut_ptr()));
+    for window in windows.iter_mut() {
+        for (b, repeat) in window.repeats.iter_mut().enumerate() {
+            *repeat = b > 0 && (b - 1) << EQUAL_BLOCK_LOG >= n_rows;
+        }
+    }
+    let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| parallel::SendPtr(windows[k].words.as_mut_ptr()));
     let (task, run) = (n.min(FILL_TASK), n.min(FILL_ROWS));
     parallel::for_each(n / task, |t| {
         let stream = Stream::new();

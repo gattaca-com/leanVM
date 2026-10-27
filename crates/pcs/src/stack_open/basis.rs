@@ -26,19 +26,13 @@ use crate::tensor_algebra::{DEGREE_E, transpose_s_hat};
 use crate::whir::{InitialBasis, LaneLift, SumcheckMessage, accumulate_msg, adjacent_dots};
 
 /// Bits of a block's low part.
-const LOW_VARS: usize = 10;
+pub(super) const LOW_VARS: usize = 10;
 /// Packing width: the bit rows of a block of words.
 const ROWS: usize = 64;
 
 /// `g * t`, elementwise: the lone fold `t + r * t` at `r = g + 1`.
 fn scale8(t: &[F192; 8], g: F192) -> [F192; 8] {
     fold_lones8_ext(t, g + F192::ONE)
-}
-
-/// The words of a block, compared as `u64`s so that equality is a `memcmp`.
-fn words(block: &[F64]) -> &[u64] {
-    // SAFETY: `F64` is a `u64`.
-    unsafe { std::slice::from_raw_parts(block.as_ptr().cast(), block.len()) }
 }
 
 /// What a weight does to one bit of the stack index.
@@ -205,26 +199,24 @@ impl Terms {
     ///
     /// The lane is swept in runs of `RUN` blocks, one pass per table, so a pattern's packed weights or a ring's
     /// fold matrices stay in L1 across the run while the run's words stay in L2.
-    fn project_lane<const CHUNKS: usize>(&self, lane: &[F64], row: &mut [F192], repeats: &mut [bool]) {
+    fn project_lane<const CHUNKS: usize>(&self, lane: &[F64], row: &mut [F192], repeats: &[bool]) {
         const RUN: usize = 32;
         let n_blocks = lane.len() >> self.low_vars;
         let block = |h: usize| &lane[h << self.low_vars..][..1 << self.low_vars];
         let mut q = vec![F192::ZERO; n_blocks * self.patterns.len()];
         let mut sigmas = vec![F192::ZERO; ROWS * self.rings.len()];
         let mut cols = [[0u8; ROWS]; CHUNKS];
-        // Padding repeats blocks. A run of equal blocks shares its dots and its folds, and a fold's weight is the
-        // run's `e_hi` mass.
+        // Padding repeats blocks, and the producer's map says which. A run of equal blocks shares its dots and its
+        // folds, and a fold's weight is the run's `e_hi` mass. A repeat's words are never read.
+        let repeat = |h: usize| h > 0 && repeats[h];
         let mut dots = vec![None; self.patterns.len()];
         let mut folds: Vec<Option<[F192; ROWS]>> = vec![None; self.rings.len()];
         let mut masses = vec![F192::ZERO; self.rings.len()];
         for start in (0..n_blocks).step_by(RUN) {
             let blocks = start..(start + RUN).min(n_blocks);
-            for h in blocks.clone() {
-                repeats[h] = h > 0 && words(block(h - 1)) == words(block(h));
-            }
             for ((pattern, q), dot) in self.patterns.iter().zip(q.chunks_exact_mut(n_blocks)).zip(&mut dots) {
                 for h in blocks.clone() {
-                    if !repeats[h] {
+                    if !repeat(h) {
                         *dot = None;
                     }
                     if pattern.active[h] {
@@ -233,7 +225,7 @@ impl Terms {
                 }
             }
             for h in blocks {
-                if !repeats[h] {
+                if !repeat(h) {
                     flush(&mut folds, &mut masses, &mut sigmas);
                 }
                 let mut transposed = false;
@@ -280,17 +272,14 @@ impl Terms {
         }
     }
 
-    /// `P`, and which blocks of the stack repeat their predecessor in the lane.
-    fn project(&self, stack: &[F64]) -> (Vec<F192>, Vec<bool>) {
+    /// `P`, given the blocks of the stack that repeat their predecessor.
+    fn project(&self, stack: &[F64], repeats: &[bool]) -> Vec<F192> {
         let (block, n_terms) = (1usize << self.lane_vars, self.n_terms());
         let n_blocks = block >> self.low_vars;
         let mut p = vec![F192::ZERO; stack.len() / block * n_terms];
-        let mut repeats = vec![false; stack.len() >> self.low_vars];
-        let repeats_ptr = parallel::SendPtr(repeats.as_mut_ptr());
         parallel::chunks_mut(&mut p, n_terms, |l, row| {
             let lane = &stack[l * block..(l + 1) * block];
-            // SAFETY: lane `l` owns the blocks `l * n_blocks..(l + 1) * n_blocks`, in bounds and disjoint.
-            let repeats = unsafe { repeats_ptr.slice(l * n_blocks, n_blocks) };
+            let repeats = &repeats[l * n_blocks..(l + 1) * n_blocks];
             match self.low_vars {
                 6 => self.project_lane::<8>(lane, row, repeats),
                 7 => self.project_lane::<16>(lane, row, repeats),
@@ -299,7 +288,7 @@ impl Terms {
                 _ => self.project_lane::<128>(lane, row, repeats),
             }
         });
-        (p, repeats)
+        p
     }
 }
 
@@ -380,9 +369,11 @@ impl LaneLift for Terms {
 
 /// The opening's weight as terms: its table `P` against the stack, its table `A`, and the lift of `A`'s last row.
 ///
-/// Every claim must lie inside the stack, and `lane_vars` must be at least 6.
+/// Every claim must lie inside the stack, and `lane_vars` must be at least 6. `repeats` tags the blocks of
+/// `2^LOW_VARS` words that equal their predecessor, or is empty; it serves lanes of at least that many words.
 pub(super) fn project(
     stack: &[F64],
+    repeats: Vec<bool>,
     lane_vars: usize,
     claims: &[StackClaim],
     lambdas: &[F192],
@@ -472,7 +463,16 @@ pub(super) fn project(
             }
         }
     }
-    let (p, repeats) = terms.project(stack);
+    let repeats = if low_vars == LOW_VARS && !repeats.is_empty() {
+        debug_assert!(
+            repeats.iter().zip(super::equal_blocks(stack)).all(|(&tagged, real)| real || !tagged),
+            "a tagged repeat is a repeat"
+        );
+        repeats
+    } else {
+        vec![false; stack.len() >> low_vars]
+    };
+    let p = terms.project(stack, &repeats);
     InitialBasis {
         p,
         a,

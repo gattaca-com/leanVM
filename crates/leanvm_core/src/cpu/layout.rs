@@ -93,6 +93,9 @@ pub struct Layout {
 /// announce it).
 pub(crate) struct Witness {
     pub(crate) q: Vec<F64>,
+    /// Which blocks of `q` equal their predecessor, as far as the fills know ([`::pcs::stack_open::equal_blocks`]
+    /// is the exact map): the padding of each column.
+    pub(crate) repeats: Vec<bool>,
     /// The virtual columns' values as `(global column index, values)`. They carry
     /// data for the bus but are not committed, so they are not in `q`.
     pub(crate) virt: Vec<(usize, Vec<F64>)>,
@@ -458,9 +461,13 @@ impl Program {
                 }
             }
         }
-        let mut windows = witness::split_stack(&mut q, &l.placements);
+        let mut repeats = witness::alloc_repeats(l.shape);
+        let mut windows = witness::split_stack(&mut q, &mut repeats, &l.placements);
         for (i, buf) in virt.iter_mut() {
-            windows[*i] = buf;
+            windows[*i] = tables::ColumnOut {
+                words: buf,
+                repeats: &mut [],
+            };
         }
 
         // Each table fills its own columns from the trace (local indices, offset
@@ -482,8 +489,12 @@ impl Program {
             const BLOCK: usize = 1 << 10;
             let written = exec.mem.cells(BLOCK);
             let image = [MEM_LO, MEM_HI, MEM_TOP, MFCNT].map(|c| {
-                assert_eq!(windows[c].len(), cells, "a memory column spans the image");
-                parallel::SendPtr(windows[c].as_mut_ptr())
+                assert_eq!(windows[c].words.len(), cells, "a memory column spans the image");
+                // Blocks past the written cells are all `unwritten`, so each repeats the block before it.
+                for (b, repeat) in windows[c].repeats.iter_mut().enumerate() {
+                    *repeat = b > 0 && (b - 1) * BLOCK >= written.len();
+                }
+                parallel::SendPtr(windows[c].words.as_mut_ptr())
             });
             parallel::for_each_chunk(cells / BLOCK, |first, end| {
                 let stream = primitives::stream::Stream::new();
@@ -510,7 +521,7 @@ impl Program {
                     }
                 }
             });
-            parallel::fill(windows[BFCNT], |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
+            parallel::fill(windows[BFCNT].words, |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
         });
         // flock's packed BLAKE2s witness q_flock, ALWAYS committed in this same stack:
         // built from the executed BLAKE2s rows in order (row j = flock instance j),
@@ -534,14 +545,16 @@ impl Program {
                     exec.mem.word(a[6] as usize),
                 )
             });
-            crate::hash_flock::build_qflock_prepared(&blocks, windows[QFLOCK])
+            let tables::ColumnOut { words, repeats } = &mut windows[QFLOCK];
+            crate::hash_flock::build_qflock_prepared(&blocks, words, repeats)
         });
 
         // (`execute` already asserts the run halts at the sentinel (pc, fp) =
         // (g^{B-1}, 0), exactly the boundary the public layout derives.)
-        drop(windows); // release the borrow of `q` and of the virtual buffers
+        drop(windows); // release the borrow of `q`, its repeat map and the virtual buffers
         Witness {
             q,
+            repeats,
             virt,
             layout: l,
             log_mem,
