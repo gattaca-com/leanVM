@@ -16,7 +16,7 @@
 //! cells, each side in one of two layouts ([`cell_lanes`]). The committed input is the lanes
 //! the VM reads, and the output is the permutation's, written as it is.
 
-use keccak_gkr::witness::{BLOCK, Extent, Slot, block_lanes};
+use keccak_gkr::witness::{BLOCK, Extent, Slot, block_lanes_into, lanes_len};
 use keccak_gkr::{Shape, Witness};
 use primitives::field::{F64, F192};
 use primitives::hash::STATE_LANES;
@@ -127,36 +127,50 @@ pub(crate) type PreparedReductionWitness = Witness;
 /// of steps, its rounds in `extents` and its committed lanes in `lanes`, slot after slot.
 pub(crate) struct Blocks {
     extents: Vec<Extent>,
+    /// The lanes of the blocks one thread ran, a block after another. The first is the executing
+    /// thread's, the rest are the workers'.
     lanes: Vec<Vec<u64>>,
     steps: usize,
+}
+
+/// Append the committed lanes of one block of steps to `lanes`.
+fn push_block(lanes: &mut Vec<u64>, steps: &[[u64; STATE_LANES]], slot: Slot) {
+    let at = lanes.len();
+    lanes.resize(at + lanes_len(DEPTH), 0);
+    // SAFETY: the caller's block owns its slot.
+    unsafe { block_lanes_into(DEPTH, steps, slot, &mut lanes[at..]) };
 }
 
 /// Run `run`, which reports the lanes of each step it executes, and build the reduction's
 /// witness behind it: executing is one thread's work, so the others take each block of steps
 /// as it completes instead of waiting for the last.
 pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LANES])) -> R) -> (R, Blocks) {
-    type Job = (usize, Vec<[u64; STATE_LANES]>, Slot);
-    let (jobs, queue) = std::sync::mpsc::channel::<Job>();
-    let queue = std::sync::Mutex::new(queue);
+    type Job = (Vec<[u64; STATE_LANES]>, Slot);
     // More workers than this slow the executing thread by more than they finish early.
     let workers = parallel::num_threads() / 2;
     // Outlives the scope: the workers write into it until they are joined, even on a panic.
     let mut extents: Vec<Extent> = Vec::new();
     let (result, lanes, steps) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
+        // The workers hand their emptied step buffers back for the next blocks.
+        let (recycle, recycled) = std::sync::mpsc::channel::<Vec<[u64; STATE_LANES]>>();
+        // Block `g` of the whole ones goes to worker `g % workers`, which owns its queue.
+        let (jobs, handles): (Vec<_>, Vec<_>) = (0..workers)
             .map(|_| {
-                scope.spawn(|| {
-                    let mut done = Vec::new();
-                    loop {
-                        let job = queue.lock().expect("a worker panicked").recv();
-                        let Ok((g, steps, slot)) = job else { break };
-                        // SAFETY: the job owns its slot.
-                        done.push((g, unsafe { block_lanes(DEPTH, &steps, slot) }));
+                let (job, queue) = std::sync::mpsc::channel::<Job>();
+                let recycle = recycle.clone();
+                let handle = scope.spawn(move || {
+                    let mut lanes = Vec::new();
+                    for (mut steps, slot) in queue {
+                        push_block(&mut lanes, &steps, slot);
+                        steps.clear();
+                        recycle.send(steps).ok();
                     }
-                    done
-                })
+                    lanes
+                });
+                (job, handle)
             })
-            .collect();
+            .unzip();
+        drop(recycle);
 
         let mut inline = Vec::new();
         let mut pending = Vec::with_capacity(BLOCK);
@@ -167,12 +181,15 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LA
                 extents.push(Extent::new(blocks, blocks.max(8)));
             }
             let slot = extents.last_mut().expect("an extent").slot(blocks);
-            let block = std::mem::replace(pending, Vec::with_capacity(BLOCK));
             if workers == 0 || last {
-                // SAFETY: the block owns its slot.
-                inline.push((blocks, unsafe { block_lanes(DEPTH, &block, slot) }));
+                push_block(&mut inline, pending, slot);
+                pending.clear();
             } else {
-                jobs.send((blocks, block, slot)).expect("the workers outlive the run");
+                let fresh = recycled.try_recv().unwrap_or_else(|_| Vec::with_capacity(BLOCK));
+                let block = std::mem::replace(pending, fresh);
+                jobs[blocks % workers]
+                    .send((block, slot))
+                    .expect("the workers outlive the run");
             }
             blocks += 1;
         };
@@ -187,12 +204,13 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LA
             dispatch(&mut pending, true);
         }
         drop(jobs);
-        let mut lanes = inline;
-        for handle in handles {
-            lanes.extend(handle.join().expect("a witness worker panicked"));
-        }
-        lanes.sort_unstable_by_key(|&(g, _)| g);
-        let lanes = lanes.into_iter().map(|(_, lanes)| lanes).collect();
+        let lanes = std::iter::once(inline)
+            .chain(
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("a witness worker panicked")),
+            )
+            .collect();
         (result, lanes, steps)
     });
     (result, Blocks { extents, lanes, steps })
@@ -211,9 +229,24 @@ impl Blocks {
             shape.slots() * shape.n(),
             "the committed states are the wrong size"
         );
+        let blocks = self.steps.div_ceil(BLOCK);
+        let workers = self.lanes.len() - 1;
+        let stride = lanes_len(DEPTH);
+        // Without workers every block is the executing thread's. With them, it ran only a last
+        // partial block, and whole block `g` is the `g / workers`-th of worker `g % workers`.
+        let lanes: Vec<&[u64]> = (0..blocks)
+            .map(|g| {
+                let (owner, nth) = match workers {
+                    0 => (0, g),
+                    _ if g + 1 == blocks && !self.steps.is_multiple_of(BLOCK) => (0, 0),
+                    _ => (1 + g % workers, g / workers),
+                };
+                &self.lanes[owner][nth * stride..][..stride]
+            })
+            .collect();
         // SAFETY: `while_executing` ran block `g` into its slot of `extents`, in order, its
         // lanes being `lanes[g]`.
-        unsafe { Witness::from_blocks(shape, self.extents, &self.lanes, q_keccak) }
+        unsafe { Witness::from_blocks(shape, self.extents, &lanes, q_keccak) }
     }
 }
 
