@@ -1645,7 +1645,7 @@ fn gen_verify(
     // Share the upper Merkle tree across queries. Unknown, unused subtrees stay
     // opaque; the guest authenticates every cap leaf a query reaches.
     let mut hints = Hints::default();
-    let mut path_children = Vec::new();
+    let (mut leaf_bytes, mut path_children) = (Vec::new(), Vec::new());
     let (mut caps, mut cap_active) = (Vec::new(), Vec::new());
     let mut openings = summary.merkle_paths.iter();
     for (&queries, &depth) in stack.config.queries.iter().zip(&stack.depth) {
@@ -1657,8 +1657,9 @@ fn gen_verify(
         for opening in openings.by_ref().take(queries) {
             hints.push_iter("merkle_leaf_rows", opening.leaf.iter().map(|x| F192::new(x.0, 0, 0)));
             path_children.clear();
-            let bytes: Vec<_> = opening.leaf.iter().flat_map(|x| x.to_bytes()).collect();
-            let mut node = pcs::merkle::hash_leaf(&bytes);
+            leaf_bytes.clear();
+            leaf_bytes.extend(opening.leaf.iter().flat_map(|x| x.to_bytes()));
+            let mut node = pcs::merkle::hash_leaf(&leaf_bytes);
             let mut index = (1 << depth) + opening.leaf_index as usize;
             for (height, sibling) in opening.siblings.iter().enumerate() {
                 if height >= path_depth {
