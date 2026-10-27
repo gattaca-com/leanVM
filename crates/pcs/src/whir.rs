@@ -523,22 +523,33 @@ fn round_msg_lsb(f: &[F192], b: &[F192]) -> SumcheckMessage {
 
 /// Build the round message and the full inner product in one pass. For an OOD
 /// basis `b = eq(z, ·)`, the inner product is the claimed MLE evaluation.
-fn round_msg_and_eval_lsb_ext(f: &[F192], b: &[F192]) -> (SumcheckMessage, F192) {
+///
+/// The basis is read one `EQ_LOW_LEN` window at a time, so a split `eq` basis is expanded in L1.
+fn round_msg_and_eval_lsb_ext(f: &[F192], b: &Basis) -> (SumcheckMessage, F192) {
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
 
+    let dots = |at: std::ops::Range<usize>| {
+        let mut buf = [F192::ZERO; EQ_LOW_LEN];
+        let mut acc = (Acc8::ZERO, Acc8::ZERO, Acc8::ZERO);
+        for s in at.clone().step_by(EQ_LOW_LEN) {
+            let w = s..(s + EQ_LOW_LEN).min(at.end);
+            let (u_0, u_2, odd) = adjacent_dots::<true>(&f[w.clone()], b.window(w, &mut buf));
+            acc.0 ^= u_0;
+            acc.1 ^= u_2;
+            acc.2 ^= odd;
+        }
+        acc
+    };
     const PAR_THRESHOLD: usize = 4096;
     let (u_0, u_2, odd) = if n / 2 < PAR_THRESHOLD {
-        adjacent_dots::<true>(f, b)
+        dots(0..n)
     } else {
         parallel::map_reduce(
             n.div_ceil(ROUND_CHUNK),
             || (Acc8::ZERO, Acc8::ZERO, Acc8::ZERO),
-            |c| {
-                let at = c * ROUND_CHUNK..(c * ROUND_CHUNK + ROUND_CHUNK).min(n);
-                adjacent_dots::<true>(&f[at.clone()], &b[at])
-            },
+            |c| dots(c * ROUND_CHUNK..(c * ROUND_CHUNK + ROUND_CHUNK).min(n)),
             |(mut a0, mut a2, mut ao), (b0, b2, bo)| {
                 a0 ^= b0;
                 a2 ^= b2;
@@ -583,11 +594,12 @@ const STREAM_FOLD_MIN: usize = 1 << 19;
 /// next-round message is built over the freshly folded values in the same pass.
 ///
 /// The basis folded is `b + sum s * v` over `glued`, summed per stage in L1: the glued sum is never stored.
+/// A window is at most `EQ_LOW_LEN` long and starts at a multiple of it, as a split `eq` basis needs.
 #[timed]
 fn fold_and_msg_lsb(
     f: &[F192],
     b: &[F192],
-    glued: &[(Vec<F192>, F192)],
+    glued: &[(Basis, F192)],
     r: F192,
 ) -> (Vec<F192>, Vec<F192>, SumcheckMessage) {
     let n = f.len();
@@ -621,7 +633,7 @@ fn fold_and_msg_lsb(
                 let sum = &mut sum[..at.len()];
                 sum.copy_from_slice(&b[at.clone()]);
                 for (v, s) in glued {
-                    add_scaled(sum, &v[at.clone()], *s);
+                    v.add_scaled_window(sum, at.clone(), *s);
                 }
                 fold_adjacent(bo, sum, r);
             }
@@ -836,6 +848,79 @@ fn add_scaled(acc: &mut [F192], v: &[F192], s: F192) {
     }
 }
 
+/// `out[j] = s * v[j]`, eight at a time where the multiplier is wide.
+#[inline]
+fn scale_into(out: &mut [F192], v: &[F192], s: F192) {
+    let (o8, o_r) = out.as_chunks_mut::<8>();
+    let (v8, v_r) = v.as_chunks::<8>();
+    let s8 = F192x8::splat(s);
+    for (o, v) in o8.iter_mut().zip(v8) {
+        *o = (s8 * F192x8::from_array(v)).to_array();
+    }
+    for (o, &v) in o_r.iter_mut().zip(v_r) {
+        *o = s * v;
+    }
+}
+
+/// Words of the low factor of a split `eq` basis: the window of a fused fold (`2 * FOLD_STAGE`).
+const EQ_LOW_LEN: usize = 512;
+
+/// A basis poly of the running sumcheck.
+enum Basis {
+    Dense(Vec<F192>),
+    /// `eq(z, ·)`, never stored whole. LSB-first, like `eq_table`: entry `x` is
+    /// `hi[x >> L] * lo[x & (2^L - 1)]` with `lo = eq(z[..L])`, `hi = eq(z[L..])`, `2^L = lo.len()`.
+    Eq { hi: Vec<F192>, lo: Vec<F192> },
+}
+
+impl Basis {
+    fn eq(z: &[F192]) -> Self {
+        let (z_lo, z_hi) = z.split_at(z.len().min(EQ_LOW_LEN.ilog2() as usize));
+        Self::Eq {
+            hi: build_eq_table_ext_parallel(z_hi),
+            lo: build_eq_table_ext_parallel(z_lo),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(v) => v.len(),
+            Self::Eq { hi, lo } => hi.len() * lo.len(),
+        }
+    }
+
+    /// The factor and the `lo` slice of an `Eq` window, which lies inside one aligned `lo`-sized block.
+    fn eq_window<'a>(hi: &[F192], lo: &'a [F192], at: &std::ops::Range<usize>) -> (F192, &'a [F192]) {
+        let (l, start) = (lo.len().ilog2(), at.start & (lo.len() - 1));
+        debug_assert!(start + at.len() <= lo.len(), "window {at:?} straddles two blocks of {}", lo.len());
+        (hi[at.start >> l], &lo[start..start + at.len()])
+    }
+
+    /// The entries `at`, at most `EQ_LOW_LEN` of them inside one aligned block: borrowed if dense, else expanded into `buf`.
+    fn window<'a>(&'a self, at: std::ops::Range<usize>, buf: &'a mut [F192; EQ_LOW_LEN]) -> &'a [F192] {
+        match self {
+            Self::Dense(v) => &v[at],
+            Self::Eq { hi, lo } => {
+                let (w, lo) = Self::eq_window(hi, lo, &at);
+                let out = &mut buf[..at.len()];
+                scale_into(out, lo, w);
+                out
+            }
+        }
+    }
+
+    /// `acc += s * self[at]`, with `at` as in [`Self::window`].
+    fn add_scaled_window(&self, acc: &mut [F192], at: std::ops::Range<usize>, s: F192) {
+        match self {
+            Self::Dense(v) => add_scaled(acc, &v[at], s),
+            Self::Eq { hi, lo } => {
+                let (w, lo) = Self::eq_window(hi, lo, &at);
+                add_scaled(acc, lo, s * w);
+            }
+        }
+    }
+}
+
 /// `out[x] += sum_l w_l * (cur_l[x] + prev_l[x])` over `(w_l, cur_l, prev_l, next_l)`.
 ///
 /// Each line of `cur_l` read also prefetches the same line of `next_l` into L2 (when not empty), so the
@@ -950,10 +1035,10 @@ pub(crate) struct SumcheckProver {
     round: usize,
     /// The level's claims, in Protocol 1 step 1 order: the OOD claims, then the
     /// query batch. Drained by `glue_pending`.
-    pending: Vec<(Vec<F192>, F192, RoundQuad)>,
+    pending: Vec<(Basis, F192, RoundQuad)>,
     /// Glued claims with their powers of lambda, not yet added to `combined_basis`.
     /// The next `fold` adds them inside its pass.
-    glued: Vec<(Vec<F192>, F192)>,
+    glued: Vec<(Basis, F192)>,
 }
 
 impl SumcheckProver {
@@ -1073,15 +1158,16 @@ impl SumcheckProver {
     fn introduce_new(&mut self, b_new: Vec<F192>, h_new: F192) -> SumcheckMessage {
         assert_eq!(b_new.len(), self.f.len());
         let msg = round_msg_lsb(&self.f, &b_new);
-        self.pending.push((b_new, h_new, RoundQuad::from_msg(msg, h_new)));
+        self.pending.push((Basis::Dense(b_new), h_new, RoundQuad::from_msg(msg, h_new)));
         msg
     }
 
-    /// Introduce `b_new` and compute its claimed inner product in the same
-    /// pass as the round message.
+    /// Introduce the OOD basis `eq(z, ·)` and compute its claimed inner product in the same
+    /// pass as the round message. The basis stays split in two small tables.
     #[timed]
-    fn introduce_new_with_eval(&mut self, b_new: Vec<F192>) -> (SumcheckMessage, F192) {
-        assert_eq!(b_new.len(), self.f.len());
+    fn introduce_ood(&mut self, z: &[F192]) -> (SumcheckMessage, F192) {
+        assert_eq!(1 << z.len(), self.f.len());
+        let b_new = Basis::eq(z);
         let (msg, h_new) = round_msg_and_eval_lsb_ext(&self.f, &b_new);
         self.pending.push((b_new, h_new, RoundQuad::from_msg(msg, h_new)));
         (msg, h_new)
@@ -1112,7 +1198,10 @@ impl SumcheckProver {
     pub(crate) fn basis(&self) -> Vec<F192> {
         let mut basis = self.combined_basis.clone();
         for (v, s) in &self.glued {
-            add_scaled(&mut basis, v, *s);
+            for at in (0..basis.len()).step_by(EQ_LOW_LEN) {
+                let at = at..(at + EQ_LOW_LEN).min(basis.len());
+                v.add_scaled_window(&mut basis[at.clone()], at, *s);
+            }
         }
         basis
     }
@@ -1160,7 +1249,7 @@ fn sample_queries_ordered(ch: &mut ProverState, block_len: usize, count: usize) 
 fn send_ood(sc: &mut SumcheckProver, ps: &mut ProverState, n_vars: usize, count: usize) {
     for _ in 0..count {
         let z = ps.sample_vec(n_vars);
-        let (intro, y) = sc.introduce_new_with_eval(build_eq_table_ext_parallel(&z));
+        let (intro, y) = sc.introduce_ood(&z);
         ps.add_scalar(y);
         send_msg(ps, intro, y);
     }
@@ -1697,7 +1786,7 @@ mod tests {
             let (f, b) = (rng.ext_vec(n), rng.ext_vec(n));
             assert_eq!(round_msg_lsb(&f, &b), msg_ref(&f, &b), "round_msg_lsb, n={n}");
 
-            let (msg, y) = round_msg_and_eval_lsb_ext(&f, &b);
+            let (msg, y) = round_msg_and_eval_lsb_ext(&f, &Basis::Dense(b.clone()));
             assert_eq!(msg, msg_ref(&f, &b), "eval message, n={n}");
             assert_eq!(
                 y,
@@ -1724,15 +1813,42 @@ mod tests {
         for log in [1usize, 3, 5, 9, 10, 12, 13] {
             let n = 1usize << log;
             let (f, b) = (rng.ext_vec(n), rng.ext_vec(n));
-            let glued: Vec<(Vec<F192>, F192)> = (0..3).map(|_| (rng.ext_vec(n), rng.ext())).collect();
+            let glued: Vec<(Basis, F192)> = (0..3).map(|_| (Basis::Dense(rng.ext_vec(n)), rng.ext())).collect();
             let mut sum = b.clone();
             for (v, s) in &glued {
-                add_scaled(&mut sum, v, *s);
+                v.add_scaled_window(&mut sum, 0..n, *s);
             }
             assert_eq!(
                 fold_and_msg_lsb(&f, &b, &glued, r),
                 fold_and_msg_lsb(&f, &sum, &[], r),
                 "n={n}"
+            );
+        }
+    }
+
+    /// A split `eq` basis acts as the dense `eq_table`, in the intro pass and in the fused fold.
+    #[test]
+    fn split_eq_basis_matches_dense_table() {
+        let mut rng = Rng::new(0xE0);
+        let r = rng.ext();
+        for log in [1usize, 2, 3, 8, 9, 10, 11, 13] {
+            let n = 1usize << log;
+            let (f, b) = (rng.ext_vec(n), rng.ext_vec(n));
+            let z = rng.ext_vec(log);
+            let (split, dense) = (Basis::eq(&z), Basis::Dense(build_eq_table_ext_parallel(&z)));
+            assert_eq!(
+                round_msg_and_eval_lsb_ext(&f, &split),
+                round_msg_and_eval_lsb_ext(&f, &dense),
+                "intro, n={n}"
+            );
+            let (s0, s1) = (rng.ext(), rng.ext());
+            let extra = rng.ext_vec(n);
+            let glued_split = [(Basis::eq(&z), s0), (Basis::Dense(extra.clone()), s1)];
+            let glued_dense = [(dense, s0), (Basis::Dense(extra), s1)];
+            assert_eq!(
+                fold_and_msg_lsb(&f, &b, &glued_split, r),
+                fold_and_msg_lsb(&f, &b, &glued_dense, r),
+                "fold, n={n}"
             );
         }
     }
