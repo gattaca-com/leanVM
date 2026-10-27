@@ -568,6 +568,12 @@ unsafe fn fold_out_buf(n: usize) -> Vec<F192> {
 /// while ago rather than stores still in flight.
 const FOLD_STAGE: usize = 256;
 
+/// Fold outputs of at least this many elements (12 MiB) take streaming stores.
+///
+/// - Eight nodes share 64 MiB of L3, so a node keeps about 8 MiB.
+/// - A larger output is evicted before the next round reads it, so an ordinary store only adds the line fetch.
+const STREAM_FOLD_MIN: usize = 1 << 19;
+
 /// Fused fold + next-round message: the witness and the basis fold, and the
 /// next-round message is built over the freshly folded values in the same pass.
 #[timed]
@@ -585,6 +591,7 @@ fn fold_and_msg_lsb(f: &[F192], b: &[F192], r: F192) -> (Vec<F192>, Vec<F192>, S
     let nb_base = parallel::SendPtr(nb.as_mut_ptr());
     // `half` is a power of two and so are `ROUND_CHUNK` and `FOLD_STAGE`: every window has even
     // length and starts at an even index, so no message pair straddles one.
+    let stream = half >= STREAM_FOLD_MIN;
     let task = |ci: usize| {
         let base = ci * ROUND_CHUNK;
         let len = ROUND_CHUNK.min(half - base);
@@ -593,13 +600,25 @@ fn fold_and_msg_lsb(f: &[F192], b: &[F192], r: F192) -> (Vec<F192>, Vec<F192>, S
         let fc = unsafe { nf_base.slice(base, len) };
         let bc = unsafe { nb_base.slice(base, len) };
         let mut acc = (Acc8::ZERO, Acc8::ZERO);
-        for s in (0..len).step_by(FOLD_STAGE) {
-            let k = FOLD_STAGE.min(len - s);
-            let (fo, bo) = (&mut fc[s..s + k], &mut bc[s..s + k]);
-            let at = 2 * (base + s)..2 * (base + s + k);
+        let fold = |fo: &mut [F192], bo: &mut [F192], at: std::ops::Range<usize>| {
             fold_adjacent(fo, &f[at.clone()], r);
             fold_adjacent(bo, &b[at], r);
-            let (u_0, u_2, _) = adjacent_dots::<false>(fo, bo);
+            adjacent_dots::<false>(fo, bo)
+        };
+        let (mut sf, mut sb) = ([F192::ZERO; FOLD_STAGE], [F192::ZERO; FOLD_STAGE]);
+        let st = primitives::stream::Stream::new();
+        for s in (0..len).step_by(FOLD_STAGE) {
+            let k = FOLD_STAGE.min(len - s);
+            let at = 2 * (base + s)..2 * (base + s + k);
+            let (u_0, u_2, _) = if stream {
+                // Folded in L1, then streamed: an output this large is not read back from cache.
+                let d = fold(&mut sf[..k], &mut sb[..k], at);
+                st.copy(&mut fc[s..s + k], &sf[..k]);
+                st.copy(&mut bc[s..s + k], &sb[..k]);
+                d
+            } else {
+                fold(&mut fc[s..s + k], &mut bc[s..s + k], at)
+            };
             acc.0 ^= u_0;
             acc.1 ^= u_2;
         }
@@ -848,13 +867,14 @@ fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run
     let weights = primitives::multilinear::eq_table(rs);
     let n_blocks = block / run;
     let zeros = vec![F64(0); run];
-    let mut out = vec![F192::ZERO; block];
+    // SAFETY: every task streams each of its output blocks below.
+    let mut out = unsafe { primitives::uninit_vec::<F192>(block) };
     parallel::chunks_mut(&mut out, TASK * run, |c, out| {
         let out_blocks = out.len() / run;
+        // The running block stays in L1 and L2; `out` takes only streaming stores, so it is never fetched.
+        let mut acc = vec![F192::ZERO; run];
+        let stream = primitives::stream::Stream::new();
         for i in 0..out_blocks {
-            if i > 0 {
-                out.copy_within((i - 1) * run..i * run, i * run);
-            }
             let h = c * TASK + i;
             let changed = |l: &usize| i == 0 || !repeats[l * n_blocks + h];
             let deltas = base
@@ -875,7 +895,8 @@ fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run
                     };
                     (weights[l], &lane[h * run..(h + 1) * run], prev, next)
                 });
-            add_lane_deltas(&mut out[i * run..(i + 1) * run], deltas);
+            add_lane_deltas(&mut acc, deltas);
+            stream.copy(&mut out[i * run..(i + 1) * run], &acc);
         }
     });
     out
