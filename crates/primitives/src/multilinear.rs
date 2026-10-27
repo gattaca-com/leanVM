@@ -33,6 +33,13 @@ pub fn eq_eval(r: &[F192], x: &[F192]) -> F192 {
         .fold(F192::ONE, |acc, (&ri, &xi)| acc * (F192::ONE + ri + xi))
 }
 
+/// `eq(r, x)` at the binary point `r` whose bit `k` is bit `k` of `bits`.
+pub fn eq_eval_bits(bits: usize, x: &[F192]) -> F192 {
+    x.iter().enumerate().fold(F192::ONE, |acc, (k, &xk)| {
+        acc * if (bits >> k) & 1 == 1 { xk } else { F192::ONE + xk }
+    })
+}
+
 /// The `eq(r, ·)` table over `n = r.len()` variables. See [`fill_eq_table_uninit`].
 pub fn eq_table(r: &[F192]) -> Vec<F192> {
     let len = 1usize << r.len();

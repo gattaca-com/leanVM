@@ -16,7 +16,7 @@ use primitives::field::{
     Acc8, F64, F64x8, F192, F192Unreduced, F192x8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
     mul_slices,
 };
-use primitives::multilinear::{eq_eval, eq_table, mle_eval_many};
+use primitives::multilinear::{eq_eval_bits, eq_table, mle_eval_many};
 use primitives::stream::Stream;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -852,10 +852,7 @@ fn decompose_formula<F: FnMut(usize, &[F192]) -> F192>(
         let zeta_lo = &zeta[..kappa];
         let zeta_hi = &zeta[kappa..];
         let sel = lay.offsets[b] >> kappa;
-        let sel_bits: Vec<F192> = (0..(lay.mu - kappa))
-            .map(|k| F192::new(((sel >> k) & 1) as u64, 0, 0))
-            .collect();
-        let eq_hi = eq_eval(&sel_bits, zeta_hi);
+        let eq_hi = eq_eval_bits(sel, zeta_hi);
         sel_sum += eq_hi;
 
         // A table's block becomes a linear form the zerocheck will sum; only the

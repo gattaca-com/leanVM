@@ -70,7 +70,8 @@ pub fn powers(x: F192, n: usize) -> Vec<F192> {
 /// chain across cores.
 pub fn g_powers(n: usize) -> Vec<F64> {
     const CHUNK: usize = 1 << 12;
-    let mut v = vec![F64::ZERO; n];
+    // SAFETY: the chunks below write every element.
+    let mut v = unsafe { crate::uninit_vec::<F64>(n) };
     parallel::chunks_mut(&mut v, CHUNK, |ci, chunk| {
         let mut acc = g_pow(ci * CHUNK);
         for slot in chunk.iter_mut() {

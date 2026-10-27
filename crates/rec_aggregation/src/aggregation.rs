@@ -913,14 +913,7 @@ fn slot_weights(points: &[F192], lambdas: &[F192], r_row: &[F192], kbc: usize) -
 
 /// `eq(point[kbc..], slot)`: the claim's weight on one stacking slot.
 fn slot_eq(point: &[F192], kbc: usize, slot: usize) -> F192 {
-    (0..leanvm_core::leaf::N_BYTECODE_SELECTORS).fold(F192::ONE, |acc, bit| {
-        let coordinate = point[kbc + bit];
-        acc * if (slot >> bit) & 1 == 1 {
-            coordinate
-        } else {
-            F192::ONE + coordinate
-        }
-    })
+    primitives::multilinear::eq_eval_bits(slot, &point[kbc..][..leanvm_core::leaf::N_BYTECODE_SELECTORS])
 }
 
 /// Variables of a bytecode claim's point: the log row count plus the stacking
