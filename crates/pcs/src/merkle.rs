@@ -85,15 +85,24 @@ impl MerkleBuilder {
                 self.leaves.hash(rows, self.nodes.level_mut(0, first_leaf, n));
                 return self.complete(0, first_leaf, n);
             }
-            // The groups climb to the cut in scratch, and only their tops are kept.
+            // The groups climb to the cut in a stack scratch, a chunk of leaves at a time, and only their tops are kept.
             assert!(n >= 1 << self.cut, "a block holds whole leaf groups");
-            let scratch = Nodes::new(n, 0);
-            self.leaves.hash(rows, scratch.level_mut(0, 0, n));
-            scratch.climb(0, 0, n, self.cut);
+            let chunk = n.min(SCRATCH_LEAVES);
+            assert!(n.is_multiple_of(chunk), "a block holds whole chunks");
             let tops = n >> self.cut;
-            self.nodes
-                .level_mut(self.cut, first_leaf >> self.cut, tops)
-                .copy_from_slice(scratch.level_mut(self.cut, 0, tops));
+            let mut scratch = [MaybeUninit::<Hash>::uninit(); 2 * SCRATCH_LEAVES];
+            for (k, rows) in rows.chunks_exact(chunk * self.leaves.row_bytes()).enumerate() {
+                let (a, b) = scratch.split_at_mut(SCRATCH_LEAVES);
+                self.leaves.hash(rows, &mut a[..chunk]);
+                let (mut src, mut dst, mut m) = (a, b, chunk);
+                for _ in 0..self.cut {
+                    hash_many::<{ 2 * OUT_LEN }>(digests_as_bytes(&mut src[..m]), digests_as_bytes(&mut dst[..m / 2]));
+                    (src, dst, m) = (dst, src, m / 2);
+                }
+                self.nodes
+                    .level_mut(self.cut, (first_leaf >> self.cut) + k * m, m)
+                    .copy_from_slice(&src[..m]);
+            }
             self.complete(self.cut, first_leaf >> self.cut, tops);
         }
     }
@@ -276,6 +285,9 @@ impl Progress {
             .is_some_and(|b| b.iter().all(|f| f.load(Ordering::Acquire)))
     }
 }
+
+/// Leaves a block hashes and climbs to the cut at a time, in a stack scratch that stays in L1.
+const SCRATCH_LEAVES: usize = 256;
 
 /// Levels below which a large tree keeps nothing: groups of `2^CUT` leaves are rehashed from their rows when opened.
 const CUT: usize = 4;
