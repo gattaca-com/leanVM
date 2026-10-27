@@ -46,7 +46,9 @@ use lean_compiler::{compile, parse_with_replacements};
 use lean_da::{BLOB_SYMBOLS, CELL_SYMBOLS, CELLS_PER_ROW, CODEWORD_SYMBOLS};
 pub use lean_da::{DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS};
 use leanvm_core::constraints::{BLOCK, BLOCK_VARS, partial_evals};
-use leanvm_core::cpu::{GPow, Program, ProveError, from_scalar, prove_with, public_input_bytes, scalar_proof, to_scalar};
+use leanvm_core::cpu::{
+    GPow, Program, ProveError, Witness, from_scalar, prove_with, public_input_bytes, scalar_proof, to_scalar,
+};
 use leanvm_core::leaf::{Block, Coord};
 use leanvm_core::tables::N_TABLES;
 use leanvm_core::transcript::FiatShamirState;
@@ -1777,6 +1779,11 @@ impl Hints {
         &mut entries[i]
     }
 
+    fn into_witness(self) -> Witness {
+        self.0.into_iter().collect()
+    }
+
+    #[cfg(test)]
     fn install(self, guest: &mut Program) {
         for (name, entries) in self.0 {
             guest.set_witness(name, entries);
@@ -2362,17 +2369,13 @@ pub fn aggregate_with_stats(
         da_list_digest(&da_roots),
         &defer,
     );
-    let mut program = guest.clone();
-    // Every aggregate is a potential child, and the guest has no opening arm below
-    // `2^MU_MIN`. A run smaller than that (a leaf of a few dozen signatures) grows
-    // its SET table until it clears the floor.
-    program.min_log_committed = MU_MIN;
     #[cfg(test)]
     if let Some(forge) = FORGE.with(|forge| forge.borrow_mut().take()) {
         forge(&mut hints);
     }
-    hints.install(&mut program);
-    let (proof, stats) = prove_with(&program, public_input, log_inv_rate, gpow).map_err(AggregationError::ProofError)?;
+    let witness = hints.into_witness();
+    let (proof, stats) =
+        prove_with(guest, &witness, public_input, log_inv_rate, gpow).map_err(AggregationError::ProofError)?;
     Ok((
         EthereumProof {
             xmss_signers: cover.xmss.signers,
@@ -3105,10 +3108,14 @@ fn compile_guest(kbc: usize) -> Program {
         let dump: String = replacements.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
         std::fs::write(&path, dump).expect("write DBG_PLACEHOLDERS");
     }
-    let guest = compile(
+    let mut guest = compile(
         &parse_with_replacements(include_str!("../guests/lean_ethereum.py"), &replacements)
             .expect("the repository aggregation guest must parse"),
     );
+    // Every aggregate is a potential child, and the guest has no opening arm below
+    // `2^MU_MIN`. A run smaller than that (a leaf of a few dozen signatures) grows
+    // its SET table until it clears the floor.
+    guest.min_log_committed = MU_MIN;
     // `DBG_DISASM=path`: dump the guest's disassembly, to read alongside a
     // `DBG_PROF_DUMP` per-pc profile. Function boundaries lead the dump, so the
     // pc a failed guest check reports can be resolved to a source function

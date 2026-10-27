@@ -116,6 +116,9 @@ fn announce_public(ps: &mut ProverState, log_mem: usize, rows: [usize; tables::N
     ps.add_scalar(F192::new(log_inv_rate as u64, 0, 0));
 }
 
+/// Named witness streams: per stream, the entries its `hint_witness` calls pop.
+pub type Witness = HashMap<String, Vec<Vec<F192>>>;
+
 #[derive(Clone)]
 pub struct Program {
     pub prog: Vec<Op>, // bytecode (size B, power of two)
@@ -138,7 +141,7 @@ pub struct Program {
     /// slice of values per `hint_witness` call; the same symbol may be
     /// hinted many times); each call pops the next entry, whose length must
     /// match its destination. Prover-side only; verification ignores them.
-    pub(crate) witness: HashMap<String, Vec<Vec<F192>>>,
+    pub(crate) witness: Witness,
     /// Function pc-ranges `(name, entry, len)` from the compiler, for the
     /// `DBG_PROF=1` per-function cycle profile ([`Program::execute`]). Purely
     /// diagnostic; empty for hand-assembled programs.
@@ -471,16 +474,20 @@ impl Stats {
 /// selects the PCS rate and is announced in the Fiat-Shamir transcript before
 /// the commitment.
 pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
-    prove_with(program, public_input, log_inv_rate, &mut GPow::new())
+    prove_with(program, &program.witness, public_input, log_inv_rate, &mut GPow::new())
 }
 
-/// [`prove`] with the g-power table the run needs owned by the caller. A run starts from
+/// [`prove`] with the witness streams `witness` in place of the program's own, so a shared
+/// program is proved without a clone.
+///
+/// The g-power table the run needs is owned by the caller. A run starts from
 /// `gpow` and leaves it grown, so a caller that proves again, even another program, passes
 /// the same table back and skips growing it. On an error `gpow` is left as a fresh table.
 #[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
 #[timed]
 pub fn prove_with(
     program: &Program,
+    witness: &Witness,
     public_input: [F192; 2],
     log_inv_rate: usize,
     gpow: &mut GPow,
@@ -488,7 +495,9 @@ pub fn prove_with(
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
-    let execution = crate::stage!("Execute program", || program.execute_with(public_input, std::mem::take(gpow)));
+    let execution = crate::stage!("Execute program", || {
+        program.execute_with(witness, public_input, std::mem::take(gpow))
+    });
     let mut exec = execution.map_err(ProveError::Execution)?;
     // A live value that came from outside the constraint system would make the proof
     // about a weaker statement than the program text, so it is refused here, on the one

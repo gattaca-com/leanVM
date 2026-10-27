@@ -314,14 +314,19 @@ impl Program {
     /// Compilation yields the `Program`; executing it (here) and proving it are
     /// separate later phases.
     pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
-        self.execute_with(public_input, GPow::new())
+        self.execute_with(&self.witness, public_input, GPow::new())
     }
 
     /// [`Self::execute`] starting from `gpow`, a table an earlier run left. The table
     /// is a function of the exponent alone and announcing more only widens its index,
     /// so a run that starts from one skips growing and announcing it again.
     #[timed]
-    pub(crate) fn execute_with(&self, public_input: [F192; 2], gpow: GPow) -> Result<Execution, ExecError> {
+    pub(crate) fn execute_with(
+        &self,
+        witness: &Witness,
+        public_input: [F192; 2],
+        gpow: GPow,
+    ) -> Result<Execution, ExecError> {
         use super::hints::{BitsDest, RHint};
 
         let ending_pc = (self.prog.len() - 1) as u32; // last bytecode slot, g^{B-1}
@@ -402,7 +407,7 @@ impl Program {
                 let s = *stream_of.entry(name).or_insert_with(|| {
                     streams.push(Stream {
                         name,
-                        entries: self.witness.get(name).map(Vec::as_slice),
+                        entries: witness.get(name).map(Vec::as_slice),
                         next: 0,
                     });
                     streams.len() as u32 - 1
