@@ -36,24 +36,16 @@ impl DeepRows {
         self.num_ntts << (self.log_d - self.deep_start)
     }
 
-    /// The sorted, distinct deep sub-blocks that hold `positions`.
-    fn sub_blocks(&self, positions: &[usize]) -> Vec<usize> {
-        let mut subs: Vec<usize> = positions.iter().map(|&q| q >> (self.log_d - self.deep_start)).collect();
-        subs.sort_unstable();
-        subs.dedup();
-        subs
+    /// The runs of the sorted `positions` that fall in one deep sub-block, ascending.
+    fn runs<'a>(&self, positions: &'a [usize]) -> impl Iterator<Item = &'a [usize]> {
+        debug_assert!(positions.is_sorted());
+        let log_sub = self.log_d - self.deep_start;
+        positions.chunk_by(move |a, b| a >> log_sub == b >> log_sub)
     }
 
-    /// The rows at `positions`, out of the finished sub-blocks `subs`, held back to back in `built`.
-    fn pick(&self, subs: &[usize], built: &[F64], positions: &[usize]) -> Vec<Vec<F64>> {
-        let log_sub = self.log_d - self.deep_start;
-        positions
-            .iter()
-            .map(|&q| {
-                let sub = subs.binary_search(&(q >> log_sub)).expect("every queried sub-block is finished");
-                built[sub * self.sub_len() + (q & ((1 << log_sub) - 1)) * self.num_ntts..][..self.num_ntts].to_vec()
-            })
-            .collect()
+    /// The sorted, distinct deep sub-blocks that hold the sorted `positions`.
+    fn sub_blocks(&self, positions: &[usize]) -> Vec<usize> {
+        self.runs(positions).map(|run| run[0] >> (self.log_d - self.deep_start)).collect()
     }
 }
 
@@ -391,17 +383,15 @@ impl AdditiveNttF64 {
         self.run_layers_from(msg, buf, log_d, num_ntts, log_inv_rate, log_d, log_inv_rate, coset, no_hook);
     }
 
-    /// Codeword rows `positions` of a buffer left by [`Self::encode_interleaved_in_place_without_deep`].
-    pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
-        let (subs, sub_len) = (deep.sub_blocks(positions), deep.sub_len());
-        let mut built = vec![F64::ZERO; subs.len() * sub_len];
-        parallel::chunks_mut(&mut built, sub_len, |i, sub| {
-            self.finish_sub_block(Some(&data[subs[i] * sub_len..][..sub_len]), sub, deep, subs[i]);
-        });
-        deep.pick(&subs, &built, positions)
+    /// Codeword rows `positions` (sorted) of a buffer left by [`Self::encode_interleaved_in_place_without_deep`],
+    /// back to back.
+    pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<F64> {
+        let sub_len = deep.sub_len();
+        self.rows_from(deep, positions, |_, sub| &data[sub * sub_len..][..sub_len])
     }
 
-    /// Codeword rows `positions` of an encode that kept no buffer, recomputed from its lane-major message.
+    /// Codeword rows `positions` (sorted) of an encode that kept no buffer, recomputed from its lane-major message,
+    /// back to back.
     pub fn rebuild_rows(
         &self,
         msg: &[F64],
@@ -409,24 +399,42 @@ impl AdditiveNttF64 {
         n_lanes: usize,
         deep: &DeepRows,
         positions: &[usize],
-    ) -> Vec<Vec<F64>> {
-        let subs = deep.sub_blocks(positions);
-        let built = self.rebuild_sub_blocks(msg, repeats, n_lanes, deep, &subs);
-        // Each sub-block finishes into the thread's scratch, so `built` is only read and never written back.
-        let (sub_len, log_sub) = (deep.sub_len(), deep.log_d - deep.deep_start);
-        let mut rows = vec![Vec::new(); positions.len()];
-        let out = parallel::SendPtr(rows.as_mut_ptr());
-        parallel::for_each(subs.len(), |i| {
+    ) -> Vec<F64> {
+        let built = self.rebuild_sub_blocks(msg, repeats, n_lanes, deep, &deep.sub_blocks(positions));
+        let sub_len = deep.sub_len();
+        self.rows_from(deep, positions, |i, _| &built[i * sub_len..][..sub_len])
+    }
+
+    /// The rows at `positions` (sorted), back to back, from the sub-blocks before their deep layers.
+    ///
+    /// `src(i, sub)` is the `i`-th sub-block, number `sub` in the codeword. Each finishes into the thread's
+    /// scratch, so only the queried rows are written.
+    fn rows_from<'a>(
+        &self,
+        deep: &DeepRows,
+        positions: &[usize],
+        src: impl Fn(usize, usize) -> &'a [F64] + Sync,
+    ) -> Vec<F64> {
+        let (sub_len, log_sub, n) = (deep.sub_len(), deep.log_d - deep.deep_start, deep.num_ntts);
+        let mut out = vec![F64::ZERO; positions.len() * n];
+        // One disjoint slice of `out` per sub-block, for its run of positions.
+        let (mut rest, mut parts) = (&mut out[..], Vec::new());
+        for run in deep.runs(positions) {
+            let (head, tail) = rest.split_at_mut(run.len() * n);
+            parts.push((head, run));
+            rest = tail;
+        }
+        parallel::chunks_mut(&mut parts, 1, |i, part| {
+            let (dst, run) = &mut part[0];
+            let sub_idx = run[0] >> log_sub;
             with_scratch(sub_len, |sub| {
-                self.finish_sub_block(Some(&built[i * sub_len..][..sub_len]), sub, deep, subs[i]);
-                for (k, &q) in positions.iter().enumerate().filter(|(_, q)| *q >> log_sub == subs[i]) {
-                    let row = sub[(q & ((1 << log_sub) - 1)) * deep.num_ntts..][..deep.num_ntts].to_vec();
-                    // SAFETY: position `k` lies in sub-block `subs[i]` alone, so one task writes slot `k`.
-                    unsafe { *out.add(k) = row };
+                self.finish_sub_block(Some(src(i, sub_idx)), sub, deep, sub_idx);
+                for (dst, &q) in dst.chunks_exact_mut(n).zip(run.iter()) {
+                    dst.copy_from_slice(&sub[(q & ((1 << log_sub) - 1)) * n..][..n]);
                 }
             });
         });
-        rows
+        out
     }
 
     /// The deep layers over sub-block `sub_idx` of the codeword, which `src` holds as the gathered pass left it.
@@ -2749,16 +2757,17 @@ mod tests {
                 drop(on_rows);
                 let context = format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}, keep_nothing={}", keep == Keep::Nothing);
                 assert_eq!(handed, want, "handed-over rows, {context}");
-                let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+                let mut positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+                positions.sort_unstable();
                 let rows = match deep {
                     Some(deep) if words.is_empty() => ntt.rebuild_rows(&msg, &repeats, n_lanes, &deep, &positions),
                     Some(deep) => ntt.finish_rows(&words, &deep, &positions),
                     None => {
                         assert_eq!(words, want, "codeword, {context}");
-                        positions.iter().map(|&q| words[q * row_words..][..row_words].to_vec()).collect()
+                        positions.iter().flat_map(|&q| words[q * row_words..][..row_words].iter().copied()).collect()
                     }
                 };
-                for (&q, row) in positions.iter().zip(&rows) {
+                for (&q, row) in positions.iter().zip(rows.chunks_exact(row_words)) {
                     assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
                 }
             }
@@ -2784,12 +2793,13 @@ mod tests {
             let deep = ntt.encode_interleaved_in_place_without_deep(&mut got, lanes, log_inv_rate, &sink_into(&mut handed, lanes));
             assert_eq!(handed, want, "handed-over rows, log_d={log_d}, lanes={lanes}");
             assert_eq!(deep.is_some(), split, "plan, log_d={log_d}, lanes={lanes}");
-            let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+            let mut positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+            positions.sort_unstable();
             let rows = match deep {
                 Some(deep) => ntt.finish_rows(&got, &deep, &positions),
-                None => positions.iter().map(|&q| got[q * lanes..][..lanes].to_vec()).collect(),
+                None => positions.iter().flat_map(|&q| got[q * lanes..][..lanes].iter().copied()).collect(),
             };
-            for (&q, row) in positions.iter().zip(&rows) {
+            for (&q, row) in positions.iter().zip(rows.chunks_exact(lanes)) {
                 assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_d={log_d}, lanes={lanes}");
             }
         }

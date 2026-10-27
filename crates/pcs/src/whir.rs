@@ -162,8 +162,14 @@ impl L0Codeword<'_> {
     /// The rows at `positions`, `row_words` words each.
     fn rows(&self, positions: &[usize]) -> Vec<Vec<F64>> {
         match self.deep {
-            Some((ntt, deep)) if self.words.is_empty() => ntt.rebuild_rows(self.stack, self.repeats, self.n_lanes, deep, positions),
-            Some((ntt, deep)) => ntt.finish_rows(self.words, deep, positions),
+            Some((ntt, deep)) if self.words.is_empty() => {
+                let rows = ntt.rebuild_rows(self.stack, self.repeats, self.n_lanes, deep, positions);
+                rows.chunks_exact(self.row_words).map(<[F64]>::to_vec).collect()
+            }
+            Some((ntt, deep)) => {
+                let rows = ntt.finish_rows(self.words, deep, positions);
+                rows.chunks_exact(self.row_words).map(<[F64]>::to_vec).collect()
+            }
             None => positions
                 .iter()
                 .map(|&q| self.words[q * self.row_words..(q + 1) * self.row_words].to_vec())
@@ -284,7 +290,11 @@ impl LigeroWitness {
     /// The rows at `positions`, each as the K words its Merkle leaf is hashed from.
     fn opened_words(&self, positions: &[usize]) -> Vec<Vec<F64>> {
         match &self.deferred {
-            Some(Deferred::Deep(ntt, deep)) => ntt.finish_rows(words(&self.mat), deep, positions),
+            Some(Deferred::Deep(ntt, deep)) => ntt
+                .finish_rows(words(&self.mat), deep, positions)
+                .chunks_exact(3 * self.num_interleaved)
+                .map(<[F64]>::to_vec)
+                .collect(),
             Some(Deferred::Cosets(ntt, log_inv_rate)) => {
                 ntt.coset_rows(words(&self.mat), 3 * self.num_interleaved, *log_inv_rate, positions)
             }
