@@ -511,7 +511,7 @@ impl AdditiveNttF64 {
                 for t in lo..hi {
                     for octet in 0..num_ntts / 8 {
                         let msg = unsafe { msg.add(0) }.cast_const();
-                        fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet, &copies);
+                        fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet, &copies, 1);
                         for (coset, run, live) in &cosets {
                             let live_rows = Some(&live[..]);
                             self.run_layers_to(scratch, Some(stage), deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
@@ -900,14 +900,15 @@ impl AdditiveNttF64 {
         let (rows, step) = (1usize << g, 1usize << log_step);
         // With a message, a task is one residue across every block, or a batch of residues when it is lane-major.
         // Without one, a task is one (block, residue) pair.
-        let batch = if lane_major.is_some() { BATCH } else { 1 };
+        let subs = stage_subs(lane_major.is_some(), log_step);
+        let batch = if lane_major.is_some() { BATCH * subs } else { 1 };
         let n_tasks = if msg.is_some() { step / batch } else { step << layer };
         // The blocks of `layer` the buffer holds, from `first_block` on.
         let blocks_held = (data.len() / num_ntts) >> (log_d - layer);
         // The message's rows. A lane-major group is an octet of lanes of a batch of residues, held in a stage.
         let msg_rows = 1usize << (log_d - layer);
         let width = if lane_major.is_some() { BATCH * 8 } else { num_ntts };
-        let stage_len = if lane_major.is_some() { rows * width } else { 0 };
+        let stage_len = if lane_major.is_some() { subs * rows * width } else { 0 };
         let base = parallel::SendPtr(data.as_mut_ptr());
         // Whole cache lines in every row, so a finished group can drain a line at a time.
         let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
@@ -1004,7 +1005,7 @@ impl AdditiveNttF64 {
                 for t in lo..hi {
                     if let (Some(m), Some(n_lanes)) = (msg, lane_major) {
                         // A task is a batch of residues: transpose an octet of lanes into the stage, then run each block.
-                        let t0 = t * BATCH;
+                        let t0 = t * batch;
                         // No fetch-ahead: a batch's lines sit 16 KB apart in blocks 16 MB apart, so they share
                         // a few L2 and L3 sets. Lines fetched a batch early are evicted before the fill reads them.
                         for octet in 0..num_ntts / 8 {
@@ -1018,9 +1019,12 @@ impl AdditiveNttF64 {
                                 num_ntts,
                                 octet,
                                 &copies,
+                                subs,
                             );
                             for block in (first_block..first_block + blocks_held).rev() {
-                                group(block, t0, None, stage, 8 * octet);
+                                for (u, staged) in stage.chunks_exact(rows * width).enumerate() {
+                                    group(block, t0 + u * BATCH, None, staged, 8 * octet);
+                                }
                             }
                         }
                     } else if let Some(m) = msg {
@@ -1702,6 +1706,26 @@ const STREAM_MIN_WORDS: usize = 1 << 23;
 /// Residues a lane-major first pass takes at once, as a log: one cache line of a lane block.
 const LOG_BATCH: usize = 3;
 const BATCH: usize = 1 << LOG_BATCH;
+/// Most batches a lane-major task fills side by side, so a lane's adjacent lines are read together.
+const STAGE_SUBS: usize = 2;
+
+/// Batches a lane-major task fills side by side, as one stage of that many batches.
+///
+/// # Why this value
+///
+/// - A batch reads one 64 byte line per lane block and row, 16 KB from the next row's.
+/// - Each such line opens its own DRAM page: 4 threads read it at 20 GB/s, where 128 byte runs reach 31 GB/s.
+/// - A second batch's line is the neighbour of the first's, so the fill reads both in one pass.
+/// - The stage doubles to 2^(g + 10) words, which spills from L2 into L3.
+/// - Measured on the base encode at 8:1 (rate 2 / rate 1, ms): 1 thread 944 -> 919 / 540 -> 504,
+///   2 threads 496 -> 482 / 287 -> 270, 4 threads 294 -> 286 / 169 -> 162.
+/// - At 8 threads it changes nothing, and at 16 threads it costs 3 %: the stage then crowds the shared L2 and L3.
+/// - So a pool of more than 4 threads keeps one batch.
+/// - A step under two batches has no neighbour line to read.
+fn stage_subs(lane_major: bool, log_step: usize) -> usize {
+    let fits = log_step >= LOG_BATCH + STAGE_SUBS.ilog2() as usize;
+    if lane_major && fits && parallel::num_threads() <= 4 { STAGE_SUBS } else { 1 }
+}
 
 /// Gathered groups of at least this many words fetch the next group's source rows while they transform.
 const FETCH_AHEAD_MIN_WORDS: usize = 1 << 13;
@@ -1811,8 +1835,10 @@ fn stage_copies(
     StageCopies { back, rows, n_octets, masks }
 }
 
-/// Transpose one octet of lanes of [`BATCH`] consecutive residues of a lane-major message into `stage`.
+/// Transpose one octet of lanes of `subs` batches of [`BATCH`] consecutive residues of a lane-major message into `stage`.
 ///
+/// - `stage` is `subs` stages of one batch each, and batch `u` starts at residue `t0 + u * BATCH`.
+/// - A row's tiles of all batches go together: the lines of one lane block that sit next to each other are read next to each other.
 /// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
 ///   is lane block `row_words - 1 - w` of the message, or zero while `w` is below the padding.
 /// - Residue `t0 + s` takes rows `t0 + s + i * step` for `i < rows`, `step = 2^log_step`.
@@ -1831,46 +1857,50 @@ fn fill_stage(
     row_words: usize,
     octet: usize,
     copies: &StageCopies,
+    subs: usize,
 ) {
-    let (back, copies) = (copies.back, copies.octet(octet, t0));
-    let rows = stage.len() / (BATCH * 8);
+    let back = copies.back;
+    let sub_words = stage.len() / subs;
+    let rows = sub_words / (BATCH * 8);
     let pad = row_words - n_lanes;
     let out = stage.as_mut_ptr();
     // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
     let block = |k: usize| row_words - 1 - (8 * octet + k);
-    if 8 * octet >= pad && copies.is_empty() {
-        // No padding lane: the tile needs no null check.
-        for i in 0..rows {
-            let j = t0 + (i << log_step);
-            let src: [*const F64; 8] = std::array::from_fn(|k| msg.wrapping_add(block(k) * msg_rows + j));
-            // SAFETY: as in the padded case below, and no source is null.
-            unsafe { transpose_tile::<false>(&src, |s| out.add((i * BATCH + s) * 8)) };
-        }
-        return;
-    }
+    let masks: [&[u8]; STAGE_SUBS] = std::array::from_fn(|u| if u < subs { copies.octet(octet, t0 + u * BATCH) } else { &[] });
     for i in 0..rows {
-        let j = t0 + (i << log_step);
-        let copy = copies.get(i).copied().unwrap_or(0);
-        // SAFETY: tile `i - back` is a tile of the stage, and `copies` has no bit before row `back`.
-        if copy == 0xFF {
-            unsafe { copy_lanes(out, i, i - back, copy) };
-            continue;
-        }
-        // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane or a copy.
-        let src: [*const F64; 8] = std::array::from_fn(|k| {
-            if 8 * octet + k < pad || copy >> k & 1 == 1 {
-                std::ptr::null()
-            } else {
-                msg.wrapping_add(block(k) * msg_rows + j)
+        // The sub-batches' lines of one lane are adjacent: a row's tiles go together.
+        for (u, masks) in masks.iter().enumerate().take(subs) {
+            let j = t0 + u * BATCH + (i << log_step);
+            let out = out.wrapping_add(u * sub_words);
+            let copy = masks.get(i).copied().unwrap_or(0);
+            if 8 * octet >= pad && copy == 0 {
+                // No padding lane: the tile needs no null check.
+                let src: [*const F64; 8] = std::array::from_fn(|k| msg.wrapping_add(block(k) * msg_rows + j));
+                // SAFETY: as in the padded case below, and no source is null.
+                unsafe { transpose_tile::<false>(&src, |s| out.add((i * BATCH + s) * 8)) };
+                continue;
             }
-        });
-        // SAFETY:
-        // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
-        // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`.
-        unsafe { transpose_tile::<true>(&src, |s| out.add((i * BATCH + s) * 8)) };
-        if copy != 0 {
-            // SAFETY: as above.
-            unsafe { copy_lanes(out, i, i - back, copy) };
+            // SAFETY: tile `i - back` is a tile of the stage, and `copies` has no bit before row `back`.
+            if copy == 0xFF {
+                unsafe { copy_lanes(out, i, i - back, copy) };
+                continue;
+            }
+            // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane or a copy.
+            let src: [*const F64; 8] = std::array::from_fn(|k| {
+                if 8 * octet + k < pad || copy >> k & 1 == 1 {
+                    std::ptr::null()
+                } else {
+                    msg.wrapping_add(block(k) * msg_rows + j)
+                }
+            });
+            // SAFETY:
+            // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
+            // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`.
+            unsafe { transpose_tile::<true>(&src, |s| out.add((i * BATCH + s) * 8)) };
+            if copy != 0 {
+                // SAFETY: as above.
+                unsafe { copy_lanes(out, i, i - back, copy) };
+            }
         }
     }
 }
