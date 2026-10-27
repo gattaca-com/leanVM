@@ -296,9 +296,7 @@ pub type BytecodeColumns = [std::sync::Arc<Vec<F64>>; 1 + BYTECODE_OPERANDS];
 /// the operand slots. The program is not committed, so these ride the seed/finalize blocks as
 /// `Coord::Public` and stack into the polynomial [`bytecode_table`] returns.
 pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
-    let max_op = prog.iter().map(Op::max_offset).max().unwrap_or(0) as usize;
-    let gpow = primitives::field::g_powers((max_op + 1).max(2));
-    let g_at = |i: u32| gpow[i as usize]; // operand g-power
+    let g_at = primitives::field::g_pow32_by_lookup;
 
     // The opcode, then the operand slots: offsets as g-powers, a `SET` immediate as its three
     // limbs, the `DEREF` store-mode flags and `KECCAK`'s layout flags as 0 or 1. Unused slots
