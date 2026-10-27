@@ -229,6 +229,7 @@ trait Lanes: Copy + std::ops::Mul<Output = Self> {
     type Elem: Copy;
     const ZERO: Self;
     fn transpose(g: [Self; 8]) -> [Self; 8];
+    fn even_odd(a: Self, b: Self) -> (Self, Self);
     fn to_array(self) -> [Self::Elem; 8];
 }
 
@@ -238,6 +239,10 @@ impl Lanes for F192x8 {
 
     fn transpose(g: [Self; 8]) -> [Self; 8] {
         F192x8::transpose(g)
+    }
+
+    fn even_odd(a: Self, b: Self) -> (Self, Self) {
+        F192x8::even_odd(a, b)
     }
 
     fn to_array(self) -> [F192; 8] {
@@ -253,6 +258,10 @@ impl Lanes for F64x8 {
         F64x8::transpose(g)
     }
 
+    fn even_odd(a: Self, b: Self) -> (Self, Self) {
+        F64x8::even_odd(a, b)
+    }
+
     fn to_array(self) -> [F64; 8] {
         F64x8::to_array(self)
     }
@@ -260,7 +269,9 @@ impl Lanes for F64x8 {
 
 /// Build and publish one task of consecutive GKR blocks, the first being block `first` of the leaf
 /// vector: `compute(l)` returns the eight leaves from leaf `l`, and each block's first radix-four
-/// layer goes to `quads`, sixteen per block.
+/// layer goes to `quads`, sixteen per block. The next two layers go to `tiers`: four nodes of level
+/// 4 per block, and one node of level 6 for each group of eight blocks that starts at a multiple of
+/// eight and lies in the task.
 ///
 /// Staged in L1 and published with streaming stores: nothing reads a leaf until GKR, long after a
 /// vector this size is evicted, so an ordinary store's fetch of every line it overwrites would
@@ -272,10 +283,12 @@ impl Lanes for F64x8 {
 /// stores once per task rather than once per block.
 ///
 /// # Safety
-/// The task owns blocks `first ..` of `quads`, sixteen per block, inside its allocation.
+/// The task owns blocks `first ..` of `quads`, sixteen per block, and of `tiers`, four and one per
+/// block, inside their allocations.
 unsafe fn publish_task<G: Lanes>(
     task: &mut [[G; 8]],
     quads: parallel::SendPtr<G::Elem>,
+    tiers: [parallel::SendPtr<G::Elem>; 2],
     first: usize,
     compute: impl Fn(usize) -> G,
 ) {
@@ -284,10 +297,17 @@ unsafe fn publish_task<G: Lanes>(
     let zero = G::ZERO.to_array()[0];
     let mut stage_quads = [[zero; 16]; 2];
     let mut pairs = [G::ZERO; 4];
+    // Level 4 of the group of eight blocks in progress, as nodes and as the lanes of each pair of
+    // blocks, and an even block's lanes, each the product of eight leaves, while it waits for its
+    // odd neighbour.
+    let mut nodes = [zero; 32];
+    let mut node_lanes = [G::ZERO; 4];
+    let mut even_block = None;
     for k in 0..=task.len() {
         let (cur, prev) = (k % 2, (k + 1) % 2);
         let base = gkr::BLOCK_VALUES * (first + k);
         let mut groups = [G::ZERO; 8];
+        let (mut evens, mut eights) = (G::ZERO, G::ZERO);
         for (j, group) in groups.iter_mut().enumerate() {
             if k < task.len() {
                 *group = compute(base + 8 * j);
@@ -299,9 +319,14 @@ unsafe fn publish_task<G: Lanes>(
                 match j {
                     0..4 => pairs[j] = v[2 * j] * v[2 * j + 1],
                     4 | 5 => {
-                        let q = (pairs[2 * j - 8] * pairs[2 * j - 7]).to_array();
-                        for (i, q) in q.into_iter().enumerate() {
+                        let lanes = pairs[2 * j - 8] * pairs[2 * j - 7];
+                        for (i, q) in lanes.to_array().into_iter().enumerate() {
                             stage_quads[prev][2 * i + j - 4] = q;
+                        }
+                        if j == 4 {
+                            evens = lanes;
+                        } else {
+                            eights = evens * lanes;
                         }
                     }
                     _ => {}
@@ -309,8 +334,46 @@ unsafe fn publish_task<G: Lanes>(
             }
         }
         if k > 0 {
+            let block = first + k - 1;
             // SAFETY: block `k - 1` of the task owns its sixteen quads, by the caller.
-            unsafe { stream.copy(quads.slice(16 * (first + k - 1), 16), &stage_quads[prev]) };
+            unsafe { stream.copy(quads.slice(16 * block, 16), &stage_quads[prev]) };
+            let (slot, last) = (block % 8, k == task.len());
+            if block.is_multiple_of(2) && !last {
+                even_block = Some(eights);
+            } else {
+                // Even and odd lanes pair into the four nodes of level 4 of a block. An odd block
+                // takes the even one before it into the other four lanes, and a block without its
+                // neighbour in the task leaves them unused.
+                let partner = even_block.take();
+                let (even, odd) = G::even_odd(partner.unwrap_or(eights), eights);
+                let products = even * odd;
+                node_lanes[slot / 2] = products;
+                let products = products.to_array();
+                let (at, count) = if partner.is_some() { (slot - 1, 8) } else { (slot, 4) };
+                nodes[4 * at..4 * at + count].copy_from_slice(&products[..count]);
+                if slot == 7 || last {
+                    let group = block - slot;
+                    let from = first.max(group);
+                    // SAFETY: the blocks `from ..= block` of the task own their level-4 nodes, by the caller.
+                    unsafe {
+                        stream.copy(
+                            tiers[0].slice(4 * from, 4 * (block + 1 - from)),
+                            &nodes[4 * (from - group)..4 * (slot + 1)],
+                        )
+                    };
+                    if slot == 7 && from == group {
+                        let pair = |x, y| {
+                            let (even, odd) = G::even_odd(x, y);
+                            even * odd
+                        };
+                        let (even, odd) =
+                            G::even_odd(pair(node_lanes[0], node_lanes[1]), pair(node_lanes[2], node_lanes[3]));
+                        let top = (even * odd).to_array();
+                        // SAFETY: the eight blocks of the group own eight nodes of level 6, by the caller.
+                        unsafe { stream.copy(tiers[1].slice(group, 8), &top) };
+                    }
+                }
+            }
         }
         if k < task.len() {
             // Group `j` of eight leaves becomes lane `j` of the block's eight vectors.
@@ -358,6 +421,10 @@ struct Side<'a> {
     leaves: Vec<gkr::Block>,
     quads: Vec<F192>,
     quads_done: Vec<usize>,
+    /// Levels 4 and 6 of the blocks `publish_task` builds, in the `staged` runs of blocks; empty
+    /// when the side has none.
+    tiers: [Vec<F192>; 2],
+    staged: Vec<Range<usize>>,
     terms: Vec<(F192, Terms<'a>)>,
 }
 
@@ -445,11 +512,26 @@ pub fn build_leaves(
                 leaves,
                 quads,
                 quads_done: lay.offsets[..blocks.len()].to_vec(),
+                tiers: [Vec::new(), Vec::new()],
+                staged: Vec::new(),
                 terms,
             }
         })
         .collect();
     const BLOCKS: usize = 128;
+    for side in &mut sides {
+        if (0..side.blocks.len()).any(|b| side.bulk(b) > 0) {
+            let level4 = side.quads.len().div_ceil(4);
+            // SAFETY: every entry is written by a task below or by `build_layers`, which
+            // computes the entries of the blocks outside `staged` unless they are identity.
+            side.tiers = unsafe {
+                [
+                    primitives::uninit_vec(level4),
+                    primitives::uninit_vec(level4.div_ceil(4)),
+                ]
+            };
+        }
+    }
     let mut jobs: Vec<(usize, usize, usize)> = (0..sides.len())
         .flat_map(|s| (0..sides[s].blocks.len()).map(move |b| (s, b)))
         .filter(|&(s, b)| sides[s].bulk(b) > 0)
@@ -458,9 +540,22 @@ pub fn build_leaves(
     jobs.sort_by_key(|&(rows, ..)| rows);
     for group in jobs.chunk_by(|x, y| x.0 == y.0) {
         let bulk = group[0].0 / gkr::BLOCK_VALUES;
+        for &(_, s, b) in group {
+            let off = sides[s].lay.offsets[b] / gkr::BLOCK_VALUES;
+            sides[s]
+                .staged
+                .extend((0..bulk.div_ceil(BLOCKS)).map(|c| off + c * BLOCKS..off + ((c + 1) * BLOCKS).min(bulk)));
+        }
         let ptrs: Vec<_> = sides
             .iter_mut()
-            .map(|s| (parallel::SendPtr(s.leaves.as_mut_ptr()), parallel::SendPtr(s.quads.as_mut_ptr())))
+            .map(|s| {
+                let [l4, l6] = s.tiers.each_mut().map(|t| parallel::SendPtr(t.as_mut_ptr()));
+                (
+                    parallel::SendPtr(s.leaves.as_mut_ptr()),
+                    parallel::SendPtr(s.quads.as_mut_ptr()),
+                    [l4, l6],
+                )
+            })
             .collect();
         parallel::for_each(bulk.div_ceil(BLOCKS), |c| {
             for &(_, s, b) in group {
@@ -471,7 +566,9 @@ pub fn build_leaves(
                 // task or block of the group touches.
                 unsafe {
                     let task = ptrs[s].0.slice(first, BLOCKS.min(bulk - c * BLOCKS));
-                    publish_task(task, ptrs[s].1, first, |l| leaf_rows8(&side.terms[b], l - off));
+                    publish_task(task, ptrs[s].1, ptrs[s].2, first, |l| {
+                        leaf_rows8(&side.terms[b], l - off)
+                    });
                 }
             }
         });
@@ -492,7 +589,15 @@ pub fn build_leaves(
                     fill_ones(&mut side.leaves, off + blk.rows, off + (1usize << blk.kappa), explicit);
                 }
             }
-            let Side { leaves, mut quads, quads_done, .. } = side;
+            let Side {
+                leaves,
+                mut quads,
+                quads_done,
+                tiers,
+                mut staged,
+                ..
+            } = side;
+            staged.sort_unstable_by_key(|run| run.start);
             let mut ones: Vec<Range<usize>> = Vec::new();
             if tiled {
                 finish_quads(&leaves, &mut quads, blocks, lay, &quads_done);
@@ -517,6 +622,8 @@ pub fn build_leaves(
                 len: explicit,
                 quads,
                 ones,
+                tiers,
+                staged,
             }
         })
         .collect()
@@ -960,6 +1067,14 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
     let mut leaves: Vec<gkr::KBlock> = unsafe { primitives::uninit_vec(block_count) };
     let mut quads = unsafe { primitives::uninit_vec::<F64>(16 * block_count) };
     let quads_ptr = parallel::SendPtr(quads.as_mut_ptr());
+    // SAFETY: as the quads, whose blocks own four nodes of level 4 and one of level 6.
+    let mut tiers: [Vec<F64>; 2] = unsafe {
+        [
+            primitives::uninit_vec(4 * block_count),
+            primitives::uninit_vec(block_count),
+        ]
+    };
+    let tier_ptrs = tiers.each_mut().map(|t| parallel::SendPtr(t.as_mut_ptr()));
     // Eight leaves from leaf `l`: a run of one column, a run of padding, or the edge of either.
     let eight = |l: usize| match segment_of(l) {
         Some((off, _, data)) if data.len() >= l - off + 8 => {
@@ -973,14 +1088,20 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
     const BLOCKS: usize = 128;
     parallel::chunks_mut(&mut leaves, BLOCKS, |c, task| {
         // SAFETY: task `c` owns the quads of its blocks, which no other task touches.
-        unsafe { publish_task(task, quads_ptr, c * BLOCKS, eight) };
+        unsafe { publish_task(task, quads_ptr, tier_ptrs, c * BLOCKS, eight) };
     });
     quads.truncate(explicit.div_ceil(4));
+    tiers[0].truncate(quads.len().div_ceil(4));
+    tiers[1].truncate(quads.len().div_ceil(4).div_ceil(4));
     gkr::Leaves {
         leaves,
         len: explicit,
         quads,
         ones: Vec::new(),
+        tiers,
+        staged: (0..block_count.div_ceil(BLOCKS))
+            .map(|c| c * BLOCKS..((c + 1) * BLOCKS).min(block_count))
+            .collect(),
     }
 }
 

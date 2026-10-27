@@ -30,11 +30,19 @@ fn window_rows(total: usize) -> usize {
 /// `ones` are sorted, disjoint runs of leaves that are the identity. The GKR never reads a whole
 /// block of 64 inside a run, at the leaves or at any level above them (see [`identity_blocks`]),
 /// so the builder may leave those blocks of `leaves` and `quads` unwritten.
+///
+/// A builder that has the quads in hand may also write the levels above them for whole blocks of 64
+/// leaves: `tiers` are levels 4 and 6, of the length the levels have (or empty), and `staged` are
+/// sorted, disjoint runs of blocks. A run holds the level-4 entries of its blocks, and the level-6
+/// entry of each group of eight blocks that starts at a multiple of eight and lies inside the run.
+/// [`build_layers`] computes the entries no run holds.
 pub struct Leaves<F: TreeField = F192> {
     pub leaves: Vec<F::Block>,
     pub len: usize,
     pub quads: Vec<F>,
     pub ones: Vec<Range<usize>>,
+    pub tiers: [Vec<F>; 2],
+    pub staged: Vec<Range<usize>>,
 }
 
 impl<F: TreeField> Leaves<F> {
@@ -46,6 +54,8 @@ impl<F: TreeField> Leaves<F> {
             len: values.len(),
             quads,
             ones: Vec::new(),
+            tiers: [Vec::new(), Vec::new()],
+            staged: Vec::new(),
         }
     }
 }
@@ -72,6 +82,12 @@ fn halve(ones: &[Range<usize>], count: usize) -> Vec<Range<usize>> {
         .map(|run| run.start.div_ceil(2)..run.end / 2)
         .filter(|run| !run.is_empty())
         .collect()
+}
+
+/// Whether `blocks` lies inside one of the runs.
+fn covers(runs: &[Range<usize>], blocks: Range<usize>) -> bool {
+    runs.get(runs.partition_point(|run| run.end <= blocks.start))
+        .is_some_and(|run| run.start <= blocks.start && blocks.end <= run.end)
 }
 
 fn in_runs(ones: &[Range<usize>], b: usize) -> bool {
@@ -296,7 +312,10 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
         len,
         quads,
         ones,
+        tiers,
+        staged,
     } = leaves;
+    let mut tiers = tiers.map(Some);
     assert!(len > 0);
     assert!(len <= 1usize << mu);
     assert_eq!(quads.len(), len.div_ceil(4));
@@ -323,14 +342,28 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
         } else if current.len() == 2 {
             Vec::from_iter([current[0] * current[1]])
         } else {
-            // SAFETY: the vector rows and the scalar rows after them cover every slot.
-            let mut next: Vec<F> = unsafe { primitives::uninit_vec(full_rows) };
+            // The builder wrote the entries of the staged blocks, whose rows the chunks below skip.
+            let tier = tiers
+                .get_mut(level / 2 - 1)
+                .and_then(Option::take)
+                .filter(|tier| !tier.is_empty());
+            let from_builder = tier.is_some();
+            let mut next: Vec<F> = tier.unwrap_or_else(|| {
+                // SAFETY: the vector rows and the scalar rows after them cover every slot.
+                unsafe { primitives::uninit_vec(full_rows) }
+            });
+            next.truncate(full_rows);
             let vector_rows = full_rows / 8 * 8;
             const CHUNK: usize = 512;
-            // Eight products come from 32 children, which lie in one block of 64 or none.
+            // Eight products come from 32 children, which lie in one block of 64 or none, and
+            // from the leaves of `2^(level - 1)` blocks of 64.
+            let span = 1usize << (level - 1);
             let fill = |c: usize, out: &mut [F]| {
                 for (i, slots) in out.chunks_exact_mut(8).enumerate() {
                     let g = c * CHUNK / 8 + i;
+                    if from_builder && covers(&staged, g * span..(g + 1) * span) {
+                        continue;
+                    }
                     if !in_runs(&skip_in, g / 2) {
                         slots.copy_from_slice(&F::eight_products(&current[32 * g..][..32]));
                     } else if !in_runs(&skip_out, g / 8) {
