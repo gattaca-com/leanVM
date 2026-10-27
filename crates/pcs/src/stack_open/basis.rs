@@ -18,12 +18,11 @@ use primitives::bits::bit_transpose_64bytes;
 use primitives::field::{
     Acc8, F64, F192, F192Unreduced, F192x8, Weights8, dot_base, fold_lones8_ext, msg_lone8_ext, xor_into8,
 };
-use primitives::stream::Stream;
 
 use super::{RingSwitchOpen, StackClaim};
 use crate::ring_switch::{RingWeight, coordinate_basis};
 use crate::tensor_algebra::{DEGREE_E, transpose_s_hat};
-use crate::whir::{InitialBasis, LaneLift, SumcheckMessage, accumulate_msg, adjacent_dots};
+use crate::whir::{InitialBasis, LaneLift, LiftBlock, adjacent_dots};
 
 /// Bits of a block's low part.
 pub(super) const LOW_VARS: usize = 10;
@@ -309,9 +308,9 @@ impl LaneLift for Terms {
     /// `b[h * 2^m + x] = sum_claims A[c] * gamma_c(h) * pi_c(x) + sum_rings Phi'(e(x))`, where
     /// `Phi'` weighs the ring's coordinates by its 192 terms of `a`, and the message of `f` against `b`.
     ///
-    /// Each block is built in an L1 scratch, read for the message and streamed out. The dense patterns
-    /// share one reduction per vector, and the next block of `f` is prefetched while they run.
-    fn lift(&self, a: &[F192], f: &[F192]) -> (Vec<F192>, SumcheckMessage) {
+    /// The setup is each pattern's weight on each block, `sum_c a[c] * gamma_c(h)` over its claims, and the
+    /// ring weights. A block is built in the caller's buffer, and the dense patterns share one reduction per vector.
+    fn blocks<'a>(&'a self, a: &[F192]) -> LiftBlock<'a> {
         let block = 1usize << self.low_vars;
         let rings: Vec<_> = self
             .rings
@@ -323,12 +322,9 @@ impl LaneLift for Terms {
                 (weight, ring.x_offset, 1usize << vars)
             })
             .collect();
-        // SAFETY: every block is streamed out whole before the message pass ends.
-        let mut b = unsafe { primitives::uninit_vec::<F192>(1 << self.lane_vars) };
-        // Each pattern's weight on each block: `sum_c a[c] * gamma_c(h)` over its claims.
         let n_patterns = self.patterns.len();
-        // SAFETY: every entry is written before the lift reads it.
-        let mut gs = unsafe { primitives::uninit_vec::<F192>(b.len() / block * n_patterns) };
+        // SAFETY: every entry is written before the blocks read it.
+        let mut gs = unsafe { primitives::uninit_vec::<F192>((1 << (self.lane_vars - self.low_vars)) * n_patterns) };
         parallel::chunks_mut(&mut gs, n_patterns.max(1), |h, row| {
             for (g, pattern) in row.iter_mut().zip(&self.patterns) {
                 *g = pattern
@@ -337,24 +333,14 @@ impl LaneLift for Terms {
                     .fold(F192::ZERO, |sum, &c| sum + a[c] * self.gamma(c)[h]);
             }
         });
-        let b_ptr = parallel::SendPtr(b.as_mut_ptr());
-        let (u_0, u_2) = accumulate_msg(b.len() / block, b.len() / 2, |h| {
-            let mut scratch = [F192::ZERO; 1 << LOW_VARS];
-            let out = &mut scratch[..block];
+        Box::new(move |h, f, out| {
             let live = || {
                 self.patterns
                     .iter()
                     .zip(&gs[h * n_patterns..][..n_patterns])
                     .filter(|(_, g)| **g != F192::ZERO)
             };
-            let next = f.as_ptr().wrapping_add((h + 1) * block);
             for (k, o) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                #[cfg(target_arch = "x86_64")]
-                for line in 0..3 {
-                    let at = next.wrapping_add(8 * k).cast::<i8>().wrapping_add(64 * line);
-                    // SAFETY: a prefetch of any address is harmless.
-                    unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(at) };
-                }
                 let products = live().filter_map(|(pattern, &g)| match &pattern.low {
                     Low::Dense { table, .. } => Some(table[k].mul_unreduced(F192x8::splat(g))),
                     Low::Sparse(_) => None,
@@ -376,18 +362,9 @@ impl LaneLift for Terms {
                     weight.add_chunk(lo - offset, &mut out[lo - h * block..hi - h * block]);
                 }
             }
-            let (u_0, u_2, _) = adjacent_dots::<false>(&f[h * block..][..block], out);
-            // SAFETY: block `h` is in bounds, and no other task writes it.
-            unsafe { Stream::new().copy_uninit(b_ptr.add(h * block), out) };
+            let (u_0, u_2, _) = adjacent_dots::<false>(f, out);
             (u_0, u_2)
-        });
-        (
-            b,
-            SumcheckMessage {
-                u_0: u_0.reduce(),
-                u_2: u_2.reduce(),
-            },
-        )
+        })
     }
 }
 

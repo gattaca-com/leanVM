@@ -789,9 +789,15 @@ fn fold_blocks(x: &[F192], block: usize, r: F192) -> Vec<F192> {
     out
 }
 
+/// Builds block `h` of the weight over a lane block after every lane round from the witness block `f`, and
+/// returns the unreduced message terms of `f` against it.
+pub(crate) type LiftBlock<'a> = Box<dyn Fn(usize, &[F192], &mut [F192]) -> (Acc8, Acc8) + Sync + 'a>;
+
 /// The weight over one lane block after every lane round, rebuilt from the term table's last row.
 pub(crate) trait LaneLift {
-    fn lift(&self, a: &[F192], f: &[F192]) -> (Vec<F192>, SumcheckMessage);
+    /// The per-block body for the table row `a`. A block is `2^low_vars` words, the length of the
+    /// `f` and `out` it is given.
+    fn blocks<'a>(&'a self, a: &[F192]) -> LiftBlock<'a>;
 }
 
 /// The basis the sumcheck starts from: the weight as terms, `b(l, x) = sum_t a[l][t] * K_t(x)`,
@@ -964,22 +970,37 @@ fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a
     }
 }
 
-/// The witness after every lane round, straight from the base lanes: `sum_l eq(rs, l) * base_l`.
+/// The witness and the lifted weight after every lane round, and the message of one against the other.
 ///
-/// A block that repeats its predecessor in its lane adds what that lane added to the block before, so a block
-/// of the sum is the block before it plus the deltas of the lanes whose block changed. A task starts from nothing.
+/// The witness is straight from the base lanes: `sum_l eq(rs, l) * base_l`. A block that repeats its predecessor
+/// in its lane adds what that lane added to the block before, so a block of the sum is the block before it plus
+/// the deltas of the lanes whose block changed. A task starts from nothing.
+///
+/// `lift` turns each witness block into its weight block while the witness block is still in cache, and both
+/// stream out.
 #[timed]
-fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run: usize) -> Vec<F192> {
+fn fold_all_lanes(
+    base: &[F64],
+    block: usize,
+    rs: &[F192],
+    repeats: &[bool],
+    run: usize,
+    lift: &LiftBlock,
+) -> (Vec<F192>, Vec<F192>, SumcheckMessage) {
     const TASK: usize = 32;
     let weights = primitives::multilinear::eq_table(rs);
     let n_blocks = block / run;
     let zeros = vec![F64(0); run];
     // SAFETY: every task streams each of its output blocks below.
-    let mut out = unsafe { primitives::uninit_vec::<F192>(block) };
-    parallel::chunks_mut(&mut out, TASK * run, |c, out| {
-        let out_blocks = out.len() / run;
-        // The running block stays in L1 and L2; `out` takes only streaming stores, so it is never fetched.
+    let (mut f, mut b) = unsafe { (primitives::uninit_vec::<F192>(block), primitives::uninit_vec::<F192>(block)) };
+    let (f_ptr, b_ptr) = (parallel::SendPtr(f.as_mut_ptr()), parallel::SendPtr(b.as_mut_ptr()));
+    let (u_0, u_2) = accumulate_msg(n_blocks.div_ceil(TASK), block / 2, |c| {
+        let out_blocks = TASK.min(n_blocks - c * TASK);
+        // The running block and the weight block stay in L1 and L2; the outputs take only streaming stores,
+        // so they are never fetched.
         let mut acc = vec![F192::ZERO; run];
+        let mut weight = vec![F192::ZERO; run];
+        let (mut u_0, mut u_2) = (Acc8::ZERO, Acc8::ZERO);
         let stream = primitives::stream::Stream::new();
         for i in 0..out_blocks {
             let h = c * TASK + i;
@@ -1003,10 +1024,22 @@ fn fold_all_lanes(base: &[F64], block: usize, rs: &[F192], repeats: &[bool], run
                     (weights[l], &lane[h * run..(h + 1) * run], prev, next)
                 });
             add_lane_deltas(&mut acc, deltas);
-            stream.copy(&mut out[i * run..(i + 1) * run], &acc);
+            let (t_0, t_2) = lift(h, &acc, &mut weight);
+            u_0 ^= t_0;
+            u_2 ^= t_2;
+            // SAFETY: block `h` is in bounds, and no other task writes it.
+            unsafe {
+                stream.copy_uninit(f_ptr.add(h * run), &acc);
+                stream.copy_uninit(b_ptr.add(h * run), &weight);
+            }
         }
+        (u_0, u_2)
     });
-    out
+    let msg = SumcheckMessage {
+        u_0: u_0.reduce(),
+        u_2: u_2.reduce(),
+    };
+    (f, b, msg)
 }
 
 /// Running sumcheck: the lane rounds on the tables of the initial basis, then extension-field folds.
@@ -1102,15 +1135,16 @@ impl SumcheckProver {
         self.combined_basis = fold_blocks(&self.combined_basis, self.block, r);
         let msg = if last {
             let lift = self.lift.take().expect("the lift is taken by the last lane round only");
-            self.f = fold_all_lanes(
+            let blocks = lift.blocks(&self.combined_basis);
+            let (f, b, msg) = fold_all_lanes(
                 &self.base,
                 self.lane_block,
                 &self.lane_rs,
                 &self.repeats,
                 self.repeat_len,
+                &blocks,
             );
-            let (b, msg) = lift.lift(&self.combined_basis, &self.f);
-            self.combined_basis = b;
+            (self.f, self.combined_basis) = (f, b);
             msg
         } else {
             round_msg_blocks(&self.f, &self.combined_basis, self.block)
