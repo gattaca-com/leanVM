@@ -66,6 +66,39 @@ impl Part {
     const ZERO: Self = Self([0; PART_WORDS]);
 
     /// Product `q` at bits `48 * q ..`: four products to three words.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi"))]
+    #[inline(always)]
+    fn pack(products: &[u64; PART]) -> Self {
+        use core::arch::x86_64::*;
+        /// Byte `j` of output register `k` is byte `j % 6` of product `(64 * k + j) / 6`, which lies
+        /// in register `k` or `k + 1` of the products, eight to a register.
+        const BYTES: [[u8; 64]; 3] = {
+            let mut idx = [[0u8; 64]; 3];
+            let mut k = 0;
+            while k < 3 {
+                let mut j = 0;
+                while j < 64 {
+                    let (q, b) = ((64 * k + j) / 6, (64 * k + j) % 6);
+                    idx[k][j] = ((q - 8 * k) * 8 + b) as u8;
+                    j += 1;
+                }
+                k += 1;
+            }
+            idx
+        };
+        // SAFETY: the products are four registers, the parts three, and AVX-512 VBMI is enabled at compile time.
+        unsafe {
+            let p: [__m512i; 4] = std::array::from_fn(|i| _mm512_loadu_si512(products.as_ptr().add(8 * i).cast()));
+            let mut out = Self([0; PART_WORDS]);
+            for k in 0..3 {
+                let idx = _mm512_loadu_si512(BYTES[k].as_ptr().cast());
+                _mm512_store_si512(out.0.as_mut_ptr().add(8 * k).cast(), _mm512_permutex2var_epi8(p[k], idx, p[k + 1]));
+            }
+            out
+        }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi")))]
     #[inline(always)]
     fn pack(products: &[u64; PART]) -> Self {
         let mut out = [0u64; PART_WORDS];
