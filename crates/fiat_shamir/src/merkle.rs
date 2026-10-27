@@ -65,7 +65,7 @@ impl PrunedMerklePaths {
     /// For `q` queries in a tree of depth `d` the octopus is at most `q · d`
     /// hashes (what `q` independent paths would cost) and typically much
     /// smaller, since a sibling shared by several paths is emitted once.
-    pub fn prune(tree: &[Hash], num_leaves: usize, positions: &[usize], row: impl Fn(usize) -> Vec<F64>) -> Self {
+    pub fn prune<'a>(tree: &[Hash], num_leaves: usize, positions: &[usize], row: impl Fn(usize) -> &'a [F64]) -> Self {
         assert!(num_leaves.is_power_of_two() && num_leaves > 0);
         assert_eq!(tree.len(), 2 * num_leaves - 1);
         let level_start = |level: usize| 2 * num_leaves - ((2 * num_leaves) >> level);
@@ -73,11 +73,11 @@ impl PrunedMerklePaths {
     }
 
     /// Like [`Self::prune`], for a tree held in pieces: `node(level, i)` is node `i` of `level`, leaves at level 0.
-    pub fn prune_with(
+    pub fn prune_with<'a>(
         num_leaves: usize,
         positions: &[usize],
         node: impl Fn(usize, usize) -> Hash,
-        row: impl Fn(usize) -> Vec<F64>,
+        row: impl Fn(usize) -> &'a [F64],
     ) -> Self {
         assert!(num_leaves.is_power_of_two() && num_leaves > 0);
         let sorted = sorted_unique(positions);
@@ -109,7 +109,7 @@ impl PrunedMerklePaths {
         }
 
         Self {
-            leaf_data: sorted.iter().map(|&q| row(q)).collect(),
+            leaf_data: sorted.iter().map(|&q| row(q).to_vec()).collect(),
             sibling_hashes,
         }
     }

@@ -298,7 +298,7 @@ impl LigeroWitness {
         let row = |q| fetched_row(&group, &group_rows, row_words, q);
         let mut rows = Vec::with_capacity(queries.len() * self.num_interleaved);
         rows.extend(queries.iter().flat_map(|&q| row(q).chunks_exact(3).map(|w| F192::new(w[0].0, w[1].0, w[2].0))));
-        let paths = self.tree.prune(queries, row_words, row_words, &group_rows, |q| row(q).to_vec());
+        let paths = self.tree.prune(queries, row_words, row_words, &group_rows, row);
         (rows, paths)
     }
 
@@ -1320,7 +1320,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     }
     // ... but the stored proof carries the sorted-unique rows + one octopus over
     // the sorted-unique positions (the verifier re-fans them to ordered).
-    ps.hint_merkle(l0_tree.prune(&queries_0, row_words, num_interleaved_0, &group_rows_0, |q| image(q).to_vec()));
+    ps.hint_merkle(l0_tree.prune(&queries_0, row_words, num_interleaved_0, &group_rows_0, image));
     // Nothing reads the L0 codeword, its stack or its tree again, and the next levels' buffers can be served
     // from their memory.
     drop((prover_data, stack, stack_repeats));

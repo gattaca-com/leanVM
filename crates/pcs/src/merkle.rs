@@ -323,30 +323,26 @@ impl CutTree {
     ///
     /// `group_rows` are the full rows of [`Self::group_positions`], `row_words` each, back to back, hashed
     /// as the leaves `zeros(leaf_words - row_words) ‖ row`.
-    pub fn prune(
+    pub fn prune<'a>(
         &self,
         positions: &[usize],
         row_words: usize,
         leaf_words: usize,
         group_rows: &[F64],
-        row: impl Fn(usize) -> Vec<F64>,
+        row: impl Fn(usize) -> &'a [F64],
     ) -> PrunedMerklePaths {
         let (groups, size) = (self.groups(positions), 1usize << self.cut);
-        assert_eq!(group_rows.len(), groups.len() * size * row_words, "the rows of every group");
-        let leaves = LeafHasher::new(8 * row_words, 8 * leaf_words);
-        // Per group, the flat tree of its leaves.
-        let local: Vec<Vec<Hash>> = group_rows
-            .chunks_exact(size * row_words)
-            .map(|rows| {
-                let nodes = Nodes::new(size, 0);
-                // SAFETY: the nodes are ours alone, and the climb writes every level it reads.
-                unsafe {
-                    leaves.hash(words_as_bytes(rows), nodes.level_mut(0, 0, size));
-                    nodes.climb(0, 0, size, self.cut);
-                    nodes.assume_init()
-                }
-            })
-            .collect();
+        let n = groups.len() * size;
+        assert_eq!(group_rows.len(), n * row_words, "the rows of every group");
+        // All groups' leaves as one flat tree up to the cut: a group is aligned, so no climb mixes two.
+        let mut nodes = Nodes::new(n, 0);
+        // SAFETY: the nodes are ours alone, the climb writes every level it reads, and the levels kept are written.
+        let local = unsafe {
+            LeafHasher::new(8 * row_words, 8 * leaf_words).hash(words_as_bytes(group_rows), nodes.level_mut(0, 0, n));
+            nodes.climb(0, 0, n, self.cut);
+            nodes.tree.truncate(Self::start(n, self.cut));
+            nodes.assume_init()
+        };
         let node = |level: usize, i: usize| {
             if level >= self.cut {
                 return self.nodes[Self::start(self.num_leaves, level) - Self::start(self.num_leaves, self.cut) + i];
@@ -355,7 +351,7 @@ impl CutTree {
             let group = groups
                 .binary_search(&(i / width))
                 .expect("a sibling is in an opened group");
-            local[group][Self::start(size, level) + i % width]
+            local[Self::start(n, level) + group * width + i % width]
         };
         PrunedMerklePaths::prune_with(self.num_leaves, positions, node, row)
     }
@@ -532,7 +528,7 @@ mod tests {
                 .map(|i| F64(i as u64 * 0x9E37_79B9 + 1))
                 .collect();
             let full = merkle_tree_padded_rows(&data, num_leaves, row_words, leaf_words);
-            let row = |q: usize| data[q * row_words..][..row_words].to_vec();
+            let row = |q: usize| &data[q * row_words..][..row_words];
             let builder = MerkleBuilder::with_bytes(num_leaves, 8 * row_words, 8 * leaf_words, CUT);
             builder.absorb_all(words_as_bytes(&data));
             let cut = builder.finish();
@@ -543,7 +539,7 @@ mod tests {
                 (0..num_leaves).step_by(7).collect(),
             ] {
                 let group = cut.group_positions(&positions);
-                let rows: Vec<F64> = group.iter().flat_map(|&q| row(q)).collect();
+                let rows: Vec<F64> = group.iter().flat_map(|&q| row(q)).copied().collect();
                 let got = cut.prune(&positions, row_words, leaf_words, &rows, row);
                 assert_eq!(got, PrunedMerklePaths::prune(&full, num_leaves, &positions, row));
             }
