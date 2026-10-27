@@ -44,14 +44,15 @@ enum Factor {
     Eq(F192),
 }
 
-/// `prod_i factors[i](bit i of x)` for every `x`.
-fn table(factors: &[Factor]) -> Vec<F192> {
-    let mut out = Vec::with_capacity(1 << factors.len());
+/// Appends `prod_i factors[i](bit i of x)` for every `x` to `out`.
+fn extend_table(out: &mut Vec<F192>, factors: &[Factor]) {
+    let start = out.len();
+    out.reserve(1 << factors.len());
     out.push(F192::ONE);
     for &factor in factors {
-        let len = out.len();
-        out.resize(2 * len, F192::ZERO);
-        for i in 0..len {
+        let len = out.len() - start;
+        out.resize(start + 2 * len, F192::ZERO);
+        for i in start..start + len {
             let v = out[i];
             match factor {
                 Factor::Eq(p) => {
@@ -67,6 +68,12 @@ fn table(factors: &[Factor]) -> Vec<F192> {
             }
         }
     }
+}
+
+/// `prod_i factors[i](bit i of x)` for every `x`.
+fn table(factors: &[Factor]) -> Vec<F192> {
+    let mut out = Vec::new();
+    extend_table(&mut out, factors);
     out
 }
 
@@ -178,8 +185,8 @@ struct Terms {
     lane_vars: usize,
     /// Bits of a block's low part.
     low_vars: usize,
-    /// `gamma(h)` of every claim.
-    gamma: Vec<Vec<F192>>,
+    /// `gamma(h)` of every claim, `1 << (lane_vars - low_vars)` blocks each.
+    gamma: Vec<F192>,
     /// The blocks a claim's `gamma` is nonzero on, widened to whole vectors.
     ranges: Vec<std::ops::Range<usize>>,
     patterns: Vec<Pattern>,
@@ -188,7 +195,13 @@ struct Terms {
 
 impl Terms {
     fn n_claims(&self) -> usize {
-        self.gamma.len()
+        self.ranges.len()
+    }
+
+    /// `gamma(h)` of claim `c` for every block.
+    fn gamma(&self, c: usize) -> &[F192] {
+        let n_blocks = 1 << (self.lane_vars - self.low_vars);
+        &self.gamma[c * n_blocks..][..n_blocks]
     }
 
     fn n_terms(&self) -> usize {
@@ -256,7 +269,7 @@ impl Terms {
             let q = &q[p * n_blocks..(p + 1) * n_blocks];
             for &c in &pattern.claims {
                 let range = self.ranges[c].clone();
-                let (gamma, q) = (&self.gamma[c][range.clone()], &q[range]);
+                let (gamma, q) = (&self.gamma(c)[range.clone()], &q[range]);
                 let ((g8, g_r), (q8, q_r)) = (gamma.as_chunks::<8>(), q.as_chunks::<8>());
                 let sum = g8.iter().zip(q8).fold(Acc8::ZERO, |mut acc, (g, q)| {
                     acc ^= msg_lone8_ext(g, q);
@@ -312,22 +325,28 @@ impl LaneLift for Terms {
             .collect();
         // SAFETY: every block is streamed out whole before the message pass ends.
         let mut b = unsafe { primitives::uninit_vec::<F192>(1 << self.lane_vars) };
+        // Each pattern's weight on each block: `sum_c a[c] * gamma_c(h)` over its claims.
+        let n_patterns = self.patterns.len();
+        // SAFETY: every entry is written before the lift reads it.
+        let mut gs = unsafe { primitives::uninit_vec::<F192>(b.len() / block * n_patterns) };
+        parallel::chunks_mut(&mut gs, n_patterns.max(1), |h, row| {
+            for (g, pattern) in row.iter_mut().zip(&self.patterns) {
+                *g = pattern
+                    .claims
+                    .iter()
+                    .fold(F192::ZERO, |sum, &c| sum + a[c] * self.gamma(c)[h]);
+            }
+        });
         let b_ptr = parallel::SendPtr(b.as_mut_ptr());
         let (u_0, u_2) = accumulate_msg(b.len() / block, b.len() / 2, |h| {
             let mut scratch = [F192::ZERO; 1 << LOW_VARS];
             let out = &mut scratch[..block];
-            let gs = self.patterns.iter().map(|p| {
-                p.claims
+            let live = || {
+                self.patterns
                     .iter()
-                    .fold(F192::ZERO, |sum, &c| sum + a[c] * self.gamma[c][h])
-            });
-            let (mut dense, mut sparse) = (Vec::new(), Vec::new());
-            for (pattern, g) in self.patterns.iter().zip(gs).filter(|(_, g)| *g != F192::ZERO) {
-                match &pattern.low {
-                    Low::Dense { table, .. } => dense.push((table, F192x8::splat(g))),
-                    Low::Sparse(support) => sparse.push((support, g)),
-                }
-            }
+                    .zip(&gs[h * n_patterns..][..n_patterns])
+                    .filter(|(_, g)| **g != F192::ZERO)
+            };
             let next = f.as_ptr().wrapping_add((h + 1) * block);
             for (k, o) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 #[cfg(target_arch = "x86_64")]
@@ -336,14 +355,19 @@ impl LaneLift for Terms {
                     // SAFETY: a prefetch of any address is harmless.
                     unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(at) };
                 }
-                let products = dense.iter().map(|(table, g)| table[k].mul_unreduced(*g));
+                let products = live().filter_map(|(pattern, &g)| match &pattern.low {
+                    Low::Dense { table, .. } => Some(table[k].mul_unreduced(F192x8::splat(g))),
+                    Low::Sparse(_) => None,
+                });
                 *o = products
                     .reduce(|acc, p| acc ^ p)
                     .map_or([F192::ZERO; 8], |acc| acc.reduce_lanes().to_array());
             }
-            for (support, g) in sparse {
-                for &(x, c) in support {
-                    out[x] += g * c;
+            for (pattern, &g) in live() {
+                if let Low::Sparse(support) = &pattern.low {
+                    for &(x, c) in support {
+                        out[x] += g * c;
+                    }
                 }
             }
             for (weight, offset, len) in &rings {
@@ -404,13 +428,16 @@ pub(super) fn project(
         patterns: Vec::new(),
         rings: Vec::new(),
     };
-    let mut lane_weights: Vec<Vec<F192>> = Vec::new();
+    // The claims' lane weights, then the rings', each `1 << lane_bits` long.
+    let mut lanes: Vec<F192> = Vec::new();
     for (c, claim) in claims.iter().enumerate() {
         let factors = claim_factors(claim, bits);
         let (low, rest) = factors.split_at(low_vars);
         let (mid, lane) = rest.split_at(lane_vars - low_vars);
-        terms.gamma.push(table(mid));
-        lane_weights.push(table(lane).into_iter().map(|l| lambdas[c] * l).collect());
+        extend_table(&mut terms.gamma, mid);
+        let at = lanes.len();
+        extend_table(&mut lanes, lane);
+        lanes[at..].iter_mut().for_each(|l| *l *= lambdas[c]);
         match terms.patterns.iter_mut().find(|p| p.factors == low) {
             Some(pattern) => pattern.claims.push(c),
             None => terms.patterns.push(Pattern {
@@ -422,18 +449,18 @@ pub(super) fn project(
         }
     }
     let n_blocks = 1usize << (lane_vars - low_vars);
-    for gamma in &terms.gamma {
+    for gamma in terms.gamma.chunks_exact(n_blocks) {
         let nonzero = |h: &usize| gamma[*h] != F192::ZERO;
         let first = (0..n_blocks).find(nonzero).unwrap_or(0);
         let end = (0..n_blocks).rfind(nonzero).map_or(0, |h| h + 1);
         terms.ranges.push(first / 8 * 8..end.next_multiple_of(8).min(n_blocks));
     }
+    let gamma = |c: usize| &terms.gamma[c * n_blocks..][..n_blocks];
     for pattern in &mut terms.patterns {
         pattern.active = (0..n_blocks)
-            .map(|h| pattern.claims.iter().any(|&c| terms.gamma[c][h] != F192::ZERO))
+            .map(|h| pattern.claims.iter().any(|&c| gamma(c)[h] != F192::ZERO))
             .collect();
     }
-    let mut ring_lanes: Vec<Vec<F192>> = Vec::new();
     for (i, weight) in rings.iter().enumerate() {
         let factors = ring_factors(weight.point(), ring.offset, bits);
         let (low, rest) = factors.split_at(low_vars);
@@ -445,17 +472,18 @@ pub(super) fn project(
             x_offset: ring.offset & (block - 1),
             first: claims.len() + DEGREE_E * i,
         });
-        ring_lanes.push(table(lane));
+        extend_table(&mut lanes, lane);
     }
 
     let n_terms = terms.n_terms();
     let mut a = vec![F192::ZERO; n_lanes * n_terms];
     for (l, row) in a.chunks_exact_mut(n_terms).enumerate() {
-        for (slot, lane) in row.iter_mut().zip(&lane_weights) {
-            *slot = lane[l];
+        let weight_of = |t: usize| lanes[(t << lane_bits) + l];
+        for (c, slot) in row[..claims.len()].iter_mut().enumerate() {
+            *slot = weight_of(c);
         }
-        for ((weight, lane), ring) in rings.iter().zip(&ring_lanes).zip(&terms.rings) {
-            let s = lane[l];
+        for (i, (weight, ring)) in rings.iter().zip(&terms.rings).enumerate() {
+            let s = weight_of(claims.len() + i);
             if s != F192::ZERO {
                 for (w, slot) in row[ring.first..ring.first + DEGREE_E].iter_mut().enumerate() {
                     *slot = weight.apply(coordinate_basis(w) * s);
