@@ -599,10 +599,11 @@ pub fn prove_with(
 
     // Announce the prover's sizes, then commit, before sampling any challenge.
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
+    // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
+    pcs::reserve_level1(w.layout.shape.mu, log_inv_rate);
     let committed = crate::stage!("Commit", || {
         pcs::commit(&mut ps, &w.q, &w.repeats, w.layout.shape, log_inv_rate)
     });
-    pcs::reserve_level1(w.layout.shape.mu, log_inv_rate);
 
     // BLAKE2s to flock (§hash_flock), single PCS: q_flock is ALWAYS a column in
     // `w.q` (≥1 instance, a program with no BLAKE2s carries one padding instance,
