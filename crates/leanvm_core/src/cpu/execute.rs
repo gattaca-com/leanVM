@@ -376,8 +376,7 @@ impl Program {
         // Witness streams, resolved by name once so a pop indexes one.
         let plan = &self.hints;
         let mut streams: Vec<Stream> = plan
-            .names
-            .iter()
+            .names()
             .map(|name| Stream {
                 name,
                 entries: witness.0.get(name),
@@ -628,8 +627,7 @@ impl Program {
 
             // Apply the hints scheduled before this instruction.
             if plan.at[pc as usize] != 0 {
-                let (hs, first) = &plan.lists[plan.at[pc as usize] as usize - 1];
-                for (h, &stream) in hs.iter().zip(&plan.streams[*first..]) {
+                for (h, stream) in plan.list(plan.at[pc as usize]) {
                     m.dbg_hint = Some(match h {
                         RHint::FrameAddress { .. } => "FrameAddress",
                         RHint::AllocFrames { .. } => "AllocFrames",
