@@ -335,17 +335,16 @@ impl GroupRows {
 ///
 /// Block `l` takes `words` words from `l * words`, for the first `group_blocks` lanes.
 pub(crate) fn blocks_from_rows(rows: &[V64], words: usize, group_blocks: usize, table: &mut [u64]) {
-    // Each block takes one tile, `LANES` words, from every transposed tile of rows.
-    let mut tiles = table[..group_blocks * words]
-        .chunks_exact_mut(words)
-        .map(|block| block.as_chunks_mut::<LANES>().0.iter_mut());
-    let mut cols: [Option<_>; LANES] = std::array::from_fn(|_| tiles.next());
-    for tile in rows.chunks_exact(LANES) {
-        for (col, out) in cols.iter_mut().zip(transpose_lanes(tile)) {
-            if let Some(col) = col {
-                *col.next().expect("a tile per tile of rows") = out;
-            }
-        }
+    for (t, tile) in rows.chunks_exact(LANES).enumerate() {
+        block_tile(tile, t, words, group_blocks, table);
+    }
+}
+
+/// [`blocks_from_rows`] for tile `t`, the `LANES` rows `tile` from row `t * LANES`: each block takes `LANES` words.
+#[inline(always)]
+pub(crate) fn block_tile(tile: &[V64], t: usize, words: usize, group_blocks: usize, table: &mut [u64]) {
+    for (block, out) in table[..group_blocks * words].chunks_exact_mut(words).zip(transpose_lanes(tile)) {
+        *block.as_chunks_mut::<LANES>().0.get_mut(t).expect("a tile per tile of rows") = out;
     }
 }
 

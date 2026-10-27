@@ -88,10 +88,11 @@ use crate::gf2::{
 };
 use crate::witness::packed_bytes;
 use crate::witness::{
-    BitRecord, GroupRows, LANES, V32, V64, ab_words, add_carry_parts, add3_fused_parts, blocks_from_rows,
+    BitRecord, GroupRows, LANES, V32, V64, ab_words, add_carry_parts, add3_fused_parts, block_tile,
     drive_witness_packed, drive_witness_packed_into,
 };
 use crate::zerocheck::bits::{Bits, Rebuild};
+use std::ops::Range;
 use crate::zerocheck::multilinear::PackedWitness;
 use flux_profiler::timed;
 use pcs::pack::{LOG_PACKING, PACKING_WIDTH};
@@ -617,8 +618,25 @@ fn write_lin_row(rows: [&mut [V64]; 3], i: usize, lo: V32, hi: V32) {
 /// tables of `WORDS` rows each, row `i` holding word `i` of every lane's block. Every row is written.
 /// `progress(r + 1, N_ROUNDS)` follows round `r`.
 fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: &mut dyn FnMut(usize, usize)) {
+    build_rows(blocks, rows, progress, &mut |_, _| {});
+}
+
+/// The three tables as `z`, `a`, `b` rows.
+fn split3(rows: &mut [V64]) -> [&mut [V64]; 3] {
     let (z, rest) = rows.split_at_mut(WORDS);
     let (a, b) = rest.split_at_mut(WORDS);
+    [z, a, b]
+}
+
+/// [`build_group_rows`], also calling `tiles(rows, t0..t1)` once tiles `t0..t1` of eight rows are final in all three tables.
+///
+/// Each tile comes once, while it is still in cache: the last tile first holds the compression's output rows, so it comes last.
+fn build_rows(
+    blocks: &[&Compression; LANES],
+    rows: &mut [V64],
+    progress: &mut dyn FnMut(usize, usize),
+    tiles: &mut impl FnMut(&[V64], Range<usize>),
+) {
     let gather = |f: &dyn Fn(&Compression) -> u32| V32(std::array::from_fn(|l| f(blocks[l])));
     let h: [V32; 8] = std::array::from_fn(|w| gather(&|c| c.0[w]));
     let m: [V32; 16] = std::array::from_fn(|i| gather(&|c| c.1[i]));
@@ -627,7 +645,7 @@ fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: 
 
     macro_rules! lin {
         ($i:expr, $lo:expr, $hi:expr) => {
-            write_lin_row([&mut *z, &mut *a, &mut *b], $i, $lo, $hi)
+            write_lin_row(split3(rows), $i, $lo, $hi)
         };
     }
     for i in 0..4 {
@@ -639,7 +657,7 @@ fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: 
     lin!(COUNTER_LO_BASE / 64, t_lo, t_hi);
     lin!(FINAL_BASE / 64, f0, f1);
     // The constant wire, then zeros up to the message.
-    for t in [&mut *z, &mut *a, &mut *b] {
+    for t in split3(rows) {
         t[Z_CONST_POS / 64] = V64::splat(1);
         t[Z_CONST_POS / 64 + 1] = V64::ZERO;
         t[GS_WORD + N_ROUNDS * ROUND_WORDS..].fill(V64::ZERO);
@@ -655,7 +673,9 @@ fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: 
     v[14] = V32::splat(BLAKE2S_IV[6]) ^ f0;
     v[15] = V32::splat(BLAKE2S_IV[7]) ^ f1;
 
+    let mut next_tile = 1;
     for r in 0..N_ROUNDS {
+        let [z, a, b] = split3(rows);
         let word = GS_WORD + r * ROUND_WORDS;
         let oz: &mut [V64; ROUND_WORDS] = z[word..].first_chunk_mut().unwrap();
         let oa: &mut [V64; ROUND_WORDS] = a[word..].first_chunk_mut().unwrap();
@@ -668,12 +688,17 @@ fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: 
         }
         g!(0 1 2 3 4 5 6 7);
         progress(r + 1, N_ROUNDS);
+        // The zero tail is written, so the last round completes every row.
+        let end = if r + 1 == N_ROUNDS { WORDS } else { word + ROUND_WORDS } / LANES;
+        tiles(rows, next_tile..end);
+        next_tile = end;
     }
 
     for i in 0..4 {
         let out = |w: usize| h[w] ^ v[w] ^ v[w + 8];
         lin!(OUT_BASE / 64 + i, out(2 * i), out(2 * i + 1));
     }
+    tiles(rows, 0..1);
 }
 
 /// The compression whose `z` block is `block`: its inputs are the free words of the lin rows.
@@ -723,12 +748,16 @@ impl Rebuild for RebuiltFromZ<'_> {
         // Lanes past a short group repeat its last instance.
         let blocks: [Compression; LANES] =
             std::array::from_fn(|l| decode_compression(&self.z[(first + l.min(group_blocks - 1)) * WORDS..][..WORDS]));
-        build_group_rows(&std::array::from_fn(|l| &blocks[l]), &mut rows.0, &mut |_, _| {});
         // The rows are `z | a | b`, the tables `a | b | c` with `c = z`.
         let [a, b, c] = &mut out;
-        for (t_rows, table) in rows.0.chunks(WORDS).zip([&mut **c, &mut **a, &mut **b]) {
-            blocks_from_rows(t_rows, WORDS, group_blocks, table);
-        }
+        let mut tables = [&mut **c, &mut **a, &mut **b];
+        build_rows(&std::array::from_fn(|l| &blocks[l]), &mut rows.0, &mut |_, _| {}, &mut |rows, tiles| {
+            for t in tiles {
+                for (t_rows, table) in rows.chunks(WORDS).zip(&mut tables) {
+                    block_tile(&t_rows[t * LANES..][..LANES], t, WORDS, group_blocks, table);
+                }
+            }
+        });
         debug_assert!(
             c[..] == self.z[first * WORDS..][..group_blocks * WORDS],
             "the inputs rebuild z"
