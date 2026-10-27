@@ -204,18 +204,6 @@ fn pack_16_bytes(bytes: &[u8]) -> F192 {
     F192::new(word_at(0), word_at(8), 0)
 }
 
-/// A run of canonical 128-bit cells as the byte string BLAKE2s hashes: each cell
-/// is its two low limbs, little-endian, which is the order the VM's compression
-/// reads a memory cell in.
-fn cell_bytes(cells: impl IntoIterator<Item = F192>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for cell in cells {
-        bytes.extend_from_slice(&cell.c0.to_le_bytes());
-        bytes.extend_from_slice(&cell.c1.to_le_bytes());
-    }
-    bytes
-}
-
 /// How the guest splits a list's `n - 1` non-final blocks: whole windows, then the
 /// tail. Its own product identity and range check pin both, so this only has to
 /// agree with them (`claim_list_digest` in the guest). A list is never empty
@@ -230,9 +218,14 @@ fn signers_split(blocks: usize) -> [F192; 2] {
 /// One scheme's declared claims under plain BLAKE2s: one 64-byte block per claim,
 /// its pubkey then the message it signed, so the hashed string is exactly `64n` bytes
 /// and an empty list hashes the empty string. The guest computes this same digest a
-/// window of blocks at a time (`claim_list_digest`).
-fn claim_list_digest(claims: impl IntoIterator<Item = [F192; 4]>) -> [F192; 2] {
-    pack_hash_state(&primitives::hash::hash(&cell_bytes(claims.into_iter().flatten())))
+/// window of blocks at a time (`claim_list_digest`). A cell's bytes are its two low
+/// limbs, little-endian, the order the VM's compression reads a memory cell in.
+fn claim_list_digest<'a>(claims: impl Iterator<Item = ([u8; 32], &'a [u8; 32])>) -> [u8; 32] {
+    let mut hasher = primitives::hash::Hasher::new();
+    for (pk, message) in claims {
+        hasher.update(&pk).update(message);
+    }
+    hasher.finalize()
 }
 
 /// A claim as the four cells the guest hashes and its verifier reads: the pubkey's
@@ -254,18 +247,24 @@ fn lean_sphincs_claim_cells((pk, message): &LeanSphincsClaim) -> [F192; 4] {
     claim_cells(&pk.flatten(), message)
 }
 
+/// A scheme's declared claims as hints: the list's split, then one entry per claim.
+fn push_claims(hints: &mut Hints, cells: impl ExactSizeIterator<Item = [F192; 4]>) {
+    if cells.len() > 0 {
+        hints.push("signers_split", &signers_split(cells.len()));
+    }
+    for claim in cells {
+        hints.push("claims", &claim);
+    }
+}
+
 /// The signer-set digest: plain BLAKE2s of the leanXMSS list's digest then the leanSPHINCS
 /// list's, one 64-byte block (`main` in the guest). Each list digest binds its own
 /// length through BLAKE2s's byte counter, so the pair binds both lists whole.
 fn signers_hash(xmss_signers: &[LeanXmssClaim], lean_sphincs_signers: &[LeanSphincsClaim]) -> [F192; 2] {
-    let xmss = claim_list_digest(xmss_signers.iter().map(lean_xmss_claim_cells));
-    let lean_sphincs = claim_list_digest(lean_sphincs_signers.iter().map(lean_sphincs_claim_cells));
-    pack_hash_state(&primitives::hash::hash(&cell_bytes([
-        xmss[0],
-        xmss[1],
-        lean_sphincs[0],
-        lean_sphincs[1],
-    ])))
+    let xmss = claim_list_digest(xmss_signers.iter().map(|(pk, message)| (pk.flatten(), message)));
+    let lean_sphincs = claim_list_digest(lean_sphincs_signers.iter().map(|(pk, message)| (pk.flatten(), message)));
+    let mut hasher = primitives::hash::Hasher::new();
+    pack_hash_state(&hasher.update(&xmss).update(&lean_sphincs).finalize())
 }
 
 /// The claims on the three fixed polynomials that a node defers rather than
@@ -359,13 +358,10 @@ impl DeferredClaim {
     }
 
     /// The cells the statement digest absorbs, in the guest's `defer_stmt` order.
-    fn cells(&self) -> Vec<F192> {
-        let mut cells = self.bytecode_point.clone();
-        cells.push(self.bytecode_value);
-        cells.extend_from_slice(&self.matrix_point);
-        cells.push(self.matrix_a_value);
-        cells.push(self.matrix_b_value);
-        cells
+    fn cells(&self) -> impl Iterator<Item = F192> + '_ {
+        let tail = [self.matrix_a_value, self.matrix_b_value];
+        let head = self.bytecode_point.iter().copied().chain([self.bytecode_value]);
+        head.chain(self.matrix_point.iter().copied()).chain(tail)
     }
 }
 
@@ -406,15 +402,14 @@ fn statement_digest(signers_hash: [F192; 2], da_digest: [u8; 32], defer: &Deferr
         da_digest[1],
     ];
     assert_eq!(header.len(), STATEMENT_HEADER);
-    let mut cells = defer.cells();
-    if !cells.len().is_multiple_of(2) {
-        cells.push(F192::ZERO); // the guest pairs the odd cell with a zero scalar
-    }
+    // The guest pairs an odd cell with a zero scalar.
+    let pad = defer.cells().count() % 2;
+    let cells = defer.cells().chain(std::iter::repeat_n(F192::ZERO, pad));
     let head = header.iter().flat_map(|x| {
         assert_eq!(x.c2, 0, "a header value is a canonical cell");
         [x.c0, x.c1]
     });
-    lane_hash(head.chain(cells.iter().flat_map(|x| [x.c0, x.c1, x.c2])))
+    lane_hash(head.chain(cells.flat_map(|x| [x.c0, x.c1, x.c2])))
 }
 
 /// The deferred-claim data the guest binds to the outer public input: the outer
@@ -626,8 +621,12 @@ fn da_claim_cells(root: &[u8; 32]) -> [F192; 4] {
 fn da_list_digest(roots: &[[u8; 32]]) -> [u8; 32] {
     // Recompute vector hashes from the roots, including when verifying a received proof.
     // Trusting prover-supplied hashes would let zero weights certify any matrix.
-    let cells = roots.iter().flat_map(da_claim_cells);
-    primitives::hash::hash(&cell_bytes(cells))
+    let mut hasher = primitives::hash::Hasher::new();
+    for root in roots {
+        let vector_hash = lean_da::vector_digest(&lean_da::membership_vector(root));
+        hasher.update(root).update(&vector_hash);
+    }
+    hasher.finalize()
 }
 
 impl EthereumProof {
@@ -1102,9 +1101,7 @@ fn aggregate_deferred_claims(
             transcript.observe(value);
         }
         transcript.observe(subproof.matrix_claim);
-        for value in carried.cells() {
-            transcript.observe(value);
-        }
+        carried.cells().for_each(|value| transcript.observe(value));
     }
 
     let _span = tracing::info_span!("Bytecode batch", vars = kbcv).entered();
@@ -1280,14 +1277,14 @@ fn aggregate_deferred_claims(
     // backwards (`gf2`'s `back_*`) in O(circuit).
     let (mut acol, mut bcol) = flock::hash::marginal_walk_pair(&eq_rstar);
     drop(_rows);
-    let mut wa = vec![F192::ZERO; 1 << klog];
-    let mut wb = vec![F192::ZERO; 1 << klog];
     let scales: Vec<(F192, F192)> = (0..2 * child_count)
         .map(|t| (ga[t] * us[t][0], gb[t] * us[t][0]))
         .collect();
+    let mut wa: Vec<F192> = ws[0].iter().map(|&w| scales[0].0 * w).collect();
+    let mut wb: Vec<F192> = ws[0].iter().map(|&w| scales[0].1 * w).collect();
     const WEIGHT_CHUNK: usize = 1 << 10;
     parallel::chunks_mut2(&mut wa, &mut wb, WEIGHT_CHUNK, |c, wa, wb| {
-        for (&(sa, sb), w) in scales.iter().zip(&ws) {
+        for (&(sa, sb), w) in scales.iter().zip(&ws).skip(1) {
             for (j, (a, b)) in wa.iter_mut().zip(wb.iter_mut()).enumerate() {
                 let w = w[c * WEIGHT_CHUNK + j];
                 *a += sa * w;
@@ -2157,21 +2154,8 @@ pub fn aggregate_with_stats(
     hints.push("fs_seed", &[fs_seed[0], fs_seed[1]]);
     // Both lists in the guest's order, leanXMSS first: each one's split, its declared
     // claims, then its duplicates.
-    let lean_xmss_cells: Vec<[F192; 4]> = cover.xmss.signers.iter().map(lean_xmss_claim_cells).collect();
-    let lean_sphincs_cells: Vec<[F192; 4]> = cover
-        .lean_sphincs
-        .signers
-        .iter()
-        .map(lean_sphincs_claim_cells)
-        .collect();
-    for cells in [&lean_xmss_cells, &lean_sphincs_cells] {
-        if !cells.is_empty() {
-            hints.push("signers_split", &signers_split(cells.len()));
-        }
-        for claim in cells {
-            hints.push("claims", claim);
-        }
-    }
+    push_claims(&mut hints, cover.xmss.signers.iter().map(lean_xmss_claim_cells));
+    push_claims(&mut hints, cover.lean_sphincs.signers.iter().map(lean_sphincs_claim_cells));
     let dups = cover.xmss.dups.iter().map(lean_xmss_claim_cells);
     for claim in dups.chain(cover.lean_sphincs.dups.iter().map(lean_sphincs_claim_cells)) {
         hints.push("dup_claims", &claim);
@@ -2241,7 +2225,7 @@ pub fn aggregate_with_stats(
                 hints.push("child_claim_index", &[count(offset)]);
             }
         }
-        hints.push("child_defer", &child.defer.cells());
+        hints.push_iter("child_defer", child.defer.cells());
         hints.push("child_da_count", &[count(child.da_roots.len())]);
         let (sub_hints, defer) = generated.next().expect("one result per child")?;
         hints.append(sub_hints);
