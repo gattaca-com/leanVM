@@ -805,35 +805,31 @@ impl Table for JumpTable {
             op => unreachable!("a JUMP row's pc {} holds {op:?}", r.pc),
         };
         let cell = |r: &Jrow, o: u32| ctx.mem.word((r.fp + o) as usize);
-        let cond = |r: &Jrow| cell(r, ins(r).0);
-        // The is-nonzero witness `w = c⁻¹` (0 where c = 0) for every row, in one
-        // batched Montgomery inversion. `prefix[i]` is the
-        // running product of the nonzero conditions before row `i`, so `acc` ends
-        // as their full product (nonzero, hence invertible). The taken indicator
-        // `b = [c ≠ 0]` falls out of the same pass, so it costs no extra decode.
-        let (w, b) = {
-            let mut acc = F192::ONE;
-            let mut prefix: Vec<F192> = Vec::with_capacity(rows.len());
-            let mut b = vec![F64::ZERO; rows.len()];
-            for (i, r) in rows.iter().enumerate() {
-                prefix.push(acc);
-                let c = cond(r);
-                if !c.is_zero() {
-                    acc *= c;
-                    b[i] = F64::ONE;
-                }
+        // The condition is K-valued, so its inverse is one F64 inversion. `c` decodes it once. The
+        // is-nonzero witness `w = c⁻¹` (0 where c = 0) comes from one batched Montgomery inversion:
+        // the forward pass leaves in `w[i]` the running product of the nonzero conditions before row
+        // `i`, and `acc` ends as their full product (nonzero, hence invertible). The taken indicator
+        // is `c ≠ 0`.
+        let mut c: Vec<F64> = Vec::with_capacity(rows.len());
+        let mut w: Vec<F64> = Vec::with_capacity(rows.len());
+        let mut acc = F64::ONE;
+        for r in rows.iter() {
+            let ci = F64(cell(r, ins(r).0).c0);
+            c.push(ci);
+            w.push(acc);
+            if !ci.is_zero() {
+                acc *= ci;
             }
-            let mut inv = acc.inv();
-            let mut w = vec![F192::ZERO; rows.len()];
-            for i in (0..rows.len()).rev() {
-                let c = cond(rows.get(i));
-                if !c.is_zero() {
-                    w[i] = inv * prefix[i];
-                    inv *= c;
-                }
+        }
+        let mut inv = acc.inv();
+        for (wi, &ci) in w.iter_mut().zip(&c).rev() {
+            if ci.is_zero() {
+                *wi = F64::ZERO;
+            } else {
+                *wi = inv * *wi;
+                inv *= ci;
             }
-            (w, b)
-        };
+        }
         // One pass. The three offsets and the three cells they name come out of one decode.
         // Those cells are K-valued on every row, taken or not (`cpu::execute` rejects
         // anything else), so each is one lane and the memory flush carries literal zeros
@@ -854,8 +850,8 @@ impl Table for JumpTable {
                 ctx.g_at(r.rd),
                 ctx.g_at(r.rf),
                 ctx.g_at(r.bytecode_read),
-                F64(w[i].c0),
-                b[i],
+                w[i],
+                F64(!c[i].is_zero() as u64),
             ]
         });
     }
