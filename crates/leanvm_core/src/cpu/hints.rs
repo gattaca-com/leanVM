@@ -45,6 +45,8 @@ pub struct GPow {
     /// `k` of `STRIDE`. Power-of-two length, at most half full.
     coarse: Vec<u32>,
     coarsed: usize,
+    /// The last run's cell mapping, all zero again, for the next run to take.
+    pub(crate) cells: Option<super::execute::Cells>,
 }
 
 /// Spacing of the coarse index, and so the most probes a missed lookup costs.
@@ -65,6 +67,7 @@ impl GPow {
             index: vec![0; 1 << 13],
             coarse: Vec::new(),
             coarsed: 0,
+            cells: None,
         }
     }
 

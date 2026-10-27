@@ -70,7 +70,7 @@ pub(crate) struct Cell {
 /// The cells of a run: one reserved, lazily faulted array of `LIMIT` cells, so that
 /// an access is one address computation and the image never moves. All zero is the
 /// unwritten cell, which is what untouched pages hold.
-struct Cells(*mut Cell);
+pub(crate) struct Cells(*mut Cell);
 
 // SAFETY: the array is plain memory owned by this value, as a `Box<[Cell]>` would be.
 unsafe impl Send for Cells {}
@@ -102,6 +102,24 @@ impl Drop for Cells {
     fn drop(&mut self) {
         // SAFETY: the mapping `reserve` made, unmapped once.
         unsafe { libc::munmap(self.0.cast(), LIMIT * std::mem::size_of::<Cell>()) };
+    }
+}
+
+impl Memory {
+    /// The cell mapping, zeroed again so a later run can start from it. Its pages stay
+    /// faulted, so that run takes no page faults and the kernel zeroes nothing.
+    pub(crate) fn into_cells(self) -> Cells {
+        static ZERO: [u8; 1 << 16] = [0; 1 << 16];
+        let bytes = self.used.min(LIMIT) * std::mem::size_of::<Cell>();
+        // SAFETY: the first `used` cells lie inside the mapping, which `self` owns alone.
+        let touched = unsafe { std::slice::from_raw_parts_mut(self.cells.0.cast::<u8>(), bytes) };
+        parallel::chunks_mut(touched, 1 << 20, |_, chunk| {
+            let stream = primitives::stream::Stream::new();
+            for c in chunk.chunks_mut(ZERO.len()) {
+                stream.copy(c, &ZERO[..c.len()]);
+            }
+        });
+        self.cells
     }
 }
 
@@ -339,7 +357,10 @@ impl Program {
         // The write-once data memory, each cell's access count and write state with its word.
         let n0 = self.main_frame.max(2) as usize;
         let mut m = Mem {
-            cells: Cells::reserve().ok_or_else(|| ExecError::new(self, 0, Fault::OutOfMemory))?,
+            cells: match g.cells.take() {
+                Some(cells) => cells,
+                None => Cells::reserve().ok_or_else(|| ExecError::new(self, 0, Fault::OutOfMemory))?,
+            },
             used: 0,
             counts: 0,
             links: HashMap::new(),

@@ -499,6 +499,8 @@ pub fn prove_with(
     let cycles = exec.cycles;
     let w = crate::stage!("Build witness", || program.build(&exec));
     *gpow = std::mem::take(&mut exec.gpow);
+    // Build witness was the last reader of the cells.
+    gpow.cells = Some(exec.mem.into_cells());
     if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&w.layout.shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
             log_committed: w.layout.shape.mu,
