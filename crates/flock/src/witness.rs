@@ -3,7 +3,7 @@
 //! (only `hash` in this vendored subset).
 
 use primitives::stream::Stream;
-use std::ops::{BitAnd, BitOr, BitOrAssign, BitXor};
+use std::ops::{BitAnd, BitOr, BitOrAssign, BitXor, Range};
 
 /// Blocks built side by side: lane `l` of every vector belongs to block `l` of a group.
 pub(crate) const LANES: usize = 8;
@@ -331,16 +331,10 @@ impl GroupRows {
     }
 }
 
-/// Row `i` of `rows` is word `i` of each lane's block: transpose into the block-major `table`.
+/// Row `i` of the rows is word `i` of each lane's block: transpose into the block-major `table`.
 ///
 /// Block `l` takes `words` words from `l * words`, for the first `group_blocks` lanes.
-pub(crate) fn blocks_from_rows(rows: &[V64], words: usize, group_blocks: usize, table: &mut [u64]) {
-    for (t, tile) in rows.chunks_exact(LANES).enumerate() {
-        block_tile(tile, t, words, group_blocks, table);
-    }
-}
-
-/// [`blocks_from_rows`] for tile `t`, the `LANES` rows `tile` from row `t * LANES`: each block takes `LANES` words.
+/// Tile `t` is the `LANES` rows `tile` from row `t * LANES`: each block takes `LANES` words.
 #[inline(always)]
 pub(crate) fn block_tile(tile: &[V64], t: usize, words: usize, group_blocks: usize, table: &mut [u64]) {
     for (block, out) in table[..group_blocks * words].chunks_exact_mut(words).zip(transpose_lanes(tile)) {
@@ -376,9 +370,10 @@ const TASK_GROUPS: usize = 16;
 /// to `2^n_blocks_log` slots. Returns `(z, a, b)`: the three bit-packed `u64` tables
 /// (`WORDS` per instance). `a` and `b` may be shorter than `z`, see [`drive_witness_packed_into`].
 ///
-/// `build_group(states, rows, progress)` builds eight blocks at once, one per lane, from `states`.
+/// `build_group(states, rows, progress, tiles)` builds eight blocks at once, one per lane, from `states`.
 /// `rows` is `3 · WORDS` rows, the `z`, `a` and `b` tables word-major: row `i` holds word `i` of
-/// each lane's block, and every row is written. It calls `progress(done, steps)` as its steps finish.
+/// each lane's block, and every row is written. It calls `progress(done, steps)` as its steps finish,
+/// and `tiles(rows, t0..t1)` once tiles `t0..t1` of eight rows are final in all three tables.
 /// `initial_states.len()` may be less than `2^n_blocks_log`: `padding` builds a real block in
 /// every trailing slot, so that the constant column is all-ones across *every* batched instance
 /// (see `lincheck's `LincheckCircuit::const_pin_col``).
@@ -389,7 +384,7 @@ pub(crate) fn drive_witness_packed<const WORDS: usize, S: Sync, F>(
     build_group: F,
 ) -> (Vec<u64>, Vec<u64>, Vec<u64>)
 where
-    F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize)) + Sync,
+    F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize), &mut dyn FnMut(&[V64], Range<usize>)) + Sync,
 {
     let total_words = (1usize << n_blocks_log) * WORDS;
     let ab_words = ab_words::<WORDS>(initial_states.len(), n_blocks_log);
@@ -431,7 +426,7 @@ pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
     ab: Option<(&mut [u64], &mut [u64])>,
     build_group: F,
 ) where
-    F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize)) + Sync,
+    F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize), &mut dyn FnMut(&[V64], Range<usize>)) + Sync,
 {
     let n_total = 1usize << n_blocks_log;
     let n_blocks = initial_states.len();
@@ -510,18 +505,28 @@ pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
                 let prev = pending.take();
                 let (mut sent, mut of) = (0, 1);
                 let states = std::array::from_fn(|l| initial_states.get(LANES * g + l).unwrap_or(padding));
-                build_group(&states, rows, &mut |done, steps| {
-                    if let Some(p) = prev {
-                        emit(p, prev_buf, sent, done, steps);
+                let n_tables = if ab_chunks.is_some() { 3 } else { 1 };
+                // Each tile of rows is transposed into `cur_buf` once final, while it is in L1.
+                let mut tiles = |rows: &[V64], tiles: Range<usize>| {
+                    for t in tiles {
+                        for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.chunks_mut(scratch_words)).take(n_tables) {
+                            block_tile(&t_rows[t * LANES..][..LANES], t, WORDS, group_blocks, table);
+                        }
                     }
-                    (sent, of) = (done, steps);
-                });
+                };
+                build_group(
+                    &states,
+                    rows,
+                    &mut |done, steps| {
+                        if let Some(p) = prev {
+                            emit(p, prev_buf, sent, done, steps);
+                        }
+                        (sent, of) = (done, steps);
+                    },
+                    &mut tiles,
+                );
                 if let Some(p) = prev {
                     emit(p, prev_buf, sent, of, of);
-                }
-                let n_tables = if ab_chunks.is_some() { 3 } else { 1 };
-                for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.chunks_mut(scratch_words)).take(n_tables) {
-                    blocks_from_rows(t_rows, WORDS, group_blocks, table);
                 }
                 (*last, *template) = (1 - *last, is_padding);
                 pending = Some(g);

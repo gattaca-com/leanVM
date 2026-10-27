@@ -92,12 +92,12 @@ use crate::witness::{
     drive_witness_packed, drive_witness_packed_into,
 };
 use crate::zerocheck::bits::{Bits, Rebuild};
-use std::ops::Range;
 use crate::zerocheck::multilinear::PackedWitness;
 use flux_profiler::timed;
 use pcs::pack::{LOG_PACKING, PACKING_WIDTH};
 use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen};
 use primitives::field::F192;
+use std::ops::Range;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -614,13 +614,6 @@ fn write_lin_row(rows: [&mut [V64]; 3], i: usize, lo: V32, hi: V32) {
     b[i] = V64::splat(!0);
 }
 
-/// Build the (z, a, b) blocks of eight compressions, one per lane, into `rows`: the three
-/// tables of `WORDS` rows each, row `i` holding word `i` of every lane's block. Every row is written.
-/// `progress(r + 1, N_ROUNDS)` follows round `r`.
-fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: &mut dyn FnMut(usize, usize)) {
-    build_rows(blocks, rows, progress, &mut |_, _| {});
-}
-
 /// The three tables as `z`, `a`, `b` rows.
 fn split3(rows: &mut [V64]) -> [&mut [V64]; 3] {
     let (z, rest) = rows.split_at_mut(WORDS);
@@ -628,14 +621,17 @@ fn split3(rows: &mut [V64]) -> [&mut [V64]; 3] {
     [z, a, b]
 }
 
-/// [`build_group_rows`], also calling `tiles(rows, t0..t1)` once tiles `t0..t1` of eight rows are final in all three tables.
+/// Build the (z, a, b) blocks of eight compressions, one per lane, into `rows`: the three
+/// tables of `WORDS` rows each, row `i` holding word `i` of every lane's block. Every row is written.
+/// `progress(r + 1, N_ROUNDS)` follows round `r`.
 ///
+/// `tiles(rows, t0..t1)` is called once tiles `t0..t1` of eight rows are final in all three tables.
 /// Each tile comes once, while it is still in cache: the last tile first holds the compression's output rows, so it comes last.
 fn build_rows(
     blocks: &[&Compression; LANES],
     rows: &mut [V64],
     progress: &mut dyn FnMut(usize, usize),
-    tiles: &mut impl FnMut(&[V64], Range<usize>),
+    tiles: &mut dyn FnMut(&[V64], Range<usize>),
 ) {
     let gather = |f: &dyn Fn(&Compression) -> u32| V32(std::array::from_fn(|l| f(blocks[l])));
     let h: [V32; 8] = std::array::from_fn(|w| gather(&|c| c.0[w]));
@@ -687,11 +683,11 @@ fn build_rows(
             )*};
         }
         g!(0 1 2 3 4 5 6 7);
-        progress(r + 1, N_ROUNDS);
         // The zero tail is written, so the last round completes every row.
         let end = if r + 1 == N_ROUNDS { WORDS } else { word + ROUND_WORDS } / LANES;
         tiles(rows, next_tile..end);
         next_tile = end;
+        progress(r + 1, N_ROUNDS);
     }
 
     for i in 0..4 {
@@ -716,7 +712,7 @@ fn decode_compression(block: &[u64]) -> Compression {
 
 /// The bit tables of the packed witness `z`, rebuilt a group of instances at a time from the inputs `z` holds.
 ///
-/// A group costs reading three cache lines of each instance's `z` and one [`build_group_rows`].
+/// A group costs reading three cache lines of each instance's `z` and one [`build_rows`].
 /// The result is the `z`, `a`, `b` the witness generator wrote, so `c = z` is not read.
 struct RebuiltFromZ<'z> {
     z: &'z [u64],
@@ -777,7 +773,7 @@ pub fn rebuilds() -> bool {
 /// `z` is instance-major: instance `i` is the `WORDS` words from `i * WORDS`.
 #[timed]
 pub fn generate_witness_with_ab_packed(blocks: &[Compression], n_blocks_log: usize) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
-    drive_witness_packed::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, build_group_rows)
+    drive_witness_packed::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, build_rows)
 }
 
 /// The words of each of `a` and `b` that [`generate_witness_into_z`] writes for `n_blocks` compressions.
@@ -796,7 +792,7 @@ pub fn generate_witness_into_z(
     z: &mut [u64],
     ab: Option<(&mut [u64], &mut [u64])>,
 ) {
-    drive_witness_packed_into::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, z, ab, build_group_rows)
+    drive_witness_packed_into::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, z, ab, build_rows)
 }
 
 // ---------------------------------------------------------------------------
