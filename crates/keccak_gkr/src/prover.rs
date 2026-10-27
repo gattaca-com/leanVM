@@ -370,9 +370,9 @@ impl Layer<'_> {
         );
         let sums = parallel::map_reduce_with_state(
             self.n_tasks(),
-            || (vec![0u64; 4 * ROW], vec![0u64; 8 * BITS], vec![0u64; 2 * ROW]),
+            || (vec![0u64; 4 * ROW], vec![0u64; 8 * BITS]),
             RoundSums::default,
-            |(scratch, wide, rows), sums, task| {
+            |(scratch, wide), sums, task| {
                 let (segment, g, block) = self.block(task);
                 // SAFETY: each task owns its rows: a written block's two, or its segment's padding row.
                 let out = unsafe {
@@ -382,7 +382,7 @@ impl Layer<'_> {
                         pads.slice(segment * ROW, ROW)
                     }
                 };
-                let rows = &mut rows[..out.len()];
+                let rows = out;
                 let halves = rows.len() / ROW;
                 // Both groups' unreduced sums, four words each and laid out by word.
                 for j in 0..BITS {
@@ -403,8 +403,6 @@ impl Layer<'_> {
                     field.reduce_row(t, wide, BITS);
                 }
                 round.add_pair(sums, scratch, &rows[..ROW], &rows[rows.len() - ROW..], weights[task]);
-                // Built in cache for the round values, then published: the next round reads them.
-                primitives::stream::Stream::new().copy(out, rows);
             },
             RoundSums::merge,
         );
@@ -541,12 +539,13 @@ impl<'a> Round<'a> {
         let (pairs, half) = (to.live.div_ceil(2), to.m / 2);
         let mut sums = parallel::map_reduce_with_state(
             to.segments * pairs,
-            || (vec![0u64; 4 * ROW], vec![0u64; 2 * ROW]),
+            || vec![0u64; 4 * ROW],
             RoundSums::default,
-            |(scratch, rows), sums, task| {
+            |scratch, sums, task| {
                 let (segment, t) = (task / pairs, task % pairs);
                 let n = (to.live - 2 * t).min(2);
-                let rows = &mut rows[..n * ROW];
+                // SAFETY: each task owns its rows of `dst`.
+                let rows = unsafe { ptr.slice((to.live * segment + 2 * t) * ROW, n * ROW) };
                 for (i, row) in rows.as_chunks_mut::<ROW>().0.iter_mut().enumerate() {
                     fold(row, segment, 2 * t + i);
                 }
@@ -556,10 +555,6 @@ impl<'a> Round<'a> {
                     &pads[segment * ROW..][..ROW]
                 };
                 self.add_pair(sums, scratch, &rows[..ROW], high, eq[half * segment + t]);
-                // SAFETY: each task owns its rows of `dst`.
-                let out = unsafe { ptr.slice((to.live * segment + 2 * t) * ROW, n * ROW) };
-                // Built in cache for the round values, then published: the next round reads them.
-                primitives::stream::Stream::new().copy(out, rows);
             },
             RoundSums::merge,
         );
