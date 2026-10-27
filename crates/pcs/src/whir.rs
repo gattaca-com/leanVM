@@ -325,14 +325,13 @@ pub(crate) fn ligero_commit_ext(
     log_msg_cols: usize,
     log_num_interleaved: usize,
     log_inv_rate: usize,
-    ntt: &AdditiveNttF64,
 ) -> LigeroWitness {
+    let ntt = AdditiveNttF64::standard(log_msg_cols + log_inv_rate);
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
     let block_len = msg_cols << log_inv_rate;
     let log_block_len = log_msg_cols + log_inv_rate;
     assert_eq!(poly.len(), num_interleaved * msg_cols);
-    assert!(log_block_len <= ntt.log_domain_size());
 
     // One leaf per row, its F192s as K words: hashed as the encode finishes each block.
     let row_words = 3 * num_interleaved;
@@ -354,13 +353,13 @@ pub(crate) fn ligero_commit_ext(
     .in_scope(|| {
         let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
         if by_cosets {
-            encode_cosets_ext(ntt, &mat, num_interleaved, log_inv_rate, &on_rows);
-            Some(Deferred::Cosets(ntt.clone(), log_inv_rate))
+            encode_cosets_ext(&ntt, &mat, num_interleaved, log_inv_rate, &on_rows);
+            Some(Deferred::Cosets(ntt, log_inv_rate))
         } else if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
-            encode_interleaved_ext_without_deep(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows)
-                .map(|rows| Deferred::Deep(ntt.clone(), rows))
+            encode_interleaved_ext_without_deep(&ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows)
+                .map(|rows| Deferred::Deep(ntt, rows))
         } else {
-            encode_interleaved_ext(ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows);
+            encode_interleaved_ext(&ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows);
             None
         }
     });
@@ -1280,14 +1279,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     let log_msg_cols_1 = n1 - log_num_interleaved_1;
     let log_inv_rate_1 = config.log_inv_rates[1];
     let span = tracing::info_span!("Commit", level = 1).entered();
-    let ntt_1 = AdditiveNttF64::standard(log_msg_cols_1 + log_inv_rate_1);
-    let wtns_1 = ligero_commit_ext(
-        sc_prover.f_ext(),
-        log_msg_cols_1,
-        log_num_interleaved_1,
-        log_inv_rate_1,
-        &ntt_1,
-    );
+    let wtns_1 = ligero_commit_ext(sc_prover.f_ext(), log_msg_cols_1, log_num_interleaved_1, log_inv_rate_1);
     drop(span);
     ps.add_root(&wtns_1.root());
 
@@ -1415,14 +1407,8 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         let log_msg_cols_next = n_next - log_num_interleaved_next;
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let span = tracing::info_span!("Commit", level = i + 2).entered();
-        let ntt_next = AdditiveNttF64::standard(log_msg_cols_next + log_inv_rate_next);
-        let wtns_next = ligero_commit_ext(
-            sc_prover.f_ext(),
-            log_msg_cols_next,
-            log_num_interleaved_next,
-            log_inv_rate_next,
-            &ntt_next,
-        );
+        let wtns_next =
+            ligero_commit_ext(sc_prover.f_ext(), log_msg_cols_next, log_num_interleaved_next, log_inv_rate_next);
         drop(span);
         ps.add_root(&wtns_next.root());
 
@@ -1681,11 +1667,10 @@ mod tests {
         let ext_shapes = if n8 { [(17usize, 5usize), (13, 8), (9, 11), (5, 14)] } else { [(15, 5), (11, 8), (7, 11), (3, 14)] };
         for (log_msg_cols, log_inv_rate) in ext_shapes {
             let poly = rng.ext_vec(16 << log_msg_cols);
-            let ntt = AdditiveNttF64::standard(log_msg_cols + log_inv_rate);
             time(
                 &format!("ext encode log_domain {}", log_msg_cols + log_inv_rate),
                 &mut || {
-                    let w = ligero_commit_ext(&poly, log_msg_cols, 4, log_inv_rate, &ntt);
+                    let w = ligero_commit_ext(&poly, log_msg_cols, 4, log_inv_rate);
                     std::hint::black_box(w);
                 },
             );
