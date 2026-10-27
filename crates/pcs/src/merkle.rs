@@ -321,28 +321,27 @@ impl CutTree {
 
     /// The octopus over `positions`, with `row(q)` the row stored at `q`.
     ///
-    /// `group_rows` are the full rows of [`Self::group_positions`], `row_words` each, hashed
+    /// `group_rows` are the full rows of [`Self::group_positions`], `row_words` each, back to back, hashed
     /// as the leaves `zeros(leaf_words - row_words) ‖ row`.
     pub fn prune(
         &self,
         positions: &[usize],
         row_words: usize,
         leaf_words: usize,
-        group_rows: &[Vec<F64>],
+        group_rows: &[F64],
         row: impl Fn(usize) -> Vec<F64>,
     ) -> PrunedMerklePaths {
         let (groups, size) = (self.groups(positions), 1usize << self.cut);
-        assert_eq!(group_rows.len(), groups.len() * size, "the rows of every group");
+        assert_eq!(group_rows.len(), groups.len() * size * row_words, "the rows of every group");
         let leaves = LeafHasher::new(8 * row_words, 8 * leaf_words);
         // Per group, the flat tree of its leaves.
         let local: Vec<Vec<Hash>> = group_rows
-            .chunks(size)
+            .chunks_exact(size * row_words)
             .map(|rows| {
-                let image: Vec<F64> = rows.concat();
                 let nodes = Nodes::new(size, 0);
                 // SAFETY: the nodes are ours alone, and the climb writes every level it reads.
                 unsafe {
-                    leaves.hash(words_as_bytes(&image), nodes.level_mut(0, 0, size));
+                    leaves.hash(words_as_bytes(rows), nodes.level_mut(0, 0, size));
                     nodes.climb(0, 0, size, self.cut);
                     nodes.assume_init()
                 }
@@ -544,7 +543,7 @@ mod tests {
                 (0..num_leaves).step_by(7).collect(),
             ] {
                 let group = cut.group_positions(&positions);
-                let rows: Vec<Vec<F64>> = group.iter().map(|&q| row(q)).collect();
+                let rows: Vec<F64> = group.iter().flat_map(|&q| row(q)).collect();
                 let got = cut.prune(&positions, row_words, leaf_words, &rows, row);
                 assert_eq!(got, PrunedMerklePaths::prune(&full, num_leaves, &positions, row));
             }

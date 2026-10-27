@@ -159,21 +159,12 @@ pub(crate) struct L0Codeword<'a> {
 }
 
 impl L0Codeword<'_> {
-    /// The rows at `positions`, `row_words` words each.
-    fn rows(&self, positions: &[usize]) -> Vec<Vec<F64>> {
+    /// The rows at the sorted `positions`, `row_words` words each, back to back.
+    fn rows(&self, positions: &[usize]) -> Vec<F64> {
         match self.deep {
-            Some((ntt, deep)) if self.words.is_empty() => {
-                let rows = ntt.rebuild_rows(self.stack, self.repeats, self.n_lanes, deep, positions);
-                rows.chunks_exact(self.row_words).map(<[F64]>::to_vec).collect()
-            }
-            Some((ntt, deep)) => {
-                let rows = ntt.finish_rows(self.words, deep, positions);
-                rows.chunks_exact(self.row_words).map(<[F64]>::to_vec).collect()
-            }
-            None => positions
-                .iter()
-                .map(|&q| self.words[q * self.row_words..(q + 1) * self.row_words].to_vec())
-                .collect(),
+            Some((ntt, deep)) if self.words.is_empty() => ntt.rebuild_rows(self.stack, self.repeats, self.n_lanes, deep, positions),
+            Some((ntt, deep)) => ntt.finish_rows(self.words, deep, positions),
+            None => gather_rows(self.words, self.row_words, positions),
         }
     }
 }
@@ -287,33 +278,27 @@ pub(crate) struct LigeroWitness {
 }
 
 impl LigeroWitness {
-    /// The rows at `positions`, each as the K words its Merkle leaf is hashed from.
-    fn opened_words(&self, positions: &[usize]) -> Vec<Vec<F64>> {
+    /// The rows at the sorted `positions`, back to back, each as the K words its Merkle leaf is hashed from.
+    fn opened_words(&self, positions: &[usize]) -> Vec<F64> {
+        let row_words = 3 * self.num_interleaved;
         match &self.deferred {
-            Some(Deferred::Deep(ntt, deep)) => ntt
-                .finish_rows(words(&self.mat), deep, positions)
-                .chunks_exact(3 * self.num_interleaved)
-                .map(<[F64]>::to_vec)
-                .collect(),
+            Some(Deferred::Deep(ntt, deep)) => ntt.finish_rows(words(&self.mat), deep, positions),
             Some(Deferred::Cosets(ntt, log_inv_rate)) => {
-                ntt.coset_rows(words(&self.mat), 3 * self.num_interleaved, *log_inv_rate, positions)
+                ntt.coset_rows(words(&self.mat), row_words, *log_inv_rate, positions)
             }
-            None => positions
-                .iter()
-                .map(|&q| ext_row_words(&self.mat[q * self.num_interleaved..(q + 1) * self.num_interleaved]))
-                .collect(),
+            None => gather_rows(words(&self.mat), row_words, positions),
         }
     }
 
-    /// The rows at `queries`, in order, and the octopus over them.
-    fn open(&self, queries: &[usize]) -> (Vec<Vec<F64>>, PrunedMerklePaths) {
+    /// The rows at `queries`, in order and back to back, and the octopus over them.
+    fn open(&self, queries: &[usize]) -> (Vec<F192>, PrunedMerklePaths) {
         let group = self.tree.group_positions(queries);
         let group_rows = self.opened_words(&group);
-        let rows = pick_rows(&group, &group_rows, queries, 0);
         let row_words = 3 * self.num_interleaved;
-        let paths = self
-            .tree
-            .prune(queries, row_words, row_words, &group_rows, opened_row(queries, &rows));
+        let row = |q| fetched_row(&group, &group_rows, row_words, q);
+        let mut rows = Vec::with_capacity(queries.len() * self.num_interleaved);
+        rows.extend(queries.iter().flat_map(|&q| row(q).chunks_exact(3).map(|w| F192::new(w[0].0, w[1].0, w[2].0))));
+        let paths = self.tree.prune(queries, row_words, row_words, &group_rows, |q| row(q).to_vec());
         (rows, paths)
     }
 
@@ -1182,28 +1167,19 @@ fn send_ood(sc: &mut SumcheckProver, ps: &mut ProverState, n_vars: usize, count:
     }
 }
 
-/// An `E` row as the `F64` words its Merkle leaf is hashed from.
-fn ext_row_words(row: &[F192]) -> Vec<F64> {
-    row.iter().flat_map(|v| [F64(v.c0), F64(v.c1), F64(v.c2)]).collect()
+/// The rows at the sorted `positions` of `words`, `row_words` each, back to back.
+fn gather_rows(words: &[F64], row_words: usize, positions: &[usize]) -> Vec<F64> {
+    let mut out = Vec::with_capacity(positions.len() * row_words);
+    for &q in positions {
+        out.extend_from_slice(&words[q * row_words..][..row_words]);
+    }
+    out
 }
 
-/// The `E` row behind the `F64` words of its Merkle leaf.
-fn ext_row(words: &[F64]) -> Vec<F192> {
-    words
-        .chunks_exact(3)
-        .map(|w| F192::new(w[0].0, w[1].0, w[2].0))
-        .collect()
-}
-
-/// The opened row at a queried position, for the Merkle pruning: `rows[i]` is the row at `queries[i]`.
-/// The rows at `queries`, in order and without their first `skip` words, out of `rows` at the sorted `positions`.
-fn pick_rows(positions: &[usize], rows: &[Vec<F64>], queries: &[usize], skip: usize) -> Vec<Vec<F64>> {
-    let at = |q| &rows[positions.binary_search(&q).expect("a fetched row")];
-    queries.iter().map(|&q| at(q)[skip..].to_vec()).collect()
-}
-
-fn opened_row<'a>(queries: &'a [usize], rows: &'a [Vec<F64>]) -> impl Fn(usize) -> Vec<F64> + 'a {
-    move |q| rows[queries.iter().position(|&p| p == q).expect("a queried row")].clone()
+/// The row at position `q` out of `rows`, `row_words` each, back to back, which hold the sorted `group` positions.
+fn fetched_row<'a>(group: &[usize], rows: &'a [F64], row_words: usize, q: usize) -> &'a [F64] {
+    let k = group.binary_search(&q).expect("a fetched row");
+    &rows[k * row_words..][..row_words]
 }
 
 /// Prove `Σ_x witness(x) · b_initial(x) = target` against the L0 commitment
@@ -1276,16 +1252,8 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     // block `n_lanes-1-t`, so a row IS the tail of the leaf image: the absent lanes
     // are the image's leading zeros (`MerkleBuilder` shares their hash prefix, and only
     // this tail rides the proof).
-    // The same row for the induce, which folds a lane-ASCENDING row against the
-    // lane eq table: reversing the image puts block `b` at index `b` and the absent
-    // lanes' zeros at the end, where they contribute nothing.
-    let l0_fold_row = |image: &[F64]| -> Vec<F64> {
-        let mut row = vec![F64::ZERO; num_interleaved_0];
-        for (t, &word) in image.iter().enumerate() {
-            row[n_lanes - 1 - t] = word;
-        }
-        row
-    };
+    // The induce folds a lane-ASCENDING row against the lane eq table: reversing the image puts
+    // block `b` at index `b` and the absent lanes' zeros at the end, where they contribute nothing.
 
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
 
@@ -1344,17 +1312,15 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     let row_words = prover_data.row_words;
     let group_0 = l0_tree.group_positions(&queries_0);
     let group_rows_0 = prover_data.l0(&stack, &stack_repeats, n_lanes).rows(&group_0);
-    let images_0 = pick_rows(&group_0, &group_rows_0, &queries_0, row_words - n_lanes);
-    let opened_rows_0: Vec<Vec<F64>> = images_0.iter().map(|image| l0_fold_row(image)).collect();
+    let image = |q| &fetched_row(&group_0, &group_rows_0, row_words, q)[row_words - n_lanes..];
+    let mut opened_rows_0 = Vec::with_capacity(queries_0.len() * num_interleaved_0);
+    for &q in &queries_0 {
+        let zeros = std::iter::repeat_n(F64::ZERO, num_interleaved_0 - n_lanes);
+        opened_rows_0.extend(image(q).iter().rev().copied().chain(zeros));
+    }
     // ... but the stored proof carries the sorted-unique rows + one octopus over
     // the sorted-unique positions (the verifier re-fans them to ordered).
-    ps.hint_merkle(l0_tree.prune(
-        &queries_0,
-        row_words,
-        num_interleaved_0,
-        &group_rows_0,
-        opened_row(&queries_0, &images_0),
-    ));
+    ps.hint_merkle(l0_tree.prune(&queries_0, row_words, num_interleaved_0, &group_rows_0, |q| image(q).to_vec()));
     // Nothing reads the L0 codeword, its stack or its tree again, and the next levels' buffers can be served
     // from their memory.
     drop((prover_data, stack, stack_repeats));
@@ -1411,13 +1377,12 @@ pub(crate) fn recursive_prover_with_prepared_basis(
             let span = tracing::info_span!("Final level").entered();
             // Final level: stored (sorted-unique) only, no local induce; the
             // verifier fans these to ordered for its last-level induce.
-            let (words_last, paths) = wtns_prev.open(&queries_last);
+            let (rows_last, paths) = wtns_prev.open(&queries_last);
             ps.hint_merkle(paths);
             // Tie the last commitment into the running claim through the same
             // intro/glue step as every other level, then finish the remaining
             // sumcheck rounds. This closes on one weight evaluation instead of
             // a sweep over the residual cube.
-            let rows_last: Vec<Vec<F192>> = words_last.iter().map(|words| ext_row(words)).collect();
             let enforced_sum_last = induce_sumcheck_enforced_sum(&rows_last, &level_rs, &queries_last, &weights_last);
             let n_res = sc_prover.f_ext().len().trailing_zeros() as usize;
             let basis_last = induce_sumcheck_evaluate_at_residual(
@@ -1471,8 +1436,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         let weights_i = powers(lambda_i, num_queries_i);
         let span = tracing::info_span!("Open", level = i + 1).entered();
         // Ordered rows for the local induce; sorted-unique rows + octopus stored.
-        let (words_i, paths) = wtns_prev.open(&queries_i);
-        let opened_rows_i: Vec<Vec<F192>> = words_i.iter().map(|words| ext_row(words)).collect();
+        let (opened_rows_i, paths) = wtns_prev.open(&queries_i);
         ps.hint_merkle(paths);
         drop(span);
 
@@ -1641,9 +1605,7 @@ mod tests {
                 }
             }
             qs.sort_unstable();
-            let rows: Vec<Vec<F64>> = (0..n_queries)
-                .map(|_| (0..lanes).map(|_| F64(rng.next_u64())).collect())
-                .collect();
+            let rows: Vec<F64> = (0..n_queries * lanes).map(|_| F64(rng.next_u64())).collect();
             let v_challenges: Vec<F192> = (0..lanes_log).map(|_| rng.ext()).collect();
             let weights = powers(rng.ext(), n_queries);
 
@@ -1668,9 +1630,7 @@ mod tests {
         for (name, log_msg_cols, log_inv_rate) in [("n2", 19usize, 2usize), ("n8", 21, 2)] {
             let block_len = 1usize << (log_msg_cols + log_inv_rate);
             let qs: Vec<usize> = (0..n_queries).map(|_| (rng.next_u64() as usize) % block_len).collect();
-            let rows: Vec<Vec<F64>> = (0..n_queries)
-                .map(|_| (0..1usize << lanes_log).map(|_| F64(rng.next_u64())).collect())
-                .collect();
+            let rows: Vec<F64> = (0..n_queries << lanes_log).map(|_| F64(rng.next_u64())).collect();
             let v_challenges: Vec<F192> = (0..lanes_log).map(|_| rng.ext()).collect();
             let weights = powers(rng.ext(), n_queries);
             let run = || induce_sumcheck_poly_via_ntt_base(log_msg_cols, log_inv_rate, &rows, &v_challenges, &qs, &weights);

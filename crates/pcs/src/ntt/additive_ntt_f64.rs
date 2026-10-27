@@ -49,6 +49,20 @@ impl DeepRows {
     }
 }
 
+/// `out`, `n` words per position, as one disjoint slice per run of positions, paired with the run.
+fn split_runs<'a, 'b>(
+    mut out: &'a mut [F64],
+    n: usize,
+    runs: impl Iterator<Item = &'b [usize]>,
+) -> Vec<(&'a mut [F64], &'b [usize])> {
+    runs.map(|run| {
+        let (head, tail) = std::mem::take(&mut out).split_at_mut(run.len() * n);
+        out = tail;
+        (head, run)
+    })
+    .collect()
+}
+
 /// What [`AdditiveNttF64::encode_lane_major`] is asked to keep of its codeword.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Keep {
@@ -342,26 +356,23 @@ impl AdditiveNttF64 {
         });
     }
 
-    /// Codeword rows `positions` of the encode [`Self::encode_cosets`] ran, one transform per coset they touch.
-    pub fn coset_rows(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, positions: &[usize]) -> Vec<Vec<F64>> {
+    /// Codeword rows `positions` (sorted) of the encode [`Self::encode_cosets`] ran, back to back, one transform per
+    /// coset they touch.
+    pub fn coset_rows(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, positions: &[usize]) -> Vec<F64> {
+        debug_assert!(positions.is_sorted());
         let log_d = self.coset_log_d(msg.len(), num_ntts, log_inv_rate);
         let rows = msg.len() / num_ntts;
-        // Positions grouped by coset, in runs.
-        let mut order: Vec<usize> = (0..positions.len()).collect();
-        order.sort_unstable_by_key(|&i| positions[i]);
-        let runs: Vec<&[usize]> = order.chunk_by(|&a, &b| positions[a] / rows == positions[b] / rows).collect();
-        let found = parallel::map_collect(runs.len(), |r| {
+        let mut out = vec![F64::ZERO; positions.len() * num_ntts];
+        let mut parts = split_runs(&mut out, num_ntts, positions.chunk_by(|a, b| a / rows == b / rows));
+        parallel::chunks_mut(&mut parts, 1, |_, part| {
+            let (dst, run) = &mut part[0];
             with_scratch(msg.len(), |coset| {
-                self.build_coset(coset, msg, num_ntts, log_d, log_inv_rate, positions[runs[r][0]] / rows);
-                runs[r].iter().map(|&i| coset[(positions[i] % rows) * num_ntts..][..num_ntts].to_vec()).collect::<Vec<_>>()
-            })
+                self.build_coset(coset, msg, num_ntts, log_d, log_inv_rate, run[0] / rows);
+                for (dst, &q) in dst.chunks_exact_mut(num_ntts).zip(run.iter()) {
+                    dst.copy_from_slice(&coset[(q % rows) * num_ntts..][..num_ntts]);
+                }
+            });
         });
-        let mut out = vec![Vec::new(); positions.len()];
-        for (run, rows) in runs.iter().zip(found) {
-            for (&i, row) in run.iter().zip(rows) {
-                out[i] = row;
-            }
-        }
         out
     }
 
@@ -417,13 +428,7 @@ impl AdditiveNttF64 {
     ) -> Vec<F64> {
         let (sub_len, log_sub, n) = (deep.sub_len(), deep.log_d - deep.deep_start, deep.num_ntts);
         let mut out = vec![F64::ZERO; positions.len() * n];
-        // One disjoint slice of `out` per sub-block, for its run of positions.
-        let (mut rest, mut parts) = (&mut out[..], Vec::new());
-        for run in deep.runs(positions) {
-            let (head, tail) = rest.split_at_mut(run.len() * n);
-            parts.push((head, run));
-            rest = tail;
-        }
+        let mut parts = split_runs(&mut out, n, deep.runs(positions));
         parallel::chunks_mut(&mut parts, 1, |i, part| {
             let (dst, run) = &mut part[0];
             let sub_idx = run[0] >> log_sub;
@@ -2823,11 +2828,12 @@ mod tests {
             ntt.encode_cosets(&msg, lanes, log_inv_rate, &sink_into(&mut handed, lanes));
             assert_eq!(handed, want, "handed-over rows, log_rows={log_rows}, lanes={lanes}");
 
-            // Repeats and unsorted positions included.
+            // Repeats included.
             let mut positions: Vec<usize> = (0..60).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
             positions.extend_from_within(..5);
+            positions.sort_unstable();
             let rows = ntt.coset_rows(&msg, lanes, log_inv_rate, &positions);
-            for (&q, row) in positions.iter().zip(&rows) {
+            for (&q, row) in positions.iter().zip(rows.chunks_exact(lanes)) {
                 assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_rows={log_rows}, lanes={lanes}");
             }
         }

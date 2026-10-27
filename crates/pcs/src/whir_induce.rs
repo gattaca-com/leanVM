@@ -112,17 +112,17 @@ fn invert_sks(sks_vks: &[F64]) -> Vec<F64> {
 pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     log_msg_cols: usize,
     sks_vks: &[F64],
-    opened_rows: &[Vec<T>],
+    opened_rows: &[T],
     v_challenges: &[F192],
     queries: &[usize],
     weights: &[F192],
 ) -> (Vec<F192>, F192) {
     let n_queries = queries.len();
-    assert_eq!(opened_rows.len(), n_queries);
     assert_eq!(weights.len(), n_queries);
     let eq = build_eq_table_ext(v_challenges);
+    assert_eq!(opened_rows.len(), n_queries * eq.len());
     let enforced_sum = opened_rows
-        .iter()
+        .chunks_exact(eq.len())
         .zip(weights)
         .fold(F192::ZERO, |sum, (row, &w)| sum + T::dot(row, &eq) * w);
 
@@ -174,18 +174,17 @@ fn tensor_k(s: &[F64]) -> Vec<F64> {
 /// level, whose induced basis it never materializes.
 #[timed]
 pub(crate) fn induce_sumcheck_enforced_sum<T: RowElem>(
-    opened_rows: &[Vec<T>],
+    opened_rows: &[T],
     v_challenges: &[F192],
     queries: &[usize],
     weights: &[F192],
 ) -> F192 {
-    assert_eq!(opened_rows.len(), queries.len());
     let eq = build_eq_table_ext(v_challenges);
+    assert_eq!(opened_rows.len(), queries.len() * eq.len());
     debug_assert_eq!(weights.len(), queries.len());
     let mut sum = F192::ZERO;
-    for (i, row) in opened_rows.iter().enumerate() {
-        debug_assert_eq!(row.len(), eq.len());
-        sum += weights[i] * T::dot(row, &eq);
+    for (row, &w) in opened_rows.chunks_exact(eq.len()).zip(weights) {
+        sum += w * T::dot(row, &eq);
     }
     sum
 }
@@ -453,7 +452,7 @@ fn transpose_rows(tile: &mut [F192], plan: &[Vec<(usize, F64)>]) {
 pub(crate) fn induce_sumcheck_poly_via_ntt_base(
     log_msg_cols: usize,
     log_inv_rate: usize,
-    opened_rows: &[Vec<F64>],
+    opened_rows: &[F64],
     v_challenges: &[F192],
     queries: &[usize],
     weights: &[F192],
@@ -461,14 +460,14 @@ pub(crate) fn induce_sumcheck_poly_via_ntt_base(
     let log_block = log_msg_cols + log_inv_rate;
     let block_len = 1usize << log_block;
     let n_queries = queries.len();
-    assert_eq!(opened_rows.len(), n_queries);
 
     let eq = build_eq_table_ext(v_challenges);
+    assert_eq!(opened_rows.len(), n_queries * eq.len());
     debug_assert_eq!(weights.len(), n_queries);
 
     let mut enforced_sum = F192::ZERO;
-    for i in 0..n_queries {
-        enforced_sum += F64::dot(&opened_rows[i], &eq) * weights[i];
+    for (row, &w) in opened_rows.chunks_exact(eq.len()).zip(weights) {
+        enforced_sum += F64::dot(row, &eq) * w;
     }
 
     let coeffs = if log_block == 0 {
@@ -505,7 +504,7 @@ pub(crate) fn induce_sumcheck_poly_auto_base(
     log_msg_cols: usize,
     log_inv_rate: usize,
     sks_vks: &[F64],
-    opened_rows: &[Vec<F64>],
+    opened_rows: &[F64],
     v_challenges: &[F192],
     queries: &[usize],
     weights: &[F192],
