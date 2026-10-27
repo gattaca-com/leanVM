@@ -1104,6 +1104,7 @@ dependencies = [
 name = "fiat_shamir"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "parallel",
  "primitives",
  "serde",
