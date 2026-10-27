@@ -587,8 +587,15 @@ const STREAM_FOLD_MIN: usize = 1 << 19;
 
 /// Fused fold + next-round message: the witness and the basis fold, and the
 /// next-round message is built over the freshly folded values in the same pass.
+///
+/// The basis folded is `b + sum s * v` over `glued`, summed per stage in L1: the glued sum is never stored.
 #[timed]
-fn fold_and_msg_lsb(f: &[F192], b: &[F192], r: F192) -> (Vec<F192>, Vec<F192>, SumcheckMessage) {
+fn fold_and_msg_lsb(
+    f: &[F192],
+    b: &[F192],
+    glued: &[(Vec<F192>, F192)],
+    r: F192,
+) -> (Vec<F192>, Vec<F192>, SumcheckMessage) {
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -611,9 +618,19 @@ fn fold_and_msg_lsb(f: &[F192], b: &[F192], r: F192) -> (Vec<F192>, Vec<F192>, S
         let fc = unsafe { nf_base.slice(base, len) };
         let bc = unsafe { nb_base.slice(base, len) };
         let mut acc = (Acc8::ZERO, Acc8::ZERO);
-        let fold = |fo: &mut [F192], bo: &mut [F192], at: std::ops::Range<usize>| {
+        let mut sum = [F192::ZERO; 2 * FOLD_STAGE];
+        let mut fold = |fo: &mut [F192], bo: &mut [F192], at: std::ops::Range<usize>| {
             fold_adjacent(fo, &f[at.clone()], r);
-            fold_adjacent(bo, &b[at], r);
+            if glued.is_empty() {
+                fold_adjacent(bo, &b[at], r);
+            } else {
+                let sum = &mut sum[..at.len()];
+                sum.copy_from_slice(&b[at.clone()]);
+                for (v, s) in glued {
+                    add_scaled(sum, &v[at.clone()], *s);
+                }
+                fold_adjacent(bo, sum, r);
+            }
             adjacent_dots::<false>(fo, bo)
         };
         let (mut sf, mut sb) = ([F192::ZERO; FOLD_STAGE], [F192::ZERO; FOLD_STAGE]);
@@ -940,6 +957,9 @@ pub(crate) struct SumcheckProver {
     /// The level's claims, in Protocol 1 step 1 order: the OOD claims, then the
     /// query batch. Drained by `glue_pending`.
     pending: Vec<(Vec<F192>, F192, RoundQuad)>,
+    /// Glued claims with their powers of lambda, not yet added to `combined_basis`.
+    /// The next `fold` adds them inside its pass.
+    glued: Vec<(Vec<F192>, F192)>,
 }
 
 impl SumcheckProver {
@@ -975,6 +995,7 @@ impl SumcheckProver {
             quad: RoundQuad::from_msg(msg, h1),
             round: 0,
             pending: Vec::new(),
+            glued: Vec::new(),
         };
         (inst, msg)
     }
@@ -1041,7 +1062,9 @@ impl SumcheckProver {
         self.round += 1;
         let _span =
             tracing::info_span!("Sumcheck round", round = self.round, log_size = self.f.len().ilog2()).entered();
-        let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, r);
+        let glued = std::mem::take(&mut self.glued);
+        let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, &glued, r);
+        drop(glued);
         // Swap the freshly folded buffers in and drop the consumed ones, so the
         // allocator serves the next round's `fold_out_buf` from their memory.
         drop(std::mem::replace(&mut self.f, nf));
@@ -1075,6 +1098,8 @@ impl SumcheckProver {
     /// Protocol 1 step 1): claim `tau` (counting from 1) contributes
     /// `combined_basis[j] += lambda^tau * b_new[j]`, `T_r += lambda^tau *
     /// h_new`. The running claim keeps `lambda^0 = 1`.
+    ///
+    /// Only the scalars move here. The vectors wait in `glued` for the next `fold`.
     #[timed]
     fn glue_pending(&mut self, lambda: F192) {
         let pending = std::mem::take(&mut self.pending);
@@ -1083,23 +1108,19 @@ impl SumcheckProver {
         for (b_new, h_new, quad_new) in pending {
             scalar *= lambda;
             assert_eq!(b_new.len(), self.combined_basis.len());
-            const PAR_THRESHOLD: usize = 4096;
-            if self.combined_basis.len() < PAR_THRESHOLD {
-                add_scaled(&mut self.combined_basis, &b_new, scalar);
-            } else {
-                let chunk = parallel::recommended_chunk_size(self.combined_basis.len());
-                parallel::chunks_mut_zip(&mut self.combined_basis, &b_new, chunk, |_, accs, news| {
-                    add_scaled(accs, news, scalar);
-                });
-            }
             self.t_r += scalar * h_new;
             self.quad = RoundQuad::fold(&self.quad, &quad_new, scalar);
+            self.glued.push((b_new, scalar));
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn basis(&self) -> &[F192] {
-        &self.combined_basis
+    pub(crate) fn basis(&self) -> Vec<F192> {
+        let mut basis = self.combined_basis.clone();
+        for (v, s) in &self.glued {
+            add_scaled(&mut basis, v, *s);
+        }
+        basis
     }
 
     /// The folded witness, once the lane rounds are done.
@@ -1731,11 +1752,32 @@ mod tests {
 
             let fold = |x: &[F192]| -> Vec<F192> { x.chunks_exact(2).map(|p| fold_pair(p[0], p[1], r)).collect() };
             let (nb_ref, nf_ref) = (fold(&b), fold(&f));
-            let (nf, nb, msg) = fold_and_msg_lsb(&f, &b, r);
+            let (nf, nb, msg) = fold_and_msg_lsb(&f, &b, &[], r);
             assert_eq!(
                 (&nf, &nb, msg),
                 (&nf_ref, &nb_ref, msg_ref(&nf_ref, &nb_ref)),
                 "fold, n={n}"
+            );
+        }
+    }
+
+    /// A fold over glued claims equals gluing first and then folding, across stage boundaries.
+    #[test]
+    fn fold_with_glued_matches_glue_then_fold() {
+        let mut rng = Rng::new(0x61AE);
+        let r = rng.ext();
+        for log in [1usize, 3, 5, 9, 10, 12, 13] {
+            let n = 1usize << log;
+            let (f, b) = (rng.ext_vec(n), rng.ext_vec(n));
+            let glued: Vec<(Vec<F192>, F192)> = (0..3).map(|_| (rng.ext_vec(n), rng.ext())).collect();
+            let mut sum = b.clone();
+            for (v, s) in &glued {
+                add_scaled(&mut sum, v, *s);
+            }
+            assert_eq!(
+                fold_and_msg_lsb(&f, &b, &glued, r),
+                fold_and_msg_lsb(&f, &sum, &[], r),
+                "n={n}"
             );
         }
     }
