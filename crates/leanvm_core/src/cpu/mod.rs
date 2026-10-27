@@ -623,10 +623,6 @@ pub fn prove_with(
         });
         let table_claims = crate::stage!("Prove constraints", || {
             // One sumcheck for all six tables (§constraints).
-            let table_cols: Vec<Vec<&[F64]>> = spans
-                .iter()
-                .map(|&(base, n)| (0..n).map(|c| cols[base + c]).collect())
-                .collect();
             // The eq point is the bus GKR's ζ, not a fresh one: that is what lets the
             // batch settle the bus forms alongside the constraints.
             let xi = ps.sample();
@@ -634,7 +630,8 @@ pub fn prove_with(
             let sigma = sigmas(&bus.sigmas, form_pows);
             constraints::prove(
                 &airs(&l.taus, &l.rows, &bus.forms, form_pows),
-                &table_cols,
+                &cols,
+                &spans,
                 xi,
                 &bus.point,
                 &sigma,

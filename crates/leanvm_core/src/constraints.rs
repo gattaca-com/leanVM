@@ -701,8 +701,8 @@ fn round_polynomial([endpoint, quadratic]: [F192; 2], zeta: F192, claim: F192, w
 }
 
 /// Prove that every table's batched constraint vanishes on all of its rows, as ONE
-/// sumcheck over `max τ_t` variables. `cols[t]` holds table `t`'s involved columns
-/// (`2^{τ_t}` values each, read in place). Returns the per-table claims, in input
+/// sumcheck over `max τ_t` variables. Table `t`'s involved columns (`2^{τ_t}` values each, read in place)
+/// are `cols[base..base + n]` for `spans[t] = (base, n)`. Returns the per-table claims, in input
 /// order, on the nested points `ρ[..τ_t]`.
 ///
 /// `blocks` are the bus's block dots at the same `zeta` (empty when there are none, as in unit tests).
@@ -713,7 +713,8 @@ fn round_polynomial([endpoint, quadratic]: [F192; 2], zeta: F192, claim: F192, w
 #[timed]
 pub fn prove(
     airs: &[Air<'_>],
-    cols: &[Vec<&[F64]>],
+    cols: &[&[F64]],
+    spans: &[(usize, usize)],
     xi: F192,
     zeta: &[F192],
     sigma: &[F192],
@@ -726,10 +727,11 @@ pub fn prove(
     let pows = powers(xi, airs.iter().map(|a| a.n_constraints).sum());
     let mut tables: Vec<Table> = airs
         .iter()
-        .zip(cols)
+        .zip(spans)
         .zip(sigma)
         .enumerate()
-        .map(|(t, ((air, cols), &sigma))| {
+        .map(|(t, ((air, &(base, n)), &sigma))| {
+            let cols = &cols[base..base + n];
             let form = Form::extract(&air.eval, &pows[offsets[t]..][..air.n_constraints], cols.len());
             Table {
                 tau: air.tau,
@@ -1015,7 +1017,15 @@ mod tests {
         zeta[10] = F192::ZERO;
         zeta[11] = F192::ZERO;
         let sigma: Vec<F192> = (0..taus.len()).map(|_| random_e(&mut s)).collect();
-        let views: Vec<Vec<&[F64]>> = cols.iter().map(|t| t.iter().map(|c| &c[..]).collect()).collect();
+        let views: Vec<&[F64]> = cols.iter().flatten().map(|c| &c[..]).collect();
+        let mut base = 0;
+        let spans: Vec<_> = cols
+            .iter()
+            .map(|t| {
+                base += t.len();
+                (base - t.len(), t.len())
+            })
+            .collect();
         // The form multiplies (0,1), (0,3), (0,4) and (5,5); the bus names a pair either way round.
         let pairs = [(1, 0), (0, 3), (4, 0), (5, 5)];
         let blocks: Vec<TableBlocks> = taus
@@ -1036,7 +1046,7 @@ mod tests {
         assert!(Dots::new(&form, &blocks[3]).is_none(), "a pair is missing");
         let run = |blocks: &[TableBlocks]| {
             let mut ps = ProverState::from_label(b"zc-test");
-            let claims = prove(&airs, &views, xi, &zeta, &sigma, blocks, &mut ps);
+            let claims = prove(&airs, &views, &spans, xi, &zeta, &sigma, blocks, &mut ps);
             (claims, ps.sample())
         };
         let (plain, dotted) = (run(&[]), run(&blocks));
