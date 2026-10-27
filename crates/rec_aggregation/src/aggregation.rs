@@ -166,10 +166,8 @@ fn count(n: usize) -> F192 {
 
 /// The bytes of a `bits`-bit value, low first, each in the exponent: how the guest
 /// bounds a value it rebuilds (`sp_from_bytes`).
-fn exponent_bytes(value: u64, bits: usize) -> Vec<F192> {
-    (0..bits.div_ceil(8))
-        .map(|k| count((value >> (8 * k) & 0xff) as usize))
-        .collect()
+fn exponent_bytes(value: u64, bits: usize) -> impl Iterator<Item = F192> {
+    (0..bits.div_ceil(8)).map(move |k| count((value >> (8 * k) & 0xff) as usize))
 }
 
 /// A field element as the decimal `u128` literal the zkDSL parser accepts.
@@ -223,10 +221,10 @@ fn cell_bytes(cells: impl IntoIterator<Item = F192>) -> Vec<u8> {
 /// agree with them (`claim_list_digest` in the guest). A list is never empty
 /// here: both claim lists are guarded at the call, since the guest hashes an empty
 /// one without a split at all.
-fn signers_split(blocks: usize) -> Vec<F192> {
+fn signers_split(blocks: usize) -> [F192; 2] {
     assert!(blocks > 0, "an empty list has no window split");
     let leading = blocks - 1;
-    vec![count(leading / SIGNERS_WINDOW), count(leading % SIGNERS_WINDOW)]
+    [count(leading / SIGNERS_WINDOW), count(leading % SIGNERS_WINDOW)]
 }
 
 /// One scheme's declared claims under plain BLAKE2s: one 64-byte block per claim,
@@ -619,9 +617,10 @@ fn check_da_roots(roots: &[[u8; 32]]) -> Result<(), AggregateVerifyError> {
     Ok(())
 }
 
-fn da_claim_cells(root: &[u8; 32]) -> Vec<F192> {
+fn da_claim_cells(root: &[u8; 32]) -> [F192; 4] {
     let vector_hash = lean_da::vector_digest(&lean_da::membership_vector(root));
-    [pack_hash_state(root), pack_hash_state(&vector_hash)].concat()
+    let ([a, b], [c, d]) = (pack_hash_state(root), pack_hash_state(&vector_hash));
+    [a, b, c, d]
 }
 
 fn da_list_digest(roots: &[[u8; 32]]) -> [u8; 32] {
@@ -1060,7 +1059,8 @@ fn aggregate_deferred_claims(
     subproofs: &[DeferredSubproof],
     carried_claims: &[&DeferredClaim],
     bytecode: BytecodeSums,
-) -> Result<(SubHints, DeferredClaim), AggregateVerifyError> {
+    hints: &mut Hints,
+) -> Result<DeferredClaim, AggregateVerifyError> {
     let child_count = subproofs.len();
     assert_eq!(child_count, carried_claims.len(), "one carried claim per child");
     let kbcv = bytecode_vars();
@@ -1338,22 +1338,17 @@ fn aggregate_deferred_claims(
     }
 
     drop(_span);
-    let hints = vec![
-        ("bc_sumcheck_msgs", bscr),
-        ("mat_sumcheck_msgs", mscr),
-        ("bc_star_hint", vec![v_bc]),
-        ("mat_stars_hint", vec![v_a, v_b]),
-    ];
-    Ok((
-        hints,
-        DeferredClaim {
-            bytecode_point: r_bc,
-            bytecode_value: v_bc,
-            matrix_point: r_row.iter().chain(&r_col).copied().collect(),
-            matrix_a_value: v_a,
-            matrix_b_value: v_b,
-        },
-    ))
+    hints.push("bc_sumcheck_msgs", &bscr);
+    hints.push("mat_sumcheck_msgs", &mscr);
+    hints.push("bc_star_hint", &[v_bc]);
+    hints.push("mat_stars_hint", &[v_a, v_b]);
+    Ok(DeferredClaim {
+        bytecode_point: r_bc,
+        bytecode_value: v_bc,
+        matrix_point: r_row.iter().chain(&r_col).copied().collect(),
+        matrix_a_value: v_a,
+        matrix_b_value: v_b,
+    })
 }
 /// The verifier-side WHIR config for one committed size and rate, plus the
 /// query packing derived from it. The hint builder needs it for the real
@@ -1518,7 +1513,7 @@ fn gen_verify(
     proof_stream: &[F192],
     summary: &verifier::Summary,
     bytecode_value: F192,
-) -> Result<(SubHints, DeferredSubproof), AggregationError> {
+) -> Result<(Hints, DeferredSubproof), AggregationError> {
     let layout = leanvm_core::cpu::layout(
         program.bytecode_cols(),
         summary.log_memory,
@@ -1602,7 +1597,6 @@ fn gen_verify(
     // the fingerprint challenges (§sec:e2e-bc). The summary carries the point
     // only, so this is the prover's own evaluation, `program` being the guest,
     // which the caller made for all children in one dispatch.
-    let bcv = vec![bytecode_value];
 
     // ---- per-sub HINT data (the placeholder map is built once, elsewhere) ----
     // Per side, the packing order read straight off `leaf::layout`'s offsets:
@@ -1643,7 +1637,8 @@ fn gen_verify(
     // ---- Phase E2 hints (the stacked WHIR opening) ----
     // Share the upper Merkle tree across queries. Unknown, unused subtrees stay
     // opaque; the guest authenticates every cap leaf a query reaches.
-    let mut query_hints = Vec::new();
+    let mut hints = Hints::default();
+    let mut path_children = Vec::new();
     let (mut caps, mut cap_active) = (Vec::new(), Vec::new());
     let mut openings = summary.merkle_paths.iter();
     for (&queries, &depth) in stack.config.queries.iter().zip(&stack.depth) {
@@ -1653,11 +1648,8 @@ fn gen_verify(
         let mut nodes = vec![[0u8; 32]; 2 * n];
         let mut active = vec![F192::ZERO; n];
         for opening in openings.by_ref().take(queries) {
-            query_hints.push((
-                "merkle_leaf_rows",
-                opening.leaf.iter().map(|x| F192::new(x.0, 0, 0)).collect(),
-            ));
-            let mut path_children = Vec::with_capacity(4 * path_depth);
+            hints.push_iter("merkle_leaf_rows", opening.leaf.iter().map(|x| F192::new(x.0, 0, 0)));
+            path_children.clear();
             let bytes: Vec<_> = opening.leaf.iter().flat_map(|x| x.to_bytes()).collect();
             let mut node = pcs::merkle::hash_leaf(&bytes);
             let mut index = (1 << depth) + opening.leaf_index as usize;
@@ -1680,7 +1672,7 @@ fn gen_verify(
                 index >>= 1;
             }
             nodes[1] = node;
-            query_hints.push(("merkle_children", path_children));
+            hints.push("merkle_children", &path_children);
         }
         caps.extend(nodes.iter().flat_map(pack_hash_state));
         cap_active.extend(active);
@@ -1700,35 +1692,25 @@ fn gen_verify(
         matrix_claim: matpart,
     };
 
-    let mut hints = vec![
-        ("stream", {
-            // The guest replays the WHIR opening off the same stream the native
-            // verifier reads: every transmitted scalar (sumcheck messages, level
-            // roots, OOD claims, grind nonces, `yr`) is already there in protocol
-            // order, so there is nothing to reassemble. The guest's `open_stacked`
-            // picks it up at `msg_cursor = cursor`, which sits where the flock
-            // reduction stopped; the ring-switch messages are struct-observed and
-            // still do not advance that cursor.
-            let mut stream = proof_stream.to_vec();
-            stream.resize(STREAM_CAP, F192::ZERO);
-            stream
-        }),
-        ("bytecode_val", bcv),
-        ("matpart", vec![matpart]),
-        ("merkle_caps", caps),
-        ("merkle_cap_active", cap_active),
-        // the table sumcheck's round count: max_t tau_t, certified in-guest as a
-        // maximum (one of the taus, and dominating them all).
-        (
-            "zc_tau_max",
-            vec![F192::new(g_pow(*taus.iter().max().unwrap()).0, 0, 0)],
-        ),
-        // Every table's log height, which the guest certifies against its row count.
-        ("table_logs", taus.iter().map(|&t| count(t)).collect()),
-        ("col_sort_order", col_sort_order),
-        ("sort_order", sort_order),
-    ];
-    hints.extend(query_hints);
+    // The guest replays the WHIR opening off the same stream the native
+    // verifier reads: every transmitted scalar (sumcheck messages, level
+    // roots, OOD claims, grind nonces, `yr`) is already there in protocol
+    // order, so there is nothing to reassemble. The guest's `open_stacked`
+    // picks it up at `msg_cursor = cursor`, which sits where the flock
+    // reduction stopped; the ring-switch messages are struct-observed and
+    // still do not advance that cursor.
+    hints.push_iter("stream", proof_stream.iter().copied().chain(std::iter::repeat(F192::ZERO)).take(STREAM_CAP));
+    hints.push("bytecode_val", &[bytecode_value]);
+    hints.push("matpart", &[matpart]);
+    hints.push("merkle_caps", &caps);
+    hints.push("merkle_cap_active", &cap_active);
+    // the table sumcheck's round count: max_t tau_t, certified in-guest as a
+    // maximum (one of the taus, and dominating them all).
+    hints.push("zc_tau_max", &[count(*taus.iter().max().unwrap())]);
+    // Every table's log height, which the guest certifies against its row count.
+    hints.push_iter("table_logs", taus.iter().map(|&t| count(t)));
+    hints.push("col_sort_order", &col_sort_order);
+    hints.push("sort_order", &sort_order);
     Ok((hints, deferred))
 }
 
@@ -1745,9 +1727,6 @@ const _: () = assert!(MU_MIN >= leanvm_core::pcs::MIN_MU);
 /// outgrow the buffer the guest was compiled with.
 const MU_CAP: usize = 40;
 const STREAM_CAP: usize = 8192;
-/// Named hint entries for a single sub-proof, ordered within each stream.
-type SubHints = Vec<(&'static str, Vec<F192>)>;
-
 /// An edit to a node's hints: how a test hands the guest a witness the honest host
 /// would not.
 #[cfg(test)]
@@ -1759,37 +1738,8 @@ thread_local! {
     static FORGE: std::cell::RefCell<Option<Forgery>> = const { std::cell::RefCell::new(None) };
 }
 
-/// One `hint_witness` stream: a name and its entries, in the order the guest
-/// pops them.
-#[derive(Default)]
-pub(crate) struct Hints(Vec<(String, Vec<Vec<F192>>)>);
-
-impl Hints {
-    fn push(&mut self, name: &str, entry: Vec<F192>) {
-        match self.0.iter_mut().find(|(n, _)| n == name) {
-            Some((_, entries)) => entries.push(entry),
-            None => self.0.push((name.to_string(), vec![entry])),
-        }
-    }
-
-    /// Entry `i` of stream `name`, for a test to forge.
-    #[cfg(test)]
-    fn entry_mut(&mut self, name: &str, i: usize) -> &mut Vec<F192> {
-        let (_, entries) = self.0.iter_mut().find(|(n, _)| n == name).expect("a hinted stream");
-        &mut entries[i]
-    }
-
-    fn into_witness(self) -> Witness {
-        self.0.into_iter().collect()
-    }
-
-    #[cfg(test)]
-    fn install(self, guest: &mut Program) {
-        for (name, entries) in self.0 {
-            guest.set_witness(name, entries);
-        }
-    }
-}
+/// The `hint_witness` streams of one node, entries in the order the guest pops them.
+pub(crate) type Hints = Witness;
 
 /// The coverage slot each write in the guest's coverage walk targets, in walk
 /// order: the raw signatures first, then each child's claim lists.
@@ -1928,13 +1878,13 @@ fn plan_coverage(
 /// The digits of a WOTS+C codeword as the guest dispatches on them: `DIGIT_GROUP` at
 /// a time, then the last alone, each group's index little endian in base
 /// `CHAIN_LEN`, in the exponent.
-fn digit_hints(codeword: &[u8]) -> impl Iterator<Item = Vec<F192>> + '_ {
+fn digit_hints(codeword: &[u8]) -> impl Iterator<Item = F192> + '_ {
     codeword.chunks(DIGIT_GROUP).map(|group| {
         let index = group
             .iter()
             .rev()
             .fold(0, |index, &digit| index * lean_xmss::CHAIN_LEN + digit as usize);
-        vec![count(index)]
+        count(index)
     })
 }
 
@@ -1942,28 +1892,31 @@ fn digit_hints(codeword: &[u8]) -> impl Iterator<Item = Vec<F192>> + '_ {
 /// bottom first, the randomizer, the codeword's digits, the chain values they start
 /// from, and the ordered children of every node on the path.
 fn lean_xmss_hints(
+    hints: &mut Hints,
     pk: &LeanXmssPublicKey,
     sig: &LeanXmssSignature,
     message: &lean_xmss::Message,
-) -> Result<SubHints, AggregationError> {
+) -> Result<(), AggregationError> {
     let pp = &pk.public_param;
     let bits = (0..lean_xmss::LOG_LIFETIME).map(|b| F192::new(u64::from(sig.leaf_index >> b & 1), 0, 0));
-    let mut hints: SubHints = vec![("leaf_index_bits", bits.collect())];
+    hints.push_iter("leaf_index_bits", bits);
     let mut root: Vec<u8> = message.to_vec();
     for (layer, layer_sig) in [&sig.bottom, &sig.top].into_iter().enumerate() {
         let e = lean_xmss::layer_index(sig.leaf_index, layer);
         let (codeword, reached) = lean_xmss::layer_root(pp, layer, e, &root, layer_sig, |pair| {
-            hints.push(("siblings", vec![pack_16_bytes(&pair[0]), pack_16_bytes(&pair[1])]));
+            hints.push("siblings", &[pack_16_bytes(&pair[0]), pack_16_bytes(&pair[1])]);
         })
         .ok_or(AggregationError::MalformedRawSignature)?;
-        hints.push(("randomizer", vec![pack_16_bytes(&layer_sig.randomizer)]));
-        hints.extend(digit_hints(&codeword).map(|entry| ("digits", entry)));
+        hints.push("randomizer", &[pack_16_bytes(&layer_sig.randomizer)]);
+        for index in digit_hints(&codeword) {
+            hints.push("digits", &[index]);
+        }
         for value in &layer_sig.chain_values {
-            hints.push(("chain_starts", vec![pack_16_bytes(value)]));
+            hints.push("chain_starts", &[pack_16_bytes(value)]);
         }
         root = reached.to_vec();
     }
-    Ok(hints)
+    Ok(())
 }
 
 /// One leanSPHINCS signature's witness: the randomizer, the forest's opened chain
@@ -1981,10 +1934,10 @@ fn push_lean_sphincs_hints(
     sig: &LeanSphincsSignature,
 ) -> Result<(), AggregationError> {
     let pp = &pk.public_param;
-    hints.push("sp_rand", vec![pack_16_bytes(&sig.randomizer)]);
+    hints.push("sp_rand", &[pack_16_bytes(&sig.randomizer)]);
     let subtrees = sig.forest.iter().flat_map(|tree| &tree.subtrees);
     for value in subtrees.flat_map(|subtree| &subtree.values) {
-        hints.push("sp_forest_values", vec![pack_16_bytes(value)]);
+        hints.push("sp_forest_values", &[pack_16_bytes(value)]);
     }
     let (idx, marks) = lean_sphincs::message_digest(pp, &sig.randomizer, message);
     // The digest's bits past its fields, which only the guest's rebuild of it reads.
@@ -1997,44 +1950,44 @@ fn push_lean_sphincs_hints(
         let position = lean_sphincs::DIGEST_BITS + bit;
         value | u64::from(digest[position / 8] >> (position % 8) & 1) << bit
     });
-    hints.push("sp_unused", exponent_bytes(unused, unused_bits));
+    hints.push_iter("sp_unused", exponent_bytes(unused, unused_bits));
     for word in marks.iter().flat_map(|mark| mark.words) {
-        hints.push("sp_words", vec![count(word)]);
+        hints.push("sp_words", &[count(word)]);
     }
     // A field the guest dispatches on: in the exponent, and as an address holds it.
     let mark = |index: usize, field: u32| {
         let address = lean_sphincs::address(&lean_sphincs::tweak(0, field, 0));
-        vec![count(index), pack_16_bytes(&address)]
+        [count(index), pack_16_bytes(&address)]
     };
     // A leaf's address field carries its tree, a key's its subtree, so the guest
     // reaches either address in one sum off the index.
     for (c, (tree, mark_of)) in sig.forest.iter().zip(&marks).enumerate() {
         hints.push(
             "sp_leaves",
-            mark(mark_of.leaf, c as u32 | lean_sphincs::leaf_field(mark_of.leaf)),
+            &mark(mark_of.leaf, c as u32 | lean_sphincs::leaf_field(mark_of.leaf)),
         );
         for (j, (subtree, &key)) in tree.subtrees.iter().zip(&mark_of.keys).enumerate() {
-            hints.push("sp_keys", mark(key, (128 * j as u32) | lean_sphincs::key_field(key)));
+            hints.push("sp_keys", &mark(key, (128 * j as u32) | lean_sphincs::key_field(key)));
             for node in &subtree.path {
-                hints.push("sp_forest_nodes", vec![pack_16_bytes(node)]);
+                hints.push("sp_forest_nodes", &[pack_16_bytes(node)]);
             }
         }
         for node in &tree.path {
-            hints.push("sp_forest_nodes", vec![pack_16_bytes(node)]);
+            hints.push("sp_forest_nodes", &[pack_16_bytes(node)]);
         }
     }
     let forest_key = lean_sphincs::forest_recover(pp, idx as u32, &marks, &sig.forest);
     let codeword = lean_sphincs::encode(pp, idx as u32, &forest_key, sig.counter)
         .ok_or(AggregationError::MalformedRawSignature)?;
-    hints.push(
+    hints.push_iter(
         "sp_counter",
         exponent_bytes(u64::from(sig.counter), 8 * lean_sphincs::COUNTER_LEN),
     );
-    for entry in digit_hints(&codeword) {
-        hints.push("digits", entry);
+    for index in digit_hints(&codeword) {
+        hints.push("digits", &[index]);
     }
     for opened in &sig.wots {
-        hints.push("chain_starts", vec![pack_16_bytes(opened)]);
+        hints.push("chain_starts", &[pack_16_bytes(opened)]);
     }
     let leaf = lean_sphincs::wots_leaf(pp, idx as u32, &forest_key, sig.counter, &sig.wots)
         .ok_or(AggregationError::MalformedRawSignature)?;
@@ -2042,7 +1995,7 @@ fn push_lean_sphincs_hints(
     // handed the two children in order and checks that the node it holds is the
     // one its bit names.
     let root = lean_sphincs::tree_fold_with(pp, idx, leaf, &sig.path, |pair| {
-        hints.push("siblings", vec![pack_16_bytes(&pair[0]), pack_16_bytes(&pair[1])]);
+        hints.push("siblings", &[pack_16_bytes(&pair[0]), pack_16_bytes(&pair[1])]);
     });
     debug_assert_eq!(root, pk.root, "the hinted walk reaches the public key");
     Ok(())
@@ -2183,7 +2136,7 @@ pub fn aggregate_with_stats(
     let mut hints = Hints::default();
     hints.push(
         "meta",
-        vec![
+        &[
             count(cover.xmss.signers.len()),
             count(cover.xmss.dups.len()),
             count(raw_lean_xmss.len()),
@@ -2195,7 +2148,7 @@ pub fn aggregate_with_stats(
         ],
     );
     let fs_seed = leanvm_core::cpu::fs_seed(guest);
-    hints.push("fs_seed", vec![fs_seed[0], fs_seed[1]]);
+    hints.push("fs_seed", &[fs_seed[0], fs_seed[1]]);
     // Both lists in the guest's order, leanXMSS first: each one's split, its declared
     // claims, then its duplicates.
     let lean_xmss_cells: Vec<[F192; 4]> = cover.xmss.signers.iter().map(lean_xmss_claim_cells).collect();
@@ -2207,30 +2160,34 @@ pub fn aggregate_with_stats(
         .collect();
     for cells in [&lean_xmss_cells, &lean_sphincs_cells] {
         if !cells.is_empty() {
-            hints.push("signers_split", signers_split(cells.len()));
+            hints.push("signers_split", &signers_split(cells.len()));
         }
         for claim in cells {
-            hints.push("claims", claim.to_vec());
+            hints.push("claims", claim);
         }
     }
     let dups = cover.xmss.dups.iter().map(lean_xmss_claim_cells);
     for claim in dups.chain(cover.lean_sphincs.dups.iter().map(lean_sphincs_claim_cells)) {
-        hints.push("dup_claims", claim.to_vec());
+        hints.push("dup_claims", &claim);
     }
     // Each slot is hinted as an offset into its scheme's region, which is how one
     // range check keeps a scheme's writers off the other's claims.
-    let lean_xmss_hints = parallel::map_collect(raw_lean_xmss.len(), |i| {
-        let (pk, message, sig) = &raw_lean_xmss[i];
-        lean_xmss_hints(pk, sig, message)
-    });
-    for (&offset, sub) in cover.xmss.raw.iter().zip(lean_xmss_hints) {
-        hints.push("raw_index", vec![count(offset)]);
-        for (name, entry) in sub? {
-            hints.push(name, entry);
+    // Workers fill one arena per chunk of signatures, which append in signature order.
+    let chunk = parallel::recommended_chunk_size(raw_lean_xmss.len()).max(1);
+    let chunks = parallel::map_collect(raw_lean_xmss.len().div_ceil(chunk), |c| {
+        let mut sub = Hints::default();
+        for i in c * chunk..((c + 1) * chunk).min(raw_lean_xmss.len()) {
+            let (pk, message, sig) = &raw_lean_xmss[i];
+            sub.push("raw_index", &[count(cover.xmss.raw[i])]);
+            lean_xmss_hints(&mut sub, pk, sig, message)?;
         }
+        Ok(sub)
+    });
+    for sub in chunks {
+        hints.append(sub?);
     }
     for (&offset, (pk, message, sig)) in cover.lean_sphincs.raw.iter().zip(&raw_lean_sphincs) {
-        hints.push("sp_raw_index", vec![count(offset)]);
+        hints.push("sp_raw_index", &[count(offset)]);
         push_lean_sphincs_hints(&mut hints, &(*pk, *message), sig)?;
     }
 
@@ -2264,22 +2221,20 @@ pub fn aggregate_with_stats(
     for (i, child) in children.iter().enumerate() {
         hints.push(
             "child_meta",
-            vec![count(child.xmss_signers.len()), count(child.lean_sphincs_signers.len())],
+            &[count(child.xmss_signers.len()), count(child.lean_sphincs_signers.len())],
         );
         for offsets in [&cover.xmss.children[i], &cover.lean_sphincs.children[i]] {
             if !offsets.is_empty() {
-                hints.push("signers_split", signers_split(offsets.len()));
+                hints.push("signers_split", &signers_split(offsets.len()));
             }
             for &offset in offsets {
-                hints.push("child_claim_index", vec![count(offset)]);
+                hints.push("child_claim_index", &[count(offset)]);
             }
         }
-        hints.push("child_defer", child.defer.cells());
-        hints.push("child_da_count", vec![count(child.da_roots.len())]);
+        hints.push("child_defer", &child.defer.cells());
+        hints.push("child_da_count", &[count(child.da_roots.len())]);
         let (sub_hints, defer) = generated.next().expect("one result per child")?;
-        for (name, entry) in sub_hints {
-            hints.push(name, entry);
-        }
+        hints.append(sub_hints);
         subs.push(defer);
         carried.push(&child.defer);
     }
@@ -2290,17 +2245,12 @@ pub fn aggregate_with_stats(
         let leaf = DeferredClaim::leaf();
         hints.push(
             "leaf_defer",
-            vec![leaf.bytecode_value, leaf.matrix_a_value, leaf.matrix_b_value],
+            &[leaf.bytecode_value, leaf.matrix_a_value, leaf.matrix_b_value],
         );
         leaf
     } else {
         let _span = tracing::info_span!("Batch deferred claims").entered();
-        let (agg_hints, reduced) =
-            aggregate_deferred_claims(&subs, &carried, bytecode).map_err(AggregationError::InvalidChild)?;
-        for (name, entry) in agg_hints {
-            hints.push(name, entry);
-        }
-        reduced
+        aggregate_deferred_claims(&subs, &carried, bytecode, &mut hints).map_err(AggregationError::InvalidChild)?
     };
 
     let direct_root = if blobs.is_empty() {
@@ -2313,23 +2263,22 @@ pub fn aggregate_with_stats(
             .as_chunks::<CELL_SYMBOLS>()
             .0
         {
-            hints.push("da_weights", block.to_vec());
+            hints.push("da_weights", block);
         }
         hints.push(
             "da_shape",
-            vec![count(n_rows), count(n_rows.next_power_of_two().ilog2() as usize)],
+            &[count(n_rows), count(n_rows.next_power_of_two().ilog2() as usize)],
         );
         // Padding rows are constants the guest bakes, so only the real rows'
         // symbols ride the stream.
         let (c, m) = (CELL_SYMBOLS, CODEWORD_SYMBOLS);
         for j in 0..CELLS_PER_ROW {
             for i in 0..n_rows {
-                hints.push(
+                hints.push_iter(
                     "da_symbols",
                     witness.codewords[i * m + j * c..i * m + (j + 1) * c]
                         .iter()
-                        .map(|&w| F192::from(F64(w)))
-                        .collect(),
+                        .map(|&w| F192::from(F64(w))),
                 );
             }
         }
@@ -2354,14 +2303,14 @@ pub fn aggregate_with_stats(
         .chain(children.iter().flat_map(|child| &child.da_roots))
     {
         let slot = take_slot(&da_roots, &mut claimed, &mut da_dups, root);
-        hints.push("da_index", vec![count(slot)]);
+        hints.push("da_index", &[count(slot)]);
     }
     if claimed.contains(&false) {
         return Err(AggregationError::BlobNotCovered);
     }
-    hints.push("da_meta", vec![count(da_roots.len()), count(da_dups.len())]);
+    hints.push("da_meta", &[count(da_roots.len()), count(da_dups.len())]);
     for root in da_roots.iter().chain(&da_dups) {
-        hints.push("da_roots", da_claim_cells(root));
+        hints.push("da_roots", &da_claim_cells(root));
     }
 
     let public_input = statement_digest(
@@ -2373,9 +2322,8 @@ pub fn aggregate_with_stats(
     if let Some(forge) = FORGE.with(|forge| forge.borrow_mut().take()) {
         forge(&mut hints);
     }
-    let witness = hints.into_witness();
     let (proof, stats) =
-        prove_with(guest, &witness, public_input, log_inv_rate, gpow).map_err(AggregationError::ProofError)?;
+        prove_with(guest, &hints, public_input, log_inv_rate, gpow).map_err(AggregationError::ProofError)?;
     Ok((
         EthereumProof {
             xmss_signers: cover.xmss.signers,
@@ -3429,11 +3377,11 @@ def main():
         let guest = compile(&parse_with_replacements(&source, &placeholder_map(18)).unwrap());
         let run = |point: &[F192], offset: usize, kappa: usize, expected: F192| {
             let mut hints = Hints::default();
-            hints.push("point", point.to_vec());
-            hints.push("offset", vec![count(offset)]);
-            hints.push("kappa", vec![count(kappa)]);
+            hints.push("point", point);
+            hints.push("offset", &[count(offset)]);
+            hints.push("kappa", &[count(kappa)]);
             let mut program = guest.clone();
-            hints.install(&mut program);
+            program.set_witnesses(hints);
             program.execute([expected, F192::ZERO])
         };
         let mut rng = StdRng::seed_from_u64(813);
@@ -3496,17 +3444,11 @@ def main():
         }
         let run = |index: usize, leaf: [u8; 32], pairs: &[[[u8; 32]; 2]], root: [u8; 32]| {
             let mut hints = Hints::default();
-            hints.push(
-                "bits",
-                (0..3).map(|k| F192::from(F64(((index >> k) & 1) as u64))).collect(),
-            );
-            hints.push("leaf", pack_hash_state(&leaf).to_vec());
-            hints.push(
-                "merkle_children",
-                pairs.iter().flatten().flat_map(pack_hash_state).collect(),
-            );
+            hints.push_iter("bits", (0..3).map(|k| F192::from(F64(((index >> k) & 1) as u64))));
+            hints.push("leaf", &pack_hash_state(&leaf));
+            hints.push_iter("merkle_children", pairs.iter().flatten().flat_map(pack_hash_state));
             let mut program = guest.clone();
-            hints.install(&mut program);
+            program.set_witnesses(hints);
             program.execute(pack_hash_state(&root))
         };
         for index in 0..8 {
@@ -3837,12 +3779,12 @@ def main():
                 .map(|i| primitives::hash::hash(&(i as u64).to_le_bytes()))
                 .collect();
             let mut hints = Hints::default();
-            hints.push("n", vec![count(n)]);
+            hints.push("n", &[count(n)]);
             for root in &roots {
-                hints.push("root", da_claim_cells(root));
+                hints.push("root", &da_claim_cells(root));
             }
             let mut program = guest.clone();
-            hints.install(&mut program);
+            program.set_witnesses(hints);
             let public = pack_hash_state(&da_list_digest(&roots));
             let execution = program.execute(public).unwrap();
             assert!(execution.unconstrained_reads.is_empty(), "{n} roots");
@@ -3882,17 +3824,17 @@ def main():
             let mut hints = Hints::default();
             hints.push(
                 "roots",
-                [
+                &[
                     da_claim_cells(&first),
                     da_claim_cells(&second),
                     da_claim_cells(&outside),
                 ]
                 .concat(),
             );
-            hints.push("n_slots", vec![count(slots)]);
-            hints.push("da_index", vec![index]);
+            hints.push("n_slots", &[count(slots)]);
+            hints.push("da_index", &[index]);
             let mut program = guest.clone();
-            hints.install(&mut program);
+            program.set_witnesses(hints);
             program.execute(pack_hash_state(&da_list_digest(&[claimed])))
         };
         assert!(run(2, count(0), first).unwrap().unconstrained_reads.is_empty());
@@ -3916,17 +3858,14 @@ def main():
             let mut hints = Hints::default();
             hints.push(
                 "da_shape",
-                vec![count(n_rows), count(n_rows.next_power_of_two().ilog2() as usize)],
+                &[count(n_rows), count(n_rows.next_power_of_two().ilog2() as usize)],
             );
             for j in 0..CELLS_PER_ROW {
                 for i in 0..n_rows {
                     let start = i * CODEWORD_SYMBOLS + j * CELL_SYMBOLS;
-                    hints.push(
+                    hints.push_iter(
                         "da_symbols",
-                        words[start..start + CELL_SYMBOLS]
-                            .iter()
-                            .map(|&w| F192::from(F64(w)))
-                            .collect(),
+                        words[start..start + CELL_SYMBOLS].iter().map(|&w| F192::from(F64(w))),
                     );
                 }
             }
@@ -3934,10 +3873,10 @@ def main():
                 .as_chunks::<CELL_SYMBOLS>()
                 .0
             {
-                hints.push("da_weights", block.to_vec());
+                hints.push("da_weights", block);
             }
             let mut program = guest.clone();
-            hints.install(&mut program);
+            program.set_witnesses(hints);
             program.execute(public)
         };
         let honest = run(&codewords).unwrap();
@@ -4360,7 +4299,7 @@ def main():
         };
 
         assert_eq!(
-            lean_xmss_hints(&pk, &sig, &message).err(),
+            lean_xmss_hints(&mut Hints::default(), &pk, &sig, &message).err(),
             Some(AggregationError::MalformedRawSignature)
         );
         assert_eq!(

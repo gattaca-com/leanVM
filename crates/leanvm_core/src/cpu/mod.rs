@@ -116,8 +116,68 @@ fn announce_public(ps: &mut ProverState, log_mem: usize, rows: [usize; tables::N
     ps.add_scalar(F192::new(log_inv_rate as u64, 0, 0));
 }
 
+/// One witness stream: its entries back to back in `data`, entry `i` ending at `ends[i]`.
+#[derive(Clone, Default)]
+pub struct WitnessStream {
+    data: Vec<F192>,
+    ends: Vec<u32>,
+}
+
+impl WitnessStream {
+    fn push_iter(&mut self, entry: impl IntoIterator<Item = F192>) {
+        self.data.extend(entry);
+        self.ends.push(self.data.len() as u32);
+    }
+
+    /// Entry `i`, if the stream has one.
+    fn entry(&self, i: usize) -> Option<&[F192]> {
+        let end = *self.ends.get(i)? as usize;
+        Some(&self.data[self.start(i)..end])
+    }
+
+    fn entry_mut(&mut self, i: usize) -> &mut [F192] {
+        let (start, end) = (self.start(i), self.ends[i] as usize);
+        &mut self.data[start..end]
+    }
+
+    fn start(&self, i: usize) -> usize {
+        i.checked_sub(1).map_or(0, |j| self.ends[j] as usize)
+    }
+}
+
 /// Named witness streams: per stream, the entries its `hint_witness` calls pop.
-pub type Witness = HashMap<String, Vec<Vec<F192>>>;
+#[derive(Clone, Default)]
+pub struct Witness(HashMap<String, WitnessStream>);
+
+impl Witness {
+    /// Append `entry` to stream `name`.
+    pub fn push(&mut self, name: &str, entry: &[F192]) {
+        self.push_iter(name, entry.iter().copied());
+    }
+
+    /// [`Self::push`] of an entry the iterator yields, with no buffer in between.
+    pub fn push_iter(&mut self, name: &str, entry: impl IntoIterator<Item = F192>) {
+        match self.0.get_mut(name) {
+            Some(stream) => stream.push_iter(entry),
+            None => self.0.entry(name.to_string()).or_default().push_iter(entry),
+        }
+    }
+
+    /// Append every stream of `other` to the stream of the same name.
+    pub fn append(&mut self, other: Self) {
+        for (name, stream) in other.0 {
+            let ours = self.0.entry(name).or_default();
+            let shift = ours.data.len() as u32;
+            ours.data.extend(stream.data);
+            ours.ends.extend(stream.ends.into_iter().map(|end| end + shift));
+        }
+    }
+
+    /// Entry `i` of stream `name`, for a test to forge.
+    pub fn entry_mut(&mut self, name: &str, i: usize) -> &mut [F192] {
+        self.0.get_mut(name).expect("a stream").entry_mut(i)
+    }
+}
 
 #[derive(Clone)]
 pub struct Program {
@@ -191,7 +251,7 @@ impl Program {
             bytecode_hash,
             bytecode_cols,
             main_frame,
-            witness: HashMap::new(),
+            witness: Witness::default(),
             fn_ranges: Vec::new(),
             src_lines: Vec::new(),
             min_log_committed: 0,
@@ -237,7 +297,16 @@ impl Program {
     /// may be hinted many times). Prover-side data: entirely unconstrained,
     /// invisible to verification.
     pub fn set_witness(&mut self, name: impl Into<String>, entries: Vec<Vec<F192>>) {
-        self.witness.insert(name.into(), entries);
+        let mut stream = WitnessStream::default();
+        for entry in entries {
+            stream.push_iter(entry);
+        }
+        self.witness.0.insert(name.into(), stream);
+    }
+
+    /// Replace every witness stream with `witness`.
+    pub fn set_witnesses(&mut self, witness: Witness) {
+        self.witness = witness;
     }
 
     /// Assemble a program directly from a fixed bytecode vector, starting at

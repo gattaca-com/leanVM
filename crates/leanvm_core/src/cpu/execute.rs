@@ -278,7 +278,7 @@ fn in_k(what: &'static str, v: F192) -> Result<F64, Fault> {
 /// once per run, so a pop indexes it rather than hashing its name.
 struct Stream<'a> {
     name: &'a str,
-    entries: Option<&'a [Vec<F192>]>,
+    entries: Option<&'a WitnessStream>,
     next: usize,
 }
 
@@ -288,11 +288,11 @@ impl<'a> Stream<'a> {
         let entries = self
             .entries
             .ok_or_else(|| Fault::Witness(format!("no witness stream `{name}` (Program::set_witness)")))?;
-        let entry = entries.get(self.next).ok_or_else(|| {
+        let entry = entries.entry(self.next).ok_or_else(|| {
             Fault::Witness(format!(
                 "witness stream `{name}` exhausted (needs entry {}, has {})",
                 self.next + 1,
-                entries.len()
+                entries.ends.len()
             ))
         })?;
         if entry.len() != len as usize {
@@ -380,7 +380,7 @@ impl Program {
             .iter()
             .map(|name| Stream {
                 name,
-                entries: witness.get(name).map(Vec::as_slice),
+                entries: witness.0.get(name),
                 next: 0,
             })
             .collect();
