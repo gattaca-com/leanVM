@@ -45,6 +45,7 @@ mod lanes;
 
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::bit_fold::{BLOCK, BitFold};
+use crate::zerocheck::bits::{Bits, Scratch};
 #[cfg(test)]
 use crate::zerocheck::univariate_skip::pack_bits;
 use crate::zerocheck::univariate_skip::{SharedPadding, build_eq, eq_mass_below};
@@ -215,7 +216,7 @@ fn split_eq(r: &[F192]) -> (Vec<F192x8>, Vec<F192>, usize) {
     (pack_eq(&build_eq(&r[..n_lo])), build_eq(&r[n_lo..]), 1 << n_lo)
 }
 
-/// The packed `a`, `b`, `c` witnesses, 64 skip bits per row.
+/// The packed `a`, `b`, `c` witnesses in memory, 64 skip bits per row.
 ///
 /// `c` spans every position. `a` and `b` may stop early, as long as the kernels read no row past their end:
 /// a padding tail is read up to its template block only.
@@ -229,35 +230,24 @@ pub struct PackedWitness<'a> {
     pub c: &'a [u8],
 }
 
-impl<'a> PackedWitness<'a> {
-    /// The three witnesses cut into rows of `CHUNKS` bytes, one per position at this level.
-    fn rows<const CHUNKS: usize>(self) -> [&'a [[u8; CHUNKS]]; 3] {
-        let rows = [self.a, self.b, self.c].map(|packed| {
-            let (rows, rest) = packed.as_chunks::<CHUNKS>();
-            assert!(rest.is_empty(), "packed witness is whole rows");
-            rows
-        });
-        assert!(
-            rows[0].len() == rows[1].len() && rows[0].len() <= rows[2].len(),
-            "a, b no longer than c"
-        );
-        assert!(rows[2].len().is_power_of_two(), "a power-of-two number of positions");
-        rows
-    }
-}
-
 /// The folded `a`, `b`, `c` values of up to 64 consecutive positions, as eight vectors each.
 type Folded = [[F192x8; 8]; 3];
 
 /// Fold positions `first..first + len` of each witness, in the vector order of [`BitFold::fold_block_x8`].
+///
+/// A rebuilt witness is rebuilt into `scratch` as far as these positions need.
 #[inline(always)]
 fn fold_x8<const CHUNKS: usize, const GROUP_LOG: usize>(
     fold: &BitFold,
-    rows: [&[[u8; CHUNKS]]; 3],
+    bits: &Bits<'_>,
+    scratch: &mut Option<Scratch>,
     first: usize,
     len: usize,
 ) -> Folded {
-    rows.map(|r| fold.fold_block_x8::<CHUNKS, GROUP_LOG>(&r[first..first + len]))
+    let window = bits.window(first * CHUNKS..(first + len) * CHUNKS, scratch);
+    window
+        .rows::<CHUNKS>(first, len)
+        .map(|r| fold.fold_block_x8::<CHUNKS, GROUP_LOG>(r))
 }
 
 /// Two consecutive multilinear rounds from one pass over the packed bits.
@@ -298,7 +288,13 @@ impl RoundPair {
 /// ```
 ///
 /// The linear `c` term reaches `G(1)` only.
-pub fn bit_round_pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], padding: &PaddingSpec) -> RoundPair {
+pub fn bit_round_pair<'a>(
+    bits: impl Into<Bits<'a>>,
+    fold: &BitFold,
+    r_eq: &[F192],
+    padding: &PaddingSpec,
+) -> RoundPair {
+    let bits = bits.into();
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "gfni",
@@ -307,7 +303,11 @@ pub fn bit_round_pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], pa
         target_feature = "vpclmulqdq"
     ))]
     {
-        let by_instance = if fold.n_chunks() == 8 { lanes::pair(bits, fold, r_eq, padding) } else { None };
+        let by_instance = if fold.n_chunks() == 8 {
+            lanes::pair(bits, fold, r_eq, padding)
+        } else {
+            None
+        };
         if let Some(pair) = by_instance {
             return pair;
         }
@@ -325,12 +325,13 @@ pub fn bit_round_pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], pa
 /// One round straight from the packed bits, storing the folded `(a, b, c)` tables for the rounds that follow.
 ///
 /// Returns the round's `(G(1), G(inf))`, then the three tables.
-pub fn bit_round_materialize(
-    bits: PackedWitness<'_>,
+pub fn bit_round_materialize<'a>(
+    bits: impl Into<Bits<'a>>,
     fold: &BitFold,
     r_eq: &[F192],
     padding: &PaddingSpec,
 ) -> ((F192, F192), [Vec<F192>; 3]) {
+    let bits = bits.into();
     match fold.n_chunks() {
         8 => bit_round_store_kernel::<8>(bits, fold, r_eq, padding),
         16 => bit_round_store_kernel::<16>(bits, fold, r_eq, padding),
@@ -363,13 +364,12 @@ pub fn bit_round_materialize(
 ///
 /// So eight products per quad cover both rounds, the same count as two passes.
 fn bit_round_pair_kernel<const CHUNKS: usize>(
-    bits: PackedWitness<'_>,
+    bits: Bits<'_>,
     fold: &BitFold,
     r_eq: &[F192],
     padding: &PaddingSpec,
 ) -> RoundPair {
-    let rows = bits.rows::<CHUNKS>();
-    let n_quads = rows[2].len() / 4;
+    let n_quads = bits.positions::<CHUNKS>() / 4;
     assert!(n_quads >= 1, "two rounds need four positions");
     assert_eq!(r_eq.len(), n_quads.trailing_zeros() as usize + 1);
 
@@ -387,10 +387,11 @@ fn bit_round_pair_kernel<const CHUNKS: usize>(
     let shared_eq = shared.as_ref().map(|s| pack_eq(&s.eq));
     let n_live_tasks = shared.as_ref().map_or(eq_hi.len(), |s| s.live.div_ceil(lo_size));
 
-    let sums = parallel::map_reduce(
+    let sums = parallel::map_reduce_with_state(
         n_live_tasks + shared.is_some() as usize,
+        || bits.scratch(BLOCK * CHUNKS),
         || [F192::ZERO; 8],
-        |hi| {
+        |scratch, total, hi| {
             let (first, count, eq_lo, weight) = match &shared {
                 Some(s) if hi == n_live_tasks => {
                     (s.live, s.eq.len(), shared_eq.as_deref().unwrap_or_default(), s.weight)
@@ -412,14 +413,14 @@ fn bit_round_pair_kernel<const CHUNKS: usize>(
                 if !(quad_first..quad_first + n).any(live) {
                     continue;
                 }
-                let f = fold_x8::<CHUNKS, 2>(fold, rows, 4 * quad_first, 4 * n);
+                let f = fold_x8::<CHUNKS, 2>(fold, &bits, scratch, 4 * quad_first, 4 * n);
                 quad_sums(
                     &f,
                     eq_lo[lo_first / 8..][..2].try_into().expect("two vectors"),
                     &mut acc,
                 );
             }
-            acc.map(|s| weight * s.reduce())
+            *total = std::array::from_fn(|i| total[i] + weight * acc[i].reduce());
         },
         |x, y| std::array::from_fn(|i| x[i] + y[i]),
     );
@@ -483,13 +484,12 @@ fn pair_sums(f: &Folded, eq: &[F192x8; 4], acc: &mut [Prod8; 2]) {
 ///
 /// Positions pair up as `(2k, 2k + 1)`, the low index bit being the variable this round binds.
 fn bit_round_store_kernel<const CHUNKS: usize>(
-    bits: PackedWitness<'_>,
+    bits: Bits<'_>,
     fold: &BitFold,
     r_eq: &[F192],
     padding: &PaddingSpec,
 ) -> ((F192, F192), [Vec<F192>; 3]) {
-    let rows = bits.rows::<CHUNKS>();
-    let n_pos = rows[2].len();
+    let n_pos = bits.positions::<CHUNKS>();
     assert!(n_pos >= 2, "a round needs two positions");
     assert_eq!(r_eq.len(), n_pos.trailing_zeros() as usize - 1);
 
@@ -501,7 +501,11 @@ fn bit_round_store_kernel<const CHUNKS: usize>(
     let live = |pair: usize| (pair & pair_in_block_mask) < live_pairs;
 
     // Folds `count` pairs from pair `first` into `outs`, each pair weighted by `eq_lo`: the unreduced `(G(1), G(inf))`.
-    let fold_run = |first: usize, count: usize, eq_lo: &[F192x8], [oa, ob, oc]: [&mut [F192]; 3]| {
+    let fold_run = |scratch: &mut Option<Scratch>,
+                    first: usize,
+                    count: usize,
+                    eq_lo: &[F192x8],
+                    [oa, ob, oc]: [&mut [F192]; 3]| {
         let stream = Stream::new();
         let mut acc = [Prod8::ZERO; 2];
         // Thirty-two pairs per folded block.
@@ -516,7 +520,7 @@ fn bit_round_store_kernel<const CHUNKS: usize>(
                 }
                 continue;
             }
-            let f = fold_x8::<CHUNKS, 0>(fold, rows, 2 * pair_first, o_len);
+            let f = fold_x8::<CHUNKS, 0>(fold, &bits, scratch, 2 * pair_first, o_len);
             pair_sums(
                 &f,
                 eq_lo[lo_first / 8..][..4].try_into().expect("four vectors"),
@@ -541,28 +545,39 @@ fn bit_round_store_kernel<const CHUNKS: usize>(
     let template = shared.map(|s| {
         let mut t: [Vec<F192>; 3] = std::array::from_fn(|_| vec![F192::ZERO; 2 * s.eq.len()]);
         let [ta, tb, tc] = &mut t;
-        let (g1, ginf) = fold_run(s.live, s.eq.len(), &pack_eq(&s.eq), [ta, tb, tc]);
+        let (g1, ginf) = fold_run(
+            &mut bits.scratch(BLOCK * CHUNKS),
+            s.live,
+            s.eq.len(),
+            &pack_eq(&s.eq),
+            [ta, tb, tc],
+        );
         (t, (s.weight * g1.reduce(), s.weight * ginf.reduce()))
     });
 
     // `Tables` cuts a tail of blocks of at most 32 positions to its pattern, so it reads `TAIL_KEPT` positions past the live ones.
     let short_tail = padding.k_log.saturating_sub(position_log) <= 5;
-    let n_out = if short_tail { (2 * n_live_pairs).saturating_add(TAIL_KEPT).min(n_pos) } else { n_pos };
+    let n_out = if short_tail {
+        (2 * n_live_pairs).saturating_add(TAIL_KEPT).min(n_pos)
+    } else {
+        n_pos
+    };
     // SAFETY (x3): every slot is written below, padding included.
     let mut out: [Vec<F192>; 3] = std::array::from_fn(|_| unsafe { primitives::uninit_vec(n_out) });
     let [out_a, out_b, out_c] = &mut out;
     let chunks = [out_a, out_b, out_c].map(|o| parallel::Chunks::new(o, 2 * lo_size));
 
-    let (g1, ginf) = parallel::map_reduce(
+    let (g1, ginf) = parallel::map_reduce_with_state(
         chunks[0].count(),
+        || bits.scratch(BLOCK * CHUNKS),
         || (F192::ZERO, F192::ZERO),
-        |hi| {
+        |scratch, (total1, total_inf), hi| {
             // SAFETY: task `hi` takes chunk `hi` of each output once, and the buffers outlive the dispatch.
             let outs = chunks.map(|ch| unsafe { ch.get(hi) });
             let first = hi * lo_size;
             let n_live = n_live_pairs.saturating_sub(first).min(lo_size);
             let mut halves = outs.map(|o| o.split_at_mut(2 * n_live));
-            let (g1, ginf) = fold_run(first, n_live, &eq_lo, halves.each_mut().map(|h| &mut *h.0));
+            let (g1, ginf) = fold_run(scratch, first, n_live, &eq_lo, halves.each_mut().map(|h| &mut *h.0));
             if let Some((t, _)) = &template {
                 for ((_, rest), t) in halves.iter_mut().zip(t) {
                     let at = 2 * (first + n_live);
@@ -571,7 +586,8 @@ fn bit_round_store_kernel<const CHUNKS: usize>(
                     }
                 }
             }
-            (eq_hi[hi] * g1.reduce(), eq_hi[hi] * ginf.reduce())
+            *total1 += eq_hi[hi] * g1.reduce();
+            *total_inf += eq_hi[hi] * ginf.reduce();
         },
         |(s1, si), (t1, ti)| (s1 + t1, si + ti),
     );

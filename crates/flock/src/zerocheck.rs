@@ -18,26 +18,26 @@
 //! puts all three claims at ONE point and leaves lincheck a single family of
 //! bit slices for ring switching (doc/leanvm Annex C).
 
-use flux_profiler::timed;
 use fiat_shamir::transcript::ProverState;
+use flux_profiler::timed;
 use primitives::field::{F8, F192};
 
 use pcs::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 
 pub use primitives::bit_fold;
+pub mod bits;
 pub mod multilinear;
 pub mod univariate_skip;
 pub mod univariate_skip_optimized;
 
 use bit_fold::BitFold;
+use bits::Bits;
 use multilinear::{
-    PackedWitness, Tables, bit_round_materialize, bit_round_pair, fold_in_place_pair, fold_in_place_single,
-    interpolate_at_z_combined, round_pair_naive, round_single_naive,
+    Tables, bit_round_materialize, bit_round_pair, fold_in_place_pair, fold_in_place_single, interpolate_at_z_combined,
+    round_pair_naive, round_single_naive,
 };
 use primitives::multilinear::lagrange_weights_naive;
-use univariate_skip_optimized::{
-    c_s, medium_challenges, round1_shift_reduce_extract_c_packed_padded, small_challenges,
-};
+use univariate_skip_optimized::{c_s, medium_challenges, round1_bits, small_challenges};
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
 /// |Λ| = 2^K_SKIP = 64 elements, which is the round-1 prover message: one
@@ -123,47 +123,21 @@ fn send_round(
     g0 + chi * (g0 + g1 + (F192::ONE + chi) * g_inf)
 }
 
-/// `a` and `b` must hold every block the prover reads.
-///
-/// That is all blocks, or with a padding tail the blocks up to and including the template block `live_blocks`.
-/// A tail needs blocks of at least `2^(k_skip + N_INNER)` bits, so the kernels' units fit within one.
-fn assert_ab_cover(a_len: usize, b_len: usize, m: usize, padding: &PaddingSpec) {
-    let total = (1usize << m) / 8;
-    let tail = padding.live_blocks < 1usize << (m - padding.k_log);
-    let needed = if tail {
-        (padding.live_blocks + 1) << (padding.k_log - 3)
-    } else {
-        total
-    };
-    assert!(
-        !tail || padding.k_log >= K_SKIP + N_INNER,
-        "blocks hold whole round-1 units"
-    );
-    assert!(
-        a_len == b_len && (needed..=total).contains(&a_len),
-        "a, b cover the blocks read"
-    );
-}
-
 /// THE zerocheck prover entry: proves `a·b ⊕ c = 0` over the padded cube,
 /// leaving `(â, b̂, ĉ)` claimed at one point for lincheck to batch.
+///
+/// Given `a` and `b` must hold every block the prover reads: all blocks, or with a padding tail those up to and
+/// including the template block `live_blocks`. A tail needs blocks of at least `2^(k_skip + N_INNER)` bits,
+/// so the kernels' units fit within one.
 #[timed]
-pub fn prove_packed_padded(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    m: usize,
-    padding: &PaddingSpec,
-    ps: &mut ProverState,
-) -> ZerocheckClaim {
+pub fn prove_packed_padded(bits: Bits<'_>, m: usize, padding: &PaddingSpec, ps: &mut ProverState) -> ZerocheckClaim {
     let k_skip = K_SKIP;
     assert!(
         m >= k_skip + N_INNER,
         "prove requires m >= k_skip + N_INNER (= {})",
         k_skip + N_INNER
     );
-    assert_eq!(c_packed.len(), (1usize << m) / 8);
-    assert_ab_cover(a_packed.len(), b_packed.len(), m, padding);
+    bits.assert_covers(m, padding);
     let n_mlv = m - k_skip;
 
     // ---- Construct the equality tail (with fixed constants in the inner 7 dims) ----
@@ -186,9 +160,7 @@ pub fn prove_packed_padded(
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
-    let (round1_ab_opt, round1_c_opt) = round1_shift_reduce_extract_c_packed_padded(
-        a_packed, b_packed, c_packed, m, k_skip, &r_rest, &inv_table, padding,
-    );
+    let (round1_ab_opt, round1_c_opt) = round1_bits(bits, m, k_skip, &r_rest, &inv_table, padding);
     let c_s = c_s();
     let round1: Vec<F192> = round1_ab_opt
         .iter()
@@ -217,11 +189,6 @@ pub fn prove_packed_padded(
     // The kernels take the eq challenges of the variables they do not bind.
     // They return the bare `(G(1), G(inf))` that goes on the wire.
     let span = tracing::info_span!("Bit rounds").entered();
-    let bits = PackedWitness {
-        a: a_packed,
-        b: b_packed,
-        c: c_packed,
-    };
     let lagrange = lagrange_weights_naive(k_skip, z);
     // The running claim, mirrored from the verifier (same round-1 values, same z).
     // `(1 + r) G(0) + r G(1) = claim` lets the wire drop `G(0)`, so the prover needs it too.
@@ -327,6 +294,7 @@ pub fn prove_packed_padded(
 
 #[cfg(test)]
 mod tests {
+    use super::multilinear::PackedWitness;
     use super::*;
     use primitives::test_rng::Rng;
 
@@ -338,7 +306,12 @@ mod tests {
         m: usize,
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> ZerocheckClaim {
-        prove_packed_padded(a_packed, b_packed, c_packed, m, &PaddingSpec::dense(m), ps)
+        let bits = PackedWitness {
+            a: a_packed,
+            b: b_packed,
+            c: c_packed,
+        };
+        prove_packed_padded(bits.into(), m, &PaddingSpec::dense(m), ps)
     }
 
     /// The quirky evaluation `f̂(z, chi)` of a Boolean witness: the φ8-Lagrange
@@ -485,7 +458,12 @@ mod tests {
                 };
                 let ab_len = ((live_blocks + 1) * block_bits / 8).min(c_p.len());
                 let mut ps = fiat_shamir::transcript::ProverState::from_label(b"flock-test-v0");
-                let claim = prove_packed_padded(&a_p[..ab_len], &b_p[..ab_len], &c_p, m, &padding, &mut ps);
+                let bits = PackedWitness {
+                    a: &a_p[..ab_len],
+                    b: &b_p[..ab_len],
+                    c: &c_p,
+                };
+                let claim = prove_packed_padded(bits.into(), m, &padding, &mut ps);
                 (claim, ps.into_proof().stream)
             };
             assert_eq!(run(live_blocks), run(n_blocks), "live_blocks={live_blocks}");

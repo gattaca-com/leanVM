@@ -321,6 +321,29 @@ pub(crate) fn add3_fused_parts(x: V32, y: V32, z: V32) -> (V32, (V32, V32, V32),
     (sum, (maj_left, maj_right, maj_aux), (rip_left, rip_right, rip_aux))
 }
 
+/// The word-major rows of one group, `z | a | b`, which a group builder writes.
+pub struct GroupRows(pub(crate) Vec<V64>);
+
+impl GroupRows {
+    /// Rows for `words` words of each of the three tables.
+    pub(crate) fn new(words: usize) -> Self {
+        Self(vec![V64::ZERO; 3 * words])
+    }
+}
+
+/// Row `i` of `rows` is word `i` of each lane's block: transpose into the block-major `table`.
+///
+/// Block `l` takes `words` words from `l * words`, for the first `group_blocks` lanes.
+pub(crate) fn blocks_from_rows(rows: &[V64], words: usize, group_blocks: usize, table: &mut [u64]) {
+    // Row `i` of table `t` is word `i` of block `l`.
+    for (tile, i) in rows.chunks_exact(LANES).zip((0..).step_by(LANES)) {
+        let blocks = transpose_lanes(tile);
+        for (l, block) in blocks.iter().take(group_blocks).enumerate() {
+            table[l * words + i..][..LANES].copy_from_slice(block);
+        }
+    }
+}
+
 /// The bytes of the `u64` words on a little-endian target.
 pub(crate) fn packed_bytes(words: &[u64]) -> &[u8] {
     const _: () = assert!(
@@ -465,14 +488,8 @@ where
                 if let Some(p) = prev {
                     emit(p, prev_buf, sent, of, of);
                 }
-                // Row `i` of table `t` is word `i` of block `l`: transpose into the block-major buf.
                 for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.chunks_mut(scratch_words)) {
-                    for (tile, i) in t_rows.chunks_exact(LANES).zip((0..).step_by(LANES)) {
-                        let blocks = transpose_lanes(tile);
-                        for (l, block) in blocks.iter().take(group_blocks).enumerate() {
-                            table[l * WORDS + i..][..LANES].copy_from_slice(block);
-                        }
-                    }
+                    blocks_from_rows(t_rows, WORDS, group_blocks, table);
                 }
                 (*last, *template) = (1 - *last, is_padding);
                 pending = Some(g);

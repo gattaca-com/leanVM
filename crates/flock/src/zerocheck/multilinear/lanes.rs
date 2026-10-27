@@ -15,12 +15,13 @@
 //! The input is a 64-byte line from each of the group's instances, 64 instances a block apart. At 8 bytes a position,
 //! a line holds eight positions, two quads.
 
-use super::{PackedWitness, RoundPair, padding_pairs};
+use super::{RoundPair, padding_pairs};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::bit_fold::{
     BitFold,
     gfni::{ByteAcc, LineRegs, byte_matrices},
 };
+use crate::zerocheck::bits::Bits;
 use crate::zerocheck::univariate_skip::{build_eq, eq_mass_below};
 use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use primitives::field::{F192, F192x8, Prod8};
@@ -43,9 +44,9 @@ const STEP: usize = 64 / CHUNKS;
 /// The pair pass for rows of `CHUNKS` bytes, or `None` when an instance holds under two quads.
 ///
 /// Same message as [`super::bit_round_pair_kernel`], on a witness of whole instances.
-pub(super) fn pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], padding: &PaddingSpec) -> Option<RoundPair> {
+pub(super) fn pair(bits: Bits<'_>, fold: &BitFold, r_eq: &[F192], padding: &PaddingSpec) -> Option<RoundPair> {
     assert_eq!(fold.n_chunks(), CHUNKS);
-    let m = (8 * bits.c.len()).trailing_zeros() as usize;
+    let m = (8 * bits.len_bytes()).trailing_zeros() as usize;
     // A quad covers 4 positions of 2^6 skip bits times 2^t bound rows.
     let quad_log = (32 * CHUNKS).trailing_zeros() as usize;
     let in_log = padding.k_log.checked_sub(quad_log).filter(|&l| l >= 1)?;
@@ -58,7 +59,9 @@ pub(super) fn pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], paddi
     let tail = padding.live_blocks < n_inst;
     let last = if tail { padding.live_blocks } else { n_inst - 1 };
     let inst_bytes = 1usize << (padding.k_log - 3);
-    assert!(bits.a.len() >= (last + 1) * inst_bytes && bits.b.len() == bits.a.len());
+    if let Bits::Given(p) = bits {
+        assert!(p.a.len() >= (last + 1) * inst_bytes && p.b.len() == p.a.len());
+    }
 
     // Quads wholly in an instance's zero padding fold to zero.
     let (_, live) = padding_pairs(padding, quad_log - 1);
@@ -102,19 +105,32 @@ pub(super) fn pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], paddi
     });
 
     let n_groups = (last + 1).div_ceil(LANES);
-    let sums = parallel::map_reduce(
+    let sums = parallel::map_reduce_with_state(
         n_groups,
+        || bits.scratch(LANES * inst_bytes),
         || [F192::ZERO; 8],
-        |g| {
+        |scratch, total, g| {
             let (weights, scale) = match &template_weights {
                 Some(w) if g == template_group => (w, F192::ONE),
                 _ => (&lo_packed, hi[g]),
             };
             // Each lane's instance, the template's again past the last: those lanes weigh zero.
-            let lanes_of = |g| [bits.a, bits.b, bits.c].map(|t| lanes_of(t, (g * LANES, last), inst_bytes));
-            let tables = lanes_of(g);
-            let next = (g + 1 < n_groups).then(|| lanes_of(g + 1));
-            group(&tables, next.as_ref(), n_lines, &ma, &mb, weights).map(|s| s * scale)
+            let window = bits.window(
+                g * LANES * inst_bytes..((g + 1) * LANES).min(last + 1) * inst_bytes,
+                scratch,
+            );
+            let tables = window
+                .tables
+                .map(|t| lanes_of(t, window.first, (g * LANES, last), inst_bytes));
+            // Rebuilt tables are in cache already, so only given ones prefetch the next group.
+            let next = match bits {
+                Bits::Given(p) if g + 1 < n_groups => {
+                    Some([p.a, p.b, p.c].map(|t| lanes_of(t, 0, ((g + 1) * LANES, last), inst_bytes)))
+                }
+                _ => None,
+            };
+            let sums = group(&tables, next.as_ref(), n_lines, &ma, &mb, weights);
+            *total = std::array::from_fn(|i| total[i] + sums[i] * scale);
         },
         |x, y| std::array::from_fn(|i| x[i] + y[i]),
     );
@@ -128,10 +144,12 @@ pub(super) fn pair(bits: PackedWitness<'_>, fold: &BitFold, r_eq: &[F192], paddi
 }
 
 /// The 64-byte lines of instances `first..first + 64` of `table`, the instance `last` again past it.
-fn lanes_of(table: &[u8], (first, last): (usize, usize), inst_bytes: usize) -> [&[[u8; 64]]; LANES] {
+///
+/// `table` starts at byte `at` of the whole.
+fn lanes_of(table: &[u8], at: usize, (first, last): (usize, usize), inst_bytes: usize) -> [&[[u8; 64]]; LANES] {
     std::array::from_fn(|l| {
         let inst = (first + l).min(last);
-        table[inst * inst_bytes..][..inst_bytes].as_chunks().0
+        table[inst * inst_bytes - at..][..inst_bytes].as_chunks().0
     })
 }
 
@@ -240,7 +258,7 @@ fn group(
 
 #[cfg(test)]
 mod tests {
-    use super::super::bit_round_pair_kernel;
+    use super::super::{PackedWitness, bit_round_pair_kernel};
     use super::*;
     use primitives::multilinear::lagrange_weights_naive;
     use primitives::test_rng::Rng;
@@ -298,8 +316,8 @@ mod tests {
             let fold = BitFold::at_level(&lagrange, &[]);
             let r_eq = &r_rest[1..];
             assert_eq!(
-                pair(bits, &fold, r_eq, &padding),
-                Some(bit_round_pair_kernel::<CHUNKS>(bits, &fold, r_eq, &padding)),
+                pair(bits.into(), &fold, r_eq, &padding),
+                Some(bit_round_pair_kernel::<CHUNKS>(bits.into(), &fold, r_eq, &padding)),
                 "k_log={k_log}, useful={useful}, n_log={n_log}, live={live_blocks}"
             );
         }

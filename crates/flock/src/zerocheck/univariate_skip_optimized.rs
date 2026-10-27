@@ -37,6 +37,8 @@ use primitives::bits::bit_transpose_64bytes;
 use primitives::field::gf2_8::gf8_reduce;
 use primitives::field::{F8, F192, PHI_8_TABLE_192 as PHI_8_TABLE, phi8_192 as phi8};
 
+use super::bits::{Bits, Scratch};
+use super::multilinear::PackedWitness;
 #[cfg(test)]
 use super::univariate_skip::pack_bits;
 use super::univariate_skip::{SharedPadding, SplitEq, ntt_extend_vec};
@@ -870,6 +872,9 @@ impl WorkerState {
     }
 }
 
+/// Bytes of one `x_outer`'s window of each table.
+const X_OUTER_BYTES: usize = (1 << N_INNER) * N_CHUNKS;
+
 /// One `x_outer` step: shift-reduce + bit-transpose the `n_b_med` medium
 /// sub-windows, then fold them per lane through the convert table.
 ///
@@ -880,9 +885,7 @@ fn accumulate_x_outer<const FULL: bool>(
     n_b_med: usize,
     chunk_byte_base: usize,
     weights: &Weights,
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
+    [a_packed, b_packed, c_packed]: [&[u8]; 3],
     inv_table: &InvNttTableByteSingleGf8,
     state: &mut WorkerState,
 ) {
@@ -945,14 +948,12 @@ fn process_one_x_hi(
     n: usize,
     within_outer_mask: usize,
     b_med_counts: &[u8],
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
+    bits: &Bits<'_>,
     inv_table: &InvNttTableByteSingleGf8,
     weights: &[Weights],
     eq_hi_val: F192,
     grouped: bool,
-    state: &mut WorkerState,
+    (state, scratch): &mut (WorkerState, Option<Scratch>),
 ) {
     state.partials = Convert::new();
     let _ = grouped;
@@ -973,6 +974,12 @@ fn process_one_x_hi(
             continue;
         }
 
+        // The tables from this `x_outer` on, a rebuilt group's at least.
+        let chunk_byte_base = (x_outer << N_INNER) * N_CHUNKS;
+        let window = bits.window(chunk_byte_base..chunk_byte_base + X_OUTER_BYTES, scratch);
+        let [a_packed, b_packed, c_packed] = window.tables;
+        let chunk_byte_base = chunk_byte_base - window.first;
+
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "gfni",
@@ -985,9 +992,14 @@ fn process_one_x_hi(
             }
 
             let full = |i: usize| b_med_counts[(x_outer + i) & within_outer_mask] as usize == 1 << N_MEDIUM;
-            if grouped && x_outer_lo + GROUP_X_OUTERS <= n && (0..GROUP_X_OUTERS).all(full) {
-                let base = (x_outer << N_INNER) * N_CHUNKS;
-                let len = soa::GROUP * soa::WINDOW_BYTES;
+            let len = soa::GROUP * soa::WINDOW_BYTES;
+            let abs_base = chunk_byte_base + window.first;
+            if grouped
+                && x_outer_lo + GROUP_X_OUTERS <= n
+                && (0..GROUP_X_OUTERS).all(full)
+                && bits.in_one_group(abs_base..abs_base + len)
+            {
+                let base = chunk_byte_base;
                 // The next group's rows, which the kernel touches while it computes.
                 let next = [a_packed, b_packed, c_packed].map(|d| d.as_ptr().wrapping_add(base + len));
                 let WorkerState {
@@ -1021,7 +1033,6 @@ fn process_one_x_hi(
             }
         }
 
-        let chunk_byte_base = (x_outer << N_INNER) * N_CHUNKS;
         let weights = &weights[x_outer_lo];
 
         if n_b_med == (1 << N_MEDIUM) {
@@ -1029,9 +1040,7 @@ fn process_one_x_hi(
                 n_b_med,
                 chunk_byte_base,
                 weights,
-                a_packed,
-                b_packed,
-                c_packed,
+                [a_packed, b_packed, c_packed],
                 inv_table,
                 state,
             );
@@ -1040,9 +1049,7 @@ fn process_one_x_hi(
                 n_b_med,
                 chunk_byte_base,
                 weights,
-                a_packed,
-                b_packed,
-                c_packed,
+                [a_packed, b_packed, c_packed],
                 inv_table,
                 state,
             );
@@ -1113,16 +1120,29 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F192>, Vec<F192>) {
-    round1_padded(
-        a_packed, b_packed, c_packed, m, k_skip, r_rest, inv_table, padding, true,
-    )
+    let bits = PackedWitness {
+        a: a_packed,
+        b: b_packed,
+        c: c_packed,
+    };
+    round1_bits(bits.into(), m, k_skip, r_rest, inv_table, padding)
 }
 
-/// [`round1_shift_reduce_extract_c_packed_padded`], with the group kernel switchable for tests.
+/// [`round1_shift_reduce_extract_c_packed_padded`] on any [`Bits`].
+pub fn round1_bits(
+    bits: Bits<'_>,
+    m: usize,
+    k_skip: usize,
+    r_rest: &[F192],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F192>, Vec<F192>) {
+    round1_padded(bits, m, k_skip, r_rest, inv_table, padding, true)
+}
+
+/// [`round1_bits`], with the group kernel switchable for tests.
 fn round1_padded(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
+    bits: Bits<'_>,
     m: usize,
     k_skip: usize,
     r_rest: &[F192],
@@ -1136,9 +1156,7 @@ fn round1_padded(
         "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
         k_skip + N_INNER
     );
-    let total_bytes = (1usize << m) / 8;
-    assert_eq!(c_packed.len(), total_bytes);
-    super::assert_ab_cover(a_packed.len(), b_packed.len(), m, padding);
+    bits.assert_covers(m, padding);
     assert_eq!(r_rest.len(), m - k_skip);
     assert_eq!(inv_table.k, k_skip);
 
@@ -1165,7 +1183,7 @@ fn round1_padded(
     // `x_hi` values that worker claims and combined at the end.
     let (res_ab, res_c_s) = parallel::fold_reduce(
         n_live_tasks + shared.is_some() as usize,
-        WorkerState::new,
+        || (WorkerState::new(), bits.scratch(X_OUTER_BYTES)),
         |state, x_hi| {
             let (first, n, weights, eq_hi_val) = match &shared {
                 Some(s) if x_hi == n_live_tasks => (live_outer, s.eq.len(), &shared_weights, s.weight),
@@ -1181,9 +1199,7 @@ fn round1_padded(
                 n,
                 within_outer_mask,
                 &b_med_counts,
-                a_packed,
-                b_packed,
-                c_packed,
+                &bits,
                 inv_table,
                 weights,
                 eq_hi_val,
@@ -1191,14 +1207,15 @@ fn round1_padded(
                 state,
             );
         },
-        |mut a, b| {
+        |(mut a, scratch), (b, _)| {
             for i in 0..ELL {
                 a.local_res_ab[i] += b.local_res_ab[i];
                 a.local_res_c_s[i] += b.local_res_c_s[i];
             }
-            a
+            (a, scratch)
         },
     )
+    .0
     .into_results();
 
     let res_c_lifted = ntt_extend_vec(&res_c_s, inv_table);
@@ -1438,9 +1455,12 @@ mod tests {
             let r = build_protocol_r_rest(m, &outer);
             let table = make_inv_table();
             let run = |grouped| {
-                round1_padded(
-                    &packed[0], &packed[1], &packed[2], m, K_SKIP, &r, &table, &padding, grouped,
-                )
+                let bits = PackedWitness {
+                    a: &packed[0],
+                    b: &packed[1],
+                    c: &packed[2],
+                };
+                round1_padded(bits.into(), m, K_SKIP, &r, &table, &padding, grouped)
             };
             assert_eq!(run(true), run(false), "k_log={k_log} live={live_blocks}");
         }

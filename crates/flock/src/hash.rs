@@ -82,15 +82,18 @@
 //! witness bits. Pinning them to a caller's values is the embedding
 //! protocol's job, via PCS openings at fixed indices.
 
-use flux_profiler::timed;
 use crate::gf2::{
     ADD3_BITS, CARRY_BITS_PER_ADD, MatrixSide, WireWord, back_add, back_add3_fused, walk_add, walk_add3_fused,
     wire_from_const, wire_from_slot_base, wire_rotl, wire_rotr, wire_xor,
 };
 use crate::witness::packed_bytes;
 use crate::witness::{
-    BitRecord, LANES, V32, V64, add_carry_parts, add3_fused_parts, drive_witness_packed, drive_witness_packed_into,
+    BitRecord, GroupRows, LANES, V32, V64, add_carry_parts, add3_fused_parts, blocks_from_rows, drive_witness_packed,
+    drive_witness_packed_into,
 };
+use crate::zerocheck::bits::{Bits, Rebuild};
+use crate::zerocheck::multilinear::PackedWitness;
+use flux_profiler::timed;
 use pcs::pack::{LOG_PACKING, PACKING_WIDTH};
 use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen};
 use primitives::field::F192;
@@ -533,9 +536,8 @@ const ROUND_WORDS: usize = N_G_PER_ROUND * G_STRIDE / 64;
 const _: () = assert!(
     GS_BASE.is_multiple_of(64) && (N_G_PER_ROUND * G_STRIDE).is_multiple_of(64) && USEFUL_BITS.is_multiple_of(64)
 );
-const _: () = assert!(
-    Z_CONST_POS.is_multiple_of(64) && MSG_BASE - Z_CONST_POS == 128 && COUNTER_LO_BASE.is_multiple_of(64)
-);
+const _: () =
+    assert!(Z_CONST_POS.is_multiple_of(64) && MSG_BASE - Z_CONST_POS == 128 && COUNTER_LO_BASE.is_multiple_of(64));
 
 /// G block `gi` of a round, for every lane: updates the state `v` and appends its record to the
 /// round's bit stream of each table (`z`, `a`, `b`), each with its partial word `carry`.
@@ -671,6 +673,66 @@ fn build_group_rows(blocks: &[&Compression; LANES], rows: &mut [V64], progress: 
     for i in 0..4 {
         let out = |w: usize| h[w] ^ v[w] ^ v[w + 8];
         lin!(OUT_BASE / 64 + i, out(2 * i), out(2 * i + 1));
+    }
+}
+
+/// The compression whose `z` block is `block`: its inputs are the free words of the lin rows.
+fn decode_compression(block: &[u64]) -> Compression {
+    // A lin row packs two 32-bit inputs, the low one first.
+    let half = |base: usize, i: usize| (block[base / 64 + i / 2] >> (32 * (i % 2))) as u32;
+    (
+        std::array::from_fn(|i| half(CV_BASE, i)),
+        std::array::from_fn(|i| half(MSG_BASE, i)),
+        block[COUNTER_LO_BASE / 64],
+        half(FINAL_BASE, 0),
+        half(FINAL_BASE, 1),
+    )
+}
+
+/// The bit tables of the packed witness `z`, rebuilt a group of instances at a time from the inputs `z` holds.
+///
+/// A group costs reading three cache lines of each instance's `z` and one [`build_group_rows`].
+/// The result is the `z`, `a`, `b` the witness generator wrote, so `c = z` is not read.
+struct RebuiltFromZ<'z> {
+    z: &'z [u64],
+}
+
+impl RebuiltFromZ<'_> {
+    /// Instances in a group: eight, or all of them below eight.
+    fn group_blocks(&self) -> usize {
+        (self.z.len() / WORDS).min(LANES)
+    }
+}
+
+impl Rebuild for RebuiltFromZ<'_> {
+    fn group_bytes(&self) -> usize {
+        self.group_blocks() * WORDS * 8
+    }
+
+    fn len_bytes(&self) -> usize {
+        self.z.len() * 8
+    }
+
+    fn new_rows(&self) -> GroupRows {
+        GroupRows::new(WORDS)
+    }
+
+    fn rebuild(&self, group: usize, rows: &mut GroupRows, mut out: [&mut [u64]; 3]) {
+        let group_blocks = self.group_blocks();
+        let first = group * group_blocks;
+        // Lanes past a short group repeat its last instance.
+        let blocks: [Compression; LANES] =
+            std::array::from_fn(|l| decode_compression(&self.z[(first + l.min(group_blocks - 1)) * WORDS..][..WORDS]));
+        build_group_rows(&std::array::from_fn(|l| &blocks[l]), &mut rows.0, &mut |_, _| {});
+        // The rows are `z | a | b`, the tables `a | b | c` with `c = z`.
+        let [a, b, c] = &mut out;
+        for (t_rows, table) in rows.0.chunks(WORDS).zip([&mut **c, &mut **a, &mut **b]) {
+            blocks_from_rows(t_rows, WORDS, group_blocks, table);
+        }
+        debug_assert!(
+            c[..] == self.z[first * WORDS..][..group_blocks * WORDS],
+            "the inputs rebuild z"
+        );
     }
 }
 
@@ -862,14 +924,19 @@ impl Blake2sSetup {
             useful_bits_per_block: USEFUL_BITS,
             live_blocks: self.n_blocks,
         };
-        let zc_claim = crate::zerocheck::prove_packed_padded(
-            packed_bytes(a_packed_words),
-            packed_bytes(b_packed_words),
-            packed_bytes(z_packed), // C = I, so c == z
-            self.m(),
-            &padding,
-            ps,
-        );
+        // With one thread the core has spare DRAM bandwidth, so reading the tables beats rebuilding them.
+        // With more threads the bandwidth is the limit, so the passes rebuild `a`, `b` and `c = z` from `z`.
+        let rebuilt = RebuiltFromZ { z: z_packed };
+        let bits = if parallel::num_threads() == 1 {
+            Bits::Given(PackedWitness {
+                a: packed_bytes(a_packed_words),
+                b: packed_bytes(b_packed_words),
+                c: packed_bytes(z_packed), // C = I, so c == z
+            })
+        } else {
+            Bits::Rebuilt(&rebuilt)
+        };
+        let zc_claim = crate::zerocheck::prove_packed_padded(bits, self.m(), &padding, ps);
 
         ZerocheckStage {
             x_ab: x_ab_of(&zc_claim, K_LOG - K_SKIP),
@@ -1092,6 +1159,83 @@ mod tests {
             let mut z = vec![0u64; full.0.len()];
             let (a, b) = generate_witness_into_z(&blocks, n_blocks_log, &mut z);
             assert!(z == full.0 && a == full.1 && b == full.2, "{n_blocks} blocks");
+        }
+    }
+
+    fn random_blocks(rng: &mut Rng, n_blocks: usize) -> Vec<Compression> {
+        (0..n_blocks)
+            .map(|i| {
+                let f0 = if i % 3 == 0 { u32::MAX } else { 0 };
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    rng.next_u64() >> (i % 40),
+                    f0,
+                    (i % 2) as u32,
+                )
+            })
+            .collect()
+    }
+
+    /// The inputs in `z` rebuild the `z`, `a` and `b` the generator wrote, group by group.
+    #[test]
+    fn rebuilt_groups_match_the_witness() {
+        let mut rng = Rng::new(0x2EB11);
+        for n_blocks in [1usize, 3, 8, 64, 1000, 1025] {
+            let blocks = random_blocks(&mut rng, n_blocks);
+            let (z, a, b) = generate_witness_with_ab_packed(&blocks, min_n_blocks_log(n_blocks));
+            let source = RebuiltFromZ { z: &z };
+            assert!(
+                blocks
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| decode_compression(&z[i * WORDS..][..WORDS]) == *c)
+            );
+            let mut rows = source.new_rows();
+            let group_words = source.group_bytes() / 8;
+            for g in 0..z.len() / group_words {
+                let mut out = [(); 3].map(|()| vec![0u64; group_words]);
+                let [oa, ob, oc] = &mut out;
+                source.rebuild(g, &mut rows, [oa, ob, oc]);
+                let at = g * group_words..(g + 1) * group_words;
+                assert!(out[2] == z[at.clone()], "z, group {g} of {n_blocks}");
+                if at.end <= a.len() {
+                    assert!(
+                        out[0] == a[at.clone()] && out[1] == b[at],
+                        "a, b, group {g} of {n_blocks}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The zerocheck on rebuilt bits leaves the proof and claim it leaves on the given tables.
+    #[test]
+    fn rebuilt_zerocheck_matches_the_given_tables() {
+        use crate::zerocheck::{PaddingSpec, prove_packed_padded};
+        let mut rng = Rng::new(0x2EB12);
+        for n_blocks in [1usize, 5, 8, 300, 1000, 1024, 1025] {
+            let blocks = random_blocks(&mut rng, n_blocks);
+            let n_blocks_log = min_n_blocks_log(n_blocks);
+            let (z, a, b) = generate_witness_with_ab_packed(&blocks, n_blocks_log);
+            let padding = PaddingSpec {
+                k_log: K_LOG,
+                useful_bits_per_block: USEFUL_BITS,
+                live_blocks: n_blocks,
+            };
+            let m = K_LOG + n_blocks_log;
+            let run = |bits: Bits<'_>| {
+                let mut ps = fiat_shamir::transcript::ProverState::from_label(b"flock-test-v0");
+                let claim = prove_packed_padded(bits, m, &padding, &mut ps);
+                (claim, ps.into_proof().stream)
+            };
+            let given = PackedWitness {
+                a: packed_bytes(&a),
+                b: packed_bytes(&b),
+                c: packed_bytes(&z),
+            };
+            let rebuilt = RebuiltFromZ { z: &z };
+            assert!(run(given.into()) == run(Bits::Rebuilt(&rebuilt)), "{n_blocks} blocks");
         }
     }
 
