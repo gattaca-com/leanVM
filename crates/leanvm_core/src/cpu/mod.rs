@@ -131,10 +131,13 @@ pub struct Program {
     /// The public bytecode columns [`layout::layout`] puts in the seed and finalize
     /// blocks, built once at assembly. Same trust as `bytecode_hash`.
     pub(crate) bytecode_cols: layout::BytecodeColumns,
+    /// The largest operand offset in `prog`, so that every instruction access of a run is
+    /// within the cells it bounds. Same trust as `bytecode_hash`.
+    pub(crate) max_offset: usize,
     /// Prover-side frame/buffer allocation hints (keyed by global pc) and the
     /// size of `main`'s frame: the nondeterminism [`Program::execute`] needs to
     /// run the program. Public verification ([`verify`]) ignores them.
-    pub(crate) hints: HashMap<u32, Vec<hints::RHint>>,
+    pub(crate) hints: hints::HintPlan,
     pub(crate) main_frame: u32,
     /// Named prover witness streams for the program's `hint_witness` calls
     /// ([`Program::set_witness`]): a stream is a sequence of *entries* (one
@@ -182,10 +185,11 @@ impl Program {
             primitives::hash::Hasher::new().update(bytes).finalize()
         };
         Self {
+            max_offset: prog.iter().map(Op::max_offset).max().unwrap_or(0) as usize,
+            hints: hints::HintPlan::new(hints, prog.len()),
             prog,
             bytecode_hash,
             bytecode_cols,
-            hints,
             main_frame,
             witness: HashMap::new(),
             fn_ranges: Vec::new(),

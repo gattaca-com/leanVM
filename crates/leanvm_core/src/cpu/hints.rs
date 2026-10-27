@@ -3,6 +3,7 @@
 //! table + reverse index the hint interpreter grows on demand.
 
 use primitives::field::{F64, mul_by_g};
+use std::collections::HashMap;
 
 /// Frame-relative offset operand (matches the compiler's `ir::Off`).
 pub type Off = u32;
@@ -239,6 +240,49 @@ pub enum BitsDest {
     Stack(Off),
     /// Heap cells `m[fp+ptr]·g^k`, the pointer read at run time.
     Heap(Off),
+}
+
+/// The hints of a program flattened into a dense per-pc index, built once at assembly.
+///
+/// A map keyed by pc would be probed each step for what is almost always a miss, so
+/// `at` holds, per pc, 0 for no hints or the 1-based index into `lists`. Each list pairs
+/// a pc's hints with where their streams start in `streams`, which holds per hint the
+/// index into `names` of its witness stream (`u32::MAX` for a hint that has none).
+#[derive(Clone)]
+pub(crate) struct HintPlan {
+    pub(crate) at: Vec<u32>,
+    pub(crate) lists: Vec<(Vec<RHint>, usize)>,
+    pub(crate) streams: Vec<u32>,
+    /// The distinct witness stream names, so a run resolves each to its entries once.
+    pub(crate) names: Vec<String>,
+}
+
+impl HintPlan {
+    pub(crate) fn new(hints: HashMap<u32, Vec<RHint>>, code_len: usize) -> Self {
+        let mut plan = Self {
+            at: vec![0; code_len],
+            lists: Vec::with_capacity(hints.len()),
+            streams: Vec::new(),
+            names: Vec::new(),
+        };
+        for (pc, hs) in hints {
+            let first = plan.streams.len();
+            for h in &hs {
+                let (RHint::WitnessStack { name, .. } | RHint::WitnessHeap { name, .. }) = h else {
+                    plan.streams.push(u32::MAX);
+                    continue;
+                };
+                let id = plan.names.iter().position(|n| n == name).unwrap_or_else(|| {
+                    plan.names.push(name.clone());
+                    plan.names.len() - 1
+                });
+                plan.streams.push(id as u32);
+            }
+            plan.lists.push((hs, first));
+            plan.at[pc as usize] = plan.lists.len() as u32;
+        }
+        plan
+    }
 }
 
 /// A hint resolved to concrete offsets/sizes, keyed by global program counter.

@@ -226,17 +226,7 @@ pub type BytecodeColumns = [std::sync::Arc<Vec<F64>>; 8];
 /// committed, so these ride the seed/finalize blocks as `Coord::Public` and
 /// stack into the polynomial [`bytecode_table`] returns.
 pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
-    let max_op = prog
-        .iter()
-        .map(|op| match *op {
-            Op::Xor { a, b, c } | Op::Mul { a, b, c } => a.max(b).max(c),
-            Op::Set { o, .. } => o,
-            Op::Deref { o1, o2, o3, .. } => o1.max(o2).max(o3),
-            Op::Jump { oc, od, of } => oc.max(od).max(of),
-            Op::Blake2s { ins, cv, out, md } => ins[0].max(ins[1]).max(ins[2]).max(ins[3]).max(cv).max(out).max(md),
-        })
-        .max()
-        .unwrap_or(0) as usize;
+    let max_op = prog.iter().map(Op::max_offset).max().unwrap_or(0) as usize;
     let gpow = primitives::field::g_powers((max_op + 1).max(2));
     let g_at = |i: u32| gpow[i as usize]; // operand g-power
 
