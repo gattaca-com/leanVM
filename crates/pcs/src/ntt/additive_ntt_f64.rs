@@ -82,27 +82,28 @@ pub struct Encoded {
     pub deep: Option<DeepRows>,
 }
 
-/// Table of the normalized subspace polynomials at the basis.
+/// Table of the normalized subspace polynomials at the basis, rows end to end.
 ///
-/// - Row `i` holds `s_i(b_j)` for every basis element `b_j` with `j >= i`.
+/// - Row `i` holds `s_i(b_j)` for every basis element `b_j` with `j >= i`, so `l - i` values.
 /// - Each row is scaled so that its first entry is one.
-fn generate_evals_from_subspace(basis: &[F64]) -> Vec<Vec<F64>> {
+fn generate_evals_from_subspace(basis: &[F64]) -> Vec<F64> {
     let l = basis.len();
-    let mut evals: Vec<Vec<F64>> = Vec::with_capacity(l);
-    evals.push(basis.to_vec());
+    let mut evals = Vec::with_capacity(l * (l + 1) / 2);
+    evals.extend_from_slice(basis);
+    let mut prev = 0;
     for i in 1..l {
-        let mut row = Vec::with_capacity(l - i);
-        for k in 1..evals[i - 1].len() {
-            let val = evals[i - 1][k] * (evals[i - 1][k] + evals[i - 1][0]);
-            row.push(val);
+        for k in 1..=l - i {
+            let (v, first) = (evals[prev + k], evals[prev]);
+            evals.push(v * (v + first));
         }
-        evals.push(row);
+        prev += l - i + 1;
     }
-    for row in evals.iter_mut() {
+    let mut rest = &mut evals[..];
+    for i in 0..l {
+        let (row, tail) = rest.split_at_mut(l - i);
         let inv = row[0].inv();
-        for v in row.iter_mut() {
-            *v *= inv;
-        }
+        row.iter_mut().for_each(|v| *v *= inv);
+        rest = tail;
     }
     evals
 }
@@ -128,20 +129,30 @@ pub type RowSink<'a> = dyn Fn(usize, &[F64]) + Sync + 'a;
 /// lived inside this very subfield).
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF64 {
-    evals: Vec<Vec<F64>>,
+    /// The rows of [`generate_evals_from_subspace`], end to end.
+    evals: Vec<F64>,
     /// Per eval row, the subset sums of `row[1..]` over each byte of a block index:
     /// a twiddle of a block below `2^24` is three loads and two XORs.
-    tables: Vec<Box<[[F64; 256]; 3]>>,
+    tables: Vec<[[F64; 256]; 3]>,
 }
 
 impl AdditiveNttF64 {
+    /// Row `i`, which starts after `l + (l - 1) + ... + (l - i + 1)` values.
+    fn row(&self, i: usize) -> &[F64] {
+        let l = self.tables.len();
+        let start = i * l - i * i.saturating_sub(1) / 2;
+        &self.evals[start..start + l - i]
+    }
+
     fn new(basis: &[F64]) -> Self {
         let evals = generate_evals_from_subspace(basis);
-        let tables = evals
-            .iter()
-            .map(|row| {
+        let mut rest = &evals[..];
+        let tables = (0..basis.len())
+            .map(|i| {
+                let (row, tail) = rest.split_at(basis.len() - i);
+                rest = tail;
                 let basis = &row[1..];
-                let mut t = Box::new([[F64::ZERO; 256]; 3]);
+                let mut t = [[F64::ZERO; 256]; 3];
                 for (k, part) in t.iter_mut().enumerate() {
                     let sub = &basis[(8 * k).min(basis.len())..(8 * k + 8).min(basis.len())];
                     for (x, slot) in part.iter_mut().enumerate() {
@@ -164,7 +175,7 @@ impl AdditiveNttF64 {
     }
 
     pub fn log_domain_size(&self) -> usize {
-        self.evals.len()
+        self.tables.len()
     }
 
     /// Twiddle of one block at one layer.
@@ -178,7 +189,7 @@ impl AdditiveNttF64 {
             let t = &self.tables[row];
             t[0][block & 255] + t[1][(block >> 8) & 255] + t[2][(block >> 16) & 255]
         } else {
-            span_get(&self.evals[row][1..], block)
+            span_get(&self.row(row)[1..], block)
         }
     }
 
@@ -190,7 +201,7 @@ impl AdditiveNttF64 {
     /// one scan of the three basis rows replaces seven.
     pub(crate) fn twiddles_radix8(&self, layer: usize, block: usize) -> [F64; 7] {
         let l = self.log_domain_size();
-        let (v1, v2) = (&self.evals[l - layer - 2], &self.evals[l - layer - 3]);
+        let (v1, v2) = (self.row(l - layer - 2), self.row(l - layer - 3));
         // `a` and `c` are the deeper layers' twiddles of this block's first sub-block.
         let t0 = self.twiddle(layer, block);
         let a = self.twiddle(layer + 1, 2 * block);
