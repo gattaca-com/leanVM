@@ -736,6 +736,14 @@ impl Rebuild for RebuiltFromZ<'_> {
     }
 }
 
+/// Whether the zerocheck rebuilds `a`, `b` and `c = z` from `z`, rather than reading them.
+///
+/// With one thread the core has spare DRAM bandwidth, so reading the tables beats rebuilding them.
+/// With more threads the bandwidth is the limit, so rebuilding wins.
+fn rebuilds() -> bool {
+    parallel::num_threads() > 1
+}
+
 /// Produce `(z, a, b)` for `blocks.len()` compressions padded to `2^n_blocks_log` slots.
 /// `z` is instance-major: instance `i` is the `WORDS` words from `i * WORDS`.
 #[timed]
@@ -747,7 +755,10 @@ pub fn generate_witness_with_ab_packed(blocks: &[Compression], n_blocks_log: usi
 /// which may be uninitialized; returns `(a, b)`.
 #[timed]
 pub fn generate_witness_into_z(blocks: &[Compression], n_blocks_log: usize, z: &mut [u64]) -> (Vec<u64>, Vec<u64>) {
-    drive_witness_packed_into::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, z, build_group_rows)
+    // Where the zerocheck rebuilds `a` and `b`, they stay allocated but unwritten.
+    // The buffers are kept only so the allocator's extent layout is unchanged:
+    // dropping them costs +1 GiB peak RSS (measured), a lead for the allocator work.
+    drive_witness_packed_into::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, z, !rebuilds(), build_group_rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -924,10 +935,9 @@ impl Blake2sSetup {
             useful_bits_per_block: USEFUL_BITS,
             live_blocks: self.n_blocks,
         };
-        // With one thread the core has spare DRAM bandwidth, so reading the tables beats rebuilding them.
-        // With more threads the bandwidth is the limit, so the passes rebuild `a`, `b` and `c = z` from `z`.
+        // The passes rebuild `a`, `b` and `c = z` from `z`, or read the tables the generator wrote.
         let rebuilt = RebuiltFromZ { z: z_packed };
-        let bits = if parallel::num_threads() == 1 {
+        let bits = if !rebuilds() {
             Bits::Given(PackedWitness {
                 a: packed_bytes(a_packed_words),
                 b: packed_bytes(b_packed_words),
@@ -1158,7 +1168,11 @@ mod tests {
             let full = generate_witness_with_ab_packed(&blocks, n_blocks_log);
             let mut z = vec![0u64; full.0.len()];
             let (a, b) = generate_witness_into_z(&blocks, n_blocks_log, &mut z);
-            assert!(z == full.0 && a == full.1 && b == full.2, "{n_blocks} blocks");
+            // Where the zerocheck rebuilds them, `a` and `b` are left unwritten.
+            assert!(
+                z == full.0 && (rebuilds() || (a == full.1 && b == full.2)),
+                "{n_blocks} blocks"
+            );
         }
     }
 

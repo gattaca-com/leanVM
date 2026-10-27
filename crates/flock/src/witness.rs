@@ -384,7 +384,8 @@ where
     let total_words = (1usize << n_blocks_log) * WORDS;
     // SAFETY: `drive_witness_packed_into` writes every word of `z`.
     let mut z = unsafe { primitives::uninit_vec::<u64>(total_words) };
-    let (a, b) = drive_witness_packed_into::<WORDS, S, F>(initial_states, padding, n_blocks_log, &mut z, build_group);
+    let (a, b) =
+        drive_witness_packed_into::<WORDS, S, F>(initial_states, padding, n_blocks_log, &mut z, true, build_group);
     (z, a, b)
 }
 
@@ -393,11 +394,14 @@ where
 ///
 /// The returned `a` and `b` stop after the group holding block `n_blocks`, the first all-padding block.
 /// The zerocheck reads that one padding block and none after it.
+///
+/// With `write_ab` false, `a` and `b` keep their size but stay untouched: they are neither transposed nor streamed.
 pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
     initial_states: &[S],
     padding: &S,
     n_blocks_log: usize,
     z: &mut [u64],
+    write_ab: bool,
     build_group: F,
 ) -> (Vec<u64>, Vec<u64>)
 where
@@ -459,7 +463,7 @@ where
                 let (z, ab) = buf.split_at(scratch_words);
                 let (a, b) = ab.split_at(scratch_words);
                 stream.copy(&mut z_chunks.get(g)[words.clone()], &z[words.clone()]);
-                if g < ab_groups {
+                if write_ab && g < ab_groups {
                     stream.copy(&mut a_chunks.get(g)[words.clone()], &a[words.clone()]);
                     stream.copy(&mut b_chunks.get(g)[words.clone()], &b[words]);
                 }
@@ -488,7 +492,8 @@ where
                 if let Some(p) = prev {
                     emit(p, prev_buf, sent, of, of);
                 }
-                for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.chunks_mut(scratch_words)) {
+                let n_tables = if write_ab { 3 } else { 1 };
+                for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.chunks_mut(scratch_words)).take(n_tables) {
                     blocks_from_rows(t_rows, WORDS, group_blocks, table);
                 }
                 (*last, *template) = (1 - *last, is_padding);
