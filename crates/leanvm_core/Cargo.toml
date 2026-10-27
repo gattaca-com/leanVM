@@ -8,7 +8,7 @@ publish = false
 workspace = true
 
 [dependencies]
-flux-profiler = { path = "/arch/home/alexey/development/flux/crates/flux-profiler" }
+flux-profiler = { git = "https://github.com/gattaca-com/flux", rev = "cb55dcb7fd31d525b09317f98ed0e47fac4ea60a" }
 parallel.workspace = true
 primitives.workspace = true
 fiat_shamir.workspace = true
