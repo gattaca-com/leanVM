@@ -135,12 +135,13 @@ impl ProverData {
     }
 
     /// The codeword as the opening reads it. `stack` is the committed message, `n_lanes` its lanes.
-    pub(crate) fn l0<'a>(&'a self, stack: &'a [F64], n_lanes: usize) -> L0Codeword<'a> {
+    pub(crate) fn l0<'a>(&'a self, stack: &'a [F64], repeats: &'a [bool], n_lanes: usize) -> L0Codeword<'a> {
         L0Codeword {
             words: &self.codeword,
             row_words: self.row_words,
             deep: self.deep.as_ref(),
             stack,
+            repeats,
             n_lanes,
         }
     }
@@ -152,6 +153,8 @@ pub(crate) struct L0Codeword<'a> {
     row_words: usize,
     deep: Option<&'a (AdditiveNttF64, DeepRows)>,
     stack: &'a [F64],
+    /// The stack's blocks that equal their predecessor, or none.
+    repeats: &'a [bool],
     n_lanes: usize,
 }
 
@@ -159,7 +162,7 @@ impl L0Codeword<'_> {
     /// The rows at `positions`, `row_words` words each.
     fn rows(&self, positions: &[usize]) -> Vec<Vec<F64>> {
         match self.deep {
-            Some((ntt, deep)) if self.words.is_empty() => ntt.rebuild_rows(self.stack, self.n_lanes, deep, positions),
+            Some((ntt, deep)) if self.words.is_empty() => ntt.rebuild_rows(self.stack, self.repeats, self.n_lanes, deep, positions),
             Some((ntt, deep)) => ntt.finish_rows(self.words, deep, positions),
             None => positions
                 .iter()
@@ -202,8 +205,16 @@ const KEEP_CODEWORD_MAX_BYTES: usize = 1 << 30;
 /// The encoded row is padded to a whole AVX-512 vector of lanes with zero lanes
 /// in front, so the NTT has no masked tail and the leaf's zero prefix is whole
 /// blocks more often. The padding is the image's zeros and never rides the proof.
+///
+/// `repeats` tags the message's blocks of `2^EQUAL_BLOCK_LOG` words that equal their predecessor, or is empty.
 #[timed]
-pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate: usize) -> (Commitment, ProverData) {
+pub fn commit(
+    message: &[F64],
+    repeats: &[bool],
+    log_n: usize,
+    log_batch_size: usize,
+    log_inv_rate: usize,
+) -> (Commitment, ProverData) {
     assert!(log_inv_rate >= 1, "log_inv_rate must be >= 1 for a non-trivial RS code");
     assert!(log_n > log_batch_size, "witness must be wider than the interleaving");
     let log_rows = log_n - log_batch_size;
@@ -230,7 +241,7 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
             } else {
                 Keep::Whole
             };
-            let Encoded { words, deep } = ntt.encode_lane_major(message, n_lanes, row_words, log_inv_rate, keep, &on_rows);
+            let Encoded { words, deep } = ntt.encode_lane_major(message, repeats, n_lanes, row_words, log_inv_rate, keep, &on_rows);
             (words, deep.map(|deep| (ntt, deep)))
         });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
@@ -1008,11 +1019,20 @@ impl SumcheckProver {
         msg
     }
 
-    /// The committed lanes if `keep`, once the lane rounds have read them for the last time. Otherwise they go now.
-    fn take_stack(&mut self, keep: bool) -> Vec<F64> {
+    /// The committed lanes if `keep`, once the lane rounds have read them for the last time, and their map of
+    /// blocks of `2^EQUAL_BLOCK_LOG` words that repeat their predecessor, which is empty if the projection
+    /// tagged blocks of another size. Otherwise they go now.
+    fn take_stack(&mut self, keep: bool) -> (Vec<F64>, Vec<bool>) {
         assert!(self.lift.is_none(), "the lane rounds are over");
         let base = std::mem::take(&mut self.base);
-        if keep { base } else { Vec::new() }
+        let repeats = std::mem::take(&mut self.repeats);
+        if !keep {
+            (Vec::new(), Vec::new())
+        } else if self.repeat_len == 1 << crate::stack_open::EQUAL_BLOCK_LOG {
+            (base, repeats)
+        } else {
+            (base, Vec::new())
+        }
     }
 
     #[timed]
@@ -1252,7 +1272,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     }
     drop(sumcheck_span);
     // A rebuilding L0 open recomputes its rows from the stack, so that lives until then. Otherwise it goes now.
-    let stack = sc_prover.take_stack(prover_data.rebuilds());
+    let (stack, stack_repeats) = sc_prover.take_stack(prover_data.rebuilds());
 
     // Commit f^1 = folded (now E-valued) witness as wtns_1.
     let n1 = log_n - initial_k;
@@ -1292,7 +1312,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     // The tree keeps no leaves: the rows of whole leaf groups are read back and rehashed.
     let row_words = prover_data.row_words;
     let group_0 = l0_tree.group_positions(&queries_0);
-    let group_rows_0 = prover_data.l0(&stack, n_lanes).rows(&group_0);
+    let group_rows_0 = prover_data.l0(&stack, &stack_repeats, n_lanes).rows(&group_0);
     let images_0 = pick_rows(&group_0, &group_rows_0, &queries_0, row_words - n_lanes);
     let opened_rows_0: Vec<Vec<F64>> = images_0.iter().map(|image| l0_fold_row(image)).collect();
     // ... but the stored proof carries the sorted-unique rows + one octopus over
@@ -1306,7 +1326,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     ));
     // Nothing reads the L0 codeword, its stack or its tree again, and the next levels' buffers can be served
     // from their memory.
-    drop((prover_data, stack));
+    drop((prover_data, stack, stack_repeats));
     drop(span);
 
     // Induce basis_0 from the L0 opens. L0 dominates the induce phase, where
@@ -1540,7 +1560,7 @@ mod tests {
                 };
 
                 let prove = |msg: &[F64]| {
-                    let (cm, pd) = commit(msg, log_n, pc.initial_k, pc.log_inv_rates[0]);
+                    let (cm, pd) = commit(msg, &[], log_n, pc.initial_k, pc.log_inv_rates[0]);
                     let mut ps = fiat_shamir::transcript::ProverState::from_label(b"whir-test");
                     open_batch_mixed_whir_stacked(&mut ps, log_n, msg.to_vec(), Vec::new(), pd, &pc, &claims, &ring);
                     (cm.root, ps.into_proof())
@@ -1664,7 +1684,7 @@ mod tests {
         let (log_rows, n_lanes, log_batch) = (if n8 { 21usize } else { 19 }, 47usize, 6usize);
         let message: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
         time("base encode", &mut || {
-            let (c, _) = commit(&message, log_rows + log_batch, log_batch, 2);
+            let (c, _) = commit(&message, &[], log_rows + log_batch, log_batch, 2);
             std::hint::black_box(c);
         });
         let ext_shapes = if n8 { [(17usize, 5usize), (13, 8), (9, 11), (5, 14)] } else { [(15, 5), (11, 8), (7, 11), (3, 14)] };

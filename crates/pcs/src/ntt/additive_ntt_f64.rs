@@ -11,6 +11,7 @@ use flux_profiler::timed;
 use std::cell::RefCell;
 
 use primitives::field::F64;
+use crate::stack_open::EQUAL_BLOCK_LOG;
 use primitives::log2_strict_usize;
 use primitives::stream::Stream;
 
@@ -281,9 +282,13 @@ impl AdditiveNttF64 {
     /// - With [`Keep::Nothing`], if a single such pass covers the layers before the deep pass, the codeword is never whole:
     ///   the encode runs once per half of the cosets, in one half-size buffer, and the deep pass goes to `on_rows` only.
     /// - Otherwise the codeword is whole and the encode is as the in-place one.
+    ///
+    /// `repeats` tags the message's blocks of `2^EQUAL_BLOCK_LOG` words that equal their predecessor, or is empty.
+    /// The stage fill copies the lines of a repeat from the stage instead of reading them, see [`stage_copies`].
     pub fn encode_lane_major(
         &self,
         msg: &[F64],
+        repeats: &[bool],
         n_lanes: usize,
         num_ntts: usize,
         log_inv_rate: usize,
@@ -307,7 +312,7 @@ impl AdditiveNttF64 {
         let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
         let mut deep = None;
         for first in (0..1usize << log_inv_rate).step_by(held).rev() {
-            let cosets = (n_lanes, first..first + held);
+            let cosets = (n_lanes, first..first + held, repeats);
             deep = self.transform_deferring_deep(
                 &mut data,
                 num_ntts,
@@ -397,9 +402,16 @@ impl AdditiveNttF64 {
     }
 
     /// Codeword rows `positions` of an encode that kept no buffer, recomputed from its lane-major message.
-    pub fn rebuild_rows(&self, msg: &[F64], n_lanes: usize, deep: &DeepRows, positions: &[usize]) -> Vec<Vec<F64>> {
+    pub fn rebuild_rows(
+        &self,
+        msg: &[F64],
+        repeats: &[bool],
+        n_lanes: usize,
+        deep: &DeepRows,
+        positions: &[usize],
+    ) -> Vec<Vec<F64>> {
         let subs = deep.sub_blocks(positions);
-        let built = self.rebuild_sub_blocks(msg, n_lanes, deep, &subs);
+        let built = self.rebuild_sub_blocks(msg, repeats, n_lanes, deep, &subs);
         deep.pick(&subs, &built, positions)
     }
 
@@ -423,7 +435,14 @@ impl AdditiveNttF64 {
     ///
     /// Panics unless the encode had the plan this reads back: one lane-major gathered pass.
     #[timed]
-    pub fn rebuild_sub_blocks(&self, msg: &[F64], n_lanes: usize, deep: &DeepRows, subs: &[usize]) -> Vec<F64> {
+    pub fn rebuild_sub_blocks(
+        &self,
+        msg: &[F64],
+        repeats: &[bool],
+        n_lanes: usize,
+        deep: &DeepRows,
+        subs: &[usize],
+    ) -> Vec<F64> {
         let DeepRows { log_d, num_ntts, start, deep_start } = *deep;
         let g = deep_start - start;
         let (rows, log_step) = (1usize << g, log_d - deep_start);
@@ -443,6 +462,7 @@ impl AdditiveNttF64 {
         // SAFETY: a group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
         let mut built = unsafe { primitives::uninit_vec::<F64>(subs.len() * sub_len) };
         let (out, msg) = (parallel::SendPtr(built.as_mut_ptr()), parallel::SendPtr(msg.as_ptr().cast_mut()));
+        let copies = stage_copies(repeats, log_step, rows, msg_rows, n_lanes, num_ntts);
         parallel::for_each_chunk((1usize << log_step) / BATCH, |lo, hi| {
             // One octet of lanes of a batch of residues is 64 lanes of one transform.
             let stage_len = rows * BATCH * 8;
@@ -451,7 +471,7 @@ impl AdditiveNttF64 {
                 for t in lo..hi {
                     for octet in 0..num_ntts / 8 {
                         let msg = unsafe { msg.add(0) }.cast_const();
-                        fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet);
+                        fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet, &copies);
                         for (coset, run, live) in &cosets {
                             let live_rows = Some(&live[..]);
                             self.run_layers_to(scratch, Some(stage), deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
@@ -560,12 +580,12 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         on_rows: Option<&RowSink<'_>>,
         defer_deep: bool,
-        lane_major: Option<(usize, std::ops::Range<usize>)>,
+        lane_major: Option<(usize, std::ops::Range<usize>, &[bool])>,
     ) -> Option<DeepRows> {
         // The buffer is 2^log_d rows of `num_ntts` words, or the layer-`start` blocks `cosets` of them.
-        let (mut lane_major, cosets) = match lane_major {
-            Some((n_lanes, cosets)) => (Some(n_lanes), cosets),
-            None => (None, 0..1 << start),
+        let (mut lane_major, cosets, repeats) = match lane_major {
+            Some((n_lanes, cosets, repeats)) => (Some(n_lanes), cosets, repeats),
+            None => (None, 0..1 << start, &[][..]),
         };
         assert!(num_ntts > 0);
         assert_eq!(data.len() % num_ntts, 0);
@@ -597,7 +617,8 @@ impl AdditiveNttF64 {
         let mut layer = start;
         while layer < deep_start {
             let g = (deep_start - layer).min(fit2);
-            self.gathered_pass(data, log_d, num_ntts, layer, g, msg.take(), lane_major.take(), stream, cosets.start);
+            let lane_major = lane_major.take().map(|n_lanes| (n_lanes, repeats));
+            self.gathered_pass(data, log_d, num_ntts, layer, g, msg.take(), lane_major, stream, cosets.start);
             layer += g;
         }
 
@@ -829,10 +850,11 @@ impl AdditiveNttF64 {
         layer: usize,
         g: usize,
         msg: Option<parallel::SendPtr<F64>>,
-        lane_major: Option<usize>,
+        lane_major: Option<(usize, &[bool])>,
         stream: bool,
         first_block: usize,
     ) {
+        let (lane_major, repeats) = lane_major.map_or((None, &[][..]), |(n_lanes, repeats)| (Some(n_lanes), repeats));
         // A group is 2^g rows, `step` rows apart.
         let log_step = log_d - layer - g;
         let (rows, step) = (1usize << g, 1usize << log_step);
@@ -853,6 +875,9 @@ impl AdditiveNttF64 {
         // A small group's rows arrive without help, and its bookkeeping would cost more than it saves.
         let fetch_ahead = rows * num_ntts >= FETCH_AHEAD_MIN_WORDS;
         let drain_per_hook = (rows * width / 8).div_ceil(hooks);
+        let copies = lane_major.map_or_else(StageCopies::none, |n_lanes| {
+            stage_copies(repeats, log_step, rows, msg_rows, n_lanes, num_ntts)
+        });
         parallel::for_each_chunk(n_tasks, |lo, hi| {
             // One L2-resident scratch of 2^g rows serves every group of the task.
             // A draining task has two: one transforms while the other empties.
@@ -952,6 +977,7 @@ impl AdditiveNttF64 {
                                 n_lanes,
                                 num_ntts,
                                 octet,
+                                &copies,
                             );
                             for block in (first_block..first_block + blocks_held).rev() {
                                 group(block, t0, None, stage, 8 * octet);
@@ -1645,6 +1671,86 @@ fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
     })
 }
 
+/// The tiles of a stage that repeat an earlier tile, as a bit per lane of each octet.
+struct StageCopies {
+    /// A repeat tile is a copy of the tile this many rows before it.
+    back: usize,
+    rows: usize,
+    n_octets: usize,
+    /// Per `t0 >> EQUAL_BLOCK_LOG`, octet of lanes and row of the stage: bit `k` is set if lane `8 * octet + k`
+    /// of the tile repeats the tile `back` rows before.
+    masks: Vec<u8>,
+}
+
+impl StageCopies {
+    fn none() -> Self {
+        Self { back: 0, rows: 0, n_octets: 0, masks: Vec::new() }
+    }
+
+    /// The masks of one octet of the batch of residues at `t0`, or none when no tile of the stage repeats.
+    fn octet(&self, octet: usize, t0: usize) -> &[u8] {
+        let at = ((t0 >> EQUAL_BLOCK_LOG) * self.n_octets + octet) * self.rows;
+        self.masks.get(at..at + self.rows).unwrap_or(&[])
+    }
+}
+
+/// Which tiles of a lane-major stage are copies of the tile `back` rows before them.
+///
+/// - Stage row `i` of residue `r` is message row `r + i * 2^log_step` of every lane. Going back `back` rows
+///   is going back `D = max(2^log_step, 2^EQUAL_BLOCK_LOG)` words: a whole number `m` of blocks.
+/// - The line of row `i` equals the line of row `i - back` if the lane's `m` blocks up to the one holding
+///   the line each repeat their predecessor: a run of repeats at least `m` long ends there.
+/// - The block holding the line is `(i << log_step >> EQUAL_BLOCK_LOG) + u`, with `u = r >> EQUAL_BLOCK_LOG`
+///   below `m`, so one mask table serves every residue of a `u`.
+/// - A padding lane is zero in both rows, so its bit is set too.
+/// - Rows before `back` read the message, as do all rows of a message with no map.
+///
+/// `repeats` is the message's map of blocks that equal their predecessor. A lane's first block never repeats.
+fn stage_copies(
+    repeats: &[bool],
+    log_step: usize,
+    rows: usize,
+    msg_rows: usize,
+    n_lanes: usize,
+    row_words: usize,
+) -> StageCopies {
+    if repeats.is_empty() || !msg_rows.is_multiple_of(1 << EQUAL_BLOCK_LOG) {
+        return StageCopies::none();
+    }
+    let distance = (1usize << log_step).max(1 << EQUAL_BLOCK_LOG);
+    let (back, m) = (distance >> log_step, distance >> EQUAL_BLOCK_LOG);
+    if back >= rows {
+        return StageCopies::none();
+    }
+    let (pad, n_octets, per_lane) = (row_words - n_lanes, row_words / 8, msg_rows >> EQUAL_BLOCK_LOG);
+    let mut masks = vec![0u8; m * n_octets * rows];
+    // The length of the run of repeats ending at each block of the lane.
+    let mut run = vec![0usize; per_lane];
+    for lane in pad..row_words {
+        let blocks = &repeats[(row_words - 1 - lane) * per_lane..][..per_lane];
+        let mut length = 0;
+        for (h, (&repeat, run)) in blocks.iter().zip(&mut run).enumerate() {
+            length = if repeat && h > 0 { length + 1 } else { 0 };
+            *run = length;
+        }
+        for u in 0..m {
+            let column = &mut masks[(u * n_octets + lane / 8) * rows..][..rows];
+            for (i, mask) in column.iter_mut().enumerate().skip(back) {
+                if run[(i << log_step >> EQUAL_BLOCK_LOG) + u] >= m {
+                    *mask |= 1 << (lane % 8);
+                }
+            }
+        }
+    }
+    for lane in 0..pad {
+        for u in 0..m {
+            let column = &mut masks[(u * n_octets + lane / 8) * rows..][..rows];
+            column.iter_mut().skip(back).for_each(|mask| *mask |= 1 << (lane % 8));
+        }
+    }
+    StageCopies { back, rows, n_octets, masks }
+}
+
 /// Transpose one octet of lanes of [`BATCH`] consecutive residues of a lane-major message into `stage`.
 ///
 /// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
@@ -1653,6 +1759,8 @@ fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
 /// - The octet is lanes `8 * octet..8 * octet + 8`. Together with the residues, they are 64 lanes of one transform.
 /// - `stage` has `rows` rows of 64 words: lane `8 * octet + k` of row `t0 + s + i * step` is word `(i * BATCH + s) * 8 + k`.
 /// - One tile is 8 words of 8 lane blocks, so each 64 byte line of a lane block is read once, whole.
+/// - A lane of tile `i` with its bit set in the octet's [`StageCopies`] is copied from the tile `back` rows
+///   before, which is already in the stage, and its line is not read.
 fn fill_stage(
     stage: &mut [F64],
     msg: *const F64,
@@ -1662,13 +1770,15 @@ fn fill_stage(
     n_lanes: usize,
     row_words: usize,
     octet: usize,
+    copies: &StageCopies,
 ) {
+    let (back, copies) = (copies.back, copies.octet(octet, t0));
     let rows = stage.len() / (BATCH * 8);
     let pad = row_words - n_lanes;
     let out = stage.as_mut_ptr();
     // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
     let block = |k: usize| row_words - 1 - (8 * octet + k);
-    if 8 * octet >= pad {
+    if 8 * octet >= pad && copies.is_empty() {
         // No padding lane: the tile needs no null check.
         for i in 0..rows {
             let j = t0 + (i << log_step);
@@ -1680,9 +1790,15 @@ fn fill_stage(
     }
     for i in 0..rows {
         let j = t0 + (i << log_step);
-        // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane.
+        let copy = copies.get(i).copied().unwrap_or(0);
+        // SAFETY: tile `i - back` is a tile of the stage, and `copies` has no bit before row `back`.
+        if copy == 0xFF {
+            unsafe { copy_lanes(out, i, i - back, copy) };
+            continue;
+        }
+        // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane or a copy.
         let src: [*const F64; 8] = std::array::from_fn(|k| {
-            if 8 * octet + k < pad {
+            if 8 * octet + k < pad || copy >> k & 1 == 1 {
                 std::ptr::null()
             } else {
                 msg.wrapping_add(block(k) * msg_rows + j)
@@ -1692,6 +1808,34 @@ fn fill_stage(
         // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
         // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`.
         unsafe { transpose_tile::<true>(&src, |s| out.add((i * BATCH + s) * 8)) };
+        if copy != 0 {
+            // SAFETY: as above.
+            unsafe { copy_lanes(out, i, i - back, copy) };
+        }
+    }
+}
+
+/// Copy the lanes of tile `from` of a stage into tile `i`, for the bits set in `mask`.
+///
+/// # Safety
+///
+/// Both tiles lie inside the stage at `out`, and `from < i`.
+#[inline(always)]
+unsafe fn copy_lanes(out: *mut F64, i: usize, from: usize, mask: u8) {
+    for s in 0..BATCH {
+        // SAFETY: the caller's bounds.
+        unsafe {
+            let (dst, src) = (out.add((i * BATCH + s) * 8), out.add((from * BATCH + s) * 8));
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            {
+                use core::arch::x86_64::*;
+                _mm512_mask_storeu_epi64(dst.cast(), mask, _mm512_loadu_si512(src.cast()));
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+            for k in (0..8).filter(|k| mask >> k & 1 == 1) {
+                *dst.add(k) = *src.add(k);
+            }
+        }
     }
 }
 
@@ -2569,7 +2713,15 @@ mod tests {
         ] {
             let log_d = log_rows + log_inv_rate;
             let ntt = AdditiveNttF64::standard(log_d);
-            let msg: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
+            let mut msg: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
+            // Runs of equal blocks, which the stage fill copies instead of reading.
+            let block = 1usize << EQUAL_BLOCK_LOG;
+            for lane in msg.chunks_mut(1 << log_rows).filter(|lane| lane.len() >= 8 * block) {
+                for b in [1, 2, 3, 5, 6] {
+                    lane.copy_within((b - 1) * block..b * block, b * block);
+                }
+            }
+            let repeats = crate::stack_open::equal_blocks(&msg);
             let row_words = n_lanes.next_multiple_of(8);
             let mut want = vec![F64::ZERO; (row_words << log_rows) << log_inv_rate];
             transpose_lane_major(&mut want[..row_words << log_rows], &msg, n_lanes, row_words, log_rows);
@@ -2578,13 +2730,13 @@ mod tests {
             for keep in [Keep::Whole, Keep::BeforeDeep, Keep::Nothing] {
                 let mut handed = vec![F64::ZERO; want.len()];
                 let on_rows = sink_into(&mut handed, row_words);
-                let Encoded { words, deep } = ntt.encode_lane_major(&msg, n_lanes, row_words, log_inv_rate, keep, &on_rows);
+                let Encoded { words, deep } = ntt.encode_lane_major(&msg, &repeats, n_lanes, row_words, log_inv_rate, keep, &on_rows);
                 drop(on_rows);
                 let context = format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}, keep_nothing={}", keep == Keep::Nothing);
                 assert_eq!(handed, want, "handed-over rows, {context}");
                 let positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
                 let rows = match deep {
-                    Some(deep) if words.is_empty() => ntt.rebuild_rows(&msg, n_lanes, &deep, &positions),
+                    Some(deep) if words.is_empty() => ntt.rebuild_rows(&msg, &repeats, n_lanes, &deep, &positions),
                     Some(deep) => ntt.finish_rows(&words, &deep, &positions),
                     None => {
                         assert_eq!(words, want, "codeword, {context}");

@@ -91,11 +91,13 @@ pub struct Committed {
 /// `witness` is the stack truncated to the lane blocks that carry data
 /// ([`crate::witness::StackShape::committed_len`]); the zero tail past them is
 /// neither encoded nor hashed, and the resulting commitment is the same one the
-/// full `2^μ` witness would have produced.
+/// full `2^μ` witness would have produced. `repeats` tags its blocks that equal their predecessor
+/// ([`::pcs::whir::commit`]).
 #[timed]
 pub fn commit(
     ps: &mut ProverState,
     witness: &[F64],
+    repeats: &[bool],
     shape: crate::witness::StackShape,
     log_inv_rate: usize,
 ) -> Committed {
@@ -109,7 +111,7 @@ pub fn commit(
         shape.committed_len(),
         "witness must be the committed lanes"
     );
-    let (commitment, prover_data) = whir_commit(witness, mu, LOG_BATCH, log_inv_rate);
+    let (commitment, prover_data) = whir_commit(witness, repeats, mu, LOG_BATCH, log_inv_rate);
     ps.add_root(&commitment.root);
     Committed {
         prover_data,

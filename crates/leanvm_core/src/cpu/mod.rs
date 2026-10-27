@@ -518,7 +518,7 @@ pub fn prove_with(
     // Announce the prover's sizes, then commit, before sampling any challenge.
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
+        pcs::commit(&mut ps, &w.q, &w.repeats, w.layout.shape, log_inv_rate)
     });
     pcs::reserve_level1(w.layout.shape.mu, log_inv_rate);
 

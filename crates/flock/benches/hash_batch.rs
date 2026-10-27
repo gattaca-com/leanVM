@@ -81,7 +81,7 @@ fn main() {
         let t_prove = Instant::now();
 
         let t = Instant::now();
-        let (commitment, prover_data) = commit(q_flock, mu, INITIAL_FOLDING_FACTOR, LOG_INV_RATE_0);
+        let (commitment, prover_data) = commit(q_flock, &[], mu, INITIAL_FOLDING_FACTOR, LOG_INV_RATE_0);
         ps.add_root(&commitment.root);
         let commit_s = t.elapsed().as_secs_f64();
 
