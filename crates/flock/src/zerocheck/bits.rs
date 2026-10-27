@@ -9,7 +9,7 @@
 //! A pass asks for a [`Window`] over a byte range of the tables. A rebuilt window is whole groups.
 
 use super::multilinear::PackedWitness;
-use crate::witness::{GroupRows, packed_bytes};
+use crate::witness::{GroupRows, LANES, V64, packed_bytes, words_of_mut};
 use std::ops::Range;
 
 /// Rebuilds the three bit tables one group of instances at a time.
@@ -42,8 +42,8 @@ impl<'a> From<PackedWitness<'a>> for Bits<'a> {
 /// A worker's cache-resident groups of rebuilt tables.
 pub struct Scratch {
     rows: GroupRows,
-    /// `a`, `b`, `c`, each `slots` groups of words.
-    tables: Vec<u64>,
+    /// `a`, `b`, `c`, each `slots` groups of words, in cache-line-aligned rows.
+    tables: Vec<V64>,
     /// The group each slot holds.
     held: Vec<usize>,
     group_words: usize,
@@ -117,7 +117,7 @@ impl<'a> Bits<'a> {
         let group_words = r.group_bytes() / 8;
         Some(Scratch {
             rows: r.new_rows(),
-            tables: vec![0; 3 * slots * group_words],
+            tables: vec![V64::ZERO; 3 * slots * group_words / LANES],
             held: vec![usize::MAX; slots],
             group_words,
         })
@@ -155,13 +155,13 @@ impl Scratch {
         let s0 = g0 % slots;
         assert!(s0 + (g1 - g0) < slots, "the window's groups fit the scratch");
         let table_words = slots * self.group_words;
+        let tables = words_of_mut(&mut self.tables);
         for g in g0..=g1 {
             let slot = g % slots;
             if self.held[slot] == g {
                 continue;
             }
-            let mut out = self
-                .tables
+            let mut out = tables
                 .chunks_exact_mut(table_words)
                 .map(|t| &mut t[slot * self.group_words..][..self.group_words]);
             let out = std::array::from_fn(|_| out.next().expect("three tables"));
@@ -170,8 +170,7 @@ impl Scratch {
         }
         let from = s0 * group_bytes;
         let to = from + (g1 - g0 + 1) * group_bytes;
-        let mut t = self
-            .tables
+        let mut t = tables
             .chunks_exact(table_words)
             .map(|t| &packed_bytes(t)[from..to]);
         Window {

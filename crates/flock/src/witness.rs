@@ -335,13 +335,24 @@ impl GroupRows {
 ///
 /// Block `l` takes `words` words from `l * words`, for the first `group_blocks` lanes.
 pub(crate) fn blocks_from_rows(rows: &[V64], words: usize, group_blocks: usize, table: &mut [u64]) {
-    // Row `i` of table `t` is word `i` of block `l`.
-    for (tile, i) in rows.chunks_exact(LANES).zip((0..).step_by(LANES)) {
-        let blocks = transpose_lanes(tile);
-        for (l, block) in blocks.iter().take(group_blocks).enumerate() {
-            table[l * words + i..][..LANES].copy_from_slice(block);
+    // Each block takes one tile, `LANES` words, from every transposed tile of rows.
+    let mut tiles = table[..group_blocks * words]
+        .chunks_exact_mut(words)
+        .map(|block| block.as_chunks_mut::<LANES>().0.iter_mut());
+    let mut cols: [Option<_>; LANES] = std::array::from_fn(|_| tiles.next());
+    for tile in rows.chunks_exact(LANES) {
+        for (col, out) in cols.iter_mut().zip(transpose_lanes(tile)) {
+            if let Some(col) = col {
+                *col.next().expect("a tile per tile of rows") = out;
+            }
         }
     }
+}
+
+/// The `u64` words of the rows, which keep their 64-byte alignment.
+pub(crate) fn words_of_mut(rows: &mut [V64]) -> &mut [u64] {
+    // SAFETY: a `V64` is `LANES` `u64`s with no padding, and `u64`'s alignment divides `V64`'s.
+    unsafe { core::slice::from_raw_parts_mut(rows.as_mut_ptr().cast(), rows.len() * LANES) }
 }
 
 /// The bytes of the `u64` words on a little-endian target.
