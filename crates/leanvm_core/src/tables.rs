@@ -805,31 +805,35 @@ impl Table for JumpTable {
             op => unreachable!("a JUMP row's pc {} holds {op:?}", r.pc),
         };
         let cell = |r: &Jrow, o: u32| ctx.mem.word((r.fp + o) as usize);
-        // The condition is K-valued, so its inverse is one F64 inversion. `c` decodes it once. The
-        // is-nonzero witness `w = c⁻¹` (0 where c = 0) comes from one batched Montgomery inversion:
-        // the forward pass leaves in `w[i]` the running product of the nonzero conditions before row
-        // `i`, and `acc` ends as their full product (nonzero, hence invertible). The taken indicator
-        // is `c ≠ 0`.
-        let mut c: Vec<F64> = Vec::with_capacity(rows.len());
-        let mut w: Vec<F64> = Vec::with_capacity(rows.len());
-        let mut acc = F64::ONE;
-        for r in rows.iter() {
-            let ci = F64(cell(r, ins(r).0).c0);
-            c.push(ci);
-            w.push(acc);
-            if !ci.is_zero() {
-                acc *= ci;
+        // The condition is K-valued, so its inverse is one F64 inversion. The is-nonzero witness
+        // `w = c⁻¹` (0 where c = 0) comes from one batched Montgomery inversion per task of rows: the
+        // forward pass leaves in `w[i]` the running product of the nonzero conditions before row `i`,
+        // and `acc` ends as their full product (nonzero, hence invertible). The taken indicator is
+        // `c ≠ 0`, which is `w ≠ 0`.
+        let cond = |r: &Jrow| F64(cell(r, ins(r).0).c0);
+        // SAFETY: the chunks tile `w` and each writes every slot of `w` before it is read.
+        let mut w = unsafe { primitives::uninit_vec::<F64>(rows.len()) };
+        parallel::chunks_mut(&mut w, FILL_TASK, |t, w| {
+            let first = t * FILL_TASK;
+            let mut acc = F64::ONE;
+            for (j, wi) in w.iter_mut().enumerate() {
+                let ci = cond(rows.get(first + j));
+                *wi = acc;
+                if !ci.is_zero() {
+                    acc *= ci;
+                }
             }
-        }
-        let mut inv = acc.inv();
-        for (wi, &ci) in w.iter_mut().zip(&c).rev() {
-            if ci.is_zero() {
-                *wi = F64::ZERO;
-            } else {
-                *wi = inv * *wi;
-                inv *= ci;
+            let mut inv = acc.inv();
+            for (j, wi) in w.iter_mut().enumerate().rev() {
+                let ci = cond(rows.get(first + j));
+                if ci.is_zero() {
+                    *wi = F64::ZERO;
+                } else {
+                    *wi = inv * *wi;
+                    inv *= ci;
+                }
             }
-        }
+        });
         // One pass. The three offsets and the three cells they name come out of one decode.
         // Those cells are K-valued on every row, taken or not (`cpu::execute` rejects
         // anything else), so each is one lane and the memory flush carries literal zeros
@@ -851,7 +855,7 @@ impl Table for JumpTable {
                 ctx.g_at(r.rf),
                 ctx.g_at(r.bytecode_read),
                 w[i],
-                F64(!c[i].is_zero() as u64),
+                F64(!w[i].is_zero() as u64),
             ]
         });
     }
