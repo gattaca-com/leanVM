@@ -412,7 +412,21 @@ impl AdditiveNttF64 {
     ) -> Vec<Vec<F64>> {
         let subs = deep.sub_blocks(positions);
         let built = self.rebuild_sub_blocks(msg, repeats, n_lanes, deep, &subs);
-        deep.pick(&subs, &built, positions)
+        // Each sub-block finishes into the thread's scratch, so `built` is only read and never written back.
+        let (sub_len, log_sub) = (deep.sub_len(), deep.log_d - deep.deep_start);
+        let mut rows = vec![Vec::new(); positions.len()];
+        let out = parallel::SendPtr(rows.as_mut_ptr());
+        parallel::for_each(subs.len(), |i| {
+            with_scratch(sub_len, |sub| {
+                self.finish_sub_block(Some(&built[i * sub_len..][..sub_len]), sub, deep, subs[i]);
+                for (k, &q) in positions.iter().enumerate().filter(|(_, q)| *q >> log_sub == subs[i]) {
+                    let row = sub[(q & ((1 << log_sub) - 1)) * deep.num_ntts..][..deep.num_ntts].to_vec();
+                    // SAFETY: position `k` lies in sub-block `subs[i]` alone, so one task writes slot `k`.
+                    unsafe { *out.add(k) = row };
+                }
+            });
+        });
+        rows
     }
 
     /// The deep layers over sub-block `sub_idx` of the codeword, which `src` holds as the gathered pass left it.
@@ -423,19 +437,19 @@ impl AdditiveNttF64 {
         self.run_layers_to(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
     }
 
-    /// The finished deep sub-blocks `subs` (sorted, distinct) of an encode that kept no buffer, back to back.
+    /// The deep sub-blocks `subs` (sorted, distinct) of an encode that kept no buffer, back to back, before their deep layers.
     ///
     /// - The encode ran one gathered pass over its lane-major message: a group is one residue of one coset,
     ///   and its transform leaves row `i` of the group as row `r` of sub-block `coset << g | i`, `g` layers deep.
     /// - So each group transforms again here, skipping the blocks that feed no row of `subs`,
     ///   and keeps only the rows that fall in a sub-block of `subs`.
-    /// - Those rows are every word of the sub-blocks before their deep layers, which then run in place.
+    /// - Those rows are every word of the sub-blocks before their deep layers, which [`Self::rebuild_rows`] runs.
     ///
     /// # Panics
     ///
     /// Panics unless the encode had the plan this reads back: one lane-major gathered pass.
     #[timed]
-    pub fn rebuild_sub_blocks(
+    fn rebuild_sub_blocks(
         &self,
         msg: &[F64],
         repeats: &[bool],
@@ -489,7 +503,6 @@ impl AdditiveNttF64 {
                 }
             });
         });
-        parallel::chunks_mut(&mut built, sub_len, |i, sub| self.finish_sub_block(None, sub, deep, subs[i]));
         built
     }
 
