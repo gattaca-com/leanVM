@@ -928,6 +928,8 @@ impl QuaternaryLayerState {
         self.ones = halve(&self.ones, count);
         std::mem::swap(&mut self.blocks, &mut self.next_blocks);
         if first.is_some() {
+            // The leaf table dies first, so the allocator can hand its pages to the next buffer.
+            drop(first);
             // SAFETY: the next fold writes every slot of `next_blocks` before any read.
             self.next_blocks = unsafe { primitives::uninit_vec(count.div_ceil(2)) };
         }
