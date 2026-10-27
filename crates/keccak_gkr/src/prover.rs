@@ -30,6 +30,8 @@ fn ternary(b: usize) -> usize {
 /// Digits a weight splits into, and the values of one.
 const DIGIT_BITS: usize = 8;
 const DIGITS: usize = 192 / DIGIT_BITS;
+/// Values of half a digit.
+const NIBBLE: usize = 1 << (DIGIT_BITS / 2);
 /// The bits of a block position's products, 48 to each pack.
 const PAYLOAD_BITS: usize = 48 * PACKS;
 /// The packs of a part of a block position, and the words of their products: with AVX-512 the
@@ -156,30 +158,39 @@ impl Groups {
     /// `sum over positions of weight[j] (x) payloads[j]` into `rows`: row `DIGIT_BITS * d + i`
     /// sums the payloads whose weight has that bit set. Each group is summed in registers, so
     /// the payloads are only read.
-    fn add_rows(&self, payloads: &[Part; BITS], rows: &mut [Part; 192], sums: &mut [Part; 1 << DIGIT_BITS]) {
+    fn add_rows(&self, payloads: &[Part; BITS], rows: &mut [Part; 192]) {
         for (rows, (order, starts)) in rows
             .as_chunks_mut::<DIGIT_BITS>()
             .0
             .iter_mut()
             .zip(self.order.iter().zip(&self.starts))
         {
-            for (v, sum) in sums.iter_mut().enumerate() {
-                let mut acc = Part::ZERO;
-                for &p in &order[starts[v] as usize..starts[v + 1] as usize] {
-                    // SAFETY: `order` holds positions.
-                    acc.add(unsafe { payloads.get_unchecked(p as usize) });
+            // The digit is a high and a low nibble. `low[l]` sums the groups whose value ends in `l`,
+            // and `high[h]` those that begin with `h`; every row is a sum of one or the other.
+            let mut low = [Part::ZERO; NIBBLE];
+            let mut high = [Part::ZERO; NIBBLE];
+            for (h, high) in high.iter_mut().enumerate() {
+                let mut sum = Part::ZERO;
+                for (l, low) in low.iter_mut().enumerate() {
+                    let v = NIBBLE * h + l;
+                    let mut acc = Part::ZERO;
+                    for &p in &order[starts[v] as usize..starts[v + 1] as usize] {
+                        // SAFETY: `order` holds positions.
+                        acc.add(unsafe { payloads.get_unchecked(p as usize) });
+                    }
+                    low.add(&acc);
+                    sum.add(&acc);
                 }
-                *sum = acc;
+                *high = sum;
             }
-            // Bit `i` of the digit: the sums whose value has it, then fold it away.
-            for (i, row) in rows.iter_mut().enumerate().rev() {
-                let (low, high) = sums[..2 << i].split_at_mut(1 << i);
-                let mut acc = Part::ZERO;
-                for (low, high) in low.iter_mut().zip(&*high) {
-                    acc.add(high);
-                    low.add(high);
+            for i in 0..DIGIT_BITS / 2 {
+                let (mut by_low, mut by_high) = (Part::ZERO, Part::ZERO);
+                for x in (0..NIBBLE).filter(|x| x >> i & 1 == 1) {
+                    by_low.add(&low[x]);
+                    by_high.add(&high[x]);
                 }
-                *row = acc;
+                rows[i] = by_low;
+                rows[DIGIT_BITS / 2 + i] = by_high;
             }
         }
     }
@@ -247,11 +258,10 @@ impl Layer<'_> {
                 (
                     vec![[Part::ZERO; BITS]; PACKS / PART],
                     vec![[Part::ZERO; 192]; PACKS / PART],
-                    Box::new([Part::ZERO; 1 << DIGIT_BITS]),
                 )
             },
             || vec![F192Unreduced::ZERO; PAYLOAD_BITS],
-            |(payloads, rows, digit_sums), sums, task| {
+            |(payloads, rows), sums, task| {
                 let (_, _, block) = self.block(task);
                 for r in 0..5 {
                     for z in 0..64 {
@@ -266,7 +276,7 @@ impl Layer<'_> {
                     }
                 }
                 for (payloads, rows) in payloads.iter().zip(rows.iter_mut()) {
-                    groups.add_rows(payloads, rows, digit_sums);
+                    groups.add_rows(payloads, rows);
                 }
                 // Row `r` holds bit `r` of each payload bit's weighted sum: transposed, they are
                 // field elements, which the block's weight multiplies.
