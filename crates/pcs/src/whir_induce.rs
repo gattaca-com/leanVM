@@ -133,39 +133,48 @@ pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     let mut low = vec![F64::ZERO; padded << lo];
     let mut high = Vec::with_capacity(n_queries << (log_msg_cols - lo));
     let mut sks = vec![F64::ZERO; log_msg_cols];
+    let mut tensor = Vec::with_capacity(1 << lo);
     for (i, &q) in queries.iter().enumerate() {
         normalized_sks_at(F64(q as u64), sks_vks, &inv_sks_vks, &mut sks);
-        for (j, v) in tensor_k(&sks[..lo]).into_iter().enumerate() {
+        tensor.clear();
+        extend_tensor_k(&mut tensor, &sks[..lo]);
+        for (j, &v) in tensor.iter().enumerate() {
             low[j * padded + i] = v;
         }
-        high.extend(tensor_k(&sks[lo..]));
+        extend_tensor_k(&mut high, &sks[lo..]);
     }
-    let mut basis = vec![F192::ZERO; 1 << log_msg_cols];
-    parallel::chunks_mut(&mut basis, 1 << lo, |j, out: &mut [F192]| {
+    // `packed[j * (padded / 8) + g]` holds the weights `w_i · high_i(j)` of the queries `8g..8g + 8`.
+    let groups = padded / 8;
+    // SAFETY: every entry is written before it is read.
+    let mut packed = unsafe { primitives::uninit_vec::<Weights8>(groups << (log_msg_cols - lo)) };
+    parallel::chunks_mut(&mut packed, groups, |j, row| {
         let scaled = |i: usize| match weights.get(i) {
             Some(w) => w.mul_base(high[(i << (log_msg_cols - lo)) | j]),
             None => F192::ZERO,
         };
-        let packed: Vec<Weights8> = (0..padded / 8)
-            .map(|g| Weights8::new(&std::array::from_fn(|t| scaled(8 * g + t))))
-            .collect();
+        for (g, slot) in row.iter_mut().enumerate() {
+            *slot = Weights8::new(&std::array::from_fn(|t| scaled(8 * g + t)));
+        }
+    });
+    // SAFETY: every element is written below.
+    let mut basis = unsafe { primitives::uninit_vec::<F192>(1 << log_msg_cols) };
+    parallel::chunks_mut(&mut basis, 1 << lo, |j, out: &mut [F192]| {
         for (out, low) in out.iter_mut().zip(low.chunks_exact(padded)) {
-            *out = dot_base(&packed, low).reduce();
+            *out = dot_base(&packed[j * groups..][..groups], low).reduce();
         }
     });
     (basis, enforced_sum)
 }
 
-/// `t[j] = Π_k s[k]^(bit k of j)`, over K.
-fn tensor_k(s: &[F64]) -> Vec<F64> {
-    let mut t = Vec::with_capacity(1 << s.len());
-    t.push(F64::ONE);
+/// Appends `t[j] = Π_k s[k]^(bit k of j)`, over K, to `out`.
+fn extend_tensor_k(out: &mut Vec<F64>, s: &[F64]) {
+    let start = out.len();
+    out.push(F64::ONE);
     for &x in s {
-        for j in 0..t.len() {
-            t.push(t[j] * x);
+        for j in start..out.len() {
+            out.push(out[j] * x);
         }
     }
-    t
 }
 
 /// Just the `enforced_sum` half of [`induce_sumcheck_poly`]:
@@ -345,25 +354,24 @@ fn transpose_forward_ntt_sparse_ext(
     });
 
     // Per replica and layer `j` of pass 2, the blocks of `2^(j+1)` rows that are not zero, with their twiddles.
-    let plans: Vec<Vec<Vec<(usize, F64)>>> = (0..n_replicas)
-        .map(|replica| {
-            let mut live = occupied[replica * rows..(replica + 1) * rows].to_vec();
-            (0..k)
-                .map(|j| {
-                    let len = 2 << j;
-                    let blocks: Vec<usize> = (0..rows / len)
-                        .filter(|&b| live[b * len..(b + 1) * len].contains(&true))
-                        .collect();
-                    blocks.iter().for_each(|&b| live[b * len..(b + 1) * len].fill(true));
-                    let layer = log_d - log_window - 1 - j;
-                    blocks
-                        .into_iter()
-                        .map(|b| (b, ntt.twiddle(layer, (replica << (k - 1 - j)) + b)))
-                        .collect()
-                })
-                .collect()
-        })
-        .collect();
+    // Layer `i = replica * k + j` is `plan[ends[i]..ends[i + 1]]`.
+    let (mut plan, mut ends, mut live) = (Vec::new(), vec![0], vec![false; rows]);
+    for replica in 0..n_replicas {
+        live.copy_from_slice(&occupied[replica * rows..(replica + 1) * rows]);
+        for j in 0..k {
+            let len = 2 << j;
+            let layer = log_d - log_window - 1 - j;
+            for b in 0..rows / len {
+                if live[b * len..(b + 1) * len].contains(&true) {
+                    live[b * len..(b + 1) * len].fill(true);
+                    plan.push((b, ntt.twiddle(layer, (replica << (k - 1 - j)) + b)));
+                }
+            }
+            ends.push(plan.len());
+        }
+    }
+
+    let layers = |replica: usize| (replica * k..(replica + 1) * k).map(|i| &plan[ends[i]..ends[i + 1]]);
 
     // SAFETY: pass 2 writes every element.
     let mut kept = unsafe { primitives::uninit_vec::<F192>(n_keep) };
@@ -380,7 +388,7 @@ fn transpose_forward_ntt_sparse_ext(
                         row.fill(F192::ZERO);
                     }
                 }
-                transpose_rows(tile, &plans[replica]);
+                transpose_rows(tile, k, layers(replica));
             };
             run_replica(&mut sum, 0);
             for replica in 1..n_replicas {
@@ -434,9 +442,9 @@ fn transpose_window(ntt: &AdditiveNttF64, nonzeros: &[(usize, F192)], data: &mut
 /// One layer per entry of `plan` over the `2^k` equal rows of `tile`, row distance `1, 2, 4, ..`:
 /// the `(block, twiddle)` pairs to butterfly. Rows pair element by element, so a block of
 /// `2^(j+1)` rows is one contiguous pair of halves.
-fn transpose_rows(tile: &mut [F192], plan: &[Vec<(usize, F64)>]) {
-    for (j, blocks) in plan.iter().enumerate() {
-        let len = tile.len() >> (plan.len() - 1 - j);
+fn transpose_rows<'a>(tile: &mut [F192], k: usize, plan: impl Iterator<Item = &'a [(usize, F64)]>) {
+    for (j, blocks) in plan.enumerate() {
+        let len = tile.len() >> (k - 1 - j);
         for &(b, t) in blocks {
             let (top, bot) = tile[b * len..(b + 1) * len].split_at_mut(len / 2);
             transpose_butterfly_ext(t, top, bot);
