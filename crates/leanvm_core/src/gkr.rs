@@ -701,9 +701,83 @@ fn fold_block_pair<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], k: usi
             [F192x8::ONE; 4]
         }
     };
-    let (first, second) = (fold(2 * k), fold(2 * k + 1));
+    interleave(fold(2 * k), fold(2 * k + 1))
+}
+
+/// The folded block of two folded source blocks: their even and odd lanes interleaved.
+#[inline(always)]
+fn interleave(first: [F192x8; 4], second: [F192x8; 4]) -> Block {
     let pairs: [(F192x8, F192x8); 4] = std::array::from_fn(|c| F192x8::even_odd(first[c], second[c]));
     std::array::from_fn(|p| if p < 4 { pairs[p].0 } else { pairs[p - 4].1 })
+}
+
+/// The leaf layer's blocks that a builder computes from its own inputs instead of storing: the first
+/// message and the first fold of the layer take them from here, and the rest from the stored leaves.
+pub trait LeafColumns: Sync {
+    /// Sorted, disjoint runs of blocks of side `s` (0 push, 1 pull) with even start and length.
+    fn runs(&self, s: usize) -> &[Range<usize>];
+
+    /// The number of tasks of a pass.
+    fn tasks(&self) -> usize;
+
+    /// Computes task `t`'s blocks, calling `f(side, block index, block)` for each, a pair of blocks
+    /// `2k`, `2k + 1` in that order, and the pairs of a run in increasing order.
+    fn task(&self, t: usize, f: &mut dyn FnMut(usize, usize, &Block));
+}
+
+/// Runs the tasks of a pass and adds up each side's message coefficients.
+fn reduce_sides(columns: &dyn LeafColumns, task: impl Fn(usize) -> [[Prod8; 4]; 2] + Sync) -> [[F192; 4]; 2] {
+    let xor = |left: [[Prod8; 4]; 2], right: [[Prod8; 4]; 2]| {
+        [xor_coefficients(left[0], right[0]), xor_coefficients(left[1], right[1])]
+    };
+    parallel::map_reduce(columns.tasks(), || [[Prod8::ZERO; 4]; 2], task, xor).map(|sum| sum.map(Prod8::reduce))
+}
+
+/// The first message of both sides' blocks of the runs.
+#[timed]
+fn columns_message(columns: &dyn LeafColumns, equality: &Equality) -> [[F192; 4]; 2] {
+    let task = |t: usize| {
+        let mut sums = [[Prod8::ZERO; 4]; 2];
+        columns.task(t, &mut |s, b, block| {
+            sums[s] = xor_coefficients(sums[s], block.summand(equality.block(b)));
+        });
+        sums
+    };
+    reduce_sides(columns, task)
+}
+
+/// Folds the blocks of the runs by `challenge` into the sides' `next_blocks`, and with an `equality`
+/// returns the message of the folded blocks.
+#[timed]
+fn columns_fold(
+    columns: &dyn LeafColumns,
+    next: [&mut [Block]; 2],
+    challenge: F192,
+    equality: Option<&Equality>,
+) -> [[F192; 4]; 2] {
+    let dst = next.map(|blocks| parallel::SendPtr(blocks.as_mut_ptr()));
+    let challenge = F192x8::splat(challenge);
+    let task = |t: usize| {
+        // The next round reads the destination; this round reads only the stage.
+        let stream = Stream::new();
+        let mut sums = [[Prod8::ZERO; 4]; 2];
+        let mut even = [F192x8::ZERO; 4];
+        columns.task(t, &mut |s, b, block| {
+            let folded = block.fold(challenge);
+            if b % 2 == 0 {
+                even = folded;
+                return;
+            }
+            let block = interleave(even, folded);
+            // SAFETY: the runs are disjoint, and a task owns the folded blocks of its own pairs.
+            unsafe { stream.copy_lines(dst[s].add(b / 2), &block) };
+            if let Some(equality) = equality {
+                sums[s] = xor_coefficients(sums[s], block.summand(equality.block(b / 2)));
+            }
+        });
+        sums
+    };
+    reduce_sides(columns, task)
 }
 
 fn xor_coefficients(mut left: [Prod8; 4], right: [Prod8; 4]) -> [Prod8; 4] {
@@ -791,6 +865,9 @@ pub struct QuaternaryLayerState {
     logical_rows: usize,
     /// Runs of blocks that are wholly identity, which the table does not store.
     ones: Vec<Range<usize>>,
+    /// Runs of blocks that are not stored either, because a [`LeafColumns`] pass computes them for the
+    /// first message and the first fold.
+    columns: Vec<Range<usize>>,
 }
 
 impl QuaternaryLayerState {
@@ -815,6 +892,7 @@ impl QuaternaryLayerState {
             first: None,
             logical_rows: width,
             ones: Vec::new(),
+            columns: Vec::new(),
         }
     }
 
@@ -837,6 +915,7 @@ impl QuaternaryLayerState {
             first: Some(table),
             logical_rows: width,
             ones: Vec::new(),
+            columns: Vec::new(),
         }
     }
 
@@ -864,7 +943,15 @@ impl QuaternaryLayerState {
             first: None,
             logical_rows: width,
             ones: Vec::new(),
+            columns: Vec::new(),
         }
+    }
+
+    /// The runs of blocks that the stored table does not hold.
+    fn unstored(&self) -> Vec<Range<usize>> {
+        let mut runs = [self.ones.as_slice(), self.columns.as_slice()].concat();
+        runs.sort_unstable_by_key(|run| run.start);
+        runs
     }
 
     /// `(q(0)+q(1), [X²]q, [X³]q, [X⁴]q)`.
@@ -874,7 +961,7 @@ impl QuaternaryLayerState {
             return first.message(&self.ones, equality);
         }
         if self.blocked() {
-            return blocks_message(&self.blocks, &self.ones, equality);
+            return blocks_message(&self.blocks, &self.unstored(), equality);
         }
         let stored_rows = self.values.len() / 4;
         let full_pairs = stored_rows / 2;
@@ -921,11 +1008,13 @@ impl QuaternaryLayerState {
         let count = blocks.div_ceil(2);
         self.next_blocks.truncate(count);
         let first = self.first.take();
+        let unstored = self.unstored();
         let message = match &first {
-            Some(first) => first.fold(&mut self.next_blocks, &self.ones, challenge, equality),
-            None => fold_block_pairs(&self.blocks, &mut self.next_blocks, &self.ones, challenge, equality),
+            Some(first) => first.fold(&mut self.next_blocks, &unstored, challenge, equality),
+            None => fold_block_pairs(&self.blocks, &mut self.next_blocks, &unstored, challenge, equality),
         };
         self.ones = halve(&self.ones, count);
+        self.columns.clear();
         std::mem::swap(&mut self.blocks, &mut self.next_blocks);
         if first.is_some() {
             // The leaf table dies first, so the allocator can hand its pages to the next buffer.
@@ -1110,19 +1199,42 @@ pub enum RootShape {
     FirstTwoShared,
 }
 
+/// Adds the column pass's messages of the first two trees to the stored blocks' messages.
+fn add_messages(messages: &mut [[F192; 4]; 3], from_columns: [[F192; 4]; 2]) {
+    for (message, extra) in messages.iter_mut().zip(from_columns) {
+        for (coefficient, extra) in message.iter_mut().zip(extra) {
+            *coefficient += extra;
+        }
+    }
+}
+
+/// [`columns_fold`] into the first two trees' `next_blocks`, which their own fold then completes.
+fn fold_columns(
+    columns: &dyn LeafColumns,
+    trees: &mut [QuaternaryLayerState; 3],
+    challenge: F192,
+    equality: Option<&Equality>,
+) -> [[F192; 4]; 2] {
+    let [push, pull, _] = trees;
+    columns_fold(columns, [&mut push.next_blocks, &mut pull.next_blocks], challenge, equality)
+}
+
 /// Prove three identity-padded grand products as one RLC-batched radix-four GKR.
 pub fn prove_product_triple(leaves: [Vec<F192>; 3], ps: &mut ProverState, shape: RootShape) -> ProductTriple {
     let [push, pull, count] = leaves.map(Leaves::new);
-    prove_product_triple_from(push, pull, count, ps, shape)
+    prove_product_triple_from(push, pull, count, None, ps, shape)
 }
 
 /// [`prove_product_triple`] over leaves whose first radix-four layer is already built, the third
 /// tree's in `C`. The proof is the same whichever field holds the third tree's values.
+///
+/// The `columns` are blocks of the first two trees' leaves that `push` and `pull` do not store.
 #[timed]
 pub fn prove_product_triple_from<C: TreeField>(
     push: Leaves,
     pull: Leaves,
     count: Leaves<C>,
+    columns: Option<&dyn LeafColumns>,
     ps: &mut ProverState,
     shape: RootShape,
 ) -> ProductTriple {
@@ -1178,6 +1290,12 @@ pub fn prove_product_triple_from<C: TreeField>(
 
         let width = 1usize << round_count;
         let mut trees = levels.each_mut().map(|tree| tree.state(layer, width));
+        let columns = columns.filter(|_| layer == 2 && round_count > 0);
+        if let Some(columns) = columns {
+            for (s, tree) in trees.iter_mut().take(2).enumerate() {
+                tree.columns = columns.runs(s).to_vec();
+            }
+        }
         let mut equality = Equality::new(point.get(1..).unwrap_or_default());
         let mut round_point = Vec::with_capacity(round_count);
         let mut messages = if round_count > 0 {
@@ -1185,6 +1303,10 @@ pub fn prove_product_triple_from<C: TreeField>(
         } else {
             [[F192::ZERO; 4]; 3]
         };
+        if let Some(columns) = columns {
+            let from_columns = columns_message(columns, &equality);
+            add_messages(&mut messages, from_columns);
+        }
         for round in 0..round_count {
             let mut coeffs = [0, 1, 2, 3].map(|coefficient| {
                 messages[0][coefficient] + lambda * (messages[1][coefficient] + lambda * messages[2][coefficient])
@@ -1198,10 +1320,19 @@ pub fn prove_product_triple_from<C: TreeField>(
             round_point.push(challenge);
             if round + 1 < round_count {
                 equality = Equality::new(&point[round + 2..]);
+                let from_columns = columns
+                    .filter(|_| round == 0)
+                    .map(|columns| fold_columns(columns, &mut trees, challenge, Some(&equality)));
                 messages = trees.each_mut().map(|tree| tree.fold_and_message(challenge, &equality));
+                if let Some(from_columns) = from_columns {
+                    add_messages(&mut messages, from_columns);
+                }
             } else {
                 // The last round has no weights left to weight a message by and needs
                 // the fold alone. Both kernels stay for that reason; `fold` is not dead.
+                if let Some(columns) = columns.filter(|_| round == 0) {
+                    fold_columns(columns, &mut trees, challenge, None);
+                }
                 for tree in &mut trees {
                     tree.fold(challenge);
                 }
@@ -1401,6 +1532,7 @@ mod tests {
                     Leaves::new(push),
                     Leaves::new(pull),
                     Leaves::<F64>::new(count),
+                    None,
                     &mut base_ps,
                     RootShape::Distinct,
                 );
@@ -1514,6 +1646,7 @@ mod tests {
                 sparse(0),
                 sparse(1),
                 Leaves::new(tree(2)),
+                None,
                 &mut sparse_ps,
                 RootShape::Distinct,
             );

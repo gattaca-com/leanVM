@@ -282,6 +282,8 @@ impl Lanes for F64x8 {
 /// reduction chains fill the gaps of the carry-less multiplier's queue, and the fence waits for the
 /// stores once per task rather than once per block.
 ///
+/// The first `columns` blocks of the task are computed but not stored: GKR recomputes them.
+///
 /// # Safety
 /// The task owns blocks `first ..` of `quads`, sixteen per block, and of `tiers`, four and one per
 /// block, inside their allocations.
@@ -290,6 +292,7 @@ unsafe fn publish_task<G: Lanes>(
     quads: parallel::SendPtr<G::Elem>,
     tiers: [parallel::SendPtr<G::Elem>; 2],
     first: usize,
+    columns: usize,
     compute: impl Fn(usize) -> G,
 ) {
     let stream = Stream::new();
@@ -314,7 +317,9 @@ unsafe fn publish_task<G: Lanes>(
             }
             if k > 0 {
                 let v = &stage[prev];
-                stream.copy(std::slice::from_mut(&mut task[k - 1][j]), &v[j..=j]);
+                if k > columns {
+                    stream.copy(std::slice::from_mut(&mut task[k - 1][j]), &v[j..=j]);
+                }
                 // Lane `j` of the two quads of each group, a product per step.
                 match j {
                     0..4 => pairs[j] = v[2 * j] * v[2 * j + 1],
@@ -412,12 +417,17 @@ fn leaf_rows8((constant, terms): &(F192, Terms), z: usize) -> F192x8 {
     acc.reduce_lanes() + F192x8::splat(*constant)
 }
 
+/// GKR blocks per task of the passes over the columns.
+const BLOCKS: usize = 128;
+
 /// One side's leaf vector while it is built, with the leaf terms of each block.
 struct Side<'a> {
     blocks: &'a [Block],
     lay: &'a Layout,
     explicit: usize,
     tiled: bool,
+    /// Whether the pairs of GKR blocks inside a block's bulk are left unstored for GKR to recompute.
+    columns: bool,
     leaves: Vec<gkr::Block>,
     quads: Vec<F192>,
     quads_done: Vec<usize>,
@@ -436,6 +446,66 @@ impl Side<'_> {
         let aligned = self.lay.offsets[b].is_multiple_of(gkr::BLOCK_VALUES);
         if blk.rows >= PAR_THRESHOLD && aligned { blk.rows / gkr::BLOCK_VALUES } else { 0 }
     }
+
+    /// The leading GKR blocks of block `b`'s bulk that are not stored: an even number, so that an odd
+    /// last block stays stored, where it pairs with the block after it.
+    fn unstored(&self, b: usize) -> usize {
+        if self.columns { self.bulk(b) & !1 } else { 0 }
+    }
+}
+
+/// The blocks of both bus sides that [`build_leaves`] left unstored, and what computes them again
+/// from the columns, in the same groups and tasks as the build.
+pub struct ColumnLeaves<'a> {
+    terms: [Vec<(F192, Terms<'a>)>; 2],
+    offsets: [&'a [usize]; 2],
+    /// `(rows, side, block)` of the blocks with unstored leaves, sorted by `rows`.
+    jobs: Vec<(usize, usize, usize)>,
+    runs: [Vec<Range<usize>>; 2],
+    tasks: usize,
+}
+
+impl ColumnLeaves<'_> {
+    /// The unstored GKR blocks of a block of `rows` rows, as [`Side::unstored`] counts them.
+    fn blocks(rows: usize) -> usize {
+        (rows / gkr::BLOCK_VALUES) & !1
+    }
+
+    /// The tasks of the group of `rows`: one per `BLOCKS` unstored blocks.
+    fn chunks(rows: usize) -> usize {
+        Self::blocks(rows).div_ceil(BLOCKS)
+    }
+}
+
+impl gkr::LeafColumns for ColumnLeaves<'_> {
+    fn runs(&self, s: usize) -> &[Range<usize>] {
+        &self.runs[s]
+    }
+
+    fn tasks(&self) -> usize {
+        self.tasks
+    }
+
+    fn task(&self, t: usize, f: &mut dyn FnMut(usize, usize, &gkr::Block)) {
+        let mut t = t;
+        for group in self.jobs.chunk_by(|x, y| x.0 == y.0) {
+            let chunks = Self::chunks(group[0].0);
+            if t >= chunks {
+                t -= chunks;
+                continue;
+            }
+            for &(rows, s, b) in group {
+                let off = self.offsets[s][b];
+                for k in t * BLOCKS..((t + 1) * BLOCKS).min(Self::blocks(rows)) {
+                    let block = F192x8::transpose(std::array::from_fn(|j| {
+                        leaf_rows8(&self.terms[s][b], gkr::BLOCK_VALUES * k + 8 * j)
+                    }));
+                    f(s, off / gkr::BLOCK_VALUES + k, &block);
+                }
+            }
+            return;
+        }
+    }
 }
 
 /// Build the leaf vectors of several sides: block `b` row `z` holds `β − Σ_i w_i c_i(z)` for
@@ -447,14 +517,19 @@ impl Side<'_> {
 /// The blocks of all sides with the same number of rows read the same table, so one pass runs
 /// them together over each chunk of rows: the table's columns come from DRAM once for all of them,
 /// and every block publishes exactly what its own pass would.
+///
+/// With `columns`, the leaves of the bulk of a block are not stored, but for an odd last GKR block:
+/// the returned [`ColumnLeaves`] computes them again from the columns, which costs less DRAM
+/// traffic than reading them back. A side that does not tile its layout keeps all its leaves.
 #[timed]
-pub fn build_leaves(
-    sides: &[(&[Block], &Layout)],
-    cols: &[&[F64]],
+pub fn build_leaves<'a>(
+    sides: &[(&'a [Block], &'a Layout); 2],
+    cols: &[&'a [F64]],
     w: &[F192],
     beta: F192,
-    gpow: &[F64],
-) -> Vec<gkr::Leaves> {
+    gpow: &'a [F64],
+    columns: bool,
+) -> (Vec<gkr::Leaves>, Option<ColumnLeaves<'a>>) {
     let mut sides: Vec<Side> = sides
         .iter()
         .map(|&(blocks, lay)| {
@@ -509,6 +584,7 @@ pub fn build_leaves(
                 lay,
                 explicit,
                 tiled,
+                columns: columns && tiled,
                 leaves,
                 quads,
                 quads_done: lay.offsets[..blocks.len()].to_vec(),
@@ -518,7 +594,6 @@ pub fn build_leaves(
             }
         })
         .collect();
-    const BLOCKS: usize = 128;
     for side in &mut sides {
         if (0..side.blocks.len()).any(|b| side.bulk(b) > 0) {
             let level4 = side.quads.len().div_ceil(4);
@@ -566,16 +641,34 @@ pub fn build_leaves(
                 // task or block of the group touches.
                 unsafe {
                     let task = ptrs[s].0.slice(first, BLOCKS.min(bulk - c * BLOCKS));
-                    publish_task(task, ptrs[s].1, ptrs[s].2, first, |l| {
+                    let columns = side.unstored(b).saturating_sub(c * BLOCKS).min(BLOCKS);
+                    publish_task(task, ptrs[s].1, ptrs[s].2, first, columns, |l| {
                         leaf_rows8(&side.terms[b], l - off)
                     });
                 }
             }
         });
     }
-    sides
+    let mut runs = [Vec::new(), Vec::new()];
+    let mut offsets = [&[][..]; 2];
+    let mut column_terms = [Vec::new(), Vec::new()];
+    let column_jobs: Vec<_> = jobs
+        .iter()
+        .copied()
+        .filter(|&(_, s, b)| sides[s].unstored(b) > 0)
+        .collect();
+    for &(_, s, b) in &column_jobs {
+        let first = sides[s].lay.offsets[b] / gkr::BLOCK_VALUES;
+        runs[s].push(first..first + sides[s].unstored(b));
+    }
+    for (s, run) in runs.iter_mut().enumerate() {
+        run.sort_unstable_by_key(|run| run.start);
+        offsets[s] = &sides[s].lay.offsets;
+    }
+    let leaves = sides
         .into_iter()
-        .map(|mut side| {
+        .enumerate()
+        .map(|(s, mut side)| {
             let (blocks, lay, explicit, tiled) = (side.blocks, side.lay, side.explicit, side.tiled);
             for b in 0..blocks.len() {
                 let (blk, off) = (&blocks[b], lay.offsets[b]);
@@ -588,6 +681,9 @@ pub fn build_leaves(
                 if tiled {
                     fill_ones(&mut side.leaves, off + blk.rows, off + (1usize << blk.kappa), explicit);
                 }
+            }
+            if !runs[s].is_empty() {
+                column_terms[s] = std::mem::take(&mut side.terms);
             }
             let Side {
                 leaves,
@@ -626,7 +722,19 @@ pub fn build_leaves(
                 staged,
             }
         })
-        .collect()
+        .collect();
+    let tasks = column_jobs
+        .chunk_by(|x, y| x.0 == y.0)
+        .map(|group| ColumnLeaves::chunks(group[0].0))
+        .sum();
+    let columns = (!column_jobs.is_empty()).then_some(ColumnLeaves {
+        terms: column_terms,
+        offsets,
+        jobs: column_jobs,
+        runs,
+        tasks,
+    });
+    (leaves, columns)
 }
 
 /// The values at `level`, of a table of `len`, that GKR never reads inside the run of identity
@@ -1082,10 +1190,9 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
             segment_of(l + t).and_then(|(off, _, data)| data.get(l + t - off).copied()).unwrap_or(F64::ONE)
         })),
     };
-    const BLOCKS: usize = 128;
     parallel::chunks_mut(&mut leaves, BLOCKS, |c, task| {
         // SAFETY: task `c` owns the quads of its blocks, which no other task touches.
-        unsafe { publish_task(task, quads_ptr, tier_ptrs, c * BLOCKS, eight) };
+        unsafe { publish_task(task, quads_ptr, tier_ptrs, c * BLOCKS, 0, eight) };
     });
     quads.truncate(explicit.div_ceil(4));
     tiers[0].truncate(quads.len().div_ceil(4));
@@ -1171,20 +1278,32 @@ pub fn prove_balance(
         .max();
     let gpow = index_k.map_or_else(Vec::new, |k| primitives::field::g_powers(1usize << k));
     // Push and pull are built together, so a table's columns are read once for both sides.
-    let (push_leaves, pull_leaves, count_leaves) = crate::stage!("Bus leaves", || {
-        let [push_leaves, pull_leaves]: [_; 2] =
-            build_leaves(&[(push, &push_lay), (pull, &pull_lay)], cols, &w, beta, &gpow)
-                .try_into()
-                .ok()
-                .expect("two sides");
-        (push_leaves, pull_leaves, build_count_leaves(count, &count_lay, cols))
+    // With several threads, GKR recomputes most of their leaves from the columns instead of storing them.
+    let columns = parallel::num_threads() > 1;
+    let (push_leaves, pull_leaves, count_leaves, column_leaves) = crate::stage!("Bus leaves", || {
+        let (leaves, column_leaves) =
+            build_leaves(&[(push, &push_lay), (pull, &pull_lay)], cols, &w, beta, &gpow, columns);
+        let [push_leaves, pull_leaves]: [_; 2] = leaves.try_into().ok().expect("two sides");
+        (
+            push_leaves,
+            pull_leaves,
+            build_count_leaves(count, &count_lay, cols),
+            column_leaves,
+        )
     });
     // Leaf construction keeps the all-one padding implicit; decomposition uses the full logical depth.
     count_lay.mu = push_lay.mu;
     // All three trees run as ONE RLC-batched GKR (equal μ: push/pull match
     // block-for-block, count is padded), so every claim lands on ONE point ζ.
     let bus_gkr = crate::stage!("Bus GKR", || {
-        gkr::prove_product_triple_from(push_leaves, pull_leaves, count_leaves, ps, gkr::RootShape::FirstTwoShared)
+        gkr::prove_product_triple_from(
+            push_leaves,
+            pull_leaves,
+            count_leaves,
+            column_leaves.as_ref().map(|c| c as &dyn gkr::LeafColumns),
+            ps,
+            gkr::RootShape::FirstTwoShared,
+        )
     });
 
     // Framework blocks keep their per-column claims (deduped: push/pull share ζ);
