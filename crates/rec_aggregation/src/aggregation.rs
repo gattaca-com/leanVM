@@ -53,7 +53,7 @@ use leanvm_core::leaf::{Block, Coord};
 use leanvm_core::tables::N_TABLES;
 use leanvm_core::transcript::FiatShamirState;
 use primitives::field::{F64, F192, F192Unreduced, G, Weights8, dot_base, g_pow};
-use primitives::multilinear::{eq_table, mle_eval_par};
+use primitives::multilinear::{eq_table, fill_eq_table_uninit, mle_eval_par};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use signatures::{lean_sphincs, lean_xmss};
 
@@ -833,48 +833,56 @@ fn bytecode_mle(point: &[F192]) -> F192 {
         .fold(F192::ZERO, |acc, value| acc + value)
 }
 
-/// What the bytecode batch reads of the stacked table for each claim point, and the weights it reads it with.
-struct BytecodeSums {
-    /// The claim's weights on the rows above the first `BLOCK_VARS` variables.
-    eq_hi: Vec<Vec<F192>>,
-    /// `G_t(low) = Σ_slot eq(slot) Σ_high eq(high) · column_slot(high, low)`, over the `BLOCK` values of `low`:
-    /// the claim's evaluation with the slot and high rows summed out.
-    sums: Vec<Vec<F192>>,
+/// Appends the `eq(r, ·)` table to `out`.
+fn extend_eq(out: &mut Vec<F192>, r: &[F192]) {
+    let len = 1 << r.len();
+    out.reserve(len);
+    fill_eq_table_uninit(r, F192::ONE, &mut out.spare_capacity_mut()[..len]);
+    // SAFETY: the fill writes all `len` entries.
+    unsafe { out.set_len(out.len() + len) };
 }
 
-/// [`BytecodeSums`] of every point, one pass over the populated table per distinct point.
+/// What the bytecode batch reads of the stacked table for each claim point, and the weights it reads it with.
+struct BytecodeSums {
+    /// The claims' weights on the rows above the first `BLOCK_VARS` variables, `2^(kbc - BLOCK_VARS)` each.
+    eq_hi: Vec<F192>,
+    /// `G_t(low) = Σ_slot eq(slot) Σ_high eq(high) · column_slot(high, low)`, over the `BLOCK` values of `low`:
+    /// the claim's evaluation with the slot and high rows summed out. `BLOCK` values per claim.
+    sums: Vec<F192>,
+}
+
+/// [`BytecodeSums`] of every point, one pass over the populated table per distinct point. The points are
+/// `bytecode_vars()` values each, end to end.
 ///
 /// Children that are leaves all carry the same claim, so a node over leaves reads the table once for them.
-fn bytecode_sums(points: &[Vec<F192>]) -> BytecodeSums {
+fn bytecode_sums(points: &[F192]) -> BytecodeSums {
     let slot_window = bytecode_window();
     let kbc = bytecode_vars() - leanvm_core::leaf::N_BYTECODE_SELECTORS;
     assert!(kbc >= BLOCK_VARS, "the bytecode has fewer rows than a block");
     let columns: Vec<&[F64]> = stacked_bytecode()[(slot_window.start << kbc)..(slot_window.end << kbc)]
         .chunks(1 << kbc)
         .collect();
-    let eq_hi: Vec<Vec<F192>> = points.iter().map(|point| eq_table(&point[BLOCK_VARS..kbc])).collect();
+    let points = points.chunks_exact(bytecode_vars());
+    let mut eq_hi = Vec::new();
+    points.clone().for_each(|point| extend_eq(&mut eq_hi, &point[BLOCK_VARS..kbc]));
     // Rows `(high, low)` with `low` the first `BLOCK_VARS` variables, which the first rounds bind. Per claim,
     // the weight splits into a factor on each of slot, high and low rows, so those rounds run on the
     // slot and high rows summed out.
-    let mut sums: Vec<Vec<F192>> = Vec::with_capacity(points.len());
-    for (t, (point, eq_hi)) in points.iter().zip(&eq_hi).enumerate() {
-        if let Some(same) = points[..t].iter().position(|earlier| earlier == point) {
-            sums.push(sums[same].clone());
+    let mut sums = Vec::with_capacity(points.len() * BLOCK);
+    for (t, (point, eq_hi)) in points.clone().zip(eq_hi.chunks_exact(1 << (kbc - BLOCK_VARS))).enumerate() {
+        if let Some(same) = points.clone().take(t).position(|earlier| earlier == point) {
+            sums.extend_from_within(same * BLOCK..(same + 1) * BLOCK);
             continue;
         }
         let per_slot = partial_evals(&columns, eq_hi, eq_hi.len());
         let weights: Vec<F192> = slot_window.clone().map(|slot| slot_eq(point, kbc, slot)).collect();
-        sums.push(
-            (0..BLOCK)
-                .map(|low| {
-                    (0..columns.len())
-                        .fold(F192Unreduced::ZERO, |acc, s| {
-                            acc ^ weights[s].mul_unreduced(per_slot[s * BLOCK + low])
-                        })
-                        .reduce()
+        sums.extend((0..BLOCK).map(|low| {
+            (0..columns.len())
+                .fold(F192Unreduced::ZERO, |acc, s| {
+                    acc ^ weights[s].mul_unreduced(per_slot[s * BLOCK + low])
                 })
-                .collect(),
-        );
+                .reduce()
+        }));
     }
     BytecodeSums { eq_hi, sums }
 }
@@ -885,7 +893,7 @@ impl BytecodeSums {
     fn value(&self, t: usize, point: &[F192]) -> F192 {
         eq_table(&point[..BLOCK_VARS])
             .iter()
-            .zip(&self.sums[t])
+            .zip(&self.sums[t * BLOCK..][..BLOCK])
             .fold(F192::ZERO, |acc, (&eq, &sum)| acc + eq * sum)
     }
 }
@@ -893,9 +901,9 @@ impl BytecodeSums {
 /// `Σ_t γ_t · eq(points[t], (r_row, ·))` over the stacking slots, once the row
 /// variables are bound. A closed form, so the row rounds never have to carry the
 /// slot half of a `2^kbcv` weight table.
-fn slot_weights(points: &[Vec<F192>], lambdas: &[F192], r_row: &[F192], kbc: usize) -> Vec<F192> {
+fn slot_weights(points: &[F192], lambdas: &[F192], r_row: &[F192], kbc: usize) -> Vec<F192> {
     let mut weights = vec![F192::ZERO; 1 << leanvm_core::leaf::N_BYTECODE_SELECTORS];
-    for (point, &lambda) in points.iter().zip(lambdas) {
+    for (point, &lambda) in points.chunks_exact(bytecode_vars()).zip(lambdas) {
         let row_weight: F192 = (0..kbc).fold(lambda, |acc, k| acc * (F192::ONE + point[k] + r_row[k]));
         for (slot, weight) in weights.iter_mut().enumerate() {
             *weight += row_weight * slot_eq(point, kbc, slot);
@@ -942,12 +950,16 @@ fn fold_lsb(table: &mut Vec<F192>, challenge: F192) {
     fold_lsb_seq(table, challenge);
 }
 
-fn fold_lsb_seq(table: &mut Vec<F192>, challenge: F192) {
-    let half = table.len() / 2;
-    for i in 0..half {
+/// Folds `table` in place: its first half is the result.
+fn fold_in_place(table: &mut [F192], challenge: F192) {
+    for i in 0..table.len() / 2 {
         table[i] = table[2 * i] + challenge * (table[2 * i] + table[2 * i + 1]);
     }
-    table.truncate(half);
+}
+
+fn fold_lsb_seq(table: &mut Vec<F192>, challenge: F192) {
+    fold_in_place(table, challenge);
+    table.truncate(table.len() / 2);
 }
 
 /// [`fold_lsb`] on every table, one table per task when the tables are many and each below [`PAR_MIN`].
@@ -1097,21 +1109,12 @@ fn aggregate_deferred_claims(
 
     let _span = tracing::info_span!("Bytecode batch", vars = kbcv).entered();
     let gbc: Vec<F192> = (0..2 * child_count).map(|_| transcript.sample()).collect();
-    let points: Vec<Vec<F192>> = subproofs
-        .iter()
-        .zip(carried_claims)
-        .flat_map(|(subproof, carried)| {
-            [
-                subproof
-                    .bytecode_row_point
-                    .iter()
-                    .chain(&subproof.bytecode_selector_point)
-                    .copied()
-                    .collect::<Vec<_>>(),
-                carried.bytecode_point.clone(),
-            ]
-        })
-        .collect();
+    let mut points = Vec::with_capacity(2 * child_count * kbcv);
+    for (subproof, carried) in subproofs.iter().zip(carried_claims) {
+        points.extend(subproof.bytecode_row_point.iter().chain(&subproof.bytecode_selector_point));
+        points.extend_from_slice(&carried.bytecode_point);
+    }
+    assert_eq!(points.len(), 2 * child_count * kbcv, "a bytecode point has one value per variable");
     let values: Vec<F192> = subproofs
         .iter()
         .zip(carried_claims)
@@ -1133,14 +1136,21 @@ fn aggregate_deferred_claims(
         .chunks(1 << kbc)
         .collect();
     let BytecodeSums { eq_hi, mut sums } = bytecode;
-    let mut eq_lo: Vec<Vec<F192>> = points.iter().map(|point| eq_table(&point[..BLOCK_VARS])).collect();
-    for _ in 0..BLOCK_VARS {
-        let pairs: Vec<(&[F192], &[F192], F192)> = (0..points.len())
-            .map(|t| (&sums[t][..], &eq_lo[t][..], gbc[t]))
+    let mut eq_lo = Vec::with_capacity(sums.len());
+    points.chunks_exact(kbcv).for_each(|point| extend_eq(&mut eq_lo, &point[..BLOCK_VARS]));
+    for round in 0..BLOCK_VARS {
+        let len = BLOCK >> round;
+        let pairs: Vec<(&[F192], &[F192], F192)> = sums
+            .chunks_exact(BLOCK)
+            .zip(eq_lo.chunks_exact(BLOCK))
+            .zip(&gbc)
+            .map(|((sums, eq_lo), &g)| (&sums[..len], &eq_lo[..len], g))
             .collect();
         let msg = round_msg(&pairs);
         let r = absorb_round(&mut transcript, &mut bscr, &mut r_bc, &mut brun, msg);
-        sums.iter_mut().chain(&mut eq_lo).for_each(|table| fold_lsb(table, r));
+        for table in sums.chunks_exact_mut(BLOCK).chain(eq_lo.chunks_exact_mut(BLOCK)) {
+            fold_in_place(&mut table[..len], r);
+        }
     }
     // The high rows: every column against the low challenges, then a sumcheck over (slot, high) pairs
     // whose weight is the claims' weight on the high rows, scaled by what the low rows left.
@@ -1151,9 +1161,9 @@ fn aggregate_deferred_claims(
     });
     let mut wt = vec![F192::ZERO; bt.len()];
     parallel::chunks_mut(&mut wt, n_hi, |s, weights| {
-        for (t, point) in points.iter().enumerate() {
-            let scale = gbc[t] * eq_lo[t][0] * slot_eq(point, kbc, slot_window.start + s);
-            for (weight, &eq) in weights.iter_mut().zip(&eq_hi[t]) {
+        for (t, point) in points.chunks_exact(kbcv).enumerate() {
+            let scale = gbc[t] * eq_lo[t * BLOCK] * slot_eq(point, kbc, slot_window.start + s);
+            for (weight, &eq) in weights.iter_mut().zip(&eq_hi[t * n_hi..][..n_hi]) {
                 *weight += scale * eq;
             }
         }
@@ -1775,8 +1785,8 @@ struct Region<K> {
     dups: Vec<K>,
     /// The slot of each raw signature, in the order given.
     raw: Vec<usize>,
-    /// Per child, the slot of each of its claims.
-    children: Vec<Vec<usize>>,
+    /// The slot of each claim of each child, in order, end to end.
+    children: Vec<usize>,
 }
 
 impl<K: Ord + Clone> Region<K> {
@@ -1810,12 +1820,8 @@ impl<K: Ord + Clone> Region<K> {
             .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
             .collect();
         let children = children
-            .map(|child| {
-                child
-                    .iter()
-                    .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
-                    .collect()
-            })
+            .flatten()
+            .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
             .collect();
         Ok(Self {
             signers,
@@ -2194,22 +2200,20 @@ pub fn aggregate_with_stats(
     // One single-threaded `gen_verify` per worker, like the replay: the children are independent.
     // Both claims of each child, in the batch's order: the fresh one, then the one it carried. The fresh
     // claim's value is read off the sums the batch needs anyway.
-    let claim_points: Vec<Vec<F192>> = replayed
-        .iter()
-        .zip(children)
-        .flat_map(|((_, summary), child)| {
-            [
-                summary.bytecode_point.iter().copied().map(from_scalar).collect(),
-                child.defer.bytecode_point.clone(),
-            ]
-        })
-        .collect();
-    if claim_points.iter().any(|point| point.len() != bytecode_vars()) {
-        return Err(AggregationError::InvalidChild(AggregateVerifyError::MalformedClaim));
+    let mut claim_points = Vec::with_capacity(2 * children.len() * bytecode_vars());
+    for ((_, summary), child) in replayed.iter().zip(children) {
+        let (fresh, carried) = (&summary.bytecode_point, &child.defer.bytecode_point);
+        if fresh.len() != bytecode_vars() || carried.len() != bytecode_vars() {
+            return Err(AggregationError::InvalidChild(AggregateVerifyError::MalformedClaim));
+        }
+        claim_points.extend(fresh.iter().copied().map(from_scalar));
+        claim_points.extend_from_slice(carried);
     }
     let bytecode = bytecode_sums(&claim_points);
-    let bytecode_values: Vec<F192> = (0..children.len())
-        .map(|i| bytecode.value(2 * i, &claim_points[2 * i]))
+    let bytecode_values: Vec<F192> = claim_points
+        .chunks_exact(2 * bytecode_vars())
+        .enumerate()
+        .map(|(i, pair)| bytecode.value(2 * i, &pair[..bytecode_vars()]))
         .collect();
     let mut generated = parallel::map_collect(children.len(), |i| {
         let (pi, summary) = &replayed[i];
@@ -2218,12 +2222,18 @@ pub fn aggregate_with_stats(
     .into_iter();
     let mut subs = Vec::with_capacity(children.len());
     let mut carried = Vec::with_capacity(children.len());
-    for (i, child) in children.iter().enumerate() {
+    let (mut xmss_slots, mut sphincs_slots) = (&cover.xmss.children[..], &cover.lean_sphincs.children[..]);
+    for child in children {
         hints.push(
             "child_meta",
             &[count(child.xmss_signers.len()), count(child.lean_sphincs_signers.len())],
         );
-        for offsets in [&cover.xmss.children[i], &cover.lean_sphincs.children[i]] {
+        for (slots, len) in [
+            (&mut xmss_slots, child.xmss_signers.len()),
+            (&mut sphincs_slots, child.lean_sphincs_signers.len()),
+        ] {
+            let offsets;
+            (offsets, *slots) = slots.split_at(len);
             if !offsets.is_empty() {
                 hints.push("signers_split", &signers_split(offsets.len()));
             }
@@ -4213,12 +4223,12 @@ def main():
                 .map(|i| F192::new(0x9e37_79b9 * (i + seed), 0x85eb_ca6b ^ (i * seed), i + 7))
                 .collect()
         };
-        let points = vec![point(1), point(2), point(1)];
+        let points = [point(1), point(2), point(1)].concat();
         let sums = bytecode_sums(&points);
-        for (t, point) in points.iter().enumerate() {
+        for (t, point) in points.chunks_exact(bytecode_vars()).enumerate() {
             assert_eq!(sums.value(t, point), bytecode_mle(point));
         }
-        assert_eq!(sums.sums[0], sums.sums[2]);
+        assert_eq!(sums.sums[..BLOCK], sums.sums[2 * BLOCK..]);
     }
 
     /// The all-zeros fast path in `DeferredClaim::recompute` must agree with the
