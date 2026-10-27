@@ -678,11 +678,10 @@ impl Table<'_> {
     fn fold_to_block(&mut self, chi: &[F192]) {
         let f = partial_evals(self.cols, &eq_table(&chi[BLOCK_VARS..self.tau]), self.rows.div_ceil(BLOCK));
         if self.dots.take().is_some() {
-            let lin: Vec<F192> = (0..BLOCK)
-                .map(|x| dot_e(self.form.lin.iter().map(|&(c, w)| (w, f[c * BLOCK + x]))))
+            let lin = |x: usize| dot_e(self.form.lin.iter().map(|&(c, w)| (w, f[c * BLOCK + x])));
+            self.state.as_mut().expect("the table joined")[0] = (0..BLOCK / 8)
+                .map(|b| F192x8::from_array(&std::array::from_fn(|l| lin(8 * b + l))))
                 .collect();
-            self.state.as_mut().expect("the table joined")[0] =
-                lin.as_chunks::<8>().0.iter().map(F192x8::from_array).collect();
         }
         self.partial = Some(f);
     }
