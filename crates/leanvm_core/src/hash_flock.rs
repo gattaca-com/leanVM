@@ -34,7 +34,9 @@ use flux_profiler::timed;
 use crate::transcript::ProverState;
 use ::pcs::pack::LOG_PACKING;
 use ::pcs::stack_open::EQUAL_BLOCK_LOG;
-use flock::hash::{Blake2sSetup, Compression, K_LOG, blake2s_compress, generate_witness_into_z};
+use flock::hash::{
+    Blake2sSetup, Compression, K_LOG, blake2s_compress, generate_witness_into_z, rebuilds, witness_ab_words,
+};
 use primitives::field::{F64, F192};
 
 pub use flock::hash::{SliceClaim, min_n_blocks_log as n_blocks_log, qflock_kappa, ring_switch_open};
@@ -49,10 +51,11 @@ pub const PINNED_T: u64 = flock::hash::PINNED_T;
 /// Flock-native reduction buffers emitted in the same fused pass as the
 /// committed, flattened `q_flock`. They stay alive across commit, bus, and
 /// constraint proving so reduction needs no second witness pass.
+///
+/// `ab` holds `A·z` and `B·z` only where the zerocheck reads them rather than rebuilding them from `z`.
 pub(crate) struct PreparedReductionWitness {
     n_blocks: usize,
-    a_packed: Vec<u64>,
-    b_packed: Vec<u64>,
+    ab: Option<(Vec<u64>, Vec<u64>)>,
 }
 
 impl PreparedReductionWitness {
@@ -63,12 +66,8 @@ impl PreparedReductionWitness {
     /// `q_flock` is the committed window, which holds the packed `z` words themselves.
     #[timed]
     pub(crate) fn prove(&self, q_flock: &[F64], ps: &mut ProverState) -> SliceClaim {
-        Blake2sSetup::new(self.n_blocks).prove_reduction_precomputed(
-            packed_words(q_flock),
-            &self.a_packed,
-            &self.b_packed,
-            ps,
-        )
+        let ab = self.ab.as_ref().map(|(a, b)| (&a[..], &b[..]));
+        Blake2sSetup::new(self.n_blocks).prove_reduction_precomputed(packed_words(q_flock), ab, ps)
     }
 }
 
@@ -226,12 +225,19 @@ pub(crate) fn build_qflock_prepared(
     // The packed `z` is generated straight into the committed window: its words are `q_flock`.
     // SAFETY: `F64` is `repr(transparent)` over `u64`, so the two slices are the same bytes.
     let words: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(q_flock.as_mut_ptr().cast(), q_flock.len()) };
-    let (a_packed, b_packed) = generate_witness_into_z(blocks, n_blocks_log(n_blocks), words);
-    PreparedReductionWitness {
-        n_blocks,
-        a_packed,
-        b_packed,
-    }
+    let n_log = n_blocks_log(n_blocks);
+    let mut ab = (!rebuilds()).then(|| {
+        let len = witness_ab_words(n_blocks, n_log);
+        // SAFETY (x2): `generate_witness_into_z` writes every word of `a` and `b`.
+        unsafe { (primitives::uninit_vec::<u64>(len), primitives::uninit_vec::<u64>(len)) }
+    });
+    generate_witness_into_z(
+        blocks,
+        n_log,
+        words,
+        ab.as_mut().map(|(a, b)| (&mut a[..], &mut b[..])),
+    );
+    PreparedReductionWitness { n_blocks, ab }
 }
 
 /// `log2` of the within-instance packed span (`2^8` words): the

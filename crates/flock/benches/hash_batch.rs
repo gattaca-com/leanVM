@@ -86,7 +86,7 @@ fn main() {
         let commit_s = t.elapsed().as_secs_f64();
 
         let t = Instant::now();
-        let stage = setup.prove_zerocheck(&z_packed, &a_packed, &b_packed, &mut ps);
+        let stage = setup.prove_zerocheck(&z_packed, Some((&a_packed, &b_packed)), &mut ps);
         let zerocheck_s = t.elapsed().as_secs_f64();
 
         let t = Instant::now();

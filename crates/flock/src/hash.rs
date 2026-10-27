@@ -88,8 +88,8 @@ use crate::gf2::{
 };
 use crate::witness::packed_bytes;
 use crate::witness::{
-    BitRecord, GroupRows, LANES, V32, V64, add_carry_parts, add3_fused_parts, blocks_from_rows, drive_witness_packed,
-    drive_witness_packed_into,
+    BitRecord, GroupRows, LANES, V32, V64, ab_words, add_carry_parts, add3_fused_parts, blocks_from_rows,
+    drive_witness_packed, drive_witness_packed_into,
 };
 use crate::zerocheck::bits::{Bits, Rebuild};
 use crate::zerocheck::multilinear::PackedWitness;
@@ -740,7 +740,7 @@ impl Rebuild for RebuiltFromZ<'_> {
 ///
 /// With one thread the core has spare DRAM bandwidth, so reading the tables beats rebuilding them.
 /// With more threads the bandwidth is the limit, so rebuilding wins.
-fn rebuilds() -> bool {
+pub fn rebuilds() -> bool {
     parallel::num_threads() > 1
 }
 
@@ -751,14 +751,23 @@ pub fn generate_witness_with_ab_packed(blocks: &[Compression], n_blocks_log: usi
     drive_witness_packed::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, build_group_rows)
 }
 
+/// The words of each of `a` and `b` that [`generate_witness_into_z`] writes for `n_blocks` compressions.
+pub fn witness_ab_words(n_blocks: usize, n_blocks_log: usize) -> usize {
+    ab_words::<WORDS>(n_blocks, n_blocks_log)
+}
+
 /// [`generate_witness_with_ab_packed`] with the packed `z` written into `z`,
-/// which may be uninitialized; returns `(a, b)`.
+/// which may be uninitialized.
+///
+/// `ab` takes `a` and `b`, each [`witness_ab_words`] long, when the zerocheck will read them (not [`rebuilds`]).
 #[timed]
-pub fn generate_witness_into_z(blocks: &[Compression], n_blocks_log: usize, z: &mut [u64]) -> (Vec<u64>, Vec<u64>) {
-    // Where the zerocheck rebuilds `a` and `b`, they stay allocated but unwritten.
-    // The buffers are kept only so the allocator's extent layout is unchanged:
-    // dropping them costs +1 GiB peak RSS (measured), a lead for the allocator work.
-    drive_witness_packed_into::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, z, !rebuilds(), build_group_rows)
+pub fn generate_witness_into_z(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    z: &mut [u64],
+    ab: Option<(&mut [u64], &mut [u64])>,
+) {
+    drive_witness_packed_into::<WORDS, _, _>(blocks, &padding_block(), n_blocks_log, z, ab, build_group_rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -887,8 +896,8 @@ impl Blake2sSetup {
     /// statement is already transcript-bound: the embedding protocol seeds
     /// with the R1CS digest and announces the count.)
     ///
-    /// The embedder has already generated the packed `z`, `A·z` and `B·z`
-    /// (`generate_witness_with_ab_packed`) before committing the flattened witness.
+    /// The embedder has already generated the packed `z` (`generate_witness_into_z`) before committing the
+    /// flattened witness. With `ab` it also generated `A·z` and `B·z`; without, the zerocheck rebuilds them.
     /// It is [`Self::prove_zerocheck`] then [`Self::prove_lincheck`], and returns the [`SliceClaim`] on
     /// `q_flock`, with its ring-switch weights.
     ///
@@ -898,11 +907,10 @@ impl Blake2sSetup {
     pub fn prove_reduction_precomputed(
         &self,
         z_packed: &[u64],
-        a_packed_words: &[u64],
-        b_packed_words: &[u64],
+        ab: Option<(&[u64], &[u64])>,
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> SliceClaim {
-        let stage = self.prove_zerocheck(z_packed, a_packed_words, b_packed_words, ps);
+        let stage = self.prove_zerocheck(z_packed, ab, ps);
         self.prove_lincheck(stage, z_packed, ps)
     }
 
@@ -913,8 +921,7 @@ impl Blake2sSetup {
     pub fn prove_zerocheck(
         &self,
         z_packed: &[u64],
-        a_packed_words: &[u64],
-        b_packed_words: &[u64],
+        ab: Option<(&[u64], &[u64])>,
         ps: &mut fiat_shamir::transcript::ProverState,
     ) -> ZerocheckStage {
         let _span = tracing::info_span!("Zerocheck").entered();
@@ -923,7 +930,9 @@ impl Blake2sSetup {
         let packed_len = 1usize << (self.m() - 6);
         assert_eq!(z_packed.len(), packed_len, "wrong packed witness length");
         // `A·z` and `B·z` may stop after the padding template block; the zerocheck checks they reach it.
-        assert_eq!(a_packed_words.len(), b_packed_words.len(), "wrong packed B·z length");
+        if let Some((a, b)) = ab {
+            assert_eq!(a.len(), b.len(), "wrong packed B·z length");
+        }
 
         // No bind_statement here: the embedding protocol (leanVM) seeds its
         // transcript with the R1CS digest and binds the instance
@@ -937,14 +946,13 @@ impl Blake2sSetup {
         };
         // The passes rebuild `a`, `b` and `c = z` from `z`, or read the tables the generator wrote.
         let rebuilt = RebuiltFromZ { z: z_packed };
-        let bits = if !rebuilds() {
-            Bits::Given(PackedWitness {
-                a: packed_bytes(a_packed_words),
-                b: packed_bytes(b_packed_words),
+        let bits = match ab {
+            Some((a, b)) => Bits::Given(PackedWitness {
+                a: packed_bytes(a),
+                b: packed_bytes(b),
                 c: packed_bytes(z_packed), // C = I, so c == z
-            })
-        } else {
-            Bits::Rebuilt(&rebuilt)
+            }),
+            None => Bits::Rebuilt(&rebuilt),
         };
         let zc_claim = crate::zerocheck::prove_packed_padded(bits, self.m(), &padding, ps);
 
@@ -1167,12 +1175,13 @@ mod tests {
             let n_blocks_log = min_n_blocks_log(n_blocks);
             let full = generate_witness_with_ab_packed(&blocks, n_blocks_log);
             let mut z = vec![0u64; full.0.len()];
-            let (a, b) = generate_witness_into_z(&blocks, n_blocks_log, &mut z);
-            // Where the zerocheck rebuilds them, `a` and `b` are left unwritten.
-            assert!(
-                z == full.0 && (rebuilds() || (a == full.1 && b == full.2)),
-                "{n_blocks} blocks"
-            );
+            let ab_words = witness_ab_words(n_blocks, n_blocks_log);
+            let (mut a, mut b) = (vec![0u64; ab_words], vec![0u64; ab_words]);
+            generate_witness_into_z(&blocks, n_blocks_log, &mut z, Some((&mut a, &mut b)));
+            assert!(z == full.0 && a == full.1 && b == full.2, "{n_blocks} blocks");
+            let mut z_only = vec![0u64; z.len()];
+            generate_witness_into_z(&blocks, n_blocks_log, &mut z_only, None);
+            assert!(z_only == z, "{n_blocks} blocks without a, b");
         }
     }
 

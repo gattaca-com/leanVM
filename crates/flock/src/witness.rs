@@ -393,29 +393,45 @@ where
     F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize)) + Sync,
 {
     let total_words = (1usize << n_blocks_log) * WORDS;
-    // SAFETY: `drive_witness_packed_into` writes every word of `z`.
+    let ab_words = ab_words::<WORDS>(initial_states.len(), n_blocks_log);
+    // SAFETY (x3): `drive_witness_packed_into` writes every word of `z`, `a` and `b`.
     let mut z = unsafe { primitives::uninit_vec::<u64>(total_words) };
-    let (a, b) =
-        drive_witness_packed_into::<WORDS, S, F>(initial_states, padding, n_blocks_log, &mut z, true, build_group);
+    let mut a = unsafe { primitives::uninit_vec::<u64>(ab_words) };
+    let mut b = unsafe { primitives::uninit_vec::<u64>(ab_words) };
+    drive_witness_packed_into::<WORDS, S, F>(
+        initial_states,
+        padding,
+        n_blocks_log,
+        &mut z,
+        Some((&mut a, &mut b)),
+        build_group,
+    );
     (z, a, b)
+}
+
+/// The words of `a` and `b` for `n_blocks` instances padded to `2^n_blocks_log` slots.
+///
+/// They stop after the group holding block `n_blocks`, the first all-padding block.
+/// The zerocheck reads that one padding block and none after it.
+pub(crate) fn ab_words<const WORDS: usize>(n_blocks: usize, n_blocks_log: usize) -> usize {
+    let group_blocks = (1usize << n_blocks_log).min(LANES);
+    let n_groups = (1usize << n_blocks_log) / group_blocks;
+    (n_blocks / group_blocks + 1).min(n_groups) * group_blocks * WORDS
 }
 
 /// [`drive_witness_packed`] with `z` written into the caller's buffer, which may
 /// be uninitialized: every word is written.
 ///
-/// The returned `a` and `b` stop after the group holding block `n_blocks`, the first all-padding block.
-/// The zerocheck reads that one padding block and none after it.
-///
-/// With `write_ab` false, `a` and `b` keep their size but stay untouched: they are neither transposed nor streamed.
+/// `ab` holds `a` and `b`, each [`ab_words`] long and possibly uninitialized, when the caller reads them.
+/// Without them, they are neither built, transposed nor streamed.
 pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
     initial_states: &[S],
     padding: &S,
     n_blocks_log: usize,
     z: &mut [u64],
-    write_ab: bool,
+    ab: Option<(&mut [u64], &mut [u64])>,
     build_group: F,
-) -> (Vec<u64>, Vec<u64>)
-where
+) where
     F: Fn(&[&S; LANES], &mut [V64], &mut dyn FnMut(usize, usize)) + Sync,
 {
     let n_total = 1usize << n_blocks_log;
@@ -430,19 +446,18 @@ where
 
     let total_words = n_total * WORDS;
     assert_eq!(z.len(), total_words, "z holds every instance's packed words");
-    // SAFETY (x3): group `g` publishes chunk `g` of every table in full below, `a` and `b` only for `g < ab_groups`.
+    // Group `g` publishes chunk `g` of every table in full below, `a` and `b` only for `g < ab_groups`.
     // The chunks are a group's blocks of packed words.
-    let ab_groups = (n_blocks / group_blocks + 1).min(n_groups);
-    let mut a = unsafe { primitives::uninit_vec::<u64>(ab_groups * group_blocks * WORDS) };
-    let mut b = unsafe { primitives::uninit_vec::<u64>(ab_groups * group_blocks * WORDS) };
+    let ab_groups = ab_words::<WORDS>(n_blocks, n_blocks_log) / (group_blocks * WORDS);
 
-    // Three output tables, indexed by the same group, each taking the group's blocks' packed words.
+    // Up to three output tables, indexed by the same group, each taking the group's blocks' packed words.
     let group_words = group_blocks * WORDS;
     let scratch_words = LANES * WORDS;
     let z_chunks = parallel::Chunks::new(z, group_words);
-    let a_chunks = parallel::Chunks::new(&mut a, group_words);
-    let b_chunks = parallel::Chunks::new(&mut b, group_words);
-    debug_assert_eq!(a_chunks.count(), ab_groups);
+    let ab_chunks = ab.map(|(a, b)| {
+        assert!(a.len() == ab_groups * group_words && b.len() == a.len(), "a and b hold their groups");
+        (parallel::Chunks::new(a, group_words), parallel::Chunks::new(b, group_words))
+    });
 
     // Each group builds in its worker's scratch, which stays in cache, then streams out.
     //
@@ -470,13 +485,15 @@ where
             // SAFETY: each group `g` takes chunk `g` of each table, one slice at a time, and
             // all three tables stay borrowed for the whole dispatch.
             let emit = |g: usize, buf: &[u64], from: usize, to: usize, of: usize| unsafe {
-                let words = (group_words / 8 * from / of * 8)..(group_words / 8 * to / of * 8);
+                let (lo, hi) = (group_words / 8 * from / of * 8, group_words / 8 * to / of * 8);
                 let (z, ab) = buf.split_at(scratch_words);
                 let (a, b) = ab.split_at(scratch_words);
-                stream.copy(&mut z_chunks.get(g)[words.clone()], &z[words.clone()]);
-                if write_ab && g < ab_groups {
-                    stream.copy(&mut a_chunks.get(g)[words.clone()], &a[words.clone()]);
-                    stream.copy(&mut b_chunks.get(g)[words.clone()], &b[words]);
+                stream.copy(&mut z_chunks.get(g)[lo..hi], &z[lo..hi]);
+                if let Some((a_chunks, b_chunks)) = &ab_chunks
+                    && g < ab_groups
+                {
+                    stream.copy(&mut a_chunks.get(g)[lo..hi], &a[lo..hi]);
+                    stream.copy(&mut b_chunks.get(g)[lo..hi], &b[lo..hi]);
                 }
             };
             let mut pending = None;
@@ -503,7 +520,7 @@ where
                 if let Some(p) = prev {
                     emit(p, prev_buf, sent, of, of);
                 }
-                let n_tables = if write_ab { 3 } else { 1 };
+                let n_tables = if ab_chunks.is_some() { 3 } else { 1 };
                 for (t_rows, table) in rows.chunks(WORDS).zip(cur_buf.chunks_mut(scratch_words)).take(n_tables) {
                     blocks_from_rows(t_rows, WORDS, group_blocks, table);
                 }
@@ -516,6 +533,4 @@ where
         },
         |(), ()| (),
     );
-
-    (a, b)
 }
