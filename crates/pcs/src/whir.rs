@@ -1787,6 +1787,10 @@ mod tests {
             let (c, _) = commit(&message, &[], log_rows + log_batch, log_batch, 2);
             std::hint::black_box(c);
         });
+        time("base encode rate 1", &mut || {
+            let (c, _) = commit(&message, &[], log_rows + log_batch, log_batch, 1);
+            std::hint::black_box(c);
+        });
         let ext_shapes = if n8 { [(17usize, 5usize), (13, 8), (9, 11), (5, 14)] } else { [(15, 5), (11, 8), (7, 11), (3, 14)] };
         for (log_msg_cols, log_inv_rate) in ext_shapes {
             let poly = rng.ext_vec(16 << log_msg_cols);
