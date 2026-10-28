@@ -412,6 +412,42 @@ impl<T> Chunks<T> {
     }
 }
 
+/// [`map_reduce_with_state`] over the chunks of `N` buffers: task `i` gets chunk `i` of each, so a kernel
+/// writing several tables takes its slices of all of them.
+///
+/// Buffer `k` is cut into chunks of `widths[k]`, the last shorter. There are as many tasks as the
+/// buffer with the most chunks has, and a buffer with fewer gives an empty slice to the tasks past its end.
+pub fn map_reduce_chunks_mut<T, const N: usize, S, A, IS, IA, F, C>(
+    bufs: [&mut [T]; N],
+    widths: [usize; N],
+    init_state: IS,
+    init_acc: IA,
+    fold: F,
+    combine: C,
+) -> A
+where
+    T: Send,
+    S: Send,
+    A: Send,
+    IS: Fn() -> S + Sync,
+    IA: Fn() -> A + Sync,
+    F: Fn(&mut S, &mut A, usize, [&mut [T]; N]) + Sync,
+    C: Fn(A, A) -> A,
+{
+    let mut k = 0;
+    let views = bufs.map(|buf| {
+        k += 1;
+        Chunks::new(buf, widths[k - 1])
+    });
+    let n_tasks = views.iter().map(Chunks::count).max().unwrap_or(0);
+    map_reduce_with_state(n_tasks, init_state, init_acc, |state, acc, i| {
+        // SAFETY: each task `i` takes chunk `i` of each buffer once, so the slices are disjoint, and
+        // `bufs` stays borrowed until the dispatch returns.
+        let chunks = views.each_ref().map(|view| if i < view.count() { unsafe { view.get(i) } } else { &mut [] });
+        fold(state, acc, i, chunks);
+    }, combine)
+}
+
 /// Parallel `dst.chunks_mut(chunk).zip(src.chunks(chunk))`, for a kernel that
 /// writes one table while reading another of the same length.
 pub fn chunks_mut_zip<T: Send, S: Sync, F>(dst: &mut [T], src: &[S], chunk: usize, f: F)
