@@ -599,115 +599,120 @@ impl AdditiveNttF64 {
         let deep_rows = on_rows.filter(|_| fuse);
 
         // Phase 3: the deep pass, one task per run of contiguous sub-blocks.
+        let plan = DeepRows { log_d, num_ntts, start, deep_start };
         if deep_start < log_d {
             // A task takes at least an L2 budget of rows, so a high rate's tiny sub-blocks
             // still reach the hasher in whole batches.
             let log_sub = (log_d - deep_start).max(fit2.min(log_d - par_log));
-            let sub_len = num_ntts << log_sub;
-            let block_len = data.len() >> start;
-            let outer = log_d - log_sub;
-            // While a sub-block transforms, the next one is prefetched into L2, spread over its row groups.
-            let (base, total) = (parallel::SendPtr(data.as_mut_ptr()), data.len());
-            let hooks = hook_calls(log_d, deep_start, log_d, outer);
-            let prefetch_next = |sub_idx: usize| {
-                let next = (sub_idx + 1) * sub_len;
-                prefetch_spread(&base, next, if next < total { sub_len } else { 0 }, hooks)
-            };
-            match msg {
-                // A separate message: build each sub-block in scratch, hash it, then write it out once.
-                //
-                // Streamed out whole, the codeword is written without ever being read.
-                Msg::Rows(m) => {
-                    // Whole cache lines in every row, so a finished sub-block can drain a line at a time.
-                    let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
-                    let deferred = stream && lines_ok;
-                    let drain_per_hook = (sub_len / 8).div_ceil(hooks);
-                    parallel::for_each_chunk(1 << outer, |lo, hi| {
-                        // A draining task has two scratches: one transforms while the other empties.
-                        with_scratch(sub_len * (1 + usize::from(deferred)), |both| {
-                            // One fence at the end of the task covers all its streaming stores.
-                            let stream = stream.then(Stream::new);
-                            let (mut scratch, mut idle) = both.split_at_mut(sub_len);
-                            let mut drain = Drain::default();
-                            for sub_idx in lo..hi {
-                                // A task sits at the same offset in every replica, or covers whole replicas.
-                                //
-                                //     task at offset off of its replica  <-  message words [off, off + sub_len)
-                                let off = (sub_idx * sub_len) % block_len;
-                                // Inside one replica the first sweep reads the message itself; across several it is copied in.
-                                let mut from = None;
-                                for part in scratch.chunks_mut(block_len) {
-                                    let words = &m[off..][..part.len()];
-                                    if sub_len <= block_len {
-                                        from = Some(words);
-                                    } else {
-                                        part.copy_from_slice(words);
-                                    }
+            self.deep_pass(data, &plan, log_sub, msg, first_coset, deep_rows, defer_deep, stream);
+        }
+
+        if let Some(f) = on_rows.filter(|_| !fuse) {
+            // Four blocks per worker.
+            let log_tasks = (4 * parallel::num_threads()).next_power_of_two().ilog2() as usize;
+            let log_rows = log_d - log_tasks.min(log_d);
+            parallel::chunks_mut(data, num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
+        }
+        (defer_deep && deep_rows.is_some() && matches!(msg, Msg::Buffer)).then_some(plan)
+    }
+
+    /// The deep layers of `plan` over sub-blocks of `2^log_sub` rows, one task per run of contiguous sub-blocks.
+    ///
+    /// - With a separate message, each sub-block is built in scratch and written out once.
+    /// - Otherwise the buffer holds the replicas, and the layers run in place.
+    /// - With `defer_deep`, an in-place sub-block is finished in scratch and the buffer keeps its pre-deep state.
+    /// - Each finished sub-block goes to `deep_rows` while it is in L2.
+    #[allow(clippy::too_many_arguments)]
+    fn deep_pass(
+        &self,
+        data: &mut [F64],
+        plan: &DeepRows,
+        log_sub: usize,
+        msg: Msg<'_>,
+        first_coset: usize,
+        deep_rows: Option<&RowSink<'_>>,
+        defer_deep: bool,
+        stream: bool,
+    ) {
+        let DeepRows { log_d, num_ntts, start, deep_start } = *plan;
+        let sub_len = num_ntts << log_sub;
+        let outer = log_d - log_sub;
+        let (base, total) = (parallel::SendPtr(data.as_mut_ptr()), data.len());
+        let hooks = hook_calls(log_d, deep_start, log_d, outer);
+        match msg {
+            // A separate message: build each sub-block in scratch, hash it, then write it out once.
+            //
+            // Streamed out whole, the codeword is written without ever being read.
+            Msg::Rows(m) => {
+                // With whole cache lines in every row, a finished sub-block drains late, as in a gathered pass.
+                let late = stream && num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
+                let per_hook = (sub_len / 8).div_ceil(hooks);
+                let block_len = total >> start;
+                parallel::for_each_chunk(1 << outer, |lo, hi| {
+                    with_scratch(sub_len << usize::from(late), |both| {
+                        // One fence at the end of the task covers all its streaming stores.
+                        let stream = stream.then(Stream::new);
+                        let (mut scratch, mut idle) = both.split_at_mut(sub_len);
+                        let mut drain = Drain::default();
+                        for sub_idx in lo..hi {
+                            // A task sits at the same offset in every replica, or covers whole replicas.
+                            //
+                            //     task at offset off of its replica  <-  message words [off, off + sub_len)
+                            let off = (sub_idx * sub_len) % block_len;
+                            // Inside one replica the first sweep reads the message; across several it is copied in.
+                            let from = (sub_len <= block_len).then(|| &m[off..][..sub_len]);
+                            if from.is_none() {
+                                scratch.chunks_mut(block_len).for_each(|part| part.copy_from_slice(&m[..part.len()]));
+                            }
+                            if late {
+                                // The previous sub-block drains while this one transforms.
+                                let hook = || drain.step(stream.as_ref(), per_hook);
+                                self.run_layers_to(
+                                    scratch, from, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, hook,
+                                );
+                                drain.step(stream.as_ref(), usize::MAX);
+                            } else {
+                                self.run_layers_to(
+                                    scratch, from, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, no_hook,
+                                );
+                            }
+                            if let Some(f) = deep_rows {
+                                f(sub_idx << log_sub, scratch);
+                            }
+                            match &stream {
+                                Some(_) if late => {
+                                    // This one drains during the next transform, while the other scratch is filled.
+                                    drain = Drain {
+                                        // SAFETY: the sub-block lies inside the codeword.
+                                        dst: unsafe { base.add(sub_idx * sub_len) },
+                                        src: scratch.as_ptr(),
+                                        row_len: sub_len,
+                                        rows: 1,
+                                        ..Drain::default()
+                                    };
+                                    std::mem::swap(&mut scratch, &mut idle);
                                 }
-                                match &stream {
-                                    Some(s) if deferred => {
-                                        // The previous sub-block drains while this one transforms.
-                                        let hook = || drain.step(Some(s), drain_per_hook);
-                                        self.run_layers_to(
-                                            scratch,
-                                            from,
-                                            log_d,
-                                            num_ntts,
-                                            deep_start,
-                                            log_d,
-                                            outer,
-                                            sub_idx,
-                                            None,
-                                            hook,
-                                        );
-                                        drain.step(Some(s), usize::MAX);
-                                        if let Some(f) = deep_rows {
-                                            f(sub_idx << log_sub, scratch);
-                                        }
-                                        // This one drains during the next transform, while the other scratch is filled.
-                                        drain = Drain {
-                                            // SAFETY: the sub-block lies inside the codeword.
-                                            dst: unsafe { base.add(sub_idx * sub_len) },
-                                            src: scratch.as_ptr(),
-                                            row_len: num_ntts,
-                                            dst_stride: num_ntts,
-                                            rows: 1 << log_sub,
-                                            ..Drain::default()
-                                        };
-                                        std::mem::swap(&mut scratch, &mut idle);
-                                    }
-                                    _ => {
-                                        self.run_layers_to(
-                                            scratch,
-                                            from,
-                                            log_d,
-                                            num_ntts,
-                                            deep_start,
-                                            log_d,
-                                            outer,
-                                            sub_idx,
-                                            None,
-                                            no_hook,
-                                        );
-                                        if let Some(f) = deep_rows {
-                                            f(sub_idx << log_sub, scratch);
-                                        }
-                                        // SAFETY: this task alone owns the sub-block of the codeword.
-                                        let dst = unsafe { base.slice(sub_idx * sub_len, sub_len) };
-                                        match &stream {
-                                            Some(s) => s.copy(dst, scratch),
-                                            None => dst.copy_from_slice(scratch),
-                                        }
+                                other => {
+                                    // SAFETY: this task alone owns the sub-block of the codeword.
+                                    let dst = unsafe { base.slice(sub_idx * sub_len, sub_len) };
+                                    match other {
+                                        Some(s) => s.copy(dst, scratch),
+                                        None => dst.copy_from_slice(scratch),
                                     }
                                 }
                             }
-                            if let Some(s) = &stream {
-                                drain.step(Some(s), usize::MAX);
-                            }
-                        });
+                        }
+                        drain.step(stream.as_ref(), usize::MAX);
                     });
-                }
-                _ => parallel::chunks_mut(data, sub_len, |local, sub| {
+                });
+            }
+            _ => {
+                // While a sub-block transforms, the next one is prefetched into L2, spread over its row groups.
+                let prefetch_next = |sub_idx: usize| {
+                    let next = (sub_idx + 1) * sub_len;
+                    prefetch_spread(&base, next, if next < total { sub_len } else { 0 }, hooks)
+                };
+                parallel::chunks_mut(data, sub_len, |local, sub| {
                     // The buffer's first sub-block, in the whole domain.
                     let sub_idx = local + (first_coset << (log_d - start - log_sub));
                     let hook = prefetch_next(local);
@@ -727,22 +732,9 @@ impl AdditiveNttF64 {
                             f(sub_idx << log_sub, sub);
                         }
                     }
-                }),
+                });
             }
         }
-
-        if let Some(f) = on_rows.filter(|_| !fuse) {
-            // Four blocks per worker.
-            let log_tasks = (4 * parallel::num_threads()).next_power_of_two().ilog2() as usize;
-            let log_rows = log_d - log_tasks.min(log_d);
-            parallel::chunks_mut(data, num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
-        }
-        (defer_deep && deep_rows.is_some() && matches!(msg, Msg::Buffer)).then_some(DeepRows {
-            log_d,
-            num_ntts,
-            start,
-            deep_start,
-        })
     }
 
     /// Run a range of layers over one sub-block of the domain.
@@ -939,6 +931,15 @@ pub(super) fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, out
 /// - A scratch row is `row_len` words and lands in pieces of `piece` words, `piece_stride` words apart.
 /// - `src` is the group's contiguous scratch, and `row`, `k` are the next piece to move.
 /// - A streaming drain moves whole aligned cache lines: `piece` is 8, and the caller checks the alignment.
+///
+/// # Draining late
+///
+/// - A burst of streaming stores after each group saturates the write-combining buffers and overlaps nothing.
+/// - So a task keeps two scratches, and the previous group drains during this group's transform.
+/// - The sweeps call a hook once per row group, and each call moves an equal share of the previous group.
+/// - The shares round up, so the group is out by the last call, and the task's last group drains at its end.
+/// - Group k+2 gathers into the scratch group k drained, and that drain ended with group k+1's transform.
+/// - Only whole aligned cache lines stream; other rows take ordinary stores, whole, on the same schedule.
 pub(super) struct Drain {
     pub(super) dst: *mut F64,
     pub(super) src: *const F64,

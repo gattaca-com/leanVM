@@ -47,13 +47,8 @@ impl AdditiveNttF64 {
     ///
     /// # Draining a group late
     ///
-    /// - A burst of streaming stores after each group saturates the write-combining buffers and overlaps nothing.
-    /// - So a task keeps two scratches, and the previous group drains during this group's transform.
-    /// - The sweeps call a hook once per row group, and each call moves an equal share of the previous group.
-    /// - The shares round up, so the group is out by the last call, and the task's last group drains at its end.
+    /// - A group drains during the next group's transform, as [`Drain`] describes.
     /// - Group k+1 never reads what group k writes: a block's rows are its own, and the message is read before block 0 is written.
-    /// - Group k+2 gathers into the scratch group k drained, and that drain ended with group k+1's transform.
-    /// - Only whole aligned cache lines stream; other rows take ordinary stores, whole, on the same schedule.
     #[allow(clippy::too_many_arguments)]
     #[timed]
     pub(super) fn gathered_pass(
