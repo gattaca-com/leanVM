@@ -1016,50 +1016,49 @@ fn fold_all_lanes(
     let weights = primitives::multilinear::eq_table(rs);
     let n_blocks = block / run;
     let zeros = vec![F64(0); run];
-    // SAFETY: every task streams each of its output blocks below.
-    let (mut f, mut b) = unsafe { (primitives::uninit_vec::<F192>(block), primitives::uninit_vec::<F192>(block)) };
-    let (f_ptr, b_ptr) = (parallel::SendPtr(f.as_mut_ptr()), parallel::SendPtr(b.as_mut_ptr()));
-    let (u_0, u_2) = accumulate_msg(n_blocks.div_ceil(TASK), block / 2, |c| {
-        let out_blocks = TASK.min(n_blocks - c * TASK);
-        // The running block and the weight block stay in L1 and L2; the outputs take only streaming stores,
-        // so they are never fetched.
-        let mut acc = vec![F192::ZERO; run];
-        let mut weight = vec![F192::ZERO; run];
-        let (mut u_0, mut u_2) = (Acc8::ZERO, Acc8::ZERO);
-        let stream = primitives::stream::Stream::new();
-        for i in 0..out_blocks {
-            let h = c * TASK + i;
-            let changed = |l: &usize| i == 0 || !repeats[l * n_blocks + h];
-            let deltas = base
-                .chunks_exact(block)
-                .enumerate()
-                .filter(|(l, _)| changed(l))
-                .map(|(l, lane)| {
-                    let prev = if i == 0 {
-                        &zeros[..]
-                    } else {
-                        &lane[(h - 1) * run..h * run]
-                    };
-                    // The lane's next block, when this task reads it.
-                    let next = if i + 1 < out_blocks && !repeats[l * n_blocks + h + 1] {
-                        &lane[(h + 1) * run..(h + 2) * run]
-                    } else {
-                        &[][..]
-                    };
-                    (weights[l], &lane[h * run..(h + 1) * run], prev, next)
-                });
-            add_lane_deltas(&mut acc, deltas);
-            let (t_0, t_2) = lift(h, &acc, &mut weight);
-            u_0 ^= t_0;
-            u_2 ^= t_2;
-            // SAFETY: block `h` is in bounds, and no other task writes it.
-            unsafe {
-                stream.copy_uninit(f_ptr.add(h * run), &acc);
-                stream.copy_uninit(b_ptr.add(h * run), &weight);
+    let mut sums = (Acc8::ZERO, Acc8::ZERO);
+    // Every task streams each of its output blocks below.
+    let [f, b] = primitives::filled_vecs([block; 2], |[f, b]| {
+        sums = accumulate_msg_chunks(f, b, TASK * run, |c, f_out, b_out| {
+            let out_blocks = f_out.len() / run;
+            // The running block and the weight block stay in L1 and L2; the outputs take only streaming stores,
+            // so they are never fetched.
+            let mut acc = vec![F192::ZERO; run];
+            let mut weight = vec![F192::ZERO; run];
+            let (mut u_0, mut u_2) = (Acc8::ZERO, Acc8::ZERO);
+            let stream = primitives::stream::Stream::new();
+            for i in 0..out_blocks {
+                let h = c * TASK + i;
+                let changed = |l: &usize| i == 0 || !repeats[l * n_blocks + h];
+                let deltas = base
+                    .chunks_exact(block)
+                    .enumerate()
+                    .filter(|(l, _)| changed(l))
+                    .map(|(l, lane)| {
+                        let prev = if i == 0 {
+                            &zeros[..]
+                        } else {
+                            &lane[(h - 1) * run..h * run]
+                        };
+                        // The lane's next block, when this task reads it.
+                        let next = if i + 1 < out_blocks && !repeats[l * n_blocks + h + 1] {
+                            &lane[(h + 1) * run..(h + 2) * run]
+                        } else {
+                            &[][..]
+                        };
+                        (weights[l], &lane[h * run..(h + 1) * run], prev, next)
+                    });
+                add_lane_deltas(&mut acc, deltas);
+                let (t_0, t_2) = lift(h, &acc, &mut weight);
+                u_0 ^= t_0;
+                u_2 ^= t_2;
+                stream.copy(&mut f_out[i * run..][..run], &acc);
+                stream.copy(&mut b_out[i * run..][..run], &weight);
             }
-        }
-        (u_0, u_2)
+            (u_0, u_2)
+        });
     });
+    let (u_0, u_2) = sums;
     let msg = SumcheckMessage {
         u_0: u_0.reduce(),
         u_2: u_2.reduce(),
