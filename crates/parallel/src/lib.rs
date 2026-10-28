@@ -445,6 +445,23 @@ where
     for_each(n_tasks, |i| f(i, unsafe { task_chunks(&views, i) }));
 }
 
+/// [`for_each_chunks_mut`] over the chunks of buffers of two element types: task `i` gets chunk `i` of
+/// each of `a` and of each of `b`. A buffer with fewer chunks gives an empty slice past its end.
+pub fn for_each_chunks_mut2<A: Send, B: Send, const M: usize, const N: usize, F>(
+    a: [&mut [A]; M],
+    a_widths: [usize; M],
+    b: [&mut [B]; N],
+    b_widths: [usize; N],
+    f: F,
+) where
+    F: Fn(usize, [&mut [A]; M], [&mut [B]; N]) + Sync,
+{
+    let (a_views, b_views) = (chunk_views(a, a_widths), chunk_views(b, b_widths));
+    let n_tasks = a_views.iter().map(Chunks::count).chain(b_views.iter().map(Chunks::count)).max().unwrap_or(0);
+    // SAFETY: the dispatch runs each task `i` once, and the buffers stay borrowed until it returns.
+    for_each(n_tasks, |i| f(i, unsafe { task_chunks(&a_views, i) }, unsafe { task_chunks(&b_views, i) }));
+}
+
 fn chunk_views<T, const N: usize>(bufs: [&mut [T]; N], widths: [usize; N]) -> [Chunks<T>; N] {
     let mut k = 0;
     bufs.map(|buf| {

@@ -284,13 +284,11 @@ impl Lanes for F64x8 {
 ///
 /// The first `columns` blocks of the task are computed but not stored: GKR recomputes them.
 ///
-/// # Safety
-/// The task owns blocks `first ..` of `quads`, sixteen per block, and of `tiers`, four and one per
-/// block, inside their allocations.
-unsafe fn publish_task<G: Lanes>(
+/// `quads` and `tiers` are the task's blocks of those tables, sixteen, four and one per block.
+fn publish_task<G: Lanes>(
     task: &mut [[G; 8]],
-    quads: parallel::SendPtr<G::Elem>,
-    tiers: [parallel::SendPtr<G::Elem>; 2],
+    quads: &mut [G::Elem],
+    [tier4, tier6]: [&mut [G::Elem]; 2],
     first: usize,
     columns: usize,
     compute: impl Fn(usize) -> G,
@@ -340,8 +338,7 @@ unsafe fn publish_task<G: Lanes>(
         }
         if k > 0 {
             let block = first + k - 1;
-            // SAFETY: block `k - 1` of the task owns its sixteen quads, by the caller.
-            unsafe { stream.copy(quads.slice(16 * block, 16), &stage_quads[prev]) };
+            stream.copy(&mut quads[16 * (k - 1)..][..16], &stage_quads[prev]);
             let (slot, last) = (block % 8, k == task.len());
             if block.is_multiple_of(2) && !last {
                 even_block = Some(eights);
@@ -359,13 +356,10 @@ unsafe fn publish_task<G: Lanes>(
                 if slot == 7 || last {
                     let group = block - slot;
                     let from = first.max(group);
-                    // SAFETY: the blocks `from ..= block` of the task own their level-4 nodes, by the caller.
-                    unsafe {
-                        stream.copy(
-                            tiers[0].slice(4 * from, 4 * (block + 1 - from)),
-                            &nodes[4 * (from - group)..4 * (slot + 1)],
-                        )
-                    };
+                    stream.copy(
+                        &mut tier4[4 * (from - first)..][..4 * (block + 1 - from)],
+                        &nodes[4 * (from - group)..4 * (slot + 1)],
+                    );
                     if slot == 7 && from == group {
                         let pair = |x, y| {
                             let (even, odd) = G::even_odd(x, y);
@@ -374,8 +368,7 @@ unsafe fn publish_task<G: Lanes>(
                         let (even, odd) =
                             G::even_odd(pair(node_lanes[0], node_lanes[1]), pair(node_lanes[2], node_lanes[3]));
                         let top = (even * odd).to_array();
-                        // SAFETY: the eight blocks of the group own eight nodes of level 6, by the caller.
-                        unsafe { stream.copy(tiers[1].slice(group, 8), &top) };
+                        stream.copy(&mut tier6[group - first..][..8], &top);
                     }
                 }
             }
@@ -637,15 +630,18 @@ pub fn build_leaves<'a>(
                 let side = &sides[s];
                 let off = side.lay.offsets[b];
                 let first = off / gkr::BLOCK_VALUES + c * BLOCKS;
-                // SAFETY: task `c` owns these blocks of the leaves and their quads, which no other
-                // task or block of the group touches.
-                unsafe {
-                    let task = ptrs[s].0.slice(first, BLOCKS.min(bulk - c * BLOCKS));
-                    let columns = side.unstored(b).saturating_sub(c * BLOCKS).min(BLOCKS);
-                    publish_task(task, ptrs[s].1, ptrs[s].2, first, columns, |l| {
-                        leaf_rows8(&side.terms[b], l - off)
-                    });
-                }
+                let len = BLOCKS.min(bulk - c * BLOCKS);
+                let columns = side.unstored(b).saturating_sub(c * BLOCKS).min(BLOCKS);
+                // SAFETY: task `c` owns these blocks of the leaves, their quads and their tiers, which no
+                // other task or block of the group touches.
+                let (task, quads, tiers) = unsafe {
+                    (
+                        ptrs[s].0.slice(first, len),
+                        ptrs[s].1.slice(16 * first, 16 * len),
+                        [ptrs[s].2[0].slice(4 * first, 4 * len), ptrs[s].2[1].slice(first, len)],
+                    )
+                };
+                publish_task(task, quads, tiers, first, columns, |l| leaf_rows8(&side.terms[b], l - off));
             }
         });
     }
@@ -1168,18 +1164,6 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
             .checked_sub(1)
             .map(|i| segments[i])
     };
-    // SAFETY: the groups below write every block and every quad slot, and join before this function returns.
-    let mut leaves: Vec<gkr::KBlock> = unsafe { primitives::uninit_vec(block_count) };
-    let mut quads = unsafe { primitives::uninit_vec::<F64>(16 * block_count) };
-    let quads_ptr = parallel::SendPtr(quads.as_mut_ptr());
-    // SAFETY: as the quads, whose blocks own four nodes of level 4 and one of level 6.
-    let mut tiers: [Vec<F64>; 2] = unsafe {
-        [
-            primitives::uninit_vec(4 * block_count),
-            primitives::uninit_vec(block_count),
-        ]
-    };
-    let tier_ptrs = tiers.each_mut().map(|t| parallel::SendPtr(t.as_mut_ptr()));
     // Eight leaves from leaf `l`: a run of one column, a run of padding, or the edge of either.
     let eight = |l: usize| match segment_of(l) {
         Some((off, _, data)) if data.len() >= l - off + 8 => {
@@ -1190,13 +1174,25 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
             segment_of(l + t).and_then(|(off, _, data)| data.get(l + t - off).copied()).unwrap_or(F64::ONE)
         })),
     };
-    parallel::chunks_mut(&mut leaves, BLOCKS, |c, task| {
-        // SAFETY: task `c` owns the quads of its blocks, which no other task touches.
-        unsafe { publish_task(task, quads_ptr, tier_ptrs, c * BLOCKS, 0, eight) };
+    // The groups below write every block and every quad slot.
+    let mut leaves_out = Vec::new();
+    let [mut quads, mut tier4, mut tier6] = primitives::filled_vecs([16 * block_count, 4 * block_count, block_count], |bufs| {
+        let [quads, tier4, tier6] = bufs;
+        leaves_out = primitives::filled_vec::<gkr::KBlock>(block_count, |leaves| {
+            parallel::for_each_chunks_mut2(
+                [leaves],
+                [BLOCKS],
+                [&mut quads[..], &mut tier4[..], &mut tier6[..]],
+                [16 * BLOCKS, 4 * BLOCKS, BLOCKS],
+                |c, [task], [quads, tier4, tier6]| publish_task(task, quads, [tier4, tier6], c * BLOCKS, 0, eight),
+            );
+        });
     });
+    let leaves = leaves_out;
     quads.truncate(explicit.div_ceil(4));
-    tiers[0].truncate(quads.len().div_ceil(4));
-    tiers[1].truncate(quads.len().div_ceil(4).div_ceil(4));
+    tier4.truncate(quads.len().div_ceil(4));
+    tier6.truncate(quads.len().div_ceil(4).div_ceil(4));
+    let tiers = [tier4, tier6];
     gkr::Leaves {
         leaves,
         len: explicit,
@@ -1448,55 +1444,81 @@ fn tables_and_prods_at(
             let n_acc = n_cols + pairs.len();
             // A table of one block keeps no dots: nothing sums over blocks.
             let n_blocks = if tau > LOW_VARS { high.len() } else { 0 };
-            // SAFETY: the tasks below write every dot, the one of accumulator `a` at block `h` to `a * n_blocks + h`.
-            let mut dots = unsafe { primitives::uninit_vec::<F192>(n_blocks * n_acc) };
-            let out = parallel::SendPtr(dots.as_mut_ptr());
-            let keep = |a: usize, h: usize, d: F192| {
-                if n_blocks > 0 {
-                    // SAFETY: the task owning block `h` is the only one to write `(a, h)`.
-                    unsafe { out.add(a * n_blocks + h).write(d) };
-                }
-            };
             // Blocks with a real row; the rest are constant. A table of one block is never skipped.
             let real = if n_blocks > 0 { rows.div_ceil(block) } else { high.len() };
-            let mut sums = parallel::map_reduce_with_state(
-                real.div_ceil(BLOCKS),
-                || vec![F64::ZERO; block],
-                || vec![F192Unreduced::ZERO; n_acc],
-                |prod, acc, task| {
+            let mut sums = Vec::new();
+            // The tasks and the constant tail write every dot, the one of accumulator `a` at block `h` to
+            // `a * n_blocks + h`: a task owns blocks `task * BLOCKS ..` of each accumulator's run.
+            let dots = primitives::filled_vec::<F192>(n_blocks * n_acc, |dots| {
+                let mut parts: Vec<&mut [F192]> = Vec::with_capacity(n_acc * n_blocks.div_ceil(BLOCKS));
+                if n_blocks > 0 {
+                    let mut runs: Vec<_> = dots.chunks_mut(n_blocks).map(|run| run.chunks_mut(BLOCKS)).collect();
+                    for _ in 0..n_blocks.div_ceil(BLOCKS) {
+                        parts.extend(runs.iter_mut().filter_map(Iterator::next));
+                    }
+                }
+                let fold = |prod: &mut Vec<F64>, acc: &mut Vec<F192Unreduced>, task: usize, out: &mut [&mut [F192]]| {
+                    let keep = |out: &mut [&mut [F192]], a: usize, h: usize, d: F192| {
+                        if let Some(run) = out.get_mut(a) {
+                            run[h - task * BLOCKS] = d;
+                        }
+                    };
                     for h in task * BLOCKS..((task + 1) * BLOCKS).min(real) {
                         let span = |c: usize| &cols[base + c][h * block..(h + 1) * block];
                         for (c, slot) in acc[..n_cols].iter_mut().enumerate() {
                             let d = dot(span(c));
-                            keep(c, h, d);
+                            keep(out, c, h, d);
                             *slot ^= high[h].mul_unreduced(d);
                         }
                         for (p, (&(a, b), slot)) in pairs.iter().zip(&mut acc[n_cols..]).enumerate() {
                             mul_slices(prod, span(a), span(b));
                             let d = dot(prod);
-                            keep(n_cols + p, h, d);
+                            keep(out, n_cols + p, h, d);
                             *slot ^= high[h].mul_unreduced(d);
                         }
                     }
-                },
-                |mut left, right| {
+                };
+                let combine = |mut left: Vec<F192Unreduced>, right: Vec<F192Unreduced>| {
                     for (slot, part) in left.iter_mut().zip(right) {
                         *slot ^= part;
                     }
                     left
-                },
-            );
-            if real < high.len() {
-                let mass = high[real..].iter().fold(F192::ZERO, |acc, &w| acc + w);
-                let row = |c: usize| cols[base + c][real * block];
-                let constants = (0..n_cols)
-                    .map(row)
-                    .chain(pairs.iter().map(|&(a, b)| row(a) * row(b)));
-                for (a, (v, slot)) in constants.zip(&mut sums).enumerate() {
-                    *slot ^= mass.mul_base_unreduced(v);
-                    (real..high.len()).for_each(|h| keep(a, h, F192::from(v)));
+                };
+                let (init_prod, init_acc) = (|| vec![F64::ZERO; block], || vec![F192Unreduced::ZERO; n_acc]);
+                sums = if n_blocks > 0 {
+                    parallel::map_reduce_chunks_mut(
+                        [&mut parts[..]],
+                        [n_acc],
+                        init_prod,
+                        init_acc,
+                        |prod, acc, task, [out]| fold(prod, acc, task, out),
+                        combine,
+                    )
+                } else {
+                    parallel::map_reduce_with_state(
+                        real.div_ceil(BLOCKS),
+                        init_prod,
+                        init_acc,
+                        |prod, acc, task| fold(prod, acc, task, &mut []),
+                        combine,
+                    )
+                };
+                if real < high.len() {
+                    let mass = high[real..].iter().fold(F192::ZERO, |acc, &w| acc + w);
+                    let row = |c: usize| cols[base + c][real * block];
+                    let constants = (0..n_cols)
+                        .map(row)
+                        .chain(pairs.iter().map(|&(a, b)| row(a) * row(b)));
+                    for (a, (v, slot)) in constants.zip(&mut sums).enumerate() {
+                        *slot ^= mass.mul_base_unreduced(v);
+                        if n_blocks > 0 {
+                            for h in real..high.len() {
+                                parts[h / BLOCKS * n_acc + a][h % BLOCKS] = F192::from(v);
+                            }
+                        }
+                    }
                 }
-            }
+            });
             let evals = sums[..n_cols].iter().map(|s| s.reduce()).collect();
             let prods = pairs
                 .iter()
