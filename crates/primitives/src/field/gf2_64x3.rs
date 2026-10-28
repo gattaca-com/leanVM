@@ -233,7 +233,7 @@ pub fn mul2(a: [F192; 2], b: [F192; 2]) -> [F192; 2] {
 #[inline(always)]
 pub fn mul4(a: [F192; 4], b: [F192; 4]) -> [F192; 4] {
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    // SAFETY: both features are enabled at compile time.
+    // SAFETY: both features are enabled at compile time, and `f192x8` fails the build without avx512bw.
     return unsafe { x86_64::mul_vec4(a, b) };
     #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
     {
@@ -271,7 +271,7 @@ pub fn mul_unreduced4(a: [F192; 4], b: [F192; 4]) -> [F192Unreduced; 4] {
 #[inline(always)]
 pub fn mul_base8(t: F192, k: [F64; 8]) -> [F192; 8] {
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    // SAFETY: both features are enabled at compile time.
+    // SAFETY: both features are enabled at compile time, and `f192x8` fails the build without avx512bw.
     return unsafe { x86_64::mul_base8(t, k) };
     #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
     k.map(|k| t.mul_base(k))
@@ -628,23 +628,26 @@ pub mod x86_64 {
     use super::{F192, F192Unreduced};
     use crate::field::gf2_64::F64;
     use core::arch::x86_64::*;
-    use core::mem::transmute;
+    use crate::Plain;
+
+    /// The bits of a vector as plain words of the same size.
+    #[inline(always)]
+    fn bits<V: Plain, W: Plain>(v: V) -> W {
+        const { assert!(size_of::<V>() == size_of::<W>()) };
+        // SAFETY: both types are plain and of one size, so every bit pattern is valid in each.
+        unsafe { core::mem::transmute_copy(&v) }
+    }
 
     /// Two 64-bit words as one register, `lo` in the low qword.
     #[inline(always)]
     pub(crate) fn pair(lo: u64, hi: u64) -> __m128i {
-        // SAFETY: SSE2 is part of the x86-64 baseline.
-        unsafe { _mm_set_epi64x(hi as i64, lo as i64) }
+        bits::<[u64; 2], __m128i>([lo, hi])
     }
 
     /// The y-folded Karatsuba product of one pair.
-    ///
-    /// # Safety
-    ///
-    /// Requires the `pclmulqdq` target feature.
     #[inline]
     #[target_feature(enable = "pclmulqdq")]
-    unsafe fn karatsuba(a: F192, b: F192) -> [__m128i; 3] {
+    fn karatsuba(a: F192, b: F192) -> [__m128i; 3] {
         // Operand registers, as in the module table.
         let (a01, b01) = (pair(a.c0, a.c1), pair(b.c0, b.c1));
         let (at, bt) = (pair(a.c2, a.c0 ^ a.c1), pair(b.c2, b.c0 ^ b.c1));
@@ -681,15 +684,12 @@ pub mod x86_64 {
     ///
     /// # Safety
     ///
-    /// Requires the `pclmulqdq` target feature.
+    /// Callable only where pclmulqdq is enabled.
     #[inline]
     #[target_feature(enable = "pclmulqdq")]
-    pub unsafe fn mul_unreduced(a: F192, b: F192) -> F192Unreduced {
-        // SAFETY: the function carries pclmulqdq; the reinterprets are between 128-bit values.
-        unsafe {
-            F192Unreduced {
-                coeffs: karatsuba(a, b).map(|d| transmute::<__m128i, [u64; 2]>(d)),
-            }
+    pub fn mul_unreduced(a: F192, b: F192) -> F192Unreduced {
+        F192Unreduced {
+            coeffs: karatsuba(a, b).map(bits::<__m128i, [u64; 2]>),
         }
     }
 
@@ -697,10 +697,10 @@ pub mod x86_64 {
     ///
     /// # Safety
     ///
-    /// Requires the `pclmulqdq` target feature.
+    /// Callable only where pclmulqdq is enabled.
     #[inline]
     #[target_feature(enable = "pclmulqdq")]
-    pub unsafe fn mul_base_unreduced(a: F192, k: F64) -> F192Unreduced {
+    pub fn mul_base_unreduced(a: F192, k: F64) -> F192Unreduced {
         // [c0, c1] and [c2, 0] against [k, 0].
         let a01 = pair(a.c0, a.c1);
         let a2 = _mm_cvtsi64_si128(a.c2 as i64);
@@ -711,25 +711,18 @@ pub mod x86_64 {
             _mm_clmulepi64_si128::<0x01>(a01, k),
             _mm_clmulepi64_si128::<0x00>(a2, k),
         ];
-        // SAFETY: the reinterprets are between 128-bit values.
-        unsafe {
-            F192Unreduced {
-                coeffs: products.map(|p| transmute::<__m128i, [u64; 2]>(p)),
-            }
+        F192Unreduced {
+            coeffs: products.map(bits::<__m128i, [u64; 2]>),
         }
     }
 
     /// Lane-wise base reduction: qword `i` of the result is the reduction of `hi[i] * x^64 + lo[i]`.
     ///
     /// The same shift network as the scalar reduction, applied to every qword at once.
-    ///
-    /// # Safety
-    ///
-    /// Requires the `avx2` target feature.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx2"))]
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn reduce_lanes256(lo: __m256i, hi: __m256i) -> __m256i {
+    fn reduce_lanes256(lo: __m256i, hi: __m256i) -> __m256i {
         // The bits of `hi * 0x1B` shifted past x^63.
         let spill = _mm256_xor_si256(
             _mm256_xor_si256(_mm256_srli_epi64::<63>(hi), _mm256_srli_epi64::<61>(hi)),
@@ -795,14 +788,10 @@ pub mod x86_64 {
     }
 
     /// The y-folded Karatsuba products of two pairs, one pair per 128-bit lane.
-    ///
-    /// # Safety
-    ///
-    /// Requires the `vpclmulqdq` and `avx2` target features.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx2"))]
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-    unsafe fn karatsuba_vec2(a: [F192; 2], b: [F192; 2]) -> [__m256i; 3] {
+    fn karatsuba_vec2(a: [F192; 2], b: [F192; 2]) -> [__m256i; 3] {
         // One coefficient of both elements, in the low qword of each lane.
         let pack = |c: [u64; 2]| _mm256_set_epi64x(0, c[1] as i64, 0, c[0] as i64);
         let (a0, a1, a2) = (pack(a.map(|e| e.c0)), pack(a.map(|e| e.c1)), pack(a.map(|e| e.c2)));
@@ -825,49 +814,39 @@ pub mod x86_64 {
     ///
     /// # Safety
     ///
-    /// Requires the `vpclmulqdq` and `avx2` target features.
+    /// Callable only where vpclmulqdq and avx2 are enabled.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx2"))]
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-    pub unsafe fn mul_vec2(a: [F192; 2], b: [F192; 2]) -> [F192; 2] {
-        // SAFETY: the function carries both features.
-        unsafe {
-            let [d0, d1, d2] = karatsuba_vec2(a, b);
-            // Lane i of c01 is [c0_i, c1_i]; the low qword of lane i of c2 is c2_i.
-            let c01 = reduce_lanes256(_mm256_unpacklo_epi64(d0, d1), _mm256_unpackhi_epi64(d0, d1));
-            let c2 = reduce_lanes256(d2, _mm256_unpackhi_epi64(d2, d2));
-            let (w01, w2) = (transmute::<__m256i, [u64; 4]>(c01), transmute::<__m256i, [u64; 4]>(c2));
-            std::array::from_fn(|i| F192::new(w01[2 * i], w01[2 * i + 1], w2[2 * i]))
-        }
+    pub fn mul_vec2(a: [F192; 2], b: [F192; 2]) -> [F192; 2] {
+        let [d0, d1, d2] = karatsuba_vec2(a, b);
+        // Lane i of c01 is [c0_i, c1_i]; the low qword of lane i of c2 is c2_i.
+        let c01 = reduce_lanes256(_mm256_unpacklo_epi64(d0, d1), _mm256_unpackhi_epi64(d0, d1));
+        let c2 = reduce_lanes256(d2, _mm256_unpackhi_epi64(d2, d2));
+        let (w01, w2) = (bits::<__m256i, [u64; 4]>(c01), bits::<__m256i, [u64; 4]>(c2));
+        std::array::from_fn(|i| F192::new(w01[2 * i], w01[2 * i + 1], w2[2 * i]))
     }
 
     /// Two independent unreduced products, packed as for the reduced version.
     ///
     /// # Safety
     ///
-    /// Requires the `vpclmulqdq` and `avx2` target features.
+    /// Callable only where vpclmulqdq and avx2 are enabled.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx2"))]
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-    pub unsafe fn mul_unreduced_vec2(a: [F192; 2], b: [F192; 2]) -> [F192Unreduced; 2] {
-        // SAFETY: the function carries both features; lane i of each register is one coefficient.
-        unsafe {
-            let d = karatsuba_vec2(a, b).map(|d| transmute::<__m256i, [[u64; 2]; 2]>(d));
-            std::array::from_fn(|i| F192Unreduced {
-                coeffs: [d[0][i], d[1][i], d[2][i]],
-            })
-        }
+    pub fn mul_unreduced_vec2(a: [F192; 2], b: [F192; 2]) -> [F192Unreduced; 2] {
+        let d = karatsuba_vec2(a, b).map(bits::<__m256i, [[u64; 2]; 2]>);
+        std::array::from_fn(|i| F192Unreduced {
+            coeffs: [d[0][i], d[1][i], d[2][i]],
+        })
     }
 
     /// The y-folded Karatsuba products of four pairs, one pair per 128-bit lane.
-    ///
-    /// # Safety
-    ///
-    /// Requires the `vpclmulqdq` and `avx512f` target features.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    unsafe fn karatsuba_vec4(a: [F192; 4], b: [F192; 4]) -> [__m512i; 3] {
+    fn karatsuba_vec4(a: [F192; 4], b: [F192; 4]) -> [__m512i; 3] {
         // One coefficient of all four elements, in the low qword of each lane.
         let pack = |c: [u64; 4]| _mm512_set_epi64(0, c[3] as i64, 0, c[2] as i64, 0, c[1] as i64, 0, c[0] as i64);
         let (a0, a1, a2) = (pack(a.map(|e| e.c0)), pack(a.map(|e| e.c1)), pack(a.map(|e| e.c2)));
@@ -890,43 +869,41 @@ pub mod x86_64 {
     ///
     /// # Safety
     ///
-    /// Requires the `vpclmulqdq` and `avx512f` target features.
+    /// Callable only where vpclmulqdq, avx512f and avx512bw are enabled.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn mul_vec4(a: [F192; 4], b: [F192; 4]) -> [F192; 4] {
-        // SAFETY: the function carries both features.
-        unsafe {
-            let [d0, d1, d2] = karatsuba_vec4(a, b);
-            // Lane i of c01 is [c0_i, c1_i]; the low qword of lane i of c2 is c2_i.
-            let c01 = reduce_lanes512(_mm512_unpacklo_epi64(d0, d1), _mm512_unpackhi_epi64(d0, d1));
-            let c2 = reduce_lanes512(d2, _mm512_unpackhi_epi64(d2, d2));
-            let (w01, w2) = (transmute::<__m512i, [u64; 8]>(c01), transmute::<__m512i, [u64; 8]>(c2));
-            std::array::from_fn(|i| F192::new(w01[2 * i], w01[2 * i + 1], w2[2 * i]))
-        }
+    #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+    pub fn mul_vec4(a: [F192; 4], b: [F192; 4]) -> [F192; 4] {
+        let [d0, d1, d2] = karatsuba_vec4(a, b);
+        // Lane i of c01 is [c0_i, c1_i]; the low qword of lane i of c2 is c2_i.
+        let c01 = reduce_lanes512(_mm512_unpacklo_epi64(d0, d1), _mm512_unpackhi_epi64(d0, d1));
+        let c2 = reduce_lanes512(d2, _mm512_unpackhi_epi64(d2, d2));
+        let (w01, w2) = (bits::<__m512i, [u64; 8]>(c01), bits::<__m512i, [u64; 8]>(c2));
+        std::array::from_fn(|i| F192::new(w01[2 * i], w01[2 * i + 1], w2[2 * i]))
     }
 
     /// Four independent unreduced products, packed as for the reduced version.
     ///
     /// # Safety
     ///
-    /// Requires the `vpclmulqdq` and `avx512f` target features.
+    /// Callable only where vpclmulqdq and avx512f are enabled.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn mul_unreduced_vec4(a: [F192; 4], b: [F192; 4]) -> [F192Unreduced; 4] {
-        // SAFETY: the function carries both features; lane i of each register is one coefficient.
-        unsafe {
-            let d = karatsuba_vec4(a, b).map(|d| transmute::<__m512i, [[u64; 2]; 4]>(d));
-            std::array::from_fn(|i| F192Unreduced {
-                coeffs: [d[0][i], d[1][i], d[2][i]],
-            })
-        }
+    pub fn mul_unreduced_vec4(a: [F192; 4], b: [F192; 4]) -> [F192Unreduced; 4] {
+        let d = karatsuba_vec4(a, b).map(bits::<__m512i, [[u64; 2]; 4]>);
+        std::array::from_fn(|i| F192Unreduced {
+            coeffs: [d[0][i], d[1][i], d[2][i]],
+        })
     }
     /// The six products of a shared pair of operand registers against eight packed scalars.
     ///
     /// `a` lane `j` meets `k_2j` through `lo` and `k_2j+1` through `hi`.
     /// Returns the products of `(a_lo, a_hi)` by `k_2j`, then by `k_2j+1`.
+    ///
+    /// # Safety
+    ///
+    /// Callable only where vpclmulqdq and avx512f are enabled.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
@@ -946,65 +923,59 @@ pub mod x86_64 {
     ///
     /// # Safety
     ///
-    /// Requires the `vpclmulqdq` and `avx512f` target features.
+    /// Callable only where vpclmulqdq, avx512f and avx512bw are enabled.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn mul_base8(t: F192, k: [F64; 8]) -> [F192; 8] {
-        // SAFETY: the function carries both features; `k` is eight qwords.
-        unsafe {
-            // `t` in every lane: [c0, c1] for both pair registers, [c2, c2] for the last.
-            let t01 = _mm512_broadcast_i32x4(pair(t.c0, t.c1));
-            let t2 = _mm512_set1_epi64(t.c2 as i64);
-            let kv = _mm512_loadu_si512(k.as_ptr().cast());
-            let [e0, e1, o0, o1, e2, o2] = mul_by_pairs(t01, t01, t2, kv);
-            // Gather each product's low and high halves into qword-wise vectors, then reduce.
-            let red = |x, y| reduce_lanes512(_mm512_unpacklo_epi64(x, y), _mm512_unpackhi_epi64(x, y));
-            let even = transmute::<__m512i, [u64; 8]>(red(e0, e1));
-            let odd = transmute::<__m512i, [u64; 8]>(red(o0, o1));
-            let c2 = transmute::<__m512i, [u64; 8]>(red(e2, o2));
-            std::array::from_fn(|i| {
-                let (j, w) = (i / 2, if i % 2 == 0 { &even } else { &odd });
-                F192::new(w[2 * j], w[2 * j + 1], c2[i])
-            })
-        }
+    #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+    pub fn mul_base8(t: F192, k: [F64; 8]) -> [F192; 8] {
+        // `t` in every lane: [c0, c1] for both pair registers, [c2, c2] for the last.
+        let t01 = _mm512_broadcast_i32x4(pair(t.c0, t.c1));
+        let t2 = _mm512_set1_epi64(t.c2 as i64);
+        let kv = crate::simd::load(&k, 0);
+        let [e0, e1, o0, o1, e2, o2] = mul_by_pairs(t01, t01, t2, kv);
+        // Gather each product's low and high halves into qword-wise vectors, then reduce.
+        let red = |x, y| reduce_lanes512(_mm512_unpacklo_epi64(x, y), _mm512_unpackhi_epi64(x, y));
+        let even = bits::<__m512i, [u64; 8]>(red(e0, e1));
+        let odd = bits::<__m512i, [u64; 8]>(red(o0, o1));
+        let c2 = bits::<__m512i, [u64; 8]>(red(e2, o2));
+        std::array::from_fn(|i| {
+            let (j, w) = (i / 2, if i % 2 == 0 { &even } else { &odd });
+            F192::new(w[2 * j], w[2 * j + 1], c2[i])
+        })
     }
 
     /// The mixed inner product over packed weights.
     ///
     /// # Safety
     ///
-    /// Requires the `vpclmulqdq` and `avx512f` target features, and `k.len() == 8 * w.len()`.
+    /// Callable only where vpclmulqdq and avx512f are enabled.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn dot_base(w: &[super::Weights8], k: &[F64]) -> F192Unreduced {
-        // SAFETY: the function carries both features; `Weights8` is 64-byte aligned, `k` holds 8 qwords per block.
-        unsafe {
-            let xor = |x, y| _mm512_xor_si512(x, y);
-            let mut acc = [_mm512_setzero_si512(); 3];
-            for (b, w) in w.iter().enumerate() {
-                let kv = _mm512_loadu_si512(k.as_ptr().add(8 * b).cast());
-                let (lo, hi, c2) = (
-                    _mm512_load_si512(w.lo.as_ptr().cast()),
-                    _mm512_load_si512(w.hi.as_ptr().cast()),
-                    _mm512_load_si512(w.c2.as_ptr().cast()),
-                );
-                let [e0, e1, o0, o1, e2, o2] = mul_by_pairs(lo, hi, c2, kv);
-                acc = [
-                    xor(acc[0], xor(e0, o0)),
-                    xor(acc[1], xor(e1, o1)),
-                    xor(acc[2], xor(e2, o2)),
-                ];
-            }
-            // Fold the four 128-bit lanes of each sum into one.
-            let lanes = acc.map(|a| {
-                let half = _mm256_xor_si256(_mm512_castsi512_si256(a), _mm512_extracti64x4_epi64::<1>(a));
-                let q = _mm_xor_si128(_mm256_castsi256_si128(half), _mm256_extracti128_si256::<1>(half));
-                transmute::<__m128i, [u64; 2]>(q)
-            });
-            F192Unreduced { coeffs: lanes }
+    pub fn dot_base(w: &[super::Weights8], k: &[F64]) -> F192Unreduced {
+        let xor = |x, y| _mm512_xor_si512(x, y);
+        let mut acc = [_mm512_setzero_si512(); 3];
+        for (b, w) in w.iter().enumerate() {
+            let kv = crate::simd::load(&k[8 * b..], 0);
+            let (lo, hi, c2) = (
+                crate::simd::load(&w.lo, 0),
+                crate::simd::load(&w.hi, 0),
+                crate::simd::load(&w.c2, 0),
+            );
+            let [e0, e1, o0, o1, e2, o2] = mul_by_pairs(lo, hi, c2, kv);
+            acc = [
+                xor(acc[0], xor(e0, o0)),
+                xor(acc[1], xor(e1, o1)),
+                xor(acc[2], xor(e2, o2)),
+            ];
         }
+        // Fold the four 128-bit lanes of each sum into one.
+        let lanes = acc.map(|a| {
+            let half = _mm256_xor_si256(_mm512_castsi512_si256(a), _mm512_extracti64x4_epi64::<1>(a));
+            let q = _mm_xor_si128(_mm256_castsi256_si128(half), _mm256_extracti128_si256::<1>(half));
+            bits::<__m128i, [u64; 2]>(q)
+        });
+        F192Unreduced { coeffs: lanes }
     }
 }
 
