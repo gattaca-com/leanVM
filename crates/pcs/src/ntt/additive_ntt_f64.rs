@@ -1416,40 +1416,35 @@ fn radix_layers(left: usize) -> usize {
 ///     group r  =  row r of every slab
 /// ```
 ///
-/// # Why the rows are disjoint
-///
-/// - Distinct groups take distinct rows inside each slab.
-/// - The slabs do not overlap.
-/// - So the groups are pairwise disjoint, and one base pointer can stand in for N nested splits.
-/// - A source, when given, is a separate buffer of the block's length: its rows never overlap the block's.
+/// - Each slab hands out its rows in turn, so the groups are disjoint without any pointer arithmetic.
+/// - A source, when given, is a separate buffer of the block's length, cut the same way.
+/// - With no source, a group is read in place.
+#[inline(always)]
 fn fused_rows<const N: usize>(
     block: &mut [F64],
     src: Option<&[F64]>,
     stride_rows: usize,
     num_ntts: usize,
-    do_one: impl Fn(&[*const F64; N], &mut [&mut [F64]; N]),
+    do_one: impl Fn(Option<[&[F64]; N]>, &mut [&mut [F64]; N]),
     mut hook: impl FnMut(),
 ) {
     // Words from one slab to the next.
     let stride = stride_rows * num_ntts;
-    debug_assert_eq!(block.len(), N * stride);
-    let base = block.as_mut_ptr();
-    // With a source, the group is read from there and written to the block; with none, it is read in place.
-    let from = src.map_or(base.cast_const(), |src| {
-        debug_assert_eq!(src.len(), block.len());
-        src.as_ptr()
+    let len = block.len();
+    debug_assert_eq!(len, N * stride);
+    let mut slabs = block.chunks_exact_mut(stride);
+    let mut block_rows: [_; N] = std::array::from_fn(|_| slabs.next().unwrap().chunks_exact_mut(num_ntts));
+    let mut src_rows = src.map(|src| {
+        debug_assert_eq!(src.len(), len);
+        let mut slabs = src.chunks_exact(stride);
+        std::array::from_fn::<_, N, _>(|_| slabs.next().unwrap().chunks_exact(num_ntts))
     });
-    for r in 0..stride_rows {
-        // Row `r` of each slab starts this many words into it.
-        let off = r * num_ntts;
-        // SAFETY:
-        // - The groups are disjoint, as argued above.
-        // - The row ends inside its slab, since the row index is below the slab height.
-        let mut rows: [&mut [F64]; N] =
-            std::array::from_fn(|i| unsafe { std::slice::from_raw_parts_mut(base.add(i * stride + off), num_ntts) });
-        // SAFETY: the source row lies inside its slab, like the block's row.
-        let srcs: [*const F64; N] = std::array::from_fn(|i| unsafe { from.add(i * stride + off) });
-        do_one(&srcs, &mut rows);
+    for _ in 0..stride_rows {
+        let mut rows: [&mut [F64]; N] = block_rows.each_mut().map(|slab| slab.next().unwrap());
+        let srcs = src_rows
+            .as_mut()
+            .map(|slabs| slabs.each_mut().map(|slab| slab.next().unwrap()));
+        do_one(srcs, &mut rows);
         hook();
     }
 }
@@ -1474,63 +1469,73 @@ fn butterfly_interleaved_fused_3layer(
     num_ntts: usize,
     hook: impl FnMut(),
 ) {
+    // On AVX-512 the whole sweep is one target-feature function, so each group's butterflies run on registers
+    // inside the sweep's loop: a call per group would pass the vectors through memory.
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    {
+        #[inline]
+        #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+        fn sweep(
+            block: &mut [F64],
+            src: Option<&[F64]>,
+            t: &[F64; 7],
+            eighth: usize,
+            num_ntts: usize,
+            hook: impl FnMut(),
+        ) {
+            fused_sweep_avx512::<8, 7>(block, src, eighth, num_ntts, t, hook, #[inline(always)] |v, t| {
+                // Layer L: rows 4 apart, one twiddle for the whole block.
+                butterfly_regs(v, 0, 4, t[0]);
+                butterfly_regs(v, 1, 5, t[0]);
+                butterfly_regs(v, 2, 6, t[0]);
+                butterfly_regs(v, 3, 7, t[0]);
+                // Layer L+1: rows 2 apart, one twiddle per half.
+                butterfly_regs(v, 0, 2, t[1]);
+                butterfly_regs(v, 1, 3, t[1]);
+                butterfly_regs(v, 4, 6, t[2]);
+                butterfly_regs(v, 5, 7, t[2]);
+                // Layer L+2: adjacent rows, one twiddle per quarter.
+                butterfly_regs(v, 0, 1, t[3]);
+                butterfly_regs(v, 2, 3, t[4]);
+                butterfly_regs(v, 4, 5, t[5]);
+                butterfly_regs(v, 6, 7, t[6]);
+            });
+        }
+        // SAFETY: this code is compiled only where VPCLMULQDQ and AVX-512F are enabled, and every such
+        // machine runs the AVX-512BW that the sweep adds.
+        unsafe { sweep(block, src, t, eighth, num_ntts, hook) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
     fused_rows::<8>(block, src, eighth, num_ntts, |src, rows| radix8_butterflies(src, rows, t), hook);
 }
 
-/// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
-///
-/// On AVX-512 they run on registers: each row's vectors are loaded and stored once per group.
+/// The sweep of [`fused_rows`] with `kernel` on registers: [`fused_lanes_avx512`] for each row group.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline(always)]
-fn radix8_butterflies(src: &[*const F64; 8], rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
-    // Inlined into the sweep: a call would pass the vectors through memory.
-    #[allow(clippy::redundant_closure)] // the closure carries the inline attribute
-    fused_lanes_avx512(
+#[inline]
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+fn fused_sweep_avx512<const N: usize, const T: usize>(
+    block: &mut [F64],
+    src: Option<&[F64]>,
+    stride_rows: usize,
+    num_ntts: usize,
+    twiddles: &[F64; T],
+    hook: impl FnMut(),
+    kernel: impl Fn(&mut RowVectors<N>, &[Twiddle; T]),
+) {
+    fused_rows::<N>(
+        block,
         src,
-        rows,
-        t,
-        #[inline(always)]
-        |v, t| radix8_regs(v, t),
+        stride_rows,
+        num_ntts,
+        |src, rows| fused_lanes_avx512(src, rows, twiddles, #[inline(always)] |v, t| kernel(v, t)),
+        hook,
     );
 }
 
-/// [`radix8_butterflies`] on registers.
-#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline(always)]
-fn radix8_regs(v: &mut RowVectors<8>, t: &[Twiddle; 7]) {
-    // Layer L: rows 4 apart, one twiddle for the whole block.
-    butterfly_regs(v, 0, 4, t[0]);
-    butterfly_regs(v, 1, 5, t[0]);
-    butterfly_regs(v, 2, 6, t[0]);
-    butterfly_regs(v, 3, 7, t[0]);
-    // Layer L+1: rows 2 apart, one twiddle per half.
-    butterfly_regs(v, 0, 2, t[1]);
-    butterfly_regs(v, 1, 3, t[1]);
-    butterfly_regs(v, 4, 6, t[2]);
-    butterfly_regs(v, 5, 7, t[2]);
-    // Layer L+2: adjacent rows, one twiddle per quarter.
-    butterfly_regs(v, 0, 1, t[3]);
-    butterfly_regs(v, 2, 3, t[4]);
-    butterfly_regs(v, 4, 5, t[5]);
-    butterfly_regs(v, 6, 7, t[6]);
-}
-
-/// Copy the rows that are read from a source into the rows that are written, where the two differ.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-#[inline(always)]
-fn copy_rows<const N: usize>(src: &[*const F64; N], rows: &mut [&mut [F64]; N]) {
-    for (&from, row) in src.iter().zip(rows.iter_mut()) {
-        if from != row.as_ptr() {
-            // SAFETY: a source row is as long as the row and does not overlap it.
-            row.copy_from_slice(unsafe { std::slice::from_raw_parts(from, row.len()) });
-        }
-    }
-}
-
 /// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[inline(always)]
-fn radix8_butterflies(src: &[*const F64; 8], rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
+fn radix8_butterflies(src: Option<[&[F64]; 8]>, rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
     copy_rows(src, rows);
     let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
     // Layer L: rows 4 apart, one twiddle for the whole block.
@@ -1548,6 +1553,15 @@ fn radix8_butterflies(src: &[*const F64; 8], rows: &mut [&mut [F64]; 8], t: &[F6
     butterfly_lanes(r2, r3, t[4]);
     butterfly_lanes(r4, r5, t[5]);
     butterfly_lanes(r6, r7, t[6]);
+}
+
+/// Copy the rows that are read from a source into the rows that are written, where the two differ.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[inline(always)]
+fn copy_rows<const N: usize>(src: Option<[&[F64]; N]>, rows: &mut [&mut [F64]; N]) {
+    for (from, row) in src.iter().flatten().zip(rows.iter_mut()) {
+        row.copy_from_slice(from);
+    }
 }
 
 /// Transpose a lane-major message into the row-major order the encoder reads.
@@ -2041,36 +2055,39 @@ fn butterfly_interleaved_fused_2layer(
     num_ntts: usize,
     hook: impl FnMut(),
 ) {
+    // On AVX-512 the sweep is one target-feature function, like the radix-8 one.
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    {
+        #[inline]
+        #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+        fn sweep(
+            block: &mut [F64],
+            src: Option<&[F64]>,
+            t: &[F64; 3],
+            quarter: usize,
+            num_ntts: usize,
+            hook: impl FnMut(),
+        ) {
+            fused_sweep_avx512::<4, 3>(block, src, quarter, num_ntts, t, hook, #[inline(always)] |v, t| {
+                // Layer L: rows 2 apart, one twiddle for the block.
+                butterfly_regs(v, 0, 2, t[0]);
+                butterfly_regs(v, 1, 3, t[0]);
+                // Layer L+1: adjacent rows, one twiddle per half.
+                butterfly_regs(v, 0, 1, t[1]);
+                butterfly_regs(v, 2, 3, t[2]);
+            });
+        }
+        // SAFETY: as in `butterfly_interleaved_fused_3layer`.
+        unsafe { sweep(block, src, t, quarter, num_ntts, hook) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
     fused_rows::<4>(block, src, quarter, num_ntts, |src, rows| radix4_butterflies(src, rows, t), hook);
-}
-
-/// The four butterflies of one radix-4 row group.
-///
-/// On AVX-512 they run on registers, like [`radix8_butterflies`].
-#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline(always)]
-fn radix4_butterflies(src: &[*const F64; 4], rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
-    #[allow(clippy::redundant_closure)] // the closure carries the inline attribute
-    fused_lanes_avx512(
-        src,
-        rows,
-        t,
-        #[inline(always)]
-        |v, t| {
-            // Layer L: rows 2 apart, one twiddle for the block.
-            butterfly_regs(v, 0, 2, t[0]);
-            butterfly_regs(v, 1, 3, t[0]);
-            // Layer L+1: adjacent rows, one twiddle per half.
-            butterfly_regs(v, 0, 1, t[1]);
-            butterfly_regs(v, 2, 3, t[2]);
-        },
-    );
 }
 
 /// The four butterflies of one radix-4 row group.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[inline(always)]
-fn radix4_butterflies(src: &[*const F64; 4], rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
+fn radix4_butterflies(src: Option<[&[F64]; 4]>, rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
     copy_rows(src, rows);
     let [r0, r1, r2, r3] = rows;
     // Layer L: rows 2 apart, one twiddle for the block.
@@ -2116,20 +2133,10 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
         return;
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    {
-        let vectors = top.len() / 8;
-        // SAFETY: the target features are enabled at compile time and each
-        // iteration reads and writes exactly eight elements from both rows.
-        unsafe {
-            for i in 0..vectors {
-                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0, 0xFF);
-            }
-            let tail = top.len() - 8 * vectors;
-            if tail > 0 {
-                let mask = (1u8 << tail) - 1;
-                butterfly_lanes_avx512(top.as_mut_ptr().add(8 * vectors), bot.as_mut_ptr().add(8 * vectors), twiddle.0, mask);
-            }
-        }
+    // SAFETY: this code is compiled only where VPCLMULQDQ and AVX-512F are enabled, and every such
+    // machine runs the AVX-512BW that the kernel adds.
+    unsafe {
+        butterfly_lanes_avx512(top, bot, twiddle.0)
     }
     #[cfg(all(
         target_arch = "x86_64",
@@ -2195,20 +2202,9 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
 pub(crate) fn transpose_butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
     debug_assert_eq!(top.len(), bot.len());
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    {
-        // SAFETY: the target features are enabled at compile time and each call
-        // touches only the words its mask selects, all within both rows.
-        unsafe {
-            let vectors = top.len() / 8;
-            for i in 0..vectors {
-                transpose_butterfly_lanes_avx512(top.as_mut_ptr().add(8 * i), bot.as_mut_ptr().add(8 * i), twiddle.0, 0xFF);
-            }
-            let tail = top.len() - 8 * vectors;
-            if tail > 0 {
-                let mask = (1u8 << tail) - 1;
-                transpose_butterfly_lanes_avx512(top.as_mut_ptr().add(8 * vectors), bot.as_mut_ptr().add(8 * vectors), twiddle.0, mask);
-            }
-        }
+    // SAFETY: as in `butterfly_lanes`.
+    unsafe {
+        transpose_butterfly_lanes_avx512(top, bot, twiddle.0)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
     for (u, v) in top.iter_mut().zip(bot.iter_mut()) {
@@ -2342,16 +2338,24 @@ unsafe fn butterfly_lanes_neon_8(top: *mut F64, bot: *mut F64, twiddle: u64) {
 
 /// `g(spill)` per top nibble `n` of a product's high word: `spill = n ^ n>>1 ^ n>>3`, the bits
 /// `g(hi) = hi * (x^4 + x^3 + x + 1)` pushes past x^63, then `g(spill)` itself, which fits a byte.
+///
+/// The 16 entries repeat in each 128-bit lane, the table of an in-lane byte shuffle.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-const G_SPILL: [u8; 16] = {
-    let mut t = [0u8; 16];
+const G_SPILL: core::arch::x86_64::__m512i = {
+    let mut words = [0u64; 8];
     let mut n = 0;
     while n < 16 {
         let s = n ^ (n >> 1) ^ (n >> 3);
-        t[n] = (s ^ (s << 1) ^ (s << 3) ^ (s << 4)) as u8;
+        let g = (s ^ (s << 1) ^ (s << 3) ^ (s << 4)) as u8 as u64;
+        words[n / 8] |= g << (8 * (n % 8));
         n += 1;
     }
-    t
+    let mut lane = 1;
+    while lane < 4 {
+        (words[2 * lane], words[2 * lane + 1]) = (words[0], words[1]);
+        lane += 1;
+    }
+    primitives::simd::from_words(words)
 };
 
 /// `u ^ v * tw` in each of the eight 64-bit lanes of an AVX-512 register, for the two kernels below.
@@ -2373,68 +2377,63 @@ const G_SPILL: [u8; 16] = {
 /// - The unpacks and the lookup stay inside 128-bit lanes, so no shuffle crosses lanes.
 /// - The reduction takes three shifts and three-way XORs, `vpternlogq 0x96`, instead of two more carry-less multiplies.
 /// - Zen 5 has one carry-less multiplier per core, so those two would dominate the kernel.
-///
-/// # Safety
-///
-/// Callable only where VPCLMULQDQ, AVX-512F and AVX-512BW are enabled, which the kernels' target features guarantee.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline(always)]
-unsafe fn mul_xor_avx512(
+#[inline]
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+fn mul_xor_avx512(
     u: core::arch::x86_64::__m512i,
     v: core::arch::x86_64::__m512i,
     tw: core::arch::x86_64::__m512i,
 ) -> core::arch::x86_64::__m512i {
     use core::arch::x86_64::*;
 
-    // SAFETY: the caller's target features cover every intrinsic below.
-    unsafe {
-        // Products v * t: even lanes, then odd lanes, one 128-bit product per 128-bit lane.
-        let even = _mm512_clmulepi64_epi128::<0x00>(v, tw);
-        let odd = _mm512_clmulepi64_epi128::<0x11>(v, tw);
-        // Back to lane order: qword i of lo / hi is the low / high half of lane i's product.
-        let lo = _mm512_unpacklo_epi64(even, odd);
-        let hi = _mm512_unpackhi_epi64(even, odd);
+    // Products v * t: even lanes, then odd lanes, one 128-bit product per 128-bit lane.
+    let even = _mm512_clmulepi64_epi128::<0x00>(v, tw);
+    let odd = _mm512_clmulepi64_epi128::<0x11>(v, tw);
+    // Back to lane order: qword i of lo / hi is the low / high half of lane i's product.
+    let lo = _mm512_unpacklo_epi64(even, odd);
+    let hi = _mm512_unpackhi_epi64(even, odd);
 
-        // Reduce modulo x^64 + x^4 + x^3 + x + 1: p mod f = lo ^ g(hi) ^ g(spill), g linear.
-        const XOR3: i32 = 0x96;
-        // g(spill) depends on hi's top nibble alone, and fits a byte: one in-lane table lookup.
-        let nibble = _mm512_srli_epi64::<60>(hi);
-        let g_spill = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(_mm_loadu_si128(G_SPILL.as_ptr().cast())), nibble);
-        // g(hi) = y ^ y<<3, with y = hi ^ hi<<1.
-        let y = _mm512_xor_si512(hi, _mm512_slli_epi64::<1>(hi));
-        _mm512_ternarylogic_epi64::<XOR3>(
-            _mm512_ternarylogic_epi64::<XOR3>(u, lo, g_spill),
-            y,
-            _mm512_slli_epi64::<3>(y),
-        )
-    }
+    // Reduce modulo x^64 + x^4 + x^3 + x + 1: p mod f = lo ^ g(hi) ^ g(spill), g linear.
+    const XOR3: i32 = 0x96;
+    // g(spill) depends on hi's top nibble alone, and fits a byte: one in-lane table lookup.
+    let nibble = _mm512_srli_epi64::<60>(hi);
+    let g_spill = _mm512_shuffle_epi8(G_SPILL, nibble);
+    // g(hi) = y ^ y<<3, with y = hi ^ hi<<1.
+    let y = _mm512_xor_si512(hi, _mm512_slli_epi64::<1>(hi));
+    _mm512_ternarylogic_epi64::<XOR3>(
+        _mm512_ternarylogic_epi64::<XOR3>(u, lo, g_spill),
+        y,
+        _mm512_slli_epi64::<3>(y),
+    )
 }
 
-/// Eight F64 butterflies with a shared twiddle, one per 64-bit lane of an AVX-512 register.
+/// The butterflies of a pair of equal-length rows with a shared twiddle, eight lanes per AVX-512 register.
 ///
-/// # Safety
-///
-/// - Requires VPCLMULQDQ, AVX-512F and AVX-512BW.
-/// - Each pointer must address the words `mask` selects, readable and writable.
+/// The last register is masked to the row's end.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline]
-#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw", enable = "avx2")]
-unsafe fn butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64, mask: u8) {
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+fn butterfly_lanes_avx512(top: &mut [F64], bot: &mut [F64], twiddle: u64) {
     use core::arch::x86_64::*;
+    use primitives::simd::{load_prefix, store_prefix, xor};
 
-    // SAFETY:
-    // - The caller supplies two rows valid for the lanes `mask` selects.
-    // - This function's target features cover every intrinsic below.
-    unsafe {
-        // Load both rows and broadcast the twiddle to every lane.
-        let u = _mm512_maskz_loadu_epi64(mask, top.cast());
-        let v = _mm512_maskz_loadu_epi64(mask, bot.cast());
-        let tw = _mm512_set1_epi64(twiddle as i64);
+    let tw = _mm512_set1_epi64(twiddle as i64);
+    let step = |top: &mut [F64], bot: &mut [F64], i: usize, n: usize| {
+        let u = load_prefix(top, i, n);
+        let v = load_prefix(bot, i, n);
         // Butterfly top: u' = u + v * t. Bottom: v' = v + u'.
         let new_u = mul_xor_avx512(u, v, tw);
-        let new_v = _mm512_xor_si512(v, new_u);
-        _mm512_mask_storeu_epi64(top.cast(), mask, new_u);
-        _mm512_mask_storeu_epi64(bot.cast(), mask, new_v);
+        store_prefix(top, i, n, new_u);
+        store_prefix(bot, i, n, xor(v, new_u));
+    };
+    let vectors = top.len() / 8;
+    for i in 0..vectors {
+        step(top, bot, i, 8);
+    }
+    let tail = top.len() - 8 * vectors;
+    if tail > 0 {
+        step(top, bot, vectors, tail);
     }
 }
 
@@ -2454,88 +2453,102 @@ type RowVectors<const N: usize> = [[core::arch::x86_64::__m512i; LANE_VECTORS]; 
 
 /// Butterfly rows `top` and `bot` of every vector in flight.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
 fn butterfly_regs<const N: usize>(v: &mut RowVectors<N>, top: usize, bot: usize, (tw, zero): Twiddle) {
     for k in 0..LANE_VECTORS {
         let (u, w) = (v[top][k], v[bot][k]);
-        // SAFETY: the target features are enabled at compile time.
-        let new_u = if zero { u } else { unsafe { mul_xor_avx512(u, w, tw) } };
+        let new_u = if zero { u } else { mul_xor_avx512(u, w, tw) };
         v[top][k] = new_u;
-        v[bot][k] = unsafe { core::arch::x86_64::_mm512_xor_si512(w, new_u) };
+        v[bot][k] = primitives::simd::xor(w, new_u);
     }
 }
 
 /// Runs `kernel` on `N` equal-length rows held in registers, [`LANE_VECTORS`] eight-lane vectors of every row at a time.
 ///
-/// - The vectors load from `src` and store to `rows`; in place, `src` holds the addresses of `rows`.
+/// - The vectors load from `src`, or from `rows` when there is none, and store to `rows`.
 /// - A vector is loaded and stored once, however many butterflies `kernel` applies to it.
 /// - The kernel orders its butterflies breadth-first, so the vectors in flight hide each other's latency.
 /// - The last chunk may be short: its vectors past the row's end load as zeros and are not stored.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
 fn fused_lanes_avx512<const N: usize, const T: usize>(
-    src: &[*const F64; N],
+    src: Option<[&[F64]; N]>,
     rows: &mut [&mut [F64]; N],
     twiddles: &[F64; T],
     kernel: impl Fn(&mut RowVectors<N>, &[Twiddle; T]),
 ) {
     use core::arch::x86_64::*;
+    use primitives::simd::{load, load_prefix, store, store_prefix};
 
     const CHUNK: usize = 8 * LANE_VECTORS;
     let len = rows[0].len();
     debug_assert!(rows.iter().all(|row| row.len() == len));
-    let ptrs: [*mut F64; N] = std::array::from_fn(|i| rows[i].as_mut_ptr());
-    // SAFETY: the target features are enabled at compile time, and every load and store
-    // stays inside its row: a whole chunk ends by `len`, and a short one is masked at `len`.
-    unsafe {
-        let tw = twiddles.map(|t| (_mm512_set1_epi64(t.0 as i64), t == F64::ZERO));
-        let mut lane = 0;
-        while lane + CHUNK <= len {
-            let mut v: RowVectors<N> =
-                std::array::from_fn(|i| std::array::from_fn(|k| _mm512_loadu_si512(src[i].add(lane + 8 * k).cast())));
-            kernel(&mut v, &tw);
-            for i in 0..N {
-                for k in 0..LANE_VECTORS {
-                    _mm512_storeu_si512(ptrs[i].add(lane + 8 * k).cast(), v[i][k]);
-                }
+    debug_assert!(src.iter().flatten().all(|row| row.len() == len));
+    let tw = twiddles.map(|t| (_mm512_set1_epi64(t.0 as i64), t == F64::ZERO));
+    let mut lane = 0;
+    while lane + CHUNK <= len {
+        // The chunk of every row, as arrays: the loads and stores below need no bounds check of their own.
+        let mut chunks: [&mut [F64; CHUNK]; N] =
+            rows.each_mut().map(|row| (&mut row[lane..lane + CHUNK]).try_into().unwrap());
+        let mut v: RowVectors<N> = match &src {
+            Some(src) => std::array::from_fn(|i| {
+                let from: &[F64; CHUNK] = src[i][lane..lane + CHUNK].try_into().unwrap();
+                std::array::from_fn(|k| load(from, k))
+            }),
+            None => std::array::from_fn(|i| std::array::from_fn(|k| load(&*chunks[i], k))),
+        };
+        kernel(&mut v, &tw);
+        for i in 0..N {
+            for k in 0..LANE_VECTORS {
+                store(chunks[i], k, v[i][k]);
             }
-            lane += CHUNK;
         }
-        if lane < len {
-            // The lanes of vector `k` of the short chunk: all eight, the row's last few, or none.
-            let mask = |k: usize| ((1u16 << len.saturating_sub(lane + 8 * k).min(8)) - 1) as u8;
-            let mut v: RowVectors<N> = std::array::from_fn(|i| {
-                std::array::from_fn(|k| _mm512_maskz_loadu_epi64(mask(k), src[i].add(lane + 8 * k).cast()))
-            });
-            kernel(&mut v, &tw);
-            for i in 0..N {
-                for k in 0..LANE_VECTORS {
-                    _mm512_mask_storeu_epi64(ptrs[i].add(lane + 8 * k).cast(), mask(k), v[i][k]);
-                }
+        lane += CHUNK;
+    }
+    if lane < len {
+        let reg = lane / 8;
+        // The lanes of vector `k` of the short chunk: all eight, the row's last few, or none.
+        let n = |k: usize| len.saturating_sub(lane + 8 * k).min(8);
+        let mut v: RowVectors<N> = std::array::from_fn(|i| {
+            std::array::from_fn(|k| match &src {
+                Some(src) => load_prefix(src[i], reg + k, n(k)),
+                None => load_prefix(&*rows[i], reg + k, n(k)),
+            })
+        });
+        kernel(&mut v, &tw);
+        for i in 0..N {
+            for k in 0..LANE_VECTORS {
+                store_prefix(rows[i], reg + k, n(k), v[i][k]);
             }
         }
     }
 }
 
 /// [`butterfly_lanes_avx512`] transposed: `s = u + v; u' = s; v' = s * t + v`.
-///
-/// # Safety
-///
-/// Same as [`butterfly_lanes_avx512`].
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline]
-#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw", enable = "avx2")]
-unsafe fn transpose_butterfly_lanes_avx512(top: *mut F64, bot: *mut F64, twiddle: u64, mask: u8) {
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+fn transpose_butterfly_lanes_avx512(top: &mut [F64], bot: &mut [F64], twiddle: u64) {
     use core::arch::x86_64::*;
+    use primitives::simd::{load_prefix, store_prefix, xor};
 
-    // SAFETY: as in `butterfly_lanes_avx512`.
-    unsafe {
-        let u = _mm512_maskz_loadu_epi64(mask, top.cast());
-        let v = _mm512_maskz_loadu_epi64(mask, bot.cast());
-        let tw = _mm512_set1_epi64(twiddle as i64);
-        let s = _mm512_xor_si512(u, v);
-        _mm512_mask_storeu_epi64(top.cast(), mask, s);
-        _mm512_mask_storeu_epi64(bot.cast(), mask, mul_xor_avx512(v, s, tw));
+    let tw = _mm512_set1_epi64(twiddle as i64);
+    let step = |top: &mut [F64], bot: &mut [F64], i: usize, n: usize| {
+        let u = load_prefix(top, i, n);
+        let v = load_prefix(bot, i, n);
+        let s = xor(u, v);
+        store_prefix(top, i, n, s);
+        store_prefix(bot, i, n, mul_xor_avx512(v, s, tw));
+    };
+    let vectors = top.len() / 8;
+    for i in 0..vectors {
+        step(top, bot, i, 8);
+    }
+    let tail = top.len() - 8 * vectors;
+    if tail > 0 {
+        step(top, bot, vectors, tail);
     }
 }
 
