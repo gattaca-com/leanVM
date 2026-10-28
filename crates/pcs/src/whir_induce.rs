@@ -8,8 +8,7 @@
 //! transposed-NTT fast path with the dispatch between them.
 
 use flux_profiler::timed;
-use crate::ntt::additive_ntt_f64::transpose_butterfly_lanes;
-use crate::ntt::AdditiveNttF64;
+use crate::ntt::{AdditiveNttF64, transpose_butterfly_lanes};
 use crate::whir_ntt_ext::words_mut;
 use crate::whir::build_eq_table_ext;
 use primitives::field::{F64, F192, Weights8, dot_base};

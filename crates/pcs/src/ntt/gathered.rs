@@ -4,9 +4,9 @@ use flux_profiler::timed;
 use primitives::field::F64;
 use primitives::stream::Stream;
 
-use super::additive_ntt_f64::{
-    AdditiveNttF64, BATCH, Drain, Msg, StageCopies, fill_stage, hook_calls, stage_copies, stage_subs, with_scratch,
-};
+use super::additive_ntt_f64::{AdditiveNttF64, Msg, with_scratch};
+use super::deep::{Drain, hook_calls};
+use super::stage::{BATCH, StageCopies, fill_stage, stage_copies, stage_subs};
 
 impl AdditiveNttF64 {
     /// Run layers `layer..layer + g` in one sweep of the buffer, one row group at a time.
