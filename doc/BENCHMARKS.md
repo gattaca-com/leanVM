@@ -45,6 +45,29 @@ sha256sum p2.bin p8.bin   # macOS: shasum -a 256
 
 The proof does not depend on the thread count or the machine (checked at 1 and 16 threads).
 
+## Profiling (flux traces)
+
+The prover is instrumented for [flux](https://github.com/gattaca-com/flux)'s `flux-profiler`: every stage span and every
+`#[timed]` function becomes a frame, per thread. Install its CLI once (same revision as the dependency in `Cargo.toml`):
+
+```sh
+cargo install --locked --git https://github.com/gattaca-com/flux --rev cb55dcb7fd31d525b09317f98ed0e47fac4ea60a flux-profiler
+```
+
+Record a trace (the script builds `leanvm`, starts it with `--flux`, attaches the CLI and writes `<out>.fxt`):
+
+```sh
+LEANVM_NUM_THREADS=4 TASKSET=0-3 scripts/flux-trace.sh n8-4core.fxt -- \
+  --repeat 2 --cooldown 0 --log-inv-rate 2 --tracing recursion --n 8 --xmss-per-leaf 900
+```
+
+- `TASKSET` pins cores with Linux `taskset`; leave it unset elsewhere. `FLUX_CLI=<path>` overrides the CLI if it is not on `PATH`.
+- A trace holds `--repeat` + 1 proofs: a warm-up pass, then the measured passes. Read a warm `Prove` (the 2nd or later),
+  and check that the warm passes agree before trusting a span.
+- Hardware counters per frame (Linux, `kernel.perf_event_paranoid <= 2`): prefix `PERF_EVENTS=instructions,cycles,l1d-misses,l2-misses,l3-misses`.
+- Open the `.fxt` in [Perfetto](https://ui.perfetto.dev) (drag and drop). Frames carry allocated and freed bytes as a `memory` track.
+- Flux overhead is within noise for our spans; the `--tracing` span tree printed by the run is a cheaper summary.
+
 ## Reference numbers (Ryzen 9 9950X, 16 cores, 2-channel DDR5, merge-main 2026-10-27)
 
 | Shape | Proving time | Peak memory |
