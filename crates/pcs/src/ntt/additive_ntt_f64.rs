@@ -35,32 +35,41 @@ impl DeepRows {
     fn sub_len(&self) -> usize {
         self.num_ntts << (self.log_d - self.deep_start)
     }
-
-    /// The runs of the sorted `positions` that fall in one deep sub-block, ascending.
-    fn runs<'a>(&self, positions: &'a [usize]) -> impl Iterator<Item = &'a [usize]> {
-        debug_assert!(positions.is_sorted());
-        let log_sub = self.log_d - self.deep_start;
-        positions.chunk_by(move |a, b| a >> log_sub == b >> log_sub)
-    }
-
-    /// The sorted, distinct deep sub-blocks that hold the sorted `positions`.
-    fn sub_blocks(&self, positions: &[usize]) -> Vec<usize> {
-        self.runs(positions).map(|run| run[0] >> (self.log_d - self.deep_start)).collect()
-    }
 }
 
-/// `out`, `n` words per position, as one disjoint slice per run of positions, paired with the run.
-fn split_runs<'a, 'b>(
-    mut out: &'a mut [F64],
+/// The rows at the sorted `positions`, `n` words each, back to back.
+///
+/// - The rows group by the block of `2^log_block` rows that holds them, one pool task per block.
+/// - `build(i, block, scratch)` writes block number `block`, the `i`-th one touched, into the thread's scratch.
+/// - Only the queried rows are copied out of it.
+fn built_rows(
     n: usize,
-    runs: impl Iterator<Item = &'b [usize]>,
-) -> Vec<(&'a mut [F64], &'b [usize])> {
-    runs.map(|run| {
-        let (head, tail) = std::mem::take(&mut out).split_at_mut(run.len() * n);
-        out = tail;
-        (head, run)
-    })
-    .collect()
+    log_block: usize,
+    positions: &[usize],
+    build: impl Fn(usize, usize, &mut [F64]) + Sync,
+) -> Vec<F64> {
+    debug_assert!(positions.is_sorted());
+    let mut out = vec![F64::ZERO; positions.len() * n];
+    let mut rest = &mut out[..];
+    let mut parts = positions
+        .chunk_by(|a, b| a >> log_block == b >> log_block)
+        .map(|run| {
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(run.len() * n);
+            rest = tail;
+            (head, run)
+        })
+        .collect::<Vec<_>>();
+    parallel::chunks_mut(&mut parts, 1, |i, part| {
+        let (dst, run) = &mut part[0];
+        let block = run[0] >> log_block;
+        with_scratch(n << log_block, |scratch| {
+            build(i, block, scratch);
+            for (dst, &q) in dst.chunks_exact_mut(n).zip(run.iter()) {
+                dst.copy_from_slice(&scratch[(q & ((1 << log_block) - 1)) * n..][..n]);
+            }
+        });
+    });
+    out
 }
 
 /// Where the layer-`start` blocks of a transform come from.
@@ -310,21 +319,10 @@ impl AdditiveNttF64 {
     /// Codeword rows `positions` (sorted) of the encode [`Self::encode_cosets`] ran, back to back, one transform per
     /// coset they touch.
     pub fn coset_rows(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, positions: &[usize]) -> Vec<F64> {
-        debug_assert!(positions.is_sorted());
         let log_d = self.coset_log_d(msg.len(), num_ntts, log_inv_rate);
-        let rows = msg.len() / num_ntts;
-        let mut out = vec![F64::ZERO; positions.len() * num_ntts];
-        let mut parts = split_runs(&mut out, num_ntts, positions.chunk_by(|a, b| a / rows == b / rows));
-        parallel::chunks_mut(&mut parts, 1, |_, part| {
-            let (dst, run) = &mut part[0];
-            with_scratch(msg.len(), |coset| {
-                self.build_coset(coset, msg, num_ntts, log_d, log_inv_rate, run[0] / rows);
-                for (dst, &q) in dst.chunks_exact_mut(num_ntts).zip(run.iter()) {
-                    dst.copy_from_slice(&coset[(q % rows) * num_ntts..][..num_ntts]);
-                }
-            });
-        });
-        out
+        built_rows(num_ntts, log_d - log_inv_rate, positions, |_, coset, buf| {
+            self.build_coset(buf, msg, num_ntts, log_d, log_inv_rate, coset)
+        })
     }
 
     /// Whether a message of `msg_words` words encodes coset by coset: one coset fits the cache budget [`COSET_WORDS`].
@@ -350,7 +348,7 @@ impl AdditiveNttF64 {
     /// back to back.
     pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<F64> {
         let sub_len = deep.sub_len();
-        self.rows_from(deep, positions, |_, sub| &data[sub * sub_len..][..sub_len])
+        self.finished_rows(deep, positions, |_, sub| &data[sub * sub_len..][..sub_len])
     }
 
     /// Codeword rows `positions` (sorted) of an encode that kept no buffer, recomputed from its lane-major message,
@@ -363,37 +361,29 @@ impl AdditiveNttF64 {
         deep: &DeepRows,
         positions: &[usize],
     ) -> Vec<F64> {
-        let built = self.rebuild_sub_blocks(msg, repeats, n_lanes, deep, &deep.sub_blocks(positions));
+        let log_sub = deep.log_d - deep.deep_start;
+        let mut subs: Vec<usize> = positions.iter().map(|q| q >> log_sub).collect();
+        subs.dedup();
+        let built = self.rebuild_sub_blocks(msg, repeats, n_lanes, deep, &subs);
         let sub_len = deep.sub_len();
-        self.rows_from(deep, positions, |i, _| &built[i * sub_len..][..sub_len])
+        self.finished_rows(deep, positions, |i, _| &built[i * sub_len..][..sub_len])
     }
 
     /// The rows at `positions` (sorted), back to back, from the sub-blocks before their deep layers.
     ///
     /// `src(i, sub)` is the `i`-th sub-block, number `sub` in the codeword. Each finishes into the thread's
     /// scratch, so only the queried rows are written.
-    fn rows_from<'a>(
+    fn finished_rows<'a>(
         &self,
         deep: &DeepRows,
         positions: &[usize],
         src: impl Fn(usize, usize) -> &'a [F64] + Sync,
     ) -> Vec<F64> {
-        let (sub_len, log_sub, n) = (deep.sub_len(), deep.log_d - deep.deep_start, deep.num_ntts);
-        let mut out = vec![F64::ZERO; positions.len() * n];
-        let mut parts = split_runs(&mut out, n, deep.runs(positions));
-        parallel::chunks_mut(&mut parts, 1, |i, part| {
-            let (dst, run) = &mut part[0];
-            let sub_idx = run[0] >> log_sub;
-            with_scratch(sub_len, |sub| {
-                let src = Some(src(i, sub_idx));
-                let (log_d, start) = (deep.log_d, deep.deep_start);
-                self.run_layers_to(sub, src, log_d, n, start, log_d, start, sub_idx, None, no_hook);
-                for (dst, &q) in dst.chunks_exact_mut(n).zip(run.iter()) {
-                    dst.copy_from_slice(&sub[(q & ((1 << log_sub) - 1)) * n..][..n]);
-                }
-            });
-        });
-        out
+        let DeepRows { log_d, num_ntts, deep_start, .. } = *deep;
+        built_rows(num_ntts, log_d - deep_start, positions, |i, sub_idx, sub| {
+            let src = Some(src(i, sub_idx));
+            self.run_layers_to(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
+        })
     }
 
     /// The deep sub-blocks `subs` (sorted, distinct) of an encode that kept no buffer, back to back, before their deep layers.
