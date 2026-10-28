@@ -3,30 +3,9 @@
 use flux_profiler::timed;
 use primitives::field::F64;
 
-use super::additive_ntt_f64::{AdditiveNttF64, L2_WORDS, no_hook, with_scratch};
+use super::additive_ntt_f64::{AdditiveNttF64, no_hook, with_scratch};
+use super::plan::Plan;
 use super::stage::{BATCH, LOG_BATCH, fill_stage, stage_copies};
-
-/// Where an encode stopped writing its buffer back: the deep pass's layers, still to run on any row read.
-#[derive(Clone, Copy, Debug)]
-pub struct DeepRows {
-    pub(super) log_d: usize,
-    pub(super) num_ntts: usize,
-    /// The first layer of the encode, where the cosets split.
-    pub(super) start: usize,
-    pub(super) deep_start: usize,
-}
-
-impl DeepRows {
-    /// Words of the buffer the encode left.
-    pub fn words(&self) -> usize {
-        self.num_ntts << self.log_d
-    }
-
-    /// Words of one deep sub-block.
-    fn sub_len(&self) -> usize {
-        self.num_ntts << (self.log_d - self.deep_start)
-    }
-}
 
 /// The rows at the sorted `positions`, `n` words each, back to back.
 ///
@@ -66,7 +45,7 @@ pub(super) fn built_rows(
 impl AdditiveNttF64 {
     /// Codeword rows `positions` (sorted) of a buffer left by [`Self::encode_interleaved_with`] with `defer_deep`,
     /// back to back.
-    pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<F64> {
+    pub fn finish_rows(&self, data: &[F64], deep: &Plan, positions: &[usize]) -> Vec<F64> {
         let sub_len = deep.sub_len();
         self.finished_rows(deep, positions, |_, sub| &data[sub * sub_len..][..sub_len])
     }
@@ -78,7 +57,7 @@ impl AdditiveNttF64 {
         msg: &[F64],
         repeats: &[bool],
         n_lanes: usize,
-        deep: &DeepRows,
+        deep: &Plan,
         positions: &[usize],
     ) -> Vec<F64> {
         let log_sub = deep.log_d - deep.deep_start;
@@ -95,11 +74,11 @@ impl AdditiveNttF64 {
     /// scratch, so only the queried rows are written.
     fn finished_rows<'a>(
         &self,
-        deep: &DeepRows,
+        deep: &Plan,
         positions: &[usize],
         src: impl Fn(usize, usize) -> &'a [F64] + Sync,
     ) -> Vec<F64> {
-        let DeepRows { log_d, num_ntts, deep_start, .. } = *deep;
+        let Plan { log_d, num_ntts, deep_start, .. } = *deep;
         built_rows(num_ntts, log_d - deep_start, positions, |i, sub_idx, sub| {
             let src = Some(src(i, sub_idx));
             self.run_layers_to(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
@@ -123,14 +102,14 @@ impl AdditiveNttF64 {
         msg: &[F64],
         repeats: &[bool],
         n_lanes: usize,
-        deep: &DeepRows,
+        deep: &Plan,
         subs: &[usize],
     ) -> Vec<F64> {
-        let DeepRows { log_d, num_ntts, start, deep_start } = *deep;
+        let Plan { log_d, num_ntts, start, deep_start, .. } = *deep;
         let g = deep_start - start;
         let (rows, log_step) = (1usize << g, log_d - deep_start);
         let (sub_len, msg_rows) = (deep.sub_len(), 1usize << (log_d - start));
-        assert!(0 < g && g <= (L2_WORDS / num_ntts).max(1).ilog2() as usize, "one gathered pass");
+        assert!(deep.single_gathered_pass(), "one gathered pass");
         assert!(num_ntts.is_multiple_of(8) && log_step >= LOG_BATCH, "the gathered pass is lane-major");
         assert_eq!(msg.len(), n_lanes * msg_rows);
         // Each coset with queried sub-blocks: its index, those sub-blocks' places in `subs`, and their group rows.

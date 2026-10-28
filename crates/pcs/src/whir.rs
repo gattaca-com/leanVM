@@ -22,7 +22,7 @@
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
 use crate::merkle::{self, Hash};
-use crate::ntt::{AdditiveNttF64, DeepRows, Encoded, Keep};
+use crate::ntt::{AdditiveNttF64, Encoded, Keep, Plan};
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use flux_profiler::timed;
@@ -120,7 +120,7 @@ pub struct ProverData {
     /// Words per codeword row: the committed lanes, with zero lanes in front up to the vector width.
     row_words: usize,
     pub merkle_tree: merkle::CutTree,
-    deep: Option<(AdditiveNttF64, DeepRows)>,
+    deep: Option<(AdditiveNttF64, Plan)>,
 }
 
 impl ProverData {
@@ -151,7 +151,7 @@ impl ProverData {
 pub(crate) struct L0Codeword<'a> {
     words: &'a [F64],
     row_words: usize,
-    deep: Option<&'a (AdditiveNttF64, DeepRows)>,
+    deep: Option<&'a (AdditiveNttF64, Plan)>,
     stack: &'a [F64],
     /// The stack's blocks that equal their predecessor, or none.
     repeats: &'a [bool],
@@ -258,7 +258,7 @@ pub fn commit(
 /// What a [`LigeroWitness`] keeps of its codeword when an encode left rows out of it.
 enum Deferred {
     /// The rows before the deep layers, which `finish_rows` completes.
-    Deep(AdditiveNttF64, DeepRows),
+    Deep(AdditiveNttF64, Plan),
     /// No codeword at all: `mat` is the message, and the encode's log inverse rate is here.
     Cosets(AdditiveNttF64, usize),
 }

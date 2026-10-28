@@ -4,7 +4,7 @@ use primitives::field::F64;
 use primitives::stream::Stream;
 
 use super::additive_ntt_f64::{AdditiveNttF64, Line, Msg, RowSink, no_hook, radix_layers, with_scratch};
-use super::rows::DeepRows;
+use super::plan::Plan;
 
 /// How many times [`AdditiveNttF64::run_layers_to`] calls its hook over `first_layer..end_layer`.
 pub(super) fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usize) -> usize {
@@ -124,7 +124,7 @@ impl AdditiveNttF64 {
     pub(super) fn deep_pass(
         &self,
         data: &mut [F64],
-        plan: &DeepRows,
+        plan: &Plan,
         log_sub: usize,
         msg: Msg<'_>,
         first_coset: usize,
@@ -132,7 +132,7 @@ impl AdditiveNttF64 {
         defer_deep: bool,
         stream: bool,
     ) {
-        let DeepRows { log_d, num_ntts, start, deep_start } = *plan;
+        let Plan { log_d, num_ntts, start, deep_start, .. } = *plan;
         let sub_len = num_ntts << log_sub;
         let outer = log_d - log_sub;
         let (base, total) = (parallel::SendPtr(data.as_mut_ptr()), data.len());

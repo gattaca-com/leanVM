@@ -16,9 +16,10 @@ use primitives::log2_strict_usize;
 use super::kernels::{
     butterfly_interleaved_block, butterfly_interleaved_fused_2layer, butterfly_interleaved_fused_3layer,
 };
-use super::rows::{DeepRows, built_rows};
+use super::plan::{L2_WORDS, Plan, l2_words};
+use super::rows::built_rows;
 use super::twiddles::Twiddles;
-use super::stage::{LOG_BATCH, transpose_lane_major};
+use super::stage::transpose_lane_major;
 
 /// Where the layer-`start` blocks of a transform come from.
 #[derive(Clone, Copy)]
@@ -49,7 +50,7 @@ pub struct Encoded {
     /// The buffer kept, or empty when nothing was.
     pub words: Vec<F64>,
     /// Set if the deep pass is left to run on a row read, from `words` or, when empty, from the message.
-    pub deep: Option<DeepRows>,
+    pub deep: Option<Plan>,
 }
 
 /// Receives a finished block of codeword rows, as `(first_row, rows)`.
@@ -136,8 +137,8 @@ impl AdditiveNttF64 {
         let msg_rows = msg.len() / n_lanes;
         assert_eq!(msg.len(), n_lanes * msg_rows, "the message is n_lanes lane blocks");
         let log_d = log2_strict_usize(msg_rows) + log_inv_rate;
-        let rebuildable = lane_major_deep_start(log_d, num_ntts, log_inv_rate)
-            .is_some_and(|deep_start| deep_start - log_inv_rate <= fit(L2_WORDS, num_ntts));
+        let rebuildable =
+            Plan::for_lanes(log_d, num_ntts, log_inv_rate).is_some_and(|plan| plan.single_gathered_pass());
         let by_halves = keep == Keep::Nothing && rebuildable;
         let defer_deep = by_halves || keep == Keep::BeforeDeep;
         // The cosets one pass holds: half of them when the opening rebuilds the rows.
@@ -227,7 +228,7 @@ impl AdditiveNttF64 {
         log_inv_rate: usize,
         defer_deep: bool,
         on_rows: &RowSink<'_>,
-    ) -> Option<DeepRows> {
+    ) -> Option<Plan> {
         assert_eq!(
             msg.len() << log_inv_rate,
             data.len(),
@@ -284,7 +285,7 @@ impl AdditiveNttF64 {
         mut msg: Msg<'_>,
         on_rows: Option<&RowSink<'_>>,
         defer_deep: bool,
-    ) -> Option<DeepRows> {
+    ) -> Option<Plan> {
         assert!(num_ntts > 0);
         assert_eq!(data.len() % num_ntts, 0);
         // The buffer is 2^log_d rows of `num_ntts` words, or the layer-`start` blocks of a lane-major message.
@@ -297,9 +298,8 @@ impl AdditiveNttF64 {
         assert!(log_d <= self.tw.log_domain_size());
         assert!(start <= log_d);
 
-        let l2_words = l2_words(matches!(msg, Msg::Lanes { .. }));
-        let (par_log, deep_start) = (par_log(log_d), deep_start(log_d, num_ntts, start, l2_words));
-        let fit2 = fit(l2_words, num_ntts);
+        // The plan reads the original message, before a lane-major one is transposed.
+        let plan = Plan::new(log_d, num_ntts, start, l2_words(matches!(msg, Msg::Lanes { .. })));
 
         // A buffer this large is evicted before the next pass reads it back.
         let stream = data.len() >= STREAM_MIN_WORDS;
@@ -310,47 +310,37 @@ impl AdditiveNttF64 {
         // A lane-major message is read by the first gathered pass, a batch of residues at a time.
         // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
         if let Msg::Lanes { words, n_lanes, .. } = msg
-            && lane_major_deep_start(log_d, num_ntts, start).is_none()
+            && Plan::for_lanes(log_d, num_ntts, start).is_none()
         {
             assert_eq!(data.len() / num_ntts, 1 << log_d, "a partial buffer needs the gathered pass");
             let log_rows = log_d - start;
             transpose_lane_major(&mut data[..num_ntts << log_rows], words, n_lanes, num_ntts, log_rows);
             msg = Msg::InPlace;
         }
-        let mut layer = start;
-        while layer < deep_start {
-            let g = (deep_start - layer).min(fit2);
+        for (layer, g) in plan.gathered() {
             let first = std::mem::replace(&mut msg, Msg::Buffer);
             self.gathered_pass(data, log_d, num_ntts, layer, g, first, stream, first_coset);
-            layer += g;
         }
 
         // Phase 2: replicas a deep-only plan cannot build inside its tasks.
         //
         //     message is block 0 of the buffer  ->  a task could overwrite it while others still copy it
         //     no layer left to run              ->  no deep task would write the buffer at all
-        if matches!(msg, Msg::InPlace) || (deep_start == log_d && matches!(msg, Msg::Rows(_))) {
+        if matches!(msg, Msg::InPlace) || (!plan.has_deep() && matches!(msg, Msg::Rows(_))) {
             replicate(data, if let Msg::Rows(m) = msg { Some(m) } else { None }, data.len() >> start);
             msg = Msg::Buffer;
         }
 
         // A lone sub-block runs on this thread, so its rows go over in parallel afterwards.
-        let fuse = 0 < deep_start && deep_start < log_d;
-        let deep_rows = on_rows.filter(|_| fuse);
+        let deep_rows = on_rows.filter(|_| plan.fuses_rows());
 
         // Phase 3: the deep pass, one task per run of contiguous sub-blocks.
-        let plan = DeepRows { log_d, num_ntts, start, deep_start };
-        if deep_start < log_d {
-            // A task takes at least an L2 budget of rows, so a high rate's tiny sub-blocks
-            // still reach the hasher in whole batches.
-            let log_sub = (log_d - deep_start).max(fit2.min(log_d - par_log));
-            self.deep_pass(data, &plan, log_sub, msg, first_coset, deep_rows, defer_deep, stream);
+        if plan.has_deep() {
+            self.deep_pass(data, &plan, plan.log_sub(), msg, first_coset, deep_rows, defer_deep, stream);
         }
 
-        if let Some(f) = on_rows.filter(|_| !fuse) {
-            // Four blocks per worker.
-            let log_tasks = (4 * parallel::num_threads()).next_power_of_two().ilog2() as usize;
-            let log_rows = log_d - log_tasks.min(log_d);
+        if let Some(f) = on_rows.filter(|_| !plan.fuses_rows()) {
+            let log_rows = plan.log_handover_rows();
             parallel::chunks_mut(data, num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
         }
         (defer_deep && deep_rows.is_some() && matches!(msg, Msg::Buffer)).then_some(plan)
@@ -460,47 +450,6 @@ impl AdditiveNttF64 {
     }
 }
 
-/// How many rows, as a log, a cache budget of `words` holds.
-///
-/// At 51 lanes: 2^17 / 51 -> 2^11 rows in L2,  2^18 / 51 -> 2^12 rows in L3.
-pub(super) fn fit(words: usize, num_ntts: usize) -> usize {
-    (words / num_ntts).max(1).ilog2() as usize
-}
-
-/// From 2^12 rows on, a deep pass cuts at least 2^LOG_SUBS_PER_WORKER sub-blocks per worker: this log of them.
-fn par_log(log_d: usize) -> usize {
-    /// Below this domain the transform is too small to split across the pool.
-    const PARALLEL_FLOOR_LOG_D: usize = 12;
-    /// Fewest rows a deep sub-block takes when splitting for parallelism.
-    const MIN_SUB_LOG: usize = 8;
-    if log_d >= PARALLEL_FLOOR_LOG_D {
-        (log2_strict_usize(parallel::num_threads().next_power_of_two()) + LOG_SUBS_PER_WORKER).min(log_d - MIN_SUB_LOG)
-    } else {
-        0
-    }
-}
-
-/// Where the deep pass of a `2^log_d`-row transform from layer `start` starts.
-///
-/// - If every layer fits one L3 sub-block, the deep pass is the whole transform: one sweep.
-/// - Otherwise the deep pass keeps one L2 sub-block of layers.
-fn deep_start(log_d: usize, num_ntts: usize, start: usize, l2_words: usize) -> usize {
-    let deep = if log_d - start <= fit(L3_WORDS, num_ntts) {
-        fit(L3_WORDS, num_ntts)
-    } else {
-        fit(l2_words, num_ntts)
-    };
-    log_d.saturating_sub(deep).max(par_log(log_d)).max(start)
-}
-
-/// The deep pass start of a lane-major encode, if its first gathered pass can read the message:
-/// a layer for it to run, whole cache lines in a row, and enough residues to batch.
-fn lane_major_deep_start(log_d: usize, num_ntts: usize, start: usize) -> Option<usize> {
-    let deep_start = deep_start(log_d, num_ntts, start, L2_WORDS);
-    let g = (deep_start - start).min(fit(L2_WORDS, num_ntts));
-    (start < deep_start && num_ntts.is_multiple_of(8) && log_d - start - g >= LOG_BATCH).then_some(deep_start)
-}
-
 /// Call `f` with each block of `1 << log_rows` rows that holds a row of `live` (sorted), or with every block of `num_blocks`.
 fn for_each_block(num_blocks: usize, log_rows: usize, live: Option<&[usize]>, mut f: impl FnMut(usize)) {
     match live {
@@ -523,64 +472,6 @@ pub(super) fn no_hook() {}
 pub(super) fn radix_layers(left: usize) -> usize {
     if left >= 4 && left % 3 == 1 { 2 } else { left.min(3) }
 }
-
-/// Words one L2-resident unit of work may span: a gathered row group or a deep sub-block.
-///
-/// # Why this value
-///
-/// - 2^17 words is 1 MiB, a whole Zen 5 L2.
-/// - Two SMT threads then spill each other's units into L3, which costs far less than a DRAM sweep.
-/// - At 51 lanes it plans one gathered pass plus the deep pass, where 2^16 words planned two plus one.
-///
-/// # On Apple silicon
-///
-/// - A deep layer costs about the same whether its sub-block fits a cache or not: the transform is compute bound.
-/// - A gathered layer costs more than a deep one, its rows scattered over more streams than the prefetcher follows.
-/// - So the budget is sized to push layers into the deep pass, not to fit a cache.
-/// - It exceeds [`L3_WORDS`], which then changes no plan.
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-pub(super) const L2_WORDS: usize = 1 << 17;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub(super) const L2_WORDS: usize = 1 << 21;
-
-/// [`L2_WORDS`] for an encode that has no lane-major message, on a pool of at most 4 threads.
-///
-/// # Why this value
-///
-/// - 2^15 words is 256 KiB: a deep sub-block of 2^9 rows of 48 words is 192 KiB.
-/// - One thread per core owns its whole 1 MiB L2, and the sub-block leaves room for the twiddles and the prefetched next sub-block.
-/// - The plan then has one more gathered layer and fewer deep ones.
-/// - Measured on the 8:1 extension encode of 2^22 words at 4 threads: 130 -> 123 ms.
-/// - 2^14 words plans a second gathered pass and costs 184 ms.
-/// - The lane-major base encode keeps [`L2_WORDS`]: 2^16 words plans a second gathered pass there and costs 40 %.
-/// - Larger pools keep [`L2_WORDS`]: their nodes share the L3 and the SMT threads share an L2.
-fn l2_words(lane_major: bool) -> usize {
-    /// Apple silicon keeps [`L2_WORDS`] whatever the plan.
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    const FEW_THREADS_L2_WORDS: usize = 1 << 15;
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    const FEW_THREADS_L2_WORDS: usize = L2_WORDS;
-    if lane_major || parallel::num_threads() > 4 { L2_WORDS } else { FEW_THREADS_L2_WORDS }
-}
-
-/// Deep sub-blocks cut per worker, as a log.
-///
-/// - Apple silicon mixes performance and efficiency cores.
-/// - With one sub-block each, the performance cores would wait on the efficiency cores' sub-blocks.
-/// - Elsewhere every core is alike, and one each suffices.
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-const LOG_SUBS_PER_WORKER: usize = 0;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const LOG_SUBS_PER_WORKER: usize = 2;
-
-/// Words a deep sub-block may span when it alone covers every layer.
-///
-/// # Why this value
-///
-/// - 2^18 words is 2 MiB, one thread's share of L3.
-/// - Such a sub-block spills from L2 into L3.
-/// - That costs extra L3 traffic, but saves a whole sweep of DRAM.
-const L3_WORDS: usize = 1 << 18;
 
 /// Words of one coset a coset-major encode may span.
 ///
