@@ -7,6 +7,7 @@ mod gathered;
 mod kernels;
 mod rows;
 mod stage;
+mod twiddles;
 pub use additive_ntt_f64::{AdditiveNttF64, Encoded, Keep, RowSink};
 pub(crate) use kernels::transpose_butterfly_lanes;
 pub use rows::DeepRows;
