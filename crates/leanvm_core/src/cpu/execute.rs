@@ -70,11 +70,7 @@ pub(crate) struct Cell {
 /// The cells of a run: one reserved, lazily faulted array of `LIMIT` cells, so that
 /// an access is one address computation and the image never moves. All zero is the
 /// unwritten cell, which is what untouched pages hold.
-pub(crate) struct Cells(*mut Cell);
-
-// SAFETY: the array is plain memory owned by this value, as a `Box<[Cell]>` would be.
-unsafe impl Send for Cells {}
-unsafe impl Sync for Cells {}
+pub(crate) struct Cells(&'static mut [Cell; LIMIT]);
 
 impl Cells {
     fn reserve() -> Option<Self> {
@@ -92,7 +88,8 @@ impl Cells {
             (p != libc::MAP_FAILED).then(|| {
                 // Huge pages are a hint: a failure only costs speed.
                 libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
-                Self(p.cast())
+                // The mapping is page-aligned, zeroed, and unmapped only by `drop`, which consumes the borrow.
+                Self(&mut *p.cast())
             })
         }
     }
@@ -101,7 +98,7 @@ impl Cells {
 impl Drop for Cells {
     fn drop(&mut self) {
         // SAFETY: the mapping `reserve` made, unmapped once.
-        unsafe { libc::munmap(self.0.cast(), LIMIT * std::mem::size_of::<Cell>()) };
+        unsafe { libc::munmap(std::ptr::from_mut(self.0).cast(), LIMIT * std::mem::size_of::<Cell>()) };
     }
 }
 
@@ -109,11 +106,10 @@ impl Memory {
     /// The cell mapping, zeroed again so a later run can start from it. Its pages stay
     /// faulted, so that run takes no page faults and the kernel zeroes nothing.
     pub(crate) fn into_cells(self) -> Cells {
-        static ZERO: [u8; 1 << 16] = [0; 1 << 16];
-        let bytes = self.used.min(LIMIT) * std::mem::size_of::<Cell>();
-        // SAFETY: the first `used` cells lie inside the mapping, which `self` owns alone.
-        let touched = unsafe { std::slice::from_raw_parts_mut(self.cells.0.cast::<u8>(), bytes) };
-        parallel::chunks_mut(touched, 1 << 20, |_, chunk| {
+        static ZERO: [Cell; (1 << 16) / std::mem::size_of::<Cell>()] =
+            [Cell { word: F192::ZERO, count: 0, state: State::Unwritten }; (1 << 16) / std::mem::size_of::<Cell>()];
+        let touched = &mut self.cells.0[..self.used.min(LIMIT)];
+        parallel::chunks_mut(touched, (1 << 20) / std::mem::size_of::<Cell>(), |_, chunk| {
             let stream = primitives::stream::Stream::new();
             for c in chunk.chunks_mut(ZERO.len()) {
                 stream.copy(c, &ZERO[..c.len()]);
@@ -143,14 +139,12 @@ impl Memory {
 
     /// The word in cell `i`.
     pub fn word(&self, i: usize) -> F192 {
-        // SAFETY: `i < used <= LIMIT`, inside the mapping.
-        if i < self.used { unsafe { (*self.cells.0.add(i)).word } } else { F192::ZERO }
+        if i < self.used { self.cells.0[i].word } else { F192::ZERO }
     }
 
     /// The cells up to the last one used, rounded up to a multiple of `to`.
     pub(crate) fn cells(&self, to: usize) -> &[Cell] {
-        // SAFETY: the mapping holds `LIMIT` cells, zero where untouched.
-        unsafe { std::slice::from_raw_parts(self.cells.0, self.used.next_multiple_of(to).min(LIMIT)) }
+        &self.cells.0[..self.used.next_multiple_of(to).min(LIMIT)]
     }
 }
 
@@ -435,13 +429,11 @@ impl Program {
             #[inline(always)]
             fn at(&mut self, c: u32) -> &mut Cell {
                 debug_assert!((c as usize) < LIMIT);
-                // SAFETY: the callers keep `c` below `LIMIT`.
-                unsafe { &mut *self.cells.0.add(c as usize) }
+                &mut self.cells.0[c as usize]
             }
             #[inline(always)]
             fn covered(&self, c: u32) -> Option<&Cell> {
-                // SAFETY: `c < LIMIT`, inside the mapping.
-                ((c as usize) < LIMIT).then(|| unsafe { &*self.cells.0.add(c as usize) })
+                self.cells.0.get(c as usize)
             }
             #[inline(always)]
             fn written(&self, cell: u32) -> bool {

@@ -228,10 +228,8 @@ impl Program {
         let bytecode_cols = layout::bytecode_columns(&prog);
         let bytecode_hash = {
             let table = layout::stacked_columns(&bytecode_cols);
-            // SAFETY: F64 is #[repr(transparent)] over u64, so the slice's byte image is
-            // exactly the concatenation of its `to_le_bytes` on little-endian targets.
-            let bytes: &[u8] =
-                unsafe { core::slice::from_raw_parts(table.as_ptr().cast::<u8>(), core::mem::size_of_val(&table[..])) };
+            // `F64` is `repr(transparent)` over `u64`: the byte image is each word's `to_le_bytes` on little-endian targets.
+            let bytes: &[u8] = primitives::cast_slice(&table);
             primitives::hash::Hasher::new().update(bytes).finalize()
         };
         Self {

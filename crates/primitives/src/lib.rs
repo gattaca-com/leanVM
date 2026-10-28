@@ -135,6 +135,27 @@ unsafe impl Plain for core::arch::x86_64::__m256i {}
 #[cfg(target_arch = "x86_64")]
 unsafe impl Plain for core::arch::x86_64::__m512i {}
 
+/// The same bytes as a slice of another plain type.
+///
+/// # Panics
+///
+/// If the slice is misaligned for `B`, or its byte length is not a multiple of `size_of::<B>()`.
+pub fn cast_slice<A: Plain, B: Plain>(a: &[A]) -> &[B] {
+    let (ptr, bytes) = (a.as_ptr().cast::<B>(), core::mem::size_of_val(a));
+    assert!(ptr.is_aligned() && bytes % core::mem::size_of::<B>() == 0, "slice does not cast");
+    // SAFETY: both types are plain, so every byte is initialized and any pattern is valid; the checks above
+    // cover alignment and length, and the lifetime is the borrow's.
+    unsafe { core::slice::from_raw_parts(ptr, bytes / core::mem::size_of::<B>()) }
+}
+
+/// [`cast_slice`] of a mutable slice.
+pub fn cast_slice_mut<A: Plain, B: Plain>(a: &mut [A]) -> &mut [B] {
+    let (ptr, bytes) = (a.as_mut_ptr().cast::<B>(), core::mem::size_of_val(a));
+    assert!(ptr.is_aligned() && bytes % core::mem::size_of::<B>() == 0, "slice does not cast");
+    // SAFETY: as `cast_slice`, and the borrow is unique.
+    unsafe { core::slice::from_raw_parts_mut(ptr, bytes / core::mem::size_of::<B>()) }
+}
+
 /// `N` vectors of the given lengths, filled in place by `fill`.
 ///
 /// It skips the zero-fill, which would cost one more pass over memory. `fill` receives one slice per
