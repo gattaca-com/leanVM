@@ -2490,7 +2490,7 @@ fn fused_lanes_avx512<const N: usize, const T: usize>(
     let mut lane = 0;
     while lane + CHUNK <= len {
         // The chunk of every row, as arrays: the loads and stores below need no bounds check of their own.
-        let mut chunks: [&mut [F64; CHUNK]; N] =
+        let chunks: [&mut [F64; CHUNK]; N] =
             rows.each_mut().map(|row| (&mut row[lane..lane + CHUNK]).try_into().unwrap());
         let mut v: RowVectors<N> = match &src {
             Some(src) => std::array::from_fn(|i| {

@@ -81,6 +81,12 @@ impl InvNttTableByteSingleGf8 {
         Self { k, ell, n_chunks, data }
     }
 
+    /// Byte `lane` of table row `w`: the extension of the row's input byte `w` at that lane.
+    #[inline]
+    pub fn entry(&self, w: usize, lane: usize) -> u8 {
+        self.data[w * self.ell + lane].0
+    }
+
     /// Raw pointer to the table data (`256 × ell` bytes, row-major). Used by
     /// the URM fused inner kernel, which can't go through the safe slice API
     /// without losing the register-fused layout.

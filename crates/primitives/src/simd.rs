@@ -6,8 +6,6 @@
 
 use core::arch::x86_64::*;
 
-use crate::field::{F64, F192};
-
 pub use crate::Plain;
 
 /// The vector of eight words, the first in the low qword.

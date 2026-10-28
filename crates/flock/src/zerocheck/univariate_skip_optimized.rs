@@ -455,7 +455,7 @@ fn shift_reduce_ab(
 ) {
     #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw"))]
     {
-        // SAFETY: gfni and avx512bw are statically enabled at compile time.
+        // SAFETY: this code is compiled only where gfni and avx512bw are enabled, and avx512f comes with avx512bw.
         unsafe { shift_reduce_ab_gfni_512(a_packed, b_packed, inv_table, chunk_byte_base, rows) };
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw")))]
@@ -476,12 +476,9 @@ fn shift_reduce_ab(
 ///
 /// `sum_K x^K y_K` is a Horner chain in F_8, one `gf2p8mulb` by `x` per step,
 /// so no widening and no final reduction are needed.
-///
-/// # Safety
-/// Requires the `gfni` and `avx512bw` target features.
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw"))]
 #[target_feature(enable = "gfni", enable = "avx512f", enable = "avx512bw")]
-unsafe fn shift_reduce_ab_gfni_512(
+fn shift_reduce_ab_gfni_512(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -489,6 +486,7 @@ unsafe fn shift_reduce_ab_gfni_512(
     rows: &mut [[u8; 64]],
 ) {
     use core::arch::x86_64::*;
+    use primitives::simd::{load, store};
 
     // One window reads `N_CHUNKS * 8` bytes of each of `a` and `b`.
     let end = chunk_byte_base + rows.len() * N_CHUNKS * 8;
@@ -497,26 +495,19 @@ unsafe fn shift_reduce_ab_gfni_512(
     let mut a_col = [F8::ZERO; ELL];
     let mut b_col = [F8::ZERO; ELL];
 
-    // SAFETY: the target features are carried by the function; the loads and
-    // stores stay within a_col/b_col/out, each exactly `ELL` bytes.
-    unsafe {
-        let x = _mm512_set1_epi8(2);
-        let windows = a_packed
-            .chunks_exact(N_CHUNKS * 8)
-            .zip(b_packed.chunks_exact(N_CHUNKS * 8));
-        for (out, (a, b)) in rows.iter_mut().zip(windows) {
-            let mut acc = _mm512_setzero_si512();
-            for k in (0..8).rev() {
-                inv_table.apply(&a[k * N_CHUNKS..][..N_CHUNKS], &mut a_col);
-                inv_table.apply(&b[k * N_CHUNKS..][..N_CHUNKS], &mut b_col);
-                let y = _mm512_gf2p8mul_epi8(
-                    _mm512_loadu_si512(a_col.as_ptr().cast()),
-                    _mm512_loadu_si512(b_col.as_ptr().cast()),
-                );
-                acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), y);
-            }
-            _mm512_storeu_si512(out.as_mut_ptr().cast(), acc);
+    let x = _mm512_set1_epi8(2);
+    let windows = a_packed
+        .chunks_exact(N_CHUNKS * 8)
+        .zip(b_packed.chunks_exact(N_CHUNKS * 8));
+    for (out, (a, b)) in rows.iter_mut().zip(windows) {
+        let mut acc = _mm512_setzero_si512();
+        for k in (0..8).rev() {
+            inv_table.apply(&a[k * N_CHUNKS..][..N_CHUNKS], &mut a_col);
+            inv_table.apply(&b[k * N_CHUNKS..][..N_CHUNKS], &mut b_col);
+            let y = _mm512_gf2p8mul_epi8(load(&a_col, 0), load(&b_col, 0));
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), y);
         }
+        store(out, 0, acc);
     }
 }
 
@@ -734,8 +725,11 @@ struct Convert {
 ))]
 impl Convert {
     fn new() -> Self {
-        // SAFETY: an all-zero bit pattern is a valid register value.
-        unsafe { core::mem::zeroed() }
+        let zero = primitives::simd::from_words([0; 8]);
+        Self {
+            ab: [zero; 24],
+            c: [zero; 24],
+        }
     }
 
     /// The matrices of the weights `(gamma^b eq_lo) phi_8(2^s)`, for each medium position `b`.
@@ -781,13 +775,7 @@ impl Convert {
             let mut acc_ab: [__m512i; 8] = std::array::from_fn(|l| self.ab[8 * g + l]);
             let mut acc_c: [__m512i; 8] = std::array::from_fn(|l| self.c[8 * g + l]);
             for ((ab, c), m) in ab.iter().zip(c).zip(matrices) {
-                // SAFETY: each row is 64 bytes.
-                let (xa, xc) = unsafe {
-                    (
-                        _mm512_loadu_si512(ab.as_ptr().cast()),
-                        _mm512_loadu_si512(c.as_ptr().cast()),
-                    )
-                };
+                let (xa, xc) = (primitives::simd::load(ab, 0), primitives::simd::load(c, 0));
                 for l in 0..8 {
                     let a = _mm512_set1_epi64(m[8 * g + l] as i64);
                     acc_ab[l] = _mm512_xor_si512(acc_ab[l], _mm512_gf2p8affine_epi64_epi8::<0>(xa, a));
@@ -1005,11 +993,11 @@ fn process_one_x_hi(
                 let WorkerState {
                     chunk_ab_bytes, group, ..
                 } = &mut *state;
-                // SAFETY: the target features are enabled at compile time, and the slices are `len` bytes.
+                // SAFETY: this code is compiled only where avx512f, avx512bw and gfni are enabled.
                 unsafe {
                     soa::shift_reduce_group(
-                        a_packed[base..base + len].as_ptr(),
-                        b_packed[base..base + len].as_ptr(),
+                        &a_packed[base..base + len],
+                        &b_packed[base..base + len],
                         soa_mats,
                         group,
                         chunk_ab_bytes,
