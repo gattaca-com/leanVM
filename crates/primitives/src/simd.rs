@@ -28,7 +28,7 @@ pub fn to_words(v: __m512i) -> [u64; 8] {
 pub fn load<T: Plain>(src: &[T], i: usize) -> __m512i {
     assert!(64 * (i + 1) <= size_of_val(src));
     // SAFETY: the assert keeps the 64 bytes inside `src`, and any bytes of a `Plain` type are readable.
-    unsafe { _mm512_loadu_si512(src.as_ptr().cast::<u8>().add(64 * i).cast()) }
+    unsafe { _mm512_loadu_si512(src.as_ptr().cast::<u8>().wrapping_add(64 * i).cast()) }
 }
 
 /// Write `v` over register `i` of `dst`: bytes `64 * i..64 * i + 64`, unaligned.
@@ -44,4 +44,25 @@ pub fn store<T: Plain>(dst: &mut [T], i: usize, v: __m512i) {
 pub fn xor(a: __m512i, b: __m512i) -> __m512i {
     // SAFETY: the module is compiled only with avx512f enabled.
     unsafe { _mm512_xor_si512(a, b) }
+}
+
+/// The first `n <= 8` words of register `i` of `src`, and zeros after them.
+///
+/// Only those words must lie inside `src`: a register may hang over its end, or start past it with `n == 0`.
+#[inline(always)]
+pub fn load_prefix<T: Plain>(src: &[T], i: usize, n: usize) -> __m512i {
+    assert!(n <= 8 && (n == 0 || 8 * i + n <= size_of_val(src) / 8));
+    // SAFETY: the assert keeps the first `n` words inside `src`, which is readable for any `Plain` bytes.
+    // The masked-out words are not accessed.
+    unsafe { _mm512_maskz_loadu_epi64(((1u16 << n) - 1) as u8, src.as_ptr().cast::<u8>().wrapping_add(64 * i).cast()) }
+}
+
+/// Write the first `n <= 8` words of `v` over register `i` of `dst`, and leave the others as they are.
+///
+/// Only those words must lie inside `dst`.
+#[inline(always)]
+pub fn store_prefix<T: Plain>(dst: &mut [T], i: usize, n: usize, v: __m512i) {
+    assert!(n <= 8 && (n == 0 || 8 * i + n <= size_of_val(dst) / 8));
+    // SAFETY: the assert keeps the first `n` words inside `dst`, and any bytes are a valid `Plain` value.
+    unsafe { _mm512_mask_storeu_epi64(dst.as_mut_ptr().cast::<u8>().wrapping_add(64 * i).cast(), ((1u16 << n) - 1) as u8, v) }
 }
