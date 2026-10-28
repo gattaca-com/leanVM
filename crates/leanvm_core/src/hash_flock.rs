@@ -199,8 +199,7 @@ pub fn padding_words() -> [F64; 18] {
 /// LSB-first convention on the same bit string.
 /// `q_flock`'s words as flock's packed `z`: the same bytes.
 fn packed_words(q_flock: &[F64]) -> &[u64] {
-    // SAFETY: `F64` is `repr(transparent)` over `u64`.
-    unsafe { std::slice::from_raw_parts(q_flock.as_ptr().cast(), q_flock.len()) }
+    primitives::cast_slice(q_flock)
 }
 
 /// Build the committed `q_flock` column (flock's packed witness) for `blocks`, padded
@@ -223,8 +222,7 @@ pub(crate) fn build_qflock_prepared(
     }
     let n_blocks = blocks.len().max(1);
     // The packed `z` is generated straight into the committed window: its words are `q_flock`.
-    // SAFETY: `F64` is `repr(transparent)` over `u64`, so the two slices are the same bytes.
-    let words: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(q_flock.as_mut_ptr().cast(), q_flock.len()) };
+    let words: &mut [u64] = primitives::cast_slice_mut(q_flock);
     let n_log = n_blocks_log(n_blocks);
     // `generate_witness_into_z` writes every word of `a` and `b`.
     let ab = if rebuilds() {
