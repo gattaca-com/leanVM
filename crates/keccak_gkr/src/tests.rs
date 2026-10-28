@@ -213,14 +213,12 @@ fn proof_verifies_against_the_commitment() {
 
 /// The witness of every block run, the padding ones included.
 fn dense(shape: Shape, inputs: &[[u64; LANES]]) -> Witness {
-    let mut extent = Extent::new(0, shape.n_blocks());
+    let extent = Extent::new(0, shape.n_blocks());
     for g in 0..shape.n_blocks() {
         let inputs = &inputs[(g * BLOCK).min(inputs.len())..((g + 1) * BLOCK).min(inputs.len())];
-        // SAFETY: each block's slot, written once.
-        unsafe { block(shape.depth(), inputs, extent.slot(g), |_, _, _| {}) };
+        block(shape.depth(), inputs, extent.slot(g), |_, _, _| {});
     }
-    // SAFETY: every block was written just above.
-    unsafe { Witness::from_extents(shape, vec![extent], shape.n_blocks(), None) }
+    Witness::from_extents(shape, vec![extent], shape.n_blocks(), None)
 }
 
 /// The padding block, run once for the blocks after the last input, proves what running each

@@ -137,8 +137,7 @@ pub(crate) struct Blocks {
 fn push_block(lanes: &mut Vec<u64>, steps: &[[u64; STATE_LANES]], slot: Slot) {
     let at = lanes.len();
     lanes.resize(at + lanes_len(DEPTH), 0);
-    // SAFETY: the caller's block owns its slot.
-    unsafe { block_lanes_into(DEPTH, steps, slot, &mut lanes[at..]) };
+    block_lanes_into(DEPTH, steps, slot, &mut lanes[at..]);
 }
 
 /// Run `run`, which reports the lanes of each step it executes, and build the reduction's
@@ -148,7 +147,7 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LA
     type Job = (Vec<[u64; STATE_LANES]>, Slot);
     // More workers than this slow the executing thread by more than they finish early.
     let workers = parallel::num_threads() / 2;
-    // Outlives the scope: the workers write into it until they are joined, even on a panic.
+    // The extents the workers write into: each slot keeps its words alive, so a panic leaves no dangling write.
     let mut extents: Vec<Extent> = Vec::new();
     let (result, lanes, steps) = std::thread::scope(|scope| {
         // The workers hand their emptied step buffers back for the next blocks.
@@ -180,7 +179,7 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LA
             if extents.last().is_none_or(|e| e.end() == blocks) {
                 extents.push(Extent::new(blocks, blocks.max(8)));
             }
-            let slot = extents.last_mut().expect("an extent").slot(blocks);
+            let slot = extents.last().expect("an extent").slot(blocks);
             if workers == 0 || last {
                 push_block(&mut inline, pending, slot);
                 pending.clear();
@@ -244,9 +243,7 @@ impl Blocks {
                 &self.lanes[owner][nth * stride..][..stride]
             })
             .collect();
-        // SAFETY: `while_executing` ran block `g` into its slot of `extents`, in order, its
-        // lanes being `lanes[g]`.
-        unsafe { Witness::from_blocks(shape, self.extents, &lanes, q_keccak) }
+        Witness::from_blocks(shape, self.extents, &lanes, q_keccak)
     }
 }
 
