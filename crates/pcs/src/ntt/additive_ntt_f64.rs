@@ -17,20 +17,8 @@ use super::layers::{Layers, no_hook};
 use super::plan::{L2_WORDS, Plan, l2_words};
 use super::rows::built_rows;
 use super::twiddles::Twiddles;
-use super::stage::transpose_lane_major;
-
-/// Where the layer-`start` blocks of a transform come from.
-#[derive(Clone, Copy)]
-pub(super) enum Msg<'a> {
-    /// The buffer holds them: every pass after the first, and the tests' plain transform.
-    Buffer,
-    /// Each is a copy of the buffer's own block 0, which the first pass overwrites last.
-    InPlace,
-    /// Each is a copy of this row-major message.
-    Rows(&'a [F64]),
-    /// Each is this lane-major message transposed; the buffer holds the cosets from `first_coset` on.
-    Lanes { words: &'a [F64], n_lanes: usize, repeats: &'a [bool], first_coset: usize },
-}
+use super::source::{Lanes, Source};
+use super::window::Window;
 
 /// What [`AdditiveNttF64::encode_lane_major`] is asked to keep of its codeword.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,7 +99,7 @@ impl AdditiveNttF64 {
     ///
     /// The replication is free: the first pass reads its rows from the message itself, see [`Self::transform`].
     pub fn encode_interleaved_in_place(&self, data: &mut [F64], num_ntts: usize, log_inv_rate: usize) {
-        self.transform(data, num_ntts, log_inv_rate, Msg::InPlace, None, false);
+        self.transform(&mut Window::new(data, num_ntts, 0), log_inv_rate, Source::InPlace, None, false);
     }
 
     /// Encode a lane-major message, handing `on_rows` every finished block, and keep what `keep` asks for.
@@ -150,8 +138,9 @@ impl AdditiveNttF64 {
         // Every word is written by the gathered pass before the deep pass reads it.
         let data = primitives::filled_vec((held * msg_rows) * num_ntts, |data| {
             for first in (0..1usize << log_inv_rate).step_by(held).rev() {
-                let msg = Msg::Lanes { words: msg, n_lanes, repeats, first_coset: first };
-                deep = self.transform(data, num_ntts, log_inv_rate, msg, Some(on_rows), defer_deep);
+                let src = Source::Lanes(Lanes { words: msg, repeats, n_lanes });
+                let mut win = Window::new(data, num_ntts, first);
+                deep = self.transform(&mut win, log_inv_rate, src, Some(on_rows), defer_deep);
             }
         });
         Encoded { words: if by_halves { Vec::new() } else { data }, deep }
@@ -237,7 +226,8 @@ impl AdditiveNttF64 {
             data.len(),
             "the codeword is 2^log_inv_rate messages"
         );
-        self.transform(data, num_ntts, log_inv_rate, Msg::Rows(msg), Some(on_rows), defer_deep)
+        let mut win = Window::new(data, num_ntts, 0);
+        self.transform(&mut win, log_inv_rate, Source::Rows(msg), Some(on_rows), defer_deep)
     }
 
     /// Run layers `start..d` of a `2^d`-row transform in as few sweeps of the buffer as possible.
@@ -262,7 +252,7 @@ impl AdditiveNttF64 {
     ///
     /// # With a message
     ///
-    /// - The layer-`start` blocks are not in the buffer yet: each is a copy of the message, see [`Msg`].
+    /// - The layer-`start` blocks are not in the buffer yet: each is a copy of the message, see [`Source`].
     /// - The first pass reads its rows from the message instead.
     /// - A lane-major message is read by that pass directly.
     ///   A plan with no such pass transposes it into block 0 of the buffer and encodes in place.
@@ -282,71 +272,49 @@ impl AdditiveNttF64 {
     /// - With `defer_deep`, the deep pass's results go only to `on_rows`, not back into the buffer.
     fn transform(
         &self,
-        data: &mut [F64],
-        num_ntts: usize,
+        win: &mut Window,
         start: usize,
-        mut msg: Msg<'_>,
+        mut src: Source<'_>,
         on_rows: Option<&RowSink<'_>>,
         defer_deep: bool,
     ) -> Option<Plan> {
-        assert!(num_ntts > 0);
-        assert_eq!(data.len() % num_ntts, 0);
         // The buffer is 2^log_d rows of `num_ntts` words, or the layer-`start` blocks of a lane-major message.
-        let (log_d, first_coset) = match msg {
-            Msg::Lanes { words, n_lanes, first_coset, .. } => {
-                (log2_strict_usize(words.len() / n_lanes) + start, first_coset)
-            }
-            _ => (log2_strict_usize(data.len() / num_ntts), 0),
-        };
+        let (num_ntts, log_d) = (win.num_ntts(), src.log_d(win, start));
         assert!(log_d <= self.tw.log_domain_size());
         assert!(start <= log_d);
 
         // The plan reads the original message, before a lane-major one is transposed.
-        let plan = Plan::new(log_d, num_ntts, start, l2_words(matches!(msg, Msg::Lanes { .. })));
-
-        // A buffer this large is evicted before the next pass reads it back.
-        let stream = data.len() >= STREAM_MIN_WORDS;
+        let plan = Plan::new(log_d, num_ntts, start, l2_words(matches!(src, Source::Lanes(_))));
 
         // Phase 1: gathered passes, each at most one L2 group of layers.
         //
         // Only the first one reads the message.
         // A lane-major message is read by the first gathered pass, a batch of residues at a time.
         // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
-        if let Msg::Lanes { words, n_lanes, .. } = msg
-            && Plan::for_lanes(log_d, num_ntts, start).is_none()
-        {
-            assert_eq!(data.len() / num_ntts, 1 << log_d, "a partial buffer needs the gathered pass");
-            let log_rows = log_d - start;
-            transpose_lane_major(&mut data[..num_ntts << log_rows], words, n_lanes, num_ntts, log_rows);
-            msg = Msg::InPlace;
+        if matches!(src, Source::Lanes(_)) && Plan::for_lanes(log_d, num_ntts, start).is_none() {
+            assert_eq!(win.len() / num_ntts, 1 << log_d, "a partial buffer needs the gathered pass");
+            src = src.transpose_into(win, log_d - start);
         }
         for (layer, g) in plan.gathered() {
-            let first = std::mem::replace(&mut msg, Msg::Buffer);
-            self.gathered_pass(data, log_d, num_ntts, layer, g, first, stream, first_coset);
+            self.gathered_pass(win, log_d, layer, g, src.take());
         }
 
         // Phase 2: replicas a deep-only plan cannot build inside its tasks.
-        //
-        //     message is block 0 of the buffer  ->  a task could overwrite it while others still copy it
-        //     no layer left to run              ->  no deep task would write the buffer at all
-        if matches!(msg, Msg::InPlace) || (!plan.has_deep() && matches!(msg, Msg::Rows(_))) {
-            replicate(data, if let Msg::Rows(m) = msg { Some(m) } else { None }, data.len() >> start);
-            msg = Msg::Buffer;
-        }
+        src = src.replicate(win, start, plan.has_deep());
 
         // A lone sub-block runs on this thread, so its rows go over in parallel afterwards.
         let deep_rows = on_rows.filter(|_| plan.fuses_rows());
 
         // Phase 3: the deep pass, one task per run of contiguous sub-blocks.
         if plan.has_deep() {
-            self.deep_pass(data, &plan, plan.log_sub(), msg, first_coset, deep_rows, defer_deep, stream);
+            self.deep_pass(win, &plan, plan.log_sub(), src, deep_rows, defer_deep);
         }
 
         if let Some(f) = on_rows.filter(|_| !plan.fuses_rows()) {
             let log_rows = plan.log_handover_rows();
-            parallel::chunks_mut(data, num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
+            parallel::chunks_mut(win.words_mut(), num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
         }
-        (defer_deep && deep_rows.is_some() && matches!(msg, Msg::Buffer)).then_some(plan)
+        (defer_deep && deep_rows.is_some() && matches!(src, Source::Replicas)).then_some(plan)
     }
 }
 
@@ -359,15 +327,6 @@ impl AdditiveNttF64 {
 /// - Four nodes of two threads each share one 32 MiB L3, so a worker's share is 4 MiB.
 /// - A larger coset spills to DRAM, and then the codeword's write pass is the cheaper plan.
 const COSET_WORDS: usize = 1 << 19;
-
-/// Buffers of at least this many words get streaming stores for data a pass does not read back.
-///
-/// # Why this value
-///
-/// - 2^23 words is 64 MiB, more than L3 keeps until the next pass.
-/// - A streaming store then skips the read an ordinary store makes before it writes.
-/// - A smaller buffer stays in L3 for the next pass, which a streaming store would give up.
-pub(super) const STREAM_MIN_WORDS: usize = 1 << 23;
 
 /// One cache line of words.
 #[derive(Clone, Copy)]
@@ -394,37 +353,6 @@ pub(super) fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R 
     })
 }
 
-/// Fill every replica of the buffer with a copy of the message.
-///
-/// - This is the unfused form of a gathered first pass.
-/// - With no `msg`, the message is the buffer's own first replica, which is left as it is.
-fn replicate(data: &mut [F64], msg: Option<&[F64]>, msg_len: usize) {
-    // Copy granularity: small enough to spread a short message over every worker.
-    const CHUNK: usize = 1 << 14;
-    let replicas = data.len() / msg_len;
-    let in_place = msg.is_none();
-    let chunks = msg_len.div_ceil(CHUNK);
-    let dst = parallel::SendPtr(data.as_mut_ptr());
-    let msg = parallel::SendPtr(msg.map_or(dst.0, |m| m.as_ptr().cast_mut()));
-    // Replica index innermost, so one worker copies a chunk into several replicas while it is cached.
-    parallel::for_each(chunks * replicas, |t| {
-        let (c, replica) = (t / replicas, t % replicas);
-        // The message already occupies replica 0.
-        if in_place && replica == 0 {
-            return;
-        }
-        let start = c * CHUNK;
-        let len = CHUNK.min(msg_len - start);
-        // SAFETY:
-        // - Only this task writes this range.
-        // - The range skips replica 0, so it never overlaps a message stored there.
-        unsafe {
-            let src = std::slice::from_raw_parts(msg.add(start), len);
-            dst.slice(replica * msg_len + start, len).copy_from_slice(src);
-        }
-    });
-}
-
 /// Test oracle: fill every replica with a copy of a message held elsewhere.
 #[cfg(test)]
 fn replicate_rows(data: &mut [F64], msg: &[F64]) {
@@ -436,6 +364,7 @@ fn replicate_rows(data: &mut [F64], msg: &[F64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ntt::stage::transpose_lane_major;
     use crate::stack_open::EQUAL_BLOCK_LOG;
     use primitives::test_rng::Rng;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -492,7 +421,7 @@ mod tests {
             let mut a = orig.clone();
             forward_scalar_from_layer(&ntt, &mut a, 1, 0);
             let mut c = orig.clone();
-            ntt.transform(&mut c, 1, 0, Msg::Buffer, None, false);
+            ntt.transform(&mut Window::new(&mut c, 1, 0), 0, Source::Replicas, None, false);
             assert_eq!(a, c, "parallel == scalar at log_d={log_d}");
 
             ntt.inverse_transform(&mut a);
@@ -539,7 +468,7 @@ mod tests {
             forward_scalar_from_layer(&ntt, &mut want, lanes, start_layer);
             // Under test: the pass-planning driver.
             let mut got = original;
-            ntt.transform(&mut got, lanes, start_layer, Msg::Buffer, None, false);
+            ntt.transform(&mut Window::new(&mut got, lanes, 0), start_layer, Source::Replicas, None, false);
 
             assert_eq!(got, want, "log_d={log_d}, lanes={lanes}, start_layer={start_layer}");
         }
@@ -642,7 +571,7 @@ mod tests {
                 if lane >= row_words - n_lanes {
                     let block = row_words - 1 - lane;
                     replicate_rows(&mut want, &msg[block * rows..(block + 1) * rows]);
-                    ntt.transform(&mut want, 1, log_inv_rate, Msg::Buffer, None, false);
+                    ntt.transform(&mut Window::new(&mut want, 1, 0), log_inv_rate, Source::Replicas, None, false);
                 }
                 for pos in 0..block_len {
                     assert_eq!(

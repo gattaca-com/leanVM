@@ -3,9 +3,11 @@
 use primitives::field::F64;
 use primitives::stream::Stream;
 
-use super::additive_ntt_f64::{AdditiveNttF64, Line, Msg, RowSink, with_scratch};
+use super::additive_ntt_f64::{AdditiveNttF64, Line, RowSink, with_scratch};
 use super::layers::{Layers, no_hook};
 use super::plan::Plan;
+use super::source::Source;
+use super::window::Window;
 
 /// A finished row group, leaving its scratch for the buffer a piece at a time.
 ///
@@ -108,29 +110,27 @@ impl AdditiveNttF64 {
     /// - Otherwise the buffer holds the replicas, and the layers run in place.
     /// - With `defer_deep`, an in-place sub-block is finished in scratch and the buffer keeps its pre-deep state.
     /// - Each finished sub-block goes to `deep_rows` while it is in L2.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn deep_pass(
         &self,
-        data: &mut [F64],
+        win: &mut Window,
         plan: &Plan,
         log_sub: usize,
-        msg: Msg<'_>,
-        first_coset: usize,
+        src: Source<'_>,
         deep_rows: Option<&RowSink<'_>>,
         defer_deep: bool,
-        stream: bool,
     ) {
+        let (first_coset, stream) = (win.first_coset(), win.stream());
         let Plan { log_d, num_ntts, start, deep_start, .. } = *plan;
         let layers = self.layers();
         let sub_len = num_ntts << log_sub;
         let outer = log_d - log_sub;
-        let (base, total) = (parallel::SendPtr(data.as_mut_ptr()), data.len());
+        let (base, total) = (win.base(), win.len());
         let hooks = Layers::hook_calls(log_d, deep_start, log_d, outer);
-        match msg {
+        match src {
             // A separate message: build each sub-block in scratch, hash it, then write it out once.
             //
             // Streamed out whole, the codeword is written without ever being read.
-            Msg::Rows(m) => {
+            Source::Rows(m) => {
                 // With whole cache lines in every row, a finished sub-block drains late, as in a gathered pass.
                 let late = stream && num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
                 let per_hook = (sub_len / 8).div_ceil(hooks);
@@ -199,7 +199,7 @@ impl AdditiveNttF64 {
                     let next = (sub_idx + 1) * sub_len;
                     prefetch_spread(&base, next, if next < total { sub_len } else { 0 }, hooks)
                 };
-                parallel::chunks_mut(data, sub_len, |local, sub| {
+                parallel::chunks_mut(win.words_mut(), sub_len, |local, sub| {
                     // The buffer's first sub-block, in the whole domain.
                     let sub_idx = local + (first_coset << (log_d - start - log_sub));
                     let hook = prefetch_next(local);

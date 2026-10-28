@@ -4,10 +4,12 @@ use flux_profiler::timed;
 use primitives::field::F64;
 use primitives::stream::Stream;
 
-use super::additive_ntt_f64::{AdditiveNttF64, Msg, with_scratch};
+use super::additive_ntt_f64::{AdditiveNttF64, with_scratch};
 use super::deep::Drain;
 use super::layers::Layers;
+use super::source::Source;
 use super::stage::{BATCH, StageCopies, fill_stage, stage_copies, stage_subs};
+use super::window::Window;
 
 impl AdditiveNttF64 {
     /// Run layers `layer..layer + g` in one sweep of the buffer, one row group at a time.
@@ -50,35 +52,28 @@ impl AdditiveNttF64 {
     ///
     /// - A group drains during the next group's transform, as [`Drain`] describes.
     /// - Group k+1 never reads what group k writes: a block's rows are its own, and the message is read before block 0 is written.
-    #[allow(clippy::too_many_arguments)]
     #[timed]
-    pub(super) fn gathered_pass(
-        &self,
-        data: &mut [F64],
-        log_d: usize,
-        num_ntts: usize,
-        layer: usize,
-        g: usize,
-        msg: Msg<'_>,
-        stream: bool,
-        first_block: usize,
-    ) {
+    pub(super) fn gathered_pass(&self, win: &mut Window, log_d: usize, layer: usize, g: usize, src: Source<'_>) {
+        let (num_ntts, first_block, stream) = (win.num_ntts(), win.first_coset(), win.stream());
         // A group is 2^g rows, `step` rows apart, of a block of `block_rows` rows.
         let log_step = log_d - layer - g;
         let (rows, step, block_rows) = (1usize << g, 1usize << log_step, 1usize << (log_d - layer));
         // The blocks the buffer holds, and the first word of row `r` of one of them in the buffer.
-        let blocks = first_block..first_block + (data.len() / num_ntts) / block_rows;
-        let row = |block: usize, r: usize| ((block - first_block) * block_rows + r) * num_ntts;
-        let base = parallel::SendPtr(data.as_mut_ptr());
+        let blocks = first_block..first_block + (win.len() / num_ntts) / block_rows;
+        let base = win.base();
+        let win = &*win;
+        let row = |block: usize, r: usize| win.row(block_rows, block, r);
         let layers = self.layers();
         // A lane-major group is 64 lanes of a batch of residues, transposed into a stage: one line per residue in each row.
-        let staged = matches!(msg, Msg::Lanes { .. });
+        let staged = matches!(src, Source::Lanes(_));
         let subs = stage_subs(staged, log_step);
         let batch = if staged { BATCH * subs } else { 1 };
         let width = if staged { BATCH * 8 } else { num_ntts };
         let (group_len, stage_len) = (rows * width, if staged { subs * rows * width } else { 0 });
-        let copies = match msg {
-            Msg::Lanes { n_lanes, repeats, .. } => stage_copies(repeats, log_step, rows, block_rows, n_lanes, num_ntts),
+        let copies = match src {
+            Source::Lanes(lanes) => {
+                stage_copies(lanes.repeats, log_step, rows, block_rows, lanes.n_lanes, num_ntts)
+            }
             _ => StageCopies::none(),
         };
         // Whole aligned cache lines in every row stream out a line at a time; other rows are stored whole.
@@ -98,11 +93,7 @@ impl AdditiveNttF64 {
                 let mut group = |block: usize, r: usize, from: Option<&[F64]>, dst: usize| {
                     if from.is_none() {
                         // Every block copies the message's rows, which the buffer's block 0 may hold, or its own rows.
-                        let src = match msg {
-                            Msg::Rows(m) => m.as_ptr().wrapping_add(row(first_block, r)),
-                            Msg::Buffer => base.0.cast_const().wrapping_add(row(block, r)),
-                            Msg::InPlace | Msg::Lanes { .. } => base.0.cast_const().wrapping_add(row(first_block, r)),
-                        };
+                        let src = src.group_src(base.0.cast_const(), row(block, r), row(first_block, r));
                         for (i, dst) in scratch.chunks_exact_mut(num_ntts).enumerate() {
                             // SAFETY:
                             // - The message and the buffer both cover every row addressed here.
@@ -128,9 +119,10 @@ impl AdditiveNttF64 {
                     std::mem::swap(&mut scratch, &mut idle);
                 };
                 for t in lo..hi {
-                    match msg {
-                        Msg::Lanes { words, n_lanes, .. } => {
+                    match src {
+                        Source::Lanes(lanes) => {
                             for octet in 0..num_ntts / 8 {
+                                let (words, n_lanes) = (lanes.words, lanes.n_lanes);
                                 fill_stage(stage, words, t * batch, log_step, block_rows, n_lanes, num_ntts, octet, &copies, subs);
                                 for block in blocks.clone().rev() {
                                     for (u, staged) in stage.chunks_exact(group_len).enumerate() {

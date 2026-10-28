@@ -4,7 +4,8 @@ use flux_profiler::timed;
 use primitives::field::F64;
 use primitives::stream::Stream;
 
-use super::additive_ntt_f64::{STREAM_MIN_WORDS, with_scratch};
+use super::additive_ntt_f64::with_scratch;
+use super::window::STREAM_MIN_WORDS;
 use crate::stack_open::EQUAL_BLOCK_LOG;
 
 /// Transpose a lane-major message into the row-major order the encoder reads.
