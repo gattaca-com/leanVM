@@ -21,7 +21,8 @@ macro_rules! row_kernel {
         cfg_select! {
             all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq") => {
                 if $width.is_multiple_of(x86::STEP) {
-                    x86::$kernel($($arg),*)
+                    // SAFETY: the features are enabled at compile time, and the caller bounds every row.
+                    unsafe { x86::$kernel($($arg),*) }
                 } else {
                     $portable
                 }
@@ -209,170 +210,163 @@ pub fn dot_pair_portable(a: [&[u64]; 2], b: [&[u64]; 2], width: usize) -> ([u64;
     (zero, infinity)
 }
 
-/// The x86 kernels on a register of [`Vector`](crate::clmul::Vector) lanes, two entries to a lane.
+/// The x86 kernels on a register of [`V`](crate::clmul::V) lanes, two entries to a lane. They carry
+/// the features of `V`, which this module's cfg guarantees, so the dispatch calls them with `unsafe`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
 mod x86 {
     use super::*;
-    use crate::clmul::{V, Vector};
+    use crate::clmul::{V, clmul_kernel};
 
     /// Entries to a register.
     pub const STEP: usize = 2 * V::N;
 
-    #[inline(always)]
-    fn load3(row: &[u64], width: usize, j: usize) -> [V; 3] {
-        std::array::from_fn(|k| V::load(row, k * width + j))
-    }
-
-    #[inline(always)]
-    fn store3(row: &mut [u64], width: usize, j: usize, value: [V; 3]) {
-        for (k, v) in value.into_iter().enumerate() {
-            V::store(row, k * width + j, v);
+    clmul_kernel! {
+        fn load3(row: &[u64], width: usize, j: usize) -> [V; 3] {
+            std::array::from_fn(|k| V::load(row, k * width + j))
         }
-    }
 
-    #[inline(always)]
-    fn xor3(a: &[V; 3], b: &[V; 3]) -> [V; 3] {
-        std::array::from_fn(|k| a[k].xor(b[k]))
-    }
-
-    /// The pairwise sums of three words, `0 + 1`, `0 + 2`, `1 + 2`, which [`karatsuba`] multiplies.
-    #[inline(always)]
-    fn sums(a: &[V; 3]) -> [V; 3] {
-        [a[0].xor(a[1]), a[0].xor(a[2]), a[1].xor(a[2])]
-    }
-
-    /// The products of the entries, as partial sums by word offset: `out[half][s]` holds the
-    /// 128-bit sum of `a[i] * b[k]` over `i + k = s`, for the even or the odd entries. Karatsuba's
-    /// six products where the schoolbook takes nine.
-    #[inline(always)]
-    fn karatsuba(a: &[V; 3], sa: &[V; 3], b: &[V; 3], sb: &[V; 3]) -> [[V; 5]; 2] {
-        let product = |x: V, y: V| [x.clmul::<0x00>(y), x.clmul::<0x11>(y)];
-        let (p0, p1, p2) = (product(a[0], b[0]), product(a[1], b[1]), product(a[2], b[2]));
-        let (m01, m02, m12) = (product(sa[0], sb[0]), product(sa[1], sb[1]), product(sa[2], sb[2]));
-        std::array::from_fn(|h| {
-            [
-                p0[h],
-                m01[h].xor(p0[h]).xor(p1[h]),
-                m02[h].xor(p0[h]).xor(p1[h]).xor(p2[h]),
-                m12[h].xor(p1[h]).xor(p2[h]),
-                p2[h],
-            ]
-        })
-    }
-
-    #[inline(always)]
-    fn partial(a: &[V; 3], b: &[V; 3]) -> [[V; 5]; 2] {
-        karatsuba(a, &sums(a), b, &sums(b))
-    }
-
-    /// Word `w` of a product from its partial sums by offset, in the low word of each lane.
-    #[inline(always)]
-    fn word(sums: &[V; 5], w: usize) -> V {
-        let low = if w < 5 { sums[w] } else { V::zero() };
-        let high = if w > 0 { sums[w - 1].high() } else { V::zero() };
-        low.xor(high)
-    }
-
-    /// Reduce the products given by their words in the low word of each lane.
-    #[inline(always)]
-    fn reduce(field: &PowerField, p: &[V; 6]) -> [V; 3] {
-        let barrett: [V; 3] = std::array::from_fn(|k| V::splat(field.barrett[k]));
-        let modulus: [V; 3] = std::array::from_fn(|k| V::splat(field.modulus[k]));
-        let high = [p[3], p[4], p[5]];
-        // The top three words of `high * barrett`: sums at offsets 2, 3 and 4.
-        let mut t = [V::zero(); 5];
-        for (i, k) in [(0, 2), (1, 1), (2, 0), (1, 2), (2, 1), (2, 2)] {
-            t[i + k] = t[i + k].xor(high[i].clmul::<0x00>(barrett[k]));
+        fn store3(row: &mut [u64], width: usize, j: usize, value: [V; 3]) {
+            for (k, v) in value.into_iter().enumerate() {
+                V::store(row, k * width + j, v);
+            }
         }
-        let q: [V; 3] = std::array::from_fn(|k| high[k].xor(word(&t, 3 + k)));
-        // The low three words of `q * modulus`: sums at offsets 0, 1 and 2.
-        let mut r = [V::zero(); 5];
-        for (i, k) in [(0, 0), (0, 1), (1, 0), (0, 2), (1, 1), (2, 0)] {
-            r[i + k] = r[i + k].xor(q[i].clmul::<0x00>(modulus[k]));
+
+        fn xor3(a: &[V; 3], b: &[V; 3]) -> [V; 3] {
+            std::array::from_fn(|k| a[k].xor(b[k]))
         }
-        std::array::from_fn(|k| p[k].xor(word(&r, k)))
-    }
 
-    /// [`reduce`] of products of four words, whose high half is their word 3 alone: most of
-    /// the products vanish.
-    #[inline(always)]
-    fn reduce4(field: &PowerField, p: &[V; 4]) -> [V; 3] {
-        let q = p[3].xor(p[3].clmul::<0x00>(V::splat(field.barrett[2])).high());
-        let r: [V; 3] = std::array::from_fn(|k| q.clmul::<0x00>(V::splat(field.modulus[k])));
-        std::array::from_fn(|k| word(&[r[0], r[1], r[2], V::zero(), V::zero()], k).xor(p[k]))
-    }
+        /// The pairwise sums of three words, `0 + 1`, `0 + 2`, `1 + 2`, which [`karatsuba`] multiplies.
+        fn sums(a: &[V; 3]) -> [V; 3] {
+            [a[0].xor(a[1]), a[0].xor(a[2]), a[1].xor(a[2])]
+        }
 
-    /// The even and the odd entries' reductions, interleaved back.
-    #[inline(always)]
-    fn reduce_pair(field: &PowerField, sums: &[[V; 5]; 2]) -> [V; 3] {
-        let [even, odd] = [0, 1].map(|half| reduce(field, &std::array::from_fn(|w| word(&sums[half], w))));
-        std::array::from_fn(|k| even[k].unpacklo(odd[k]))
-    }
+        /// The products of the entries, as partial sums by word offset: `out[half][s]` holds the
+        /// 128-bit sum of `a[i] * b[k]` over `i + k = s`, for the even or the odd entries. Karatsuba's
+        /// six products where the schoolbook takes nine.
+        fn karatsuba(a: &[V; 3], sa: &[V; 3], b: &[V; 3], sb: &[V; 3]) -> [[V; 5]; 2] {
+            let product = |x: V, y: V| [x.clmul::<0x00>(y), x.clmul::<0x11>(y)];
+            let (p0, p1, p2) = (product(a[0], b[0]), product(a[1], b[1]), product(a[2], b[2]));
+            let (m01, m02, m12) = (product(sa[0], sb[0]), product(sa[1], sb[1]), product(sa[2], sb[2]));
+            std::array::from_fn(|h| {
+                [
+                    p0[h],
+                    m01[h].xor(p0[h]).xor(p1[h]),
+                    m02[h].xor(p0[h]).xor(p1[h]).xor(p2[h]),
+                    m12[h].xor(p1[h]).xor(p2[h]),
+                    p2[h],
+                ]
+            })
+        }
 
-    pub fn dot_pair(a: [&[u64]; 2], b: [&[u64]; 2], width: usize) -> ([u64; 6], [u64; 6]) {
-        let mut acc = [[V::zero(); 5]; 2];
-        for j in (0..width).step_by(STEP) {
-            let (a0, a1, b0, b1) = (
-                load3(a[0], width, j),
-                load3(a[1], width, j),
-                load3(b[0], width, j),
-                load3(b[1], width, j),
-            );
-            for (acc, p) in acc
-                .iter_mut()
-                .zip([partial(&a0, &b0), partial(&xor3(&a0, &a1), &xor3(&b0, &b1))])
-            {
-                for s in 0..5 {
-                    acc[s] = acc[s].xor(p[0][s].xor(p[1][s]));
+        fn partial(a: &[V; 3], b: &[V; 3]) -> [[V; 5]; 2] {
+            karatsuba(a, &sums(a), b, &sums(b))
+        }
+
+        /// Word `w` of a product from its partial sums by offset, in the low word of each lane.
+        fn word(sums: &[V; 5], w: usize) -> V {
+            let low = if w < 5 { sums[w] } else { V::zero() };
+            let high = if w > 0 { sums[w - 1].high() } else { V::zero() };
+            low.xor(high)
+        }
+
+        /// Reduce the products given by their words in the low word of each lane.
+        fn reduce(field: &PowerField, p: &[V; 6]) -> [V; 3] {
+            let barrett: [V; 3] = std::array::from_fn(|k| V::splat(field.barrett[k]));
+            let modulus: [V; 3] = std::array::from_fn(|k| V::splat(field.modulus[k]));
+            let high = [p[3], p[4], p[5]];
+            // The top three words of `high * barrett`: sums at offsets 2, 3 and 4.
+            let mut t = [V::zero(); 5];
+            for (i, k) in [(0, 2), (1, 1), (2, 0), (1, 2), (2, 1), (2, 2)] {
+                t[i + k] = t[i + k].xor(high[i].clmul::<0x00>(barrett[k]));
+            }
+            let q: [V; 3] = std::array::from_fn(|k| high[k].xor(word(&t, 3 + k)));
+            // The low three words of `q * modulus`: sums at offsets 0, 1 and 2.
+            let mut r = [V::zero(); 5];
+            for (i, k) in [(0, 0), (0, 1), (1, 0), (0, 2), (1, 1), (2, 0)] {
+                r[i + k] = r[i + k].xor(q[i].clmul::<0x00>(modulus[k]));
+            }
+            std::array::from_fn(|k| p[k].xor(word(&r, k)))
+        }
+
+        /// [`reduce`] of products of four words, whose high half is their word 3 alone: most of
+        /// the products vanish.
+        fn reduce4(field: &PowerField, p: &[V; 4]) -> [V; 3] {
+            let q = p[3].xor(p[3].clmul::<0x00>(V::splat(field.barrett[2])).high());
+            let r: [V; 3] = std::array::from_fn(|k| q.clmul::<0x00>(V::splat(field.modulus[k])));
+            std::array::from_fn(|k| word(&[r[0], r[1], r[2], V::zero(), V::zero()], k).xor(p[k]))
+        }
+
+        /// The even and the odd entries' reductions, interleaved back.
+        fn reduce_pair(field: &PowerField, sums: &[[V; 5]; 2]) -> [V; 3] {
+            let [even, odd] = [0, 1].map(|half| reduce(field, &std::array::from_fn(|w| word(&sums[half], w))));
+            std::array::from_fn(|k| even[k].unpacklo(odd[k]))
+        }
+
+        pub fn dot_pair(a: [&[u64]; 2], b: [&[u64]; 2], width: usize) -> ([u64; 6], [u64; 6]) {
+            let mut acc = [[V::zero(); 5]; 2];
+            for j in (0..width).step_by(STEP) {
+                let (a0, a1, b0, b1) = (
+                    load3(a[0], width, j),
+                    load3(a[1], width, j),
+                    load3(b[0], width, j),
+                    load3(b[1], width, j),
+                );
+                for (acc, p) in acc
+                    .iter_mut()
+                    .zip([partial(&a0, &b0), partial(&xor3(&a0, &a1), &xor3(&b0, &b1))])
+                {
+                    for s in 0..5 {
+                        acc[s] = acc[s].xor(p[0][s].xor(p[1][s]));
+                    }
                 }
             }
+            let finish = |acc: &[V; 5]| {
+                let mut out = [0u64; 6];
+                for (s, sum) in acc.iter().enumerate() {
+                    let sum = sum.sum();
+                    out[s] ^= sum as u64;
+                    out[s + 1] ^= (sum >> 64) as u64;
+                }
+                out
+            };
+            (finish(&acc[0]), finish(&acc[1]))
         }
-        let finish = |acc: &[V; 5]| {
-            let mut out = [0u64; 6];
-            for (s, sum) in acc.iter().enumerate() {
-                let sum = sum.sum();
-                out[s] ^= sum as u64;
-                out[s + 1] ^= (sum >> 64) as u64;
+
+        pub fn reduce_row(field: &PowerField, dst: &mut [u64], wide: &[u64], width: usize) {
+            for j in (0..width).step_by(STEP) {
+                let w: [V; 4] = std::array::from_fn(|k| V::load(wide, k * width + j));
+                let [even, odd] = [0, 1].map(|half| {
+                    let at = |x: V| if half == 0 { x } else { x.high() };
+                    reduce4(field, &w.map(at))
+                });
+                store3(dst, width, j, std::array::from_fn(|k| even[k].unpacklo(odd[k])));
             }
-            out
-        };
-        (finish(&acc[0]), finish(&acc[1]))
-    }
-
-    pub fn reduce_row(field: &PowerField, dst: &mut [u64], wide: &[u64], width: usize) {
-        for j in (0..width).step_by(STEP) {
-            let w: [V; 4] = std::array::from_fn(|k| V::load(wide, k * width + j));
-            let [even, odd] = [0, 1].map(|half| {
-                let at = |x: V| if half == 0 { x } else { x.high() };
-                reduce4(field, &w.map(at))
-            });
-            store3(dst, width, j, std::array::from_fn(|k| even[k].unpacklo(odd[k])));
         }
-    }
 
-    pub fn mul_row(field: &PowerField, dst: &mut [u64], a: &[u64], b: &[u64], c: &[u64], width: usize) {
-        for j in (0..width).step_by(STEP) {
-            let (a, b, c) = (load3(a, width, j), load3(b, width, j), load3(c, width, j));
-            let product = reduce_pair(field, &partial(&a, &b));
-            store3(dst, width, j, xor3(&c, &product));
+        pub fn mul_row(field: &PowerField, dst: &mut [u64], a: &[u64], b: &[u64], c: &[u64], width: usize) {
+            for j in (0..width).step_by(STEP) {
+                let (a, b, c) = (load3(a, width, j), load3(b, width, j), load3(c, width, j));
+                let product = reduce_pair(field, &partial(&a, &b));
+                store3(dst, width, j, xor3(&c, &product));
+            }
         }
-    }
 
-    pub fn fold_row(
-        field: &PowerField,
-        dst: &mut [u64],
-        lo: &[u64],
-        hi: &[u64],
-        challenge: &Element,
-        width: usize,
-    ) {
-        let challenge: [V; 3] = std::array::from_fn(|k| V::splat(challenge[k]));
-        let challenge_sums = sums(&challenge);
-        for j in (0..width).step_by(STEP) {
-            let (l, h) = (load3(lo, width, j), load3(hi, width, j));
-            let delta = xor3(&l, &h);
-            let folded = reduce_pair(field, &karatsuba(&delta, &sums(&delta), &challenge, &challenge_sums));
-            store3(dst, width, j, xor3(&l, &folded));
+        pub fn fold_row(
+            field: &PowerField,
+            dst: &mut [u64],
+            lo: &[u64],
+            hi: &[u64],
+            challenge: &Element,
+            width: usize,
+        ) {
+            let challenge: [V; 3] = std::array::from_fn(|k| V::splat(challenge[k]));
+            let challenge_sums = sums(&challenge);
+            for j in (0..width).step_by(STEP) {
+                let (l, h) = (load3(lo, width, j), load3(hi, width, j));
+                let delta = xor3(&l, &h);
+                let folded = reduce_pair(field, &karatsuba(&delta, &sums(&delta), &challenge, &challenge_sums));
+                store3(dst, width, j, xor3(&l, &folded));
+            }
         }
     }
 }

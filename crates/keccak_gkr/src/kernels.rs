@@ -298,22 +298,30 @@ cfg_select! {
     }
 }
 
-/// [`products`] on a register of [`Vector`](crate::clmul::Vector) lanes, two packs to a lane: the
-/// x86 form at every width.
+/// [`products`] on a register of [`V`](crate::clmul::V) lanes, two packs to a lane: the x86 form
+/// at every width.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
-#[inline(always)]
 pub fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
-    use crate::clmul::{V, Vector};
-    let ones = V::splat(RMFE.ones as u64);
-    let mut out = [0u64; PACKS];
-    for q in (0..PACKS).step_by(2 * V::N) {
-        let (za, zb, zc) = (V::load_packs(a, q), V::load_packs(b, q), V::load_packs(c, q));
-        let linear = za.xor(zc);
-        let even = zb.clmul::<0x00>(zc).xor(linear.clmul::<0x00>(ones));
-        let odd = zb.clmul::<0x11>(zc).xor(linear.clmul::<0x11>(ones));
-        V::store(&mut out, q, even.unpacklo(odd));
+    // SAFETY: this item is compiled only where `avx2` and `pclmulqdq` are enabled, and `V`'s
+    // width, which `clmul_kernel!` follows, is chosen by the enabled features too.
+    unsafe { products_vectors(a, b, c) }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+crate::clmul::clmul_kernel! {
+    fn products_vectors(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
+        use crate::clmul::V;
+        let ones = V::splat(RMFE.ones as u64);
+        let mut out = [0u64; PACKS];
+        for q in (0..PACKS).step_by(2 * V::N) {
+            let (za, zb, zc) = (V::load_packs(a, q), V::load_packs(b, q), V::load_packs(c, q));
+            let linear = za.xor(zc);
+            let even = zb.clmul::<0x00>(zc).xor(linear.clmul::<0x00>(ones));
+            let odd = zb.clmul::<0x11>(zc).xor(linear.clmul::<0x11>(ones));
+            V::store(&mut out, q, even.unpacklo(odd));
+        }
+        out
     }
-    out
 }
 
 /// Compiled only where its features are, so its kernels are safe to call.
@@ -614,7 +622,7 @@ mod x86 {
 }
 
 /// Compiled only where its features are, so its kernels are safe to call. The embedding is
-/// NEON's nibble lookups, and the products are on a register of [`Vector`](crate::clmul::Vector)
+/// NEON's nibble lookups, and the products are on a register of [`V`](crate::clmul::V)
 /// lanes, two packs to a lane.
 #[cfg(all(
     target_arch = "x86_64",
@@ -627,7 +635,7 @@ mod avx2 {
 
     pub use super::products_clmul as products;
     use super::*;
-    use crate::clmul::{V, Vector};
+    use crate::clmul::{V, clmul_kernel};
     use primitives::{load_at, store_at};
 
     /// The 32 packs of a block position, embedded, four to a register.
@@ -744,30 +752,37 @@ mod avx2 {
         );
     }
 
-    /// `2 * N` slots at a time, their sums over the row kept in registers. A slot's product lies
-    /// in the low word of its lane, which multiplies the weights as it is. The padding slots past
-    /// the last whole register are skipped: nothing reads their sums.
     #[inline(always)]
     pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
-        let w: [[V; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
-        for p in (0..2 * MIXED).step_by(2 * V::N) {
-            let z: [V; 5] = std::array::from_fn(|x| V::load_packs(&e[x], p));
-            let mut sums = [[V::zero(); 2]; 3];
-            for x in 0..5 {
-                let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
-                let products = [zb.clmul::<0x00>(zc), zb.clmul::<0x11>(zc)];
-                for (k, sums) in sums.iter_mut().enumerate() {
-                    for (sum, product) in sums.iter_mut().zip(products) {
-                        *sum = sum.xor(product.clmul::<0x00>(w[x][k]));
+        // SAFETY: this module is compiled only where `avx2` and `pclmulqdq` are enabled.
+        unsafe { skip_row_vectors(acc, e, weights) }
+    }
+
+    clmul_kernel! {
+        /// `2 * N` slots at a time, their sums over the row kept in registers. A slot's product lies
+        /// in the low word of its lane, which multiplies the weights as it is. The padding slots past
+        /// the last whole register are skipped: nothing reads their sums.
+        fn skip_row_vectors(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
+            let w: [[V; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
+            for p in (0..2 * MIXED).step_by(2 * V::N) {
+                let z: [V; 5] = std::array::from_fn(|x| V::load_packs(&e[x], p));
+                let mut sums = [[V::zero(); 2]; 3];
+                for x in 0..5 {
+                    let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
+                    let products = [zb.clmul::<0x00>(zc), zb.clmul::<0x11>(zc)];
+                    for (k, sums) in sums.iter_mut().enumerate() {
+                        for (sum, product) in sums.iter_mut().zip(products) {
+                            *sum = sum.xor(product.clmul::<0x00>(w[x][k]));
+                        }
                     }
                 }
-            }
-            // Slot `p + h + 2 * l` is lane `l` of `sums[.][h]`, and those lanes lie side by side.
-            for (acc, sums) in acc.0.iter_mut().zip(sums) {
-                for (h, sum) in sums.into_iter().enumerate() {
-                    let (v, l) = lane(p + h);
-                    let slot = &mut acc[v].0[l..];
-                    V::store(slot, 0, V::load(slot, 0).xor(sum));
+                // Slot `p + h + 2 * l` is lane `l` of `sums[.][h]`, and those lanes lie side by side.
+                for (acc, sums) in acc.0.iter_mut().zip(sums) {
+                    for (h, sum) in sums.into_iter().enumerate() {
+                        let (v, l) = lane(p + h);
+                        let slot = &mut acc[v].0[l..];
+                        V::store(slot, 0, V::load(slot, 0).xor(sum));
+                    }
                 }
             }
         }
@@ -775,17 +790,24 @@ mod avx2 {
 
     #[inline(always)]
     pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-        std::array::from_fn(|half| {
-            let mut acc = [V::zero(); 3];
-            for q in (0..GROUP).step_by(2 * V::N) {
-                let ze = V::load_packs(e, GROUP * half + q);
-                for (acc, weights) in acc.iter_mut().zip(weights) {
-                    let zw = V::load(weights, q);
-                    *acc = acc.xor(ze.clmul::<0x00>(zw)).xor(ze.clmul::<0x11>(zw));
+        // SAFETY: this module is compiled only where `avx2` and `pclmulqdq` are enabled.
+        unsafe { fold_groups_vectors(e, weights) }
+    }
+
+    clmul_kernel! {
+        fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
+            std::array::from_fn(|half| {
+                let mut acc = [V::zero(); 3];
+                for q in (0..GROUP).step_by(2 * V::N) {
+                    let ze = V::load_packs(e, GROUP * half + q);
+                    for (acc, weights) in acc.iter_mut().zip(weights) {
+                        let zw = V::load(weights, q);
+                        *acc = acc.xor(ze.clmul::<0x00>(zw)).xor(ze.clmul::<0x11>(zw));
+                    }
                 }
-            }
-            acc.map(V::sum)
-        })
+                acc.map(|v| v.sum())
+            })
+        }
     }
 }
 
