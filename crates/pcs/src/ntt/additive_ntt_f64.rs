@@ -229,37 +229,6 @@ impl AdditiveNttF64 {
         self.transform(data, num_ntts, log_inv_rate, Some(msg), None);
     }
 
-    /// Encode in place, handing `on_rows` every finished block of rows, see [`RowSink`].
-    #[timed]
-    pub fn encode_interleaved_in_place_with(
-        &self,
-        data: &mut [F64],
-        num_ntts: usize,
-        log_inv_rate: usize,
-        on_rows: &RowSink<'_>,
-    ) {
-        let msg = parallel::SendPtr(data.as_mut_ptr());
-        self.transform(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows));
-    }
-
-    /// [`Self::encode_interleaved_in_place_with`] without writing the deep pass back.
-    ///
-    /// - Each deep sub-block is finished in scratch and handed to `on_rows` from there.
-    /// - The buffer keeps what the gathered passes left, and [`Self::finish_rows`] finishes any row again.
-    /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
-    ///
-    /// A queried row costs one sub-block transform, against a write of the whole codeword saved.
-    pub fn encode_interleaved_in_place_without_deep(
-        &self,
-        data: &mut [F64],
-        num_ntts: usize,
-        log_inv_rate: usize,
-        on_rows: &RowSink<'_>,
-    ) -> Option<DeepRows> {
-        let msg = parallel::SendPtr(data.as_mut_ptr());
-        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true, None)
-    }
-
     /// Encode a lane-major message, handing `on_rows` every finished block, and keep what `keep` asks for.
     ///
     /// - The result equals [`transpose_lane_major`] into block 0 followed by the in-place encode.
@@ -2364,17 +2333,22 @@ mod tests {
             // Under test: only the first replica holds the message, the rest is zero.
             let mut got = vec![F64::ZERO; msg_len << log_inv_rate];
             got[..msg_len].copy_from_slice(&msg);
+            ntt.encode_interleaved_in_place(&mut got, lanes, log_inv_rate);
+            assert_eq!(got, want, "log_d={log_d}, lanes={lanes}, rate={log_inv_rate}");
+
+            // Under test: a separate message, with the rows handed to a sink.
+            let mut sep = vec![F64::ZERO; got.len()];
             let mut handed = vec![F64::ZERO; got.len()];
             let hits: Vec<AtomicUsize> = (0..1usize << log_d).map(|_| AtomicUsize::new(0)).collect();
             let write = sink_into(&mut handed, lanes);
-            ntt.encode_interleaved_in_place_with(&mut got, lanes, log_inv_rate, &|row, rows| {
+            ntt.encode_interleaved_with(&mut sep, &msg, lanes, log_inv_rate, false, &|row, rows| {
                 for hit in &hits[row..row + rows.len() / lanes] {
                     hit.fetch_add(1, Ordering::Relaxed);
                 }
                 write(row, rows)
             });
             drop(write);
-            assert_eq!(got, want, "log_d={log_d}, lanes={lanes}, rate={log_inv_rate}");
+            assert_eq!(sep, want, "separate message, log_d={log_d}, lanes={lanes}, rate={log_inv_rate}");
             // Every row handed over exactly once, so the blocks tile the rows, and each is final.
             assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1), "blocks tile the rows, log_d={log_d}");
             assert_eq!(handed, want, "a handed-over block is final, log_d={log_d}");
@@ -2483,10 +2457,15 @@ mod tests {
 
     /// Without the deep writeback, the handed-over rows and the rows finished on demand
     /// must equal the full encode's, wherever the plan splits off a deep pass.
+    ///
+    /// A deep-only plan with a separate message builds the whole codeword and returns `None`.
+    /// The in-place, deep-only, deferred branch runs in `lane_major_encode_matches_transpose_then_in_place`,
+    /// at shape `(5, 2, 7)`.
     #[test]
     fn deferred_deep_rows_match_the_full_encode() {
         let mut rng = Rng::new(0xDEE9);
-        for (log_d, lanes, log_inv_rate, split) in [(14usize, 51usize, 1usize, true), (14, 64, 2, true), (9, 8, 1, true), (4, 8, 4, false)] {
+        let shapes = [(14usize, 51usize, 1usize, true), (15, 64, 2, true), (9, 8, 1, false), (4, 8, 4, false)];
+        for (log_d, lanes, log_inv_rate, split) in shapes {
             let ntt = AdditiveNttF64::standard(log_d);
             let msg_len = (lanes << log_d) >> log_inv_rate;
             let msg: Vec<F64> = (0..msg_len).map(|_| F64(rng.next_u64())).collect();
@@ -2495,9 +2474,10 @@ mod tests {
             ntt.encode_interleaved_in_place(&mut want, lanes, log_inv_rate);
 
             let mut got = vec![F64::ZERO; msg_len << log_inv_rate];
-            got[..msg_len].copy_from_slice(&msg);
             let mut handed = vec![F64::ZERO; got.len()];
-            let deep = ntt.encode_interleaved_in_place_without_deep(&mut got, lanes, log_inv_rate, &sink_into(&mut handed, lanes));
+            let sink = sink_into(&mut handed, lanes);
+            let deep = ntt.encode_interleaved_with(&mut got, &msg, lanes, log_inv_rate, true, &sink);
+            drop(sink);
             assert_eq!(handed, want, "handed-over rows, log_d={log_d}, lanes={lanes}");
             assert_eq!(deep.is_some(), split, "plan, log_d={log_d}, lanes={lanes}");
             let mut positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
