@@ -8,7 +8,7 @@ use super::additive_ntt_f64::{AdditiveNttF64, with_scratch};
 use super::deep::Drain;
 use super::layers::Layers;
 use super::source::Source;
-use super::stage::{BATCH, StageCopies, fill_stage, stage_copies, stage_subs};
+use super::stage::{BATCH, Stage, stage_subs};
 use super::window::Window;
 
 impl AdditiveNttF64 {
@@ -70,11 +70,9 @@ impl AdditiveNttF64 {
         let batch = if staged { BATCH * subs } else { 1 };
         let width = if staged { BATCH * 8 } else { num_ntts };
         let (group_len, stage_len) = (rows * width, if staged { subs * rows * width } else { 0 });
-        let copies = match src {
-            Source::Lanes(lanes) => {
-                stage_copies(lanes.repeats, log_step, rows, block_rows, lanes.n_lanes, num_ntts)
-            }
-            _ => StageCopies::none(),
+        let staging = match src {
+            Source::Lanes(lanes) => Some(Stage::new(&lanes, log_step, rows, block_rows, num_ntts, subs)),
+            _ => None,
         };
         // Whole aligned cache lines in every row stream out a line at a time; other rows are stored whole.
         let stream = stream && num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
@@ -119,11 +117,10 @@ impl AdditiveNttF64 {
                     std::mem::swap(&mut scratch, &mut idle);
                 };
                 for t in lo..hi {
-                    match src {
-                        Source::Lanes(lanes) => {
+                    match (src, &staging) {
+                        (Source::Lanes(lanes), Some(staging)) => {
                             for octet in 0..num_ntts / 8 {
-                                let (words, n_lanes) = (lanes.words, lanes.n_lanes);
-                                fill_stage(stage, words, t * batch, log_step, block_rows, n_lanes, num_ntts, octet, &copies, subs);
+                                staging.fill(stage, lanes.words, t * batch, octet);
                                 for block in blocks.clone().rev() {
                                     for (u, staged) in stage.chunks_exact(group_len).enumerate() {
                                         let r = t * batch + u * BATCH;

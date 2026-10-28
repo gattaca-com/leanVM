@@ -6,7 +6,8 @@ use primitives::field::F64;
 use super::additive_ntt_f64::{AdditiveNttF64, with_scratch};
 use super::layers::no_hook;
 use super::plan::Plan;
-use super::stage::{BATCH, LOG_BATCH, fill_stage, stage_copies};
+use super::source::Lanes;
+use super::stage::{BATCH, LOG_BATCH, Stage};
 
 /// The rows at the sorted `positions`, `n` words each, back to back.
 ///
@@ -123,7 +124,7 @@ impl AdditiveNttF64 {
                 (run[0] >> g, next - run.len()..next, run.iter().map(|sub| sub & (rows - 1)).collect())
             })
             .collect();
-        let copies = stage_copies(repeats, log_step, rows, msg_rows, n_lanes, num_ntts);
+        let staging = Stage::new(&Lanes { words: msg, repeats, n_lanes }, log_step, rows, msg_rows, num_ntts, 1);
         let layers = self.layers();
         // A group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
         primitives::filled_vec(subs.len() * sub_len, |built| {
@@ -137,7 +138,7 @@ impl AdditiveNttF64 {
                     let (stage, scratch) = all.split_at_mut(stage_len);
                     for t in lo..hi {
                         for octet in 0..num_ntts / 8 {
-                            fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet, &copies, 1);
+                            staging.fill(stage, msg, t * BATCH, octet);
                             for (coset, run, live) in &cosets {
                                 let live_rows = Some(&live[..]);
                                 layers.run(

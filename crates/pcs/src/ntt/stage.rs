@@ -5,6 +5,7 @@ use primitives::field::F64;
 use primitives::stream::Stream;
 
 use super::additive_ntt_f64::with_scratch;
+use super::source::Lanes;
 use super::window::STREAM_MIN_WORDS;
 use crate::stack_open::EQUAL_BLOCK_LOG;
 
@@ -185,40 +186,62 @@ pub(super) fn stage_copies(
     StageCopies { back, rows, n_octets, masks }
 }
 
-/// Transpose one octet of lanes of `subs` batches of [`BATCH`] consecutive residues of a lane-major message into `stage`.
+/// The transpose of a lane-major message through a stage, for one gathered pass.
 ///
-/// - `stage` is `subs` stages of one batch each, and batch `u` starts at residue `t0 + u * BATCH`.
-/// - A row's tiles of all batches go together: the lines of one lane block that sit next to each other are read next to each other.
-/// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
-///   is lane block `row_words - 1 - w` of the message, or zero while `w` is below the padding.
-/// - Residue `t0 + s` takes rows `t0 + s + i * step` for `i < rows`, `step = 2^log_step`.
-/// - The octet is lanes `8 * octet..8 * octet + 8`. Together with the residues, they are 64 lanes of one transform.
-/// - `stage` has `rows` rows of 64 words: lane `8 * octet + k` of row `t0 + s + i * step` is word `(i * BATCH + s) * 8 + k`.
-/// - One tile is 8 words of 8 lane blocks, so each 64 byte line of a lane block is read once, whole.
-/// - A lane of tile `i` with its bit set in the octet's [`StageCopies`] is copied from the tile `back` rows
-///   before, which is already in the stage, and its line is not read.
-pub(super) fn fill_stage(
-    stage: &mut [F64],
-    msg: &[F64],
-    t0: usize,
+/// - It owns the [`StageCopies`] and the geometry of the fill: the step, the message rows and the lanes.
+/// - [`Stage::fill`] moves one octet of lanes of a few batches of residues into a stage buffer.
+/// - A task fills the stage, then each block of the pass transforms a copy of it.
+pub(super) struct Stage {
+    copies: StageCopies,
     log_step: usize,
     msg_rows: usize,
     n_lanes: usize,
     row_words: usize,
-    octet: usize,
-    copies: &StageCopies,
     subs: usize,
-) {
-    // SAFETY: AVX-512F is enabled at compile time.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    unsafe {
-        fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, copies, subs)
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-    fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, copies, subs);
 }
 
-/// [`fill_stage`], a target-feature function where AVX-512 is enabled, so its tiles move through registers.
+impl Stage {
+    /// The stage of a pass with `rows` rows a group, over a message of `msg_rows` rows and `lanes`.
+    pub(super) fn new(
+        lanes: &Lanes,
+        log_step: usize,
+        rows: usize,
+        msg_rows: usize,
+        row_words: usize,
+        subs: usize,
+    ) -> Self {
+        let copies = stage_copies(lanes.repeats, log_step, rows, msg_rows, lanes.n_lanes, row_words);
+        Self { copies, log_step, msg_rows, n_lanes: lanes.n_lanes, row_words, subs }
+    }
+
+    /// Transpose one octet of lanes of `subs` batches of [`BATCH`] consecutive residues into `stage`.
+    ///
+    /// - `stage` is `subs` stages of one batch each, and batch `u` starts at residue `t0 + u * BATCH`.
+    /// - A row's tiles of all batches go together.
+    ///   The lines of one lane block that sit next to each other are read next to each other.
+    /// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
+    ///   is lane block `row_words - 1 - w` of the message, or zero while `w` is below the padding.
+    /// - Residue `t0 + s` takes rows `t0 + s + i * step` for `i < rows`, `step = 2^log_step`.
+    /// - The octet is lanes `8 * octet..8 * octet + 8`. Together with the residues, they are 64 lanes of one transform.
+    /// - `stage` has `rows` rows of 64 words.
+    ///   Lane `8 * octet + k` of row `t0 + s + i * step` is word `(i * BATCH + s) * 8 + k`.
+    /// - One tile is 8 words of 8 lane blocks, so each 64 byte line of a lane block is read once, whole.
+    /// - A lane of tile `i` with its bit set in the octet's [`StageCopies`] is copied from the tile `back` rows
+    ///   before, which is already in the stage, and its line is not read.
+    #[inline]
+    pub(super) fn fill(&self, stage: &mut [F64], msg: &[F64], t0: usize, octet: usize) {
+        let Self { log_step, msg_rows, n_lanes, row_words, subs, ref copies } = *self;
+        // SAFETY: AVX-512F is enabled at compile time.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        unsafe {
+            fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, copies, subs)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+        fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, copies, subs);
+    }
+}
+
+/// [`Stage::fill`], a target-feature function where AVX-512 is enabled, so its tiles move through registers.
 #[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512f"), target_feature(enable = "avx512f"), inline)]
 fn fill_stage_tiles(
     stage: &mut [F64],
