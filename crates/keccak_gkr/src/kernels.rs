@@ -11,6 +11,20 @@ use crate::keccak::row_positions;
 use crate::rmfe::RMFE;
 use crate::witness::BLOCK_WORDS;
 
+/// Defines the plain entry points over `target_feature` kernels of the same signature, which the
+/// stage code calls.
+macro_rules! entry {
+    ($($(#[$meta:meta])* fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)? => $kernel:ident;)*) => {$(
+        $(#[$meta])*
+        pub fn $name($($arg: $ty),*) $(-> $ret)? {
+            // SAFETY: every use of `entry!` sits in an item compiled only where the features of its
+            // kernel are enabled: the `cfg_select!` below picks the module, and the `cfg` of
+            // `products_clmul` and `clmul_kernel!` follow the enabled features.
+            unsafe { $kernel($($arg),*) }
+        }
+    )*};
+}
+
 cfg_select! {
     all(
         target_arch = "x86_64",
@@ -298,13 +312,11 @@ cfg_select! {
     }
 }
 
-/// [`products`] on a register of [`V`](crate::clmul::V) lanes, two packs to a lane: the x86 form
-/// at every width.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
-pub fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
-    // SAFETY: this item is compiled only where `avx2` and `pclmulqdq` are enabled, and `V`'s
-    // width, which `clmul_kernel!` follows, is chosen by the enabled features too.
-    unsafe { products_vectors(a, b, c) }
+entry! {
+    /// [`products`] on a register of [`V`](crate::clmul::V) lanes, two packs to a lane: the x86 form
+    /// at every width.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+    fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] => products_vectors;
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
@@ -370,10 +382,9 @@ mod x86 {
         m
     };
 
-    #[inline(always)]
-    pub fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
-        // SAFETY: the features are enabled at compile time.
-        unsafe { embed_vector(words) }
+    entry! {
+        #[inline(always)]
+        fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] => embed_vector;
     }
 
     #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
@@ -576,12 +587,11 @@ mod x86 {
         }
     }
 
-    /// The six sums are summed across their lanes together: two registers' lanes interleave into
-    /// one, which takes two shuffles where each register alone would leave the vector unit.
-    #[inline(always)]
-    pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-        // SAFETY: the features are enabled at compile time.
-        unsafe { fold_vectors(e, weights) }
+    entry! {
+        /// The six sums are summed across their lanes together: two registers' lanes interleave into
+        /// one, which takes two shuffles where each register alone would leave the vector unit.
+        #[inline(always)]
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] => fold_vectors;
     }
 
     #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
@@ -732,10 +742,9 @@ mod avx2 {
         low[8]
     }
 
-    #[inline(always)]
-    pub fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
-        // SAFETY: the features are enabled at compile time.
-        unsafe { embed_extend_vectors(words, out) }
+    entry! {
+        #[inline(always)]
+        fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) => embed_extend_vectors;
     }
 
     #[target_feature(enable = "avx2")]
@@ -752,10 +761,9 @@ mod avx2 {
         );
     }
 
-    #[inline(always)]
-    pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
-        // SAFETY: this module is compiled only where `avx2` and `pclmulqdq` are enabled.
-        unsafe { skip_row_vectors(acc, e, weights) }
+    entry! {
+        #[inline(always)]
+        fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) => skip_row_vectors;
     }
 
     clmul_kernel! {
@@ -788,10 +796,9 @@ mod avx2 {
         }
     }
 
-    #[inline(always)]
-    pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-        // SAFETY: this module is compiled only where `avx2` and `pclmulqdq` are enabled.
-        unsafe { fold_groups_vectors(e, weights) }
+    entry! {
+        #[inline(always)]
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] => fold_groups_vectors;
     }
 
     clmul_kernel! {
@@ -812,7 +819,7 @@ mod avx2 {
 }
 
 /// Compiled only where its feature is. The kernels are safe `target_feature` functions, and the
-/// entry points call them with `unsafe`.
+/// entry points call them through [`entry!`].
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 mod neon {
     use core::arch::aarch64::*;
@@ -824,10 +831,9 @@ mod neon {
 
     use super::*;
 
-    #[inline(always)]
-    pub fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
-        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
-        unsafe { embed_vectors(words) }
+    entry! {
+        #[inline(always)]
+        fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] => embed_vectors;
     }
 
     /// Sixteen bytes' even and odd bytes, two registers.
@@ -926,10 +932,9 @@ mod neon {
         low[8]
     }
 
-    #[inline(always)]
-    pub fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
-        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
-        unsafe { embed_extend_vectors(words, out) }
+    entry! {
+        #[inline(always)]
+        fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) => embed_extend_vectors;
     }
 
     #[target_feature(enable = "neon,aes")]
@@ -954,10 +959,9 @@ mod neon {
         pmull(vgetq_lane_u64(a, 0), vgetq_lane_u64(b, 0))
     }
 
-    #[inline(always)]
-    pub fn products(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
-        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
-        unsafe { products_vectors(a, b, c) }
+    entry! {
+        #[inline(always)]
+        fn products(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] => products_vectors;
     }
 
     #[target_feature(enable = "neon,aes")]
@@ -975,10 +979,9 @@ mod neon {
         out
     }
 
-    #[inline(always)]
-    pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
-        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
-        unsafe { skip_row_vectors(acc, e, weights) }
+    entry! {
+        #[inline(always)]
+        fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) => skip_row_vectors;
     }
 
     /// Two slots at a time, their sums over the row kept in registers. The padding slots are
@@ -1008,10 +1011,9 @@ mod neon {
         }
     }
 
-    #[inline(always)]
-    pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
-        unsafe { fold_groups_vectors(e, weights) }
+    entry! {
+        #[inline(always)]
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] => fold_groups_vectors;
     }
 
     #[target_feature(enable = "neon,aes")]
