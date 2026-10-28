@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use primitives::field::F64;
 use primitives::log2_strict_usize;
 
+use super::deep::DeepPass;
 use super::gathered::GatheredPass;
 use super::layers::{Layers, no_hook};
 use super::plan::{L2_WORDS, Plan, l2_words};
@@ -308,7 +309,7 @@ impl AdditiveNttF64 {
 
         // Phase 3: the deep pass, one task per run of contiguous sub-blocks.
         if plan.has_deep() {
-            self.deep_pass(win, &plan, plan.log_sub(), src, deep_rows, defer_deep);
+            DeepPass::new(&plan, deep_rows, defer_deep).run(self.layers(), win, src);
         }
 
         if let Some(f) = on_rows.filter(|_| !plan.fuses_rows()) {
