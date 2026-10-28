@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use primitives::field::F64;
 use primitives::log2_strict_usize;
 
+use super::gathered::GatheredPass;
 use super::layers::{Layers, no_hook};
 use super::plan::{L2_WORDS, Plan, l2_words};
 use super::rows::built_rows;
@@ -296,7 +297,7 @@ impl AdditiveNttF64 {
             src = src.transpose_into(win, log_d - start);
         }
         for (layer, g) in plan.gathered() {
-            self.gathered_pass(win, log_d, layer, g, src.take());
+            GatheredPass::new(&plan, win, layer, g, src.take()).run(self.layers(), win);
         }
 
         // Phase 2: replicas a deep-only plan cannot build inside its tasks.
