@@ -1,153 +1,16 @@
-//! Additive NTT over GF(2^64) in the Lin-Chung-Han novel polynomial basis.
-//!
-//! It is the Reed-Solomon encoder of every WHIR commitment over K = F_{2^64}.
-//!
-//! - Layers run neighbors-last: layer 0 pairs rows half the domain apart.
-//! - Many independent transforms share one buffer, interleaved row by row.
-//! - The E-valued encodes of deeper WHIR levels reuse it, one F64 lane per F192 coefficient.
-//! - Large transforms are bound by memory bandwidth, so the driver minimizes sweeps of the buffer.
-
-use flux_profiler::timed;
-use std::cell::RefCell;
+//! Coset-major encoding, and the tests of the encoder.
 
 use primitives::field::F64;
 use primitives::log2_strict_usize;
 
-use super::deep::DeepPass;
-use super::gathered::GatheredPass;
-use super::layers::{Layers, no_hook};
-use super::plan::{L2_WORDS, Plan, l2_words};
+use super::encode::RowSink;
+use super::facade::AdditiveNttF64;
+use super::layers::no_hook;
+use super::plan::L2_WORDS;
 use super::rows::built_rows;
-use super::twiddles::Twiddles;
-use super::source::{Lanes, Source};
-use super::window::Window;
-
-/// What [`AdditiveNttF64::encode_lane_major`] is asked to keep of its codeword.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Keep {
-    /// All of it: the deep pass is written back.
-    Whole,
-    /// The buffer as the gathered passes leave it: [`AdditiveNttF64::finish_rows`] runs the deep pass again on a row read.
-    BeforeDeep,
-    /// None of it, if the plan allows: [`AdditiveNttF64::rebuild_rows`] recomputes a row from the message.
-    Nothing,
-}
-
-/// What [`AdditiveNttF64::encode_lane_major`] kept of its codeword.
-pub struct Encoded {
-    /// The buffer kept, or empty when nothing was.
-    pub words: Vec<F64>,
-    /// Set if the deep pass is left to run on a row read, from `words` or, when empty, from the message.
-    pub deep: Option<Plan>,
-}
-
-/// Receives a finished block of codeword rows, as `(first_row, rows)`.
-///
-/// - It is called from pool tasks.
-/// - Each row is handed over exactly once.
-/// - Blocks are aligned, and all of one power-of-two size.
-/// - A block is handed over while its rows are still in cache.
-pub type RowSink<'a> = dyn Fn(usize, &[F64]) + Sync + 'a;
-
-/// Additive NTT over F_{2^64} with the standard polynomial-basis subspace
-/// `{1, x, x², …}`: the F_2-subspace is `{0, 1, …, 2^ℓ−1}` under the natural
-/// integer encoding.
-/// Additive NTT over F_{2^64} with the standard polynomial-basis subspace
-/// `{1, x, x², …}`: the F_2-subspace is `{0, 1, …, 2^ℓ−1}` under the natural
-/// integer encoding.
-///
-/// - It owns the [`Twiddles`] of the domain.
-/// - Every method here forwards to the component that does the work.
-#[derive(Clone, Debug)]
-pub struct AdditiveNttF64 {
-    tw: Twiddles,
-}
+use super::scratch::with_scratch;
 
 impl AdditiveNttF64 {
-    /// The layer sweeps over this domain.
-    pub(super) fn layers(&self) -> Layers<'_> {
-        Layers::new(&self.tw)
-    }
-
-    /// Standard NTT with basis `{1, x, …, x^(dim-1)}`. Requires `dim ≤ 63` so
-    /// the evaluation domain (and the twiddles) stay inside F_{2^64} without
-    /// wrap; far beyond any codeword size in use.
-    pub fn standard(dim: usize) -> Self {
-        Self { tw: Twiddles::standard(dim) }
-    }
-
-    pub fn log_domain_size(&self) -> usize {
-        self.tw.log_domain_size()
-    }
-
-    /// Twiddle of one block at one layer, see [`Twiddles::twiddle`].
-    #[inline]
-    pub fn twiddle(&self, layer: usize, block: usize) -> F64 {
-        self.tw.twiddle(layer, block)
-    }
-
-    /// Recover novel-basis coefficients from evaluations with a scalar inverse NTT.
-    pub fn inverse_transform(&self, data: &mut [F64]) {
-        self.tw.inverse_transform(data)
-    }
-
-    /// RS-encode a message already stored in the codeword's first replica.
-    ///
-    /// # Overview
-    ///
-    /// - The message fills the first `1 / 2^r` of the buffer, `r` the log inverse rate.
-    /// - It is row-major: word `row * n + lane` for `n` interleaved lanes.
-    /// - The buffer ends as `2^r` copies of it, each transformed from layer `r` on.
-    ///
-    /// The replication is free: the first pass reads its rows from the message itself, see [`Self::transform`].
-    pub fn encode_interleaved_in_place(&self, data: &mut [F64], num_ntts: usize, log_inv_rate: usize) {
-        self.transform(&mut Window::new(data, num_ntts, 0), log_inv_rate, Source::InPlace, None, false);
-    }
-
-    /// Encode a lane-major message, handing `on_rows` every finished block, and keep what `keep` asks for.
-    ///
-    /// - The result equals [`transpose_lane_major`] into block 0 followed by the in-place encode.
-    /// - With a gathered first pass, that pass reads the message itself and writes every block.
-    /// - So no transposed copy of the message is written and read back.
-    /// - With [`Keep::Nothing`], if a single such pass covers the layers before the deep pass, the codeword is never whole:
-    ///   the encode runs once per half of the cosets, in one half-size buffer, and the deep pass goes to `on_rows` only.
-    /// - Otherwise the codeword is whole and the encode is as the in-place one.
-    ///
-    /// `repeats` tags the message's blocks of `2^EQUAL_BLOCK_LOG` words that equal their predecessor, or is empty.
-    /// The stage fill copies the lines of a repeat from the stage instead of reading them, see [`stage_copies`].
-    pub fn encode_lane_major(
-        &self,
-        msg: &[F64],
-        repeats: &[bool],
-        n_lanes: usize,
-        num_ntts: usize,
-        log_inv_rate: usize,
-        keep: Keep,
-        on_rows: &RowSink<'_>,
-    ) -> Encoded {
-        assert!(0 < n_lanes && n_lanes <= num_ntts, "a row holds its lanes");
-        assert!(log_inv_rate >= 1, "a codeword has at least two cosets");
-        let msg_rows = msg.len() / n_lanes;
-        assert_eq!(msg.len(), n_lanes * msg_rows, "the message is n_lanes lane blocks");
-        let log_d = log2_strict_usize(msg_rows) + log_inv_rate;
-        let rebuildable =
-            Plan::for_lanes(log_d, num_ntts, log_inv_rate).is_some_and(|plan| plan.single_gathered_pass());
-        let by_halves = keep == Keep::Nothing && rebuildable;
-        let defer_deep = by_halves || keep == Keep::BeforeDeep;
-        // The cosets one pass holds: half of them when the opening rebuilds the rows.
-        let held = (1usize << log_inv_rate) >> usize::from(by_halves);
-        let mut deep = None;
-        // Every word is written by the gathered pass before the deep pass reads it.
-        let data = primitives::filled_vec((held * msg_rows) * num_ntts, |data| {
-            for first in (0..1usize << log_inv_rate).step_by(held).rev() {
-                let src = Source::Lanes(Lanes { words: msg, repeats, n_lanes });
-                let mut win = Window::new(data, num_ntts, first);
-                deep = self.transform(&mut win, log_inv_rate, src, Some(on_rows), defer_deep);
-            }
-        });
-        Encoded { words: if by_halves { Vec::new() } else { data }, deep }
-    }
-
     /// RS-encode a message coset by coset, handing `on_rows` every finished block of rows and writing no codeword.
     ///
     /// - The codeword is `2^r` cosets, each an independent transform of one copy of the message, from layer `r` on.
@@ -199,125 +62,6 @@ impl AdditiveNttF64 {
         let (first, end) = (log_inv_rate, log_d);
         self.layers().run(buf, Some(msg), log_d, num_ntts, first, end, log_inv_rate, coset, None, no_hook);
     }
-
-    /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.
-    ///
-    /// - The result equals encoding in place.
-    /// - Every codeword word is written before it is read, so the codeword may start uninitialized.
-    /// - The blocks are as for the in-place encode.
-    /// - With `defer_deep`, the deep pass is not written back: each deep sub-block is finished in scratch
-    ///   and handed to `on_rows` from there.
-    /// - The buffer then keeps what the gathered passes left, and [`Self::finish_rows`] finishes any row again.
-    /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless the codeword is exactly `2^r` messages long.
-    #[timed]
-    pub fn encode_interleaved_with(
-        &self,
-        data: &mut [F64],
-        msg: &[F64],
-        num_ntts: usize,
-        log_inv_rate: usize,
-        defer_deep: bool,
-        on_rows: &RowSink<'_>,
-    ) -> Option<Plan> {
-        assert_eq!(
-            msg.len() << log_inv_rate,
-            data.len(),
-            "the codeword is 2^log_inv_rate messages"
-        );
-        let mut win = Window::new(data, num_ntts, 0);
-        self.transform(&mut win, log_inv_rate, Source::Rows(msg), Some(on_rows), defer_deep)
-    }
-
-    /// Run layers `start..d` of a `2^d`-row transform in as few sweeps of the buffer as possible.
-    ///
-    /// A large transform is bound by memory bandwidth, so its cost is its number of sweeps.
-    ///
-    /// # Plan
-    ///
-    /// ```text
-    ///     layers:  start ............ deep_start ............ d
-    ///              |---- gathered passes ----|---- deep pass ----|
-    ///
-    ///     gathered pass:  one task per row group of 2^g rows, 2^(d - layer - g) apart
-    ///                     gathered into L2 scratch, all g layers run there, written back
-    ///     deep pass:      one task per run of contiguous sub-blocks, at least an L2 budget of rows,
-    ///                     its layers run in place (or in scratch, when a separate message has to be copied in)
-    /// ```
-    ///
-    /// - When every layer fits one L3-sized sub-block, the deep pass is the whole transform: one sweep.
-    /// - Otherwise gathered passes run until the rest fits one L2-sized sub-block.
-    /// - With `n` words a row, a block of up to `(L2 words / n)^2` rows then costs two sweeps.
-    ///
-    /// # With a message
-    ///
-    /// - The layer-`start` blocks are not in the buffer yet: each is a copy of the message, see [`Source`].
-    /// - The first pass reads its rows from the message instead.
-    /// - A lane-major message is read by that pass directly.
-    ///   A plan with no such pass transposes it into block 0 of the buffer and encodes in place.
-    /// - Its `first_coset` and the buffer's size give the layer-`start` blocks the buffer holds.
-    /// - Twiddles and rows handed to `on_rows` stay global.
-    ///
-    /// # Why block 0 goes last
-    ///
-    /// - The message may be the buffer's own block 0.
-    /// - So a gathered task visits blocks in descending order, and overwrites block 0 last.
-    /// - Tasks own disjoint row residues, so no task reads rows another task writes.
-    ///
-    /// # Finished rows
-    ///
-    /// - Each deep sub-block is final, and hands its rows to `on_rows` while they are in L2.
-    /// - Without a split deep pass, the rows go over in parallel blocks at the end.
-    /// - With `defer_deep`, the deep pass's results go only to `on_rows`, not back into the buffer.
-    fn transform(
-        &self,
-        win: &mut Window,
-        start: usize,
-        mut src: Source<'_>,
-        on_rows: Option<&RowSink<'_>>,
-        defer_deep: bool,
-    ) -> Option<Plan> {
-        // The buffer is 2^log_d rows of `num_ntts` words, or the layer-`start` blocks of a lane-major message.
-        let (num_ntts, log_d) = (win.num_ntts(), src.log_d(win, start));
-        assert!(log_d <= self.tw.log_domain_size());
-        assert!(start <= log_d);
-
-        // The plan reads the original message, before a lane-major one is transposed.
-        let plan = Plan::new(log_d, num_ntts, start, l2_words(matches!(src, Source::Lanes(_))));
-
-        // Phase 1: gathered passes, each at most one L2 group of layers.
-        //
-        // Only the first one reads the message.
-        // A lane-major message is read by the first gathered pass, a batch of residues at a time.
-        // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
-        if matches!(src, Source::Lanes(_)) && Plan::for_lanes(log_d, num_ntts, start).is_none() {
-            assert_eq!(win.len() / num_ntts, 1 << log_d, "a partial buffer needs the gathered pass");
-            src = src.transpose_into(win, log_d - start);
-        }
-        for (layer, g) in plan.gathered() {
-            GatheredPass::new(&plan, win, layer, g, src.take()).run(self.layers(), win);
-        }
-
-        // Phase 2: replicas a deep-only plan cannot build inside its tasks.
-        src = src.replicate(win, start, plan.has_deep());
-
-        // A lone sub-block runs on this thread, so its rows go over in parallel afterwards.
-        let deep_rows = on_rows.filter(|_| plan.fuses_rows());
-
-        // Phase 3: the deep pass, one task per run of contiguous sub-blocks.
-        if plan.has_deep() {
-            DeepPass::new(&plan, deep_rows, defer_deep).run(self.layers(), win, src);
-        }
-
-        if let Some(f) = on_rows.filter(|_| !plan.fuses_rows()) {
-            let log_rows = plan.log_handover_rows();
-            parallel::chunks_mut(win.words_mut(), num_ntts << log_rows, |i, rows| f(i << log_rows, rows));
-        }
-        (defer_deep && deep_rows.is_some() && matches!(src, Source::Replicas)).then_some(plan)
-    }
 }
 
 /// Words of one coset a coset-major encode may span.
@@ -330,31 +74,6 @@ impl AdditiveNttF64 {
 /// - A larger coset spills to DRAM, and then the codeword's write pass is the cheaper plan.
 const COSET_WORDS: usize = 1 << 19;
 
-/// One cache line of words.
-#[derive(Clone, Copy)]
-#[repr(C, align(64))]
-pub(super) struct Line([F64; 8]);
-
-/// Lend this thread's scratch buffer, grown to the requested length.
-///
-/// - It is cache-line aligned, so a full-width load never splits a line.
-/// - It lives as long as the thread, so no pass allocates in its hot loop.
-pub(super) fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
-    thread_local! {
-        static SCRATCH: RefCell<Vec<Line>> = const { RefCell::new(Vec::new()) };
-    }
-    SCRATCH.with_borrow_mut(|lines| {
-        // Grow only; a later, smaller request reuses the same lines.
-        if lines.len() * 8 < len {
-            lines.resize(len.div_ceil(8), Line([F64::ZERO; 8]));
-        }
-        // SAFETY:
-        // - A line is exactly eight contiguous words, with no padding.
-        // - The buffer holds at least the requested words, all initialized.
-        f(unsafe { std::slice::from_raw_parts_mut(lines.as_mut_ptr().cast::<F64>(), len) })
-    })
-}
-
 /// Test oracle: fill every replica with a copy of a message held elsewhere.
 #[cfg(test)]
 fn replicate_rows(data: &mut [F64], msg: &[F64]) {
@@ -366,7 +85,10 @@ fn replicate_rows(data: &mut [F64], msg: &[F64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ntt::encode::{Encoded, Encoder, Keep};
+    use crate::ntt::source::Source;
     use crate::ntt::stage::transpose_lane_major;
+    use crate::ntt::window::Window;
     use crate::stack_open::EQUAL_BLOCK_LOG;
     use primitives::test_rng::Rng;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -423,7 +145,7 @@ mod tests {
             let mut a = orig.clone();
             forward_scalar_from_layer(&ntt, &mut a, 1, 0);
             let mut c = orig.clone();
-            ntt.transform(&mut Window::new(&mut c, 1, 0), 0, Source::Replicas, None, false);
+            Encoder::new(&ntt.tw).transform(&mut Window::new(&mut c, 1, 0), 0, Source::Replicas, None, false);
             assert_eq!(a, c, "parallel == scalar at log_d={log_d}");
 
             ntt.inverse_transform(&mut a);
@@ -470,7 +192,8 @@ mod tests {
             forward_scalar_from_layer(&ntt, &mut want, lanes, start_layer);
             // Under test: the pass-planning driver.
             let mut got = original;
-            ntt.transform(&mut Window::new(&mut got, lanes, 0), start_layer, Source::Replicas, None, false);
+            let mut win = Window::new(&mut got, lanes, 0);
+            Encoder::new(&ntt.tw).transform(&mut win, start_layer, Source::Replicas, None, false);
 
             assert_eq!(got, want, "log_d={log_d}, lanes={lanes}, start_layer={start_layer}");
         }
@@ -573,7 +296,8 @@ mod tests {
                 if lane >= row_words - n_lanes {
                     let block = row_words - 1 - lane;
                     replicate_rows(&mut want, &msg[block * rows..(block + 1) * rows]);
-                    ntt.transform(&mut Window::new(&mut want, 1, 0), log_inv_rate, Source::Replicas, None, false);
+                    let mut win = Window::new(&mut want, 1, 0);
+                    Encoder::new(&ntt.tw).transform(&mut win, log_inv_rate, Source::Replicas, None, false);
                 }
                 for pos in 0..block_len {
                     assert_eq!(

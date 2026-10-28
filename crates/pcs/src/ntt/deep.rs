@@ -2,7 +2,8 @@
 
 use primitives::field::F64;
 
-use super::additive_ntt_f64::{RowSink, with_scratch};
+use super::encode::RowSink;
+use super::scratch::with_scratch;
 use super::drain::{Drain, LateDrain};
 use super::layers::{Layers, no_hook};
 use super::plan::Plan;

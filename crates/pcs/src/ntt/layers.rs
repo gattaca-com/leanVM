@@ -19,6 +19,11 @@ impl<'t> Layers<'t> {
     pub(super) fn new(twiddles: &'t Twiddles) -> Self {
         Self(twiddles)
     }
+
+    /// Log of the number of points of the domain.
+    pub(super) fn log_domain_size(self) -> usize {
+        self.0.log_domain_size()
+    }
 }
 
 impl Layers<'_> {

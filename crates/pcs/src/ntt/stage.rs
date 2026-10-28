@@ -4,7 +4,7 @@ use flux_profiler::timed;
 use primitives::field::F64;
 use primitives::stream::Stream;
 
-use super::additive_ntt_f64::with_scratch;
+use super::scratch::with_scratch;
 use super::source::Lanes;
 use super::window::STREAM_MIN_WORDS;
 use crate::stack_open::EQUAL_BLOCK_LOG;

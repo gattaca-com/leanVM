@@ -3,7 +3,7 @@
 use flux_profiler::timed;
 use primitives::field::F64;
 
-use super::additive_ntt_f64::with_scratch;
+use super::scratch::with_scratch;
 use super::drain::{Drain, LateDrain};
 use super::layers::Layers;
 use super::plan::Plan;

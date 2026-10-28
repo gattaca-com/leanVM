@@ -3,7 +3,8 @@
 use flux_profiler::timed;
 use primitives::field::F64;
 
-use super::additive_ntt_f64::{AdditiveNttF64, with_scratch};
+use super::facade::AdditiveNttF64;
+use super::scratch::with_scratch;
 use super::layers::no_hook;
 use super::plan::Plan;
 use super::source::Lanes;

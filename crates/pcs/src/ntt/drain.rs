@@ -3,7 +3,7 @@
 use primitives::field::F64;
 use primitives::stream::Stream;
 
-use super::additive_ntt_f64::Line;
+use super::scratch::Line;
 
 /// A finished row group, leaving its scratch for the buffer a piece at a time.
 ///
