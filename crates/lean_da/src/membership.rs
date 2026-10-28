@@ -75,9 +75,8 @@ pub fn dual_codeword(z: &[F192]) -> Vec<F192> {
         }
     }
 
-    // SAFETY: `F192` is `repr(C)` over three `u64` and `F64` is `repr(transparent)`
-    // over `u64`, so the buffer is `3m` limb-interleaved `F64` words with no padding.
-    let limbs = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<F64>(), 3 * m) };
+    // `F192` is three `u64` limbs, so the buffer is `3m` limb-interleaved `F64` words.
+    let limbs: &mut [F64] = primitives::cast_slice_mut(&mut buffer);
     AdditiveNttF64::standard(LOG_M).encode_interleaved_in_place(limbs, 3, 1);
     buffer
 }

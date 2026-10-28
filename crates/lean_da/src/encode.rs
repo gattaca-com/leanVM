@@ -37,8 +37,7 @@ pub fn encode_rows(rows: &[u64]) -> Vec<u64> {
 
 /// Borrow native symbols as field elements without allocating or copying.
 pub(crate) fn as_field_mut(data: &mut [u64]) -> &mut [F64] {
-    // SAFETY: F64 is repr(transparent) over u64, with every bit pattern valid.
-    unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<F64>(), data.len()) }
+    primitives::cast_slice_mut(data)
 }
 
 #[cfg(test)]
