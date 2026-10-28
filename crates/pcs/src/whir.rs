@@ -348,11 +348,12 @@ pub(crate) fn ligero_commit_ext(
         .in_scope(|| {
             let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
             if by_cosets {
-                encode_cosets_ext(&ntt, mat, num_interleaved, log_inv_rate, &on_rows);
+                ntt.encode_cosets(words(mat), 3 * num_interleaved, log_inv_rate, &on_rows);
                 Some(Deferred::Cosets(ntt, log_inv_rate))
             } else {
                 let defer_deep = parallel::num_threads() >= DEFER_DEEP_MIN_THREADS;
-                encode_interleaved_ext(&ntt, mat, poly, num_interleaved, log_inv_rate, defer_deep, &on_rows)
+                let (mat, msg) = (words_mut(mat), words(poly));
+                ntt.encode_interleaved_with(mat, msg, 3 * num_interleaved, log_inv_rate, defer_deep, &on_rows)
                     .map(|rows| Deferred::Deep(ntt, rows))
             }
         })

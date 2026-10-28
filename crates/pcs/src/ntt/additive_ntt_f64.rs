@@ -848,6 +848,7 @@ mod tests {
         //
         //     (log_d, lanes, start)   plan
         //     (7, 3, 0)               deep pass only, a single sub-block
+        //     (7, 17 or 24, 0)        the same, with a vector tail or whole vectors
         //     (12, 8, 0 or 1)         one gathered pass, then deep sub-blocks
         //     (14, 64, 0 or 1)        one gathered pass, then deep sub-blocks
         //     (10, 2048, 0)           wide rows shrink the cache budgets: one gathered pass
@@ -859,6 +860,8 @@ mod tests {
         let mut rng = Rng::new(0xC0FFEE);
         for (log_d, lanes, start_layer) in [
             (7usize, 3usize, 0usize),
+            (7, 17, 0),
+            (7, 24, 0),
             (12, 8, 0),
             (12, 8, 1),
             (14, 64, 0),
@@ -1108,33 +1111,6 @@ mod tests {
             let rows = ntt.coset_rows(&msg, lanes, log_inv_rate, &positions);
             for (&q, row) in positions.iter().zip(rows.chunks_exact(lanes)) {
                 assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_rows={log_rows}, lanes={lanes}");
-            }
-        }
-    }
-
-    #[test]
-    fn interleaved_lanes_are_independent_ntts() {
-        let ntt = AdditiveNttF64::standard(10);
-        let mut rng = Rng::new(2);
-        let log_d = 7;
-        let n = 1usize << log_d;
-        for lanes in [1usize, 2, 4, 8, 17, 24, 64] {
-            // SoA buffer + per-lane copies.
-            let mut soa = vec![F64::ZERO; n * lanes];
-            let mut per_lane: Vec<Vec<F64>> = vec![vec![F64::ZERO; n]; lanes];
-            for pos in 0..n {
-                for lane in 0..lanes {
-                    let v = F64(rng.next_u64());
-                    soa[pos * lanes + lane] = v;
-                    per_lane[lane][pos] = v;
-                }
-            }
-            ntt.transform(&mut soa, lanes, 0, Msg::Buffer, None, false);
-            for (lane, lane_data) in per_lane.iter_mut().enumerate() {
-                forward_scalar_from_layer(&ntt, lane_data, 1, 0);
-                for pos in 0..n {
-                    assert_eq!(soa[pos * lanes + lane], lane_data[pos]);
-                }
             }
         }
     }

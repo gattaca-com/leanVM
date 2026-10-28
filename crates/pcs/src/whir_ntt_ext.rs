@@ -21,55 +21,11 @@
 //!
 //! Every butterfly acts on each coefficient alone, so the encode runs as the base transform over `3n` lanes.
 
-use flux_profiler::timed;
-use crate::ntt::{AdditiveNttF64, DeepRows, RowSink};
 use primitives::field::{F64, F192};
 
 // An E element is exactly three K words, with no padding, so the two views line up.
 const _: () = assert!(size_of::<F192>() == 3 * size_of::<F64>());
 const _: () = assert!(align_of::<F192>() == align_of::<F64>());
-
-/// RS-encode a row-major E-valued message into a codeword, overwriting all of it.
-///
-/// - The codeword is `2^r` copies of the message, each transformed from layer `r` on.
-/// - Here `r` is the log inverse rate.
-/// - The codeword may start uninitialized.
-/// - `on_rows` gets every finished block of rows, as K words.
-/// - With `defer_deep`, the deep pass is not written back: see [`AdditiveNttF64::encode_interleaved_with`].
-///
-/// # Panics
-///
-/// Panics unless the lane count is a power of two.
-#[timed]
-pub(crate) fn encode_interleaved_ext(
-    ntt: &AdditiveNttF64,
-    mat: &mut [F192],
-    msg: &[F192],
-    num_ntts: usize,
-    log_inv_rate: usize,
-    defer_deep: bool,
-    on_rows: &RowSink<'_>,
-) -> Option<DeepRows> {
-    let (mat, msg) = k_words(mat, msg, num_ntts);
-    ntt.encode_interleaved_with(mat, msg, 3 * num_ntts, log_inv_rate, defer_deep, on_rows)
-}
-
-/// [`encode_interleaved_ext`] coset by coset, with no codeword: see [`AdditiveNttF64::encode_cosets`].
-pub(crate) fn encode_cosets_ext(
-    ntt: &AdditiveNttF64,
-    msg: &[F192],
-    num_ntts: usize,
-    log_inv_rate: usize,
-    on_rows: &RowSink<'_>,
-) {
-    ntt.encode_cosets(words(msg), 3 * num_ntts, log_inv_rate, on_rows);
-}
-
-/// Both buffers as K words: each row of n E lanes becomes 3n K lanes.
-fn k_words<'a>(mat: &'a mut [F192], msg: &'a [F192], num_ntts: usize) -> (&'a mut [F64], &'a [F64]) {
-    assert!(num_ntts.is_power_of_two());
-    (words_mut(mat), words(msg))
-}
 
 /// A slice of E elements as its K words, shared.
 pub(crate) fn words(v: &[F192]) -> &[F64] {
@@ -84,6 +40,7 @@ pub(crate) fn words_mut(v: &mut [F192]) -> &mut [F64] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ntt::AdditiveNttF64;
     use primitives::log2_strict_usize;
     use primitives::test_rng::Rng;
 
@@ -145,7 +102,7 @@ mod tests {
             forward_scalar(&ntt, &mut want, lanes, rate);
             // Under test: a zeroed codeword, filled by the encode alone.
             let mut got = vec![F192::ZERO; want.len()];
-            encode_interleaved_ext(&ntt, &mut got, &msg, lanes, rate, false, &|_, _| {});
+            ntt.encode_interleaved_with(words_mut(&mut got), words(&msg), 3 * lanes, rate, false, &|_, _| {});
             assert_eq!(got, want, "log_d={log_d}, lanes={lanes}, rate={rate}");
         }
     }
