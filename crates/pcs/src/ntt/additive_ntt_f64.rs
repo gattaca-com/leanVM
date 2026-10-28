@@ -727,7 +727,7 @@ impl AdditiveNttF64 {
                                 match &stream {
                                     Some(s) if deferred => {
                                         // The previous sub-block drains while this one transforms.
-                                        let hook = || drain.step(s, drain_per_hook);
+                                        let hook = || drain.step(Some(s), drain_per_hook);
                                         self.run_layers_to(
                                             scratch,
                                             from,
@@ -740,7 +740,7 @@ impl AdditiveNttF64 {
                                             None,
                                             hook,
                                         );
-                                        drain.step(s, usize::MAX);
+                                        drain.step(Some(s), usize::MAX);
                                         if let Some(f) = deep_rows {
                                             f(sub_idx << log_sub, scratch);
                                         }
@@ -782,7 +782,7 @@ impl AdditiveNttF64 {
                                 }
                             }
                             if let Some(s) = &stream {
-                                drain.step(s, usize::MAX);
+                                drain.step(Some(s), usize::MAX);
                             }
                         });
                     });
@@ -822,236 +822,6 @@ impl AdditiveNttF64 {
             start,
             deep_start,
         })
-    }
-
-    /// Run layers `layer..layer + g` in one sweep of the buffer, one row group at a time.
-    ///
-    /// # Row groups
-    ///
-    /// - A group takes rows `r + i * step`, for `i < 2^g`, of one layer-`layer` block.
-    /// - Here `step = 2^(d - layer - g)` and the residue `r < step`.
-    /// - Those are exactly the rows the next `g` layers pair with each other.
-    ///
-    /// ```text
-    ///     g = 2, a 16-row block, step = 4, residue r = 1:
-    ///
-    ///     rows:     0  1  2  3 |  4  5  6  7 |  8  9 10 11 | 12 13 14 15
-    ///                  ^              ^              ^              ^
-    ///     scratch:  [ row 1, row 5, row 9, row 13 ]   ->  a 4-row transform of its own
-    /// ```
-    ///
-    /// # Why the twiddles still match
-    ///
-    /// - At layer `L`, a row's block index is `row >> (d - L)`.
-    /// - The residue is below `step`, so that shift drops it.
-    /// - The scratch transform therefore takes the same twiddles as the full one.
-    ///
-    /// # With a message
-    ///
-    /// - Every block's rows come from the message.
-    /// - One task takes one residue across all blocks, block 0 last.
-    ///
-    /// # Streaming the scatter
-    ///
-    /// - A burst of streaming stores after each group saturates the write-combining buffers and overlaps nothing.
-    /// - So a streaming task keeps two scratches and drains the previous group during this group's transform.
-    /// - The sweeps call a hook once per row group, and each call moves an equal share of the previous group's lines.
-    /// - The shares round up, so the group is out by the last call.
-    /// - The task's last group drains after its loop, before the fence.
-    ///
-    /// # Why a late scatter is safe
-    ///
-    /// - Group k's rows reach the codeword after group k+1 gathered, so group k+1 must not read them.
-    /// - Without a message, a group reads only its own rows, and groups are disjoint.
-    /// - With a message, group k+1 reads the message rows of one residue `t`, and group k writes one block's rows.
-    /// - If group k is block `b > 0` of residue `t`, it writes block `b`, which is not the message.
-    /// - If group k is block 0 of residue `t`, group k+1 is residue `t + 1`, whose rows it does not write.
-    /// - Group k+2 gathers into the scratch group k drained, and that drain ended with group k+1's transform.
-    ///
-    /// Without whole cache lines (rows or codeword start off 64 bytes), a group scatters at once.
-    ///
-    /// # With a lane-major message
-    ///
-    /// - Word `w` of message row `j` is word `j` of lane block `num_ntts - 1 - w`, and zero below the padding.
-    /// - A lane block's cache line holds [`BATCH`] consecutive rows, so a task takes that many residues.
-    /// - It goes one octet of lanes at a time, and the octet of the residues is 64 lanes of one transform.
-    /// - It transposes those lanes into a stage of `2^g` rows of 64 words, one line per residue.
-    /// - Each block gathers a copy of the stage, transforms it, and scatters line by line.
-    /// - The footprint is a few `2^g * 64` word buffers, however many lanes the message has.
-    /// - Every block, block 0 too, is written from the stage, so the message is never overwritten.
-    /// - The buffer may hold only the blocks from `first_block` on, as many as it fits.
-    #[allow(clippy::too_many_arguments)]
-    #[timed]
-    fn gathered_pass(
-        &self,
-        data: &mut [F64],
-        log_d: usize,
-        num_ntts: usize,
-        layer: usize,
-        g: usize,
-        msg: Option<parallel::SendPtr<F64>>,
-        lane_major: Option<(usize, &[bool])>,
-        stream: bool,
-        first_block: usize,
-    ) {
-        let (lane_major, repeats) = lane_major.map_or((None, &[][..]), |(n_lanes, repeats)| (Some(n_lanes), repeats));
-        // A group is 2^g rows, `step` rows apart.
-        let log_step = log_d - layer - g;
-        let (rows, step) = (1usize << g, 1usize << log_step);
-        // With a message, a task is one residue across every block, or a batch of residues when it is lane-major.
-        // Without one, a task is one (block, residue) pair.
-        let subs = stage_subs(lane_major.is_some(), log_step);
-        let batch = if lane_major.is_some() { BATCH * subs } else { 1 };
-        let n_tasks = if msg.is_some() { step / batch } else { step << layer };
-        // The blocks of `layer` the buffer holds, from `first_block` on.
-        let blocks_held = (data.len() / num_ntts) >> (log_d - layer);
-        // The message's rows. A lane-major group is an octet of lanes of a batch of residues, held in a stage.
-        let msg_rows = 1usize << (log_d - layer);
-        let width = if lane_major.is_some() { BATCH * 8 } else { num_ntts };
-        let stage_len = if lane_major.is_some() { subs * rows * width } else { 0 };
-        let base = parallel::SendPtr(data.as_mut_ptr());
-        // Whole cache lines in every row, so a finished group can drain a line at a time.
-        let lines_ok = num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
-        let hooks = hook_calls(layer + g, layer, layer + g, layer);
-        // A small group's rows arrive without help, and its bookkeeping would cost more than it saves.
-        let fetch_ahead = rows * num_ntts >= FETCH_AHEAD_MIN_WORDS;
-        let drain_per_hook = (rows * width / 8).div_ceil(hooks);
-        let copies = lane_major.map_or_else(StageCopies::none, |n_lanes| {
-            stage_copies(repeats, log_step, rows, msg_rows, n_lanes, num_ntts)
-        });
-        parallel::for_each_chunk(n_tasks, |lo, hi| {
-            // One L2-resident scratch of 2^g rows serves every group of the task.
-            // A draining task has two: one transforms while the other empties.
-            let deferred = stream && lines_ok;
-            with_scratch(stage_len + rows * width * (1 + usize::from(deferred)), |all| {
-                // One fence at the end of the task covers all its streaming stores.
-                let stream = stream.then(Stream::new);
-                let (stage, both) = all.split_at_mut(stage_len);
-                let (mut scratch, mut idle) = both.split_at_mut(rows * width);
-                let mut drain = Drain::default();
-                // `next`: the first row of the group after this one, and which share of its lines this group fetches.
-                // `staged`: the group's rows, when a stage holds them.
-                // `col`: the first word of the group's lanes in a codeword row, which is nonzero for an octet.
-                let mut group = |block: usize,
-                                 r: usize,
-                                 next: Option<(*const F64, std::ops::Range<usize>)>,
-                                 staged: &[F64],
-                                 col: usize| {
-                    // Row `i` of the group, as a word offset inside its block.
-                    let row = |i: usize| (r + (i << log_step)) * num_ntts;
-                    let block_off = ((block - first_block) << (log_d - layer)) * num_ntts;
-                    // Gather: the scattered rows become one contiguous 2^g-row buffer.
-                    // A stage already is one: the first sweep reads it.
-                    let from = Some(staged).filter(|s| !s.is_empty());
-                    if from.is_none() {
-                        for (i, dst) in scratch.chunks_exact_mut(width).enumerate() {
-                            // SAFETY:
-                            // - The message and the codeword both cover every row addressed here.
-                            // - Tasks own disjoint residues, so no other task writes these rows.
-                            // - Block 0 is written last, after every read of the message in it.
-                            let src = unsafe {
-                                match msg {
-                                    Some(m) => std::slice::from_raw_parts(m.add(row(i)), num_ntts),
-                                    None => base.slice(block_off + row(i), num_ntts),
-                                }
-                            };
-                            dst.copy_from_slice(src);
-                        }
-                    }
-                    // Transform: a (layer + g)-layer domain whose sub-block index is the global block.
-                    let (log_n, outer) = (layer + g, layer);
-                    match &stream {
-                        Some(s) if deferred => {
-                            // The previous group drains while this one transforms; the rest drains now.
-                            let (first, lines) = next.unwrap_or((std::ptr::null(), 0..0));
-                            let mut fetch = prefetch_rows(first, num_ntts, step * num_ntts, lines, hooks);
-                            self.run_layers_to(scratch, from, log_n, width, layer, log_n, outer, block, None, || {
-                                drain.step(s, drain_per_hook);
-                                fetch();
-                            });
-                            drain.step(s, usize::MAX);
-                            // This group drains during the next transform, while the other scratch is gathered into.
-                            drain = Drain {
-                                // SAFETY: the group's first row lies inside the codeword.
-                                dst: unsafe { base.0.add(block_off + row(0) + col) },
-                                src: scratch.as_ptr(),
-                                row_len: width,
-                                dst_stride: step * num_ntts,
-                                // The lines of a staged row are consecutive residues, so whole codeword rows apart.
-                                line_stride: if staged.is_empty() { 8 } else { num_ntts },
-                                rows,
-                                ..Drain::default()
-                            };
-                            std::mem::swap(&mut scratch, &mut idle);
-                        }
-                        _ => {
-                            self.run_layers_to(scratch, from, log_n, width, layer, log_n, outer, block, None, no_hook);
-                            // Scatter: every row returns to its place, a staged row as one line per residue.
-                            let piece = if staged.is_empty() { num_ntts } else { 8 };
-                            for (i, row_src) in scratch.chunks_exact(width).enumerate() {
-                                for (l, src) in row_src.chunks_exact(piece).enumerate() {
-                                    // SAFETY: this group alone owns these words of the codeword.
-                                    let dst = unsafe { base.slice(block_off + row(i) + l * num_ntts + col, piece) };
-                                    match &stream {
-                                        Some(s) => s.copy(dst, src),
-                                        None => dst.copy_from_slice(src),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                };
-                let lines = rows * num_ntts / 8;
-                for t in lo..hi {
-                    if let (Some(m), Some(n_lanes)) = (msg, lane_major) {
-                        // A task is a batch of residues: transpose an octet of lanes into the stage, then run each block.
-                        let t0 = t * batch;
-                        // No fetch-ahead: a batch's lines sit 16 KB apart in blocks 16 MB apart, so they share
-                        // a few L2 and L3 sets. Lines fetched a batch early are evicted before the fill reads them.
-                        for octet in 0..num_ntts / 8 {
-                            fill_stage(
-                                stage,
-                                m.0.cast_const(),
-                                t0,
-                                log_step,
-                                msg_rows,
-                                n_lanes,
-                                num_ntts,
-                                octet,
-                                &copies,
-                                subs,
-                            );
-                            for block in (first_block..first_block + blocks_held).rev() {
-                                for (u, staged) in stage.chunks_exact(rows * width).enumerate() {
-                                    group(block, t0 + u * BATCH, None, staged, 8 * octet);
-                                }
-                            }
-                        }
-                    } else if let Some(m) = msg {
-                        // Block 0 may be the message itself, so it is transformed last.
-                        // The residue after this one reads fresh rows: its lines are fetched over this one's groups.
-                        let blocks = 1usize << layer;
-                        for (k, block) in (0..blocks).rev().enumerate() {
-                            let next = (fetch_ahead && t + 1 < hi).then(|| {
-                                let first = m.0.cast_const().wrapping_add((t + 1) * num_ntts);
-                                (first, (k * lines) >> layer..((k + 1) * lines) >> layer)
-                            });
-                            group(block, t, next, &[], 0);
-                        }
-                    } else {
-                        // Task index = block * step + residue; the next task reads its own, disjoint rows.
-                        let next = (fetch_ahead && t + 1 < hi).then(|| {
-                            let (block, r) = ((t + 1) >> log_step, (t + 1) & (step - 1));
-                            (base.0.cast_const().wrapping_add(((block << (log_d - layer)) + r) * num_ntts), 0..lines)
-                        });
-                        group(t >> log_step, t & (step - 1), next, &[], 0);
-                    }
-                }
-                if let Some(s) = &stream {
-                    drain.step(s, usize::MAX);
-                }
-            });
-        });
     }
 
     /// Run a range of layers in place over one sub-block of the domain.
@@ -1101,7 +871,7 @@ impl AdditiveNttF64 {
     /// That sweep loads from `src` and stores to `buf`, and the blocks it skips are not copied.
     /// Later sweeps work inside the blocks of the first, so they never read a word that was not copied.
     #[allow(clippy::too_many_arguments)]
-    fn run_layers_to(
+    pub(super) fn run_layers_to(
         &self,
         buf: &mut [F64],
         mut src: Option<&[F64]>,
@@ -1261,7 +1031,7 @@ fn for_each_block(num_blocks: usize, log_rows: usize, live: Option<&[usize]>, mu
 }
 
 /// How many times [`AdditiveNttF64::run_layers`] calls its hook over `first_layer..end_layer`.
-fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usize) -> usize {
+pub(super) fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usize) -> usize {
     let (mut layer, mut calls) = (first_layer, 0);
     while layer < end_layer {
         let block_size = 1usize << (log_d - layer);
@@ -1273,57 +1043,62 @@ fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usi
     calls
 }
 
-/// A finished row group of a gathered pass, leaving its scratch for the codeword a few lines at a time.
+/// A finished row group, leaving its scratch for the buffer a piece at a time.
 ///
-/// - `dst` is the group's first row in the codeword, `dst_stride` words before its next.
-/// - Line `l` of a row lands `l * line_stride` words after the row: 8 for a row that stays whole.
-/// - `src` is the group's contiguous scratch.
-/// - `row`, `line` are the next cache line to move.
-/// - Both sides are whole, aligned cache lines: the caller checks the codeword's alignment and `row_len % 8 == 0`.
-struct Drain {
-    dst: *mut F64,
-    src: *const F64,
-    row_len: usize,
-    dst_stride: usize,
-    line_stride: usize,
-    rows: usize,
-    row: usize,
-    line: usize,
+/// - `dst` is the group's first row in the buffer, `dst_stride` words before its next.
+/// - A scratch row is `row_len` words and lands in pieces of `piece` words, `piece_stride` words apart.
+/// - `src` is the group's contiguous scratch, and `row`, `k` are the next piece to move.
+/// - A streaming drain moves whole aligned cache lines: `piece` is 8, and the caller checks the alignment.
+pub(super) struct Drain {
+    pub(super) dst: *mut F64,
+    pub(super) src: *const F64,
+    pub(super) row_len: usize,
+    pub(super) dst_stride: usize,
+    pub(super) piece: usize,
+    pub(super) piece_stride: usize,
+    pub(super) rows: usize,
+    pub(super) row: usize,
+    pub(super) k: usize,
 }
 
 impl Default for Drain {
-    /// A group with no rows left to move.
+    /// A group with no rows left to move, in whole lines.
     fn default() -> Self {
         Self {
             dst: std::ptr::null_mut(),
             src: std::ptr::null(),
             row_len: 0,
             dst_stride: 0,
-            line_stride: 8,
+            piece: 8,
+            piece_stride: 8,
             rows: 0,
             row: 0,
-            line: 0,
+            k: 0,
         }
     }
 }
 
 impl Drain {
-    /// Stream out up to `lines` more cache lines.
+    /// Move up to `pieces` more pieces: streamed, or stored normally without a stream.
     #[inline(always)]
-    fn step(&mut self, stream: &Stream, lines: usize) {
-        for _ in 0..lines.min((self.rows - self.row) * (self.row_len / 8) - self.line) {
+    pub(super) fn step(&mut self, stream: Option<&Stream>, pieces: usize) {
+        let per_row = self.row_len / self.piece;
+        for _ in 0..pieces.min((self.rows - self.row) * per_row - self.k) {
             // SAFETY:
-            // - The cursor is inside the group, so both lines are in bounds and line-aligned.
-            // - Only this group's owner writes these rows of the codeword.
-            // - The scratch half is neither written nor gathered into until its group has drained.
+            // - The cursor is inside the group, so both pieces are in bounds, and line-aligned when streamed.
+            // - Only this group's owner writes these rows of the buffer.
+            // - The scratch is neither written nor gathered into until its group has drained.
             unsafe {
-                let dst = self.dst.add(self.row * self.dst_stride + self.line * self.line_stride);
-                let src = self.src.add(self.row * self.row_len + self.line * 8);
-                stream.copy_lines(dst.cast::<Line>(), &*src.cast::<Line>());
+                let dst = self.dst.add(self.row * self.dst_stride + self.k * self.piece_stride);
+                let src = self.src.add(self.row * self.row_len + self.k * self.piece);
+                match stream {
+                    Some(s) => s.copy_lines(dst.cast::<Line>(), &*src.cast::<Line>()),
+                    None => dst.copy_from_nonoverlapping(src, self.piece),
+                }
             }
-            self.line += 1;
-            if self.line == self.row_len / 8 {
-                (self.row, self.line) = (self.row + 1, 0);
+            self.k += 1;
+            if self.k == per_row {
+                (self.row, self.k) = (self.row + 1, 0);
             }
         }
     }
@@ -1350,41 +1125,6 @@ fn prefetch_spread(base: &parallel::SendPtr<F64>, start: usize, words: usize, ca
             };
         }
         done = end;
-    }
-}
-
-/// A hook that prefetches cache lines `lines` of a row group into L2, evenly over `calls` calls.
-///
-/// - The group's rows are `row_words` words long and `stride` words apart, from `first`.
-/// - Line `n` is line `n % (row_words / 8)` of row `n / (row_words / 8)`.
-fn prefetch_rows(
-    first: *const F64,
-    row_words: usize,
-    stride: usize,
-    lines: std::ops::Range<usize>,
-    calls: usize,
-) -> impl FnMut() {
-    let per_row = row_words / 8;
-    let mut left = lines.len();
-    // A group with nothing to fetch divides nothing.
-    let per_call = if left == 0 { 0 } else { left.div_ceil(calls) };
-    // The cursor: the next line's row and its offset inside the row, so no call divides.
-    let (mut row, mut col) = if left == 0 { (0, 0) } else { (lines.start / per_row, lines.start % per_row) };
-    move || {
-        for _ in 0..per_call.min(left) {
-            // Only an address is formed, never a reference.
-            let line = first.wrapping_add(row * stride + col * 8);
-            // SAFETY: a prefetch of any address is harmless.
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(line.cast())
-            };
-            col += 1;
-            if col == per_row {
-                (row, col) = (row + 1, 0);
-            }
-        }
-        left = left.saturating_sub(per_call);
     }
 }
 
@@ -1719,7 +1459,7 @@ const STREAM_MIN_WORDS: usize = 1 << 23;
 
 /// Residues a lane-major first pass takes at once, as a log: one cache line of a lane block.
 const LOG_BATCH: usize = 3;
-const BATCH: usize = 1 << LOG_BATCH;
+pub(super) const BATCH: usize = 1 << LOG_BATCH;
 /// Most batches a lane-major task fills side by side, so a lane's adjacent lines are read together.
 const STAGE_SUBS: usize = 2;
 
@@ -1736,13 +1476,10 @@ const STAGE_SUBS: usize = 2;
 /// - At 8 threads it changes nothing, and at 16 threads it costs 3 %: the stage then crowds the shared L2 and L3.
 /// - So a pool of more than 4 threads keeps one batch.
 /// - A step under two batches has no neighbour line to read.
-fn stage_subs(lane_major: bool, log_step: usize) -> usize {
+pub(super) fn stage_subs(lane_major: bool, log_step: usize) -> usize {
     let fits = log_step >= LOG_BATCH + STAGE_SUBS.ilog2() as usize;
     if lane_major && fits && parallel::num_threads() <= 4 { STAGE_SUBS } else { 1 }
 }
-
-/// Gathered groups of at least this many words fetch the next group's source rows while they transform.
-const FETCH_AHEAD_MIN_WORDS: usize = 1 << 13;
 
 /// One cache line of words.
 #[derive(Clone, Copy)]
@@ -1753,7 +1490,7 @@ struct Line([F64; 8]);
 ///
 /// - It is cache-line aligned, so a full-width load never splits a line.
 /// - It lives as long as the thread, so no pass allocates in its hot loop.
-fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
+pub(super) fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
     thread_local! {
         static SCRATCH: RefCell<Vec<Line>> = const { RefCell::new(Vec::new()) };
     }
@@ -1770,7 +1507,7 @@ fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [F64]) -> R) -> R {
 }
 
 /// The tiles of a stage that repeat an earlier tile, as a bit per lane of each octet.
-struct StageCopies {
+pub(super) struct StageCopies {
     /// A repeat tile is a copy of the tile this many rows before it.
     back: usize,
     rows: usize,
@@ -1781,7 +1518,7 @@ struct StageCopies {
 }
 
 impl StageCopies {
-    fn none() -> Self {
+    pub(super) fn none() -> Self {
         Self { back: 0, rows: 0, n_octets: 0, masks: Vec::new() }
     }
 
@@ -1804,7 +1541,7 @@ impl StageCopies {
 /// - Rows before `back` read the message, as do all rows of a message with no map.
 ///
 /// `repeats` is the message's map of blocks that equal their predecessor. A lane's first block never repeats.
-fn stage_copies(
+pub(super) fn stage_copies(
     repeats: &[bool],
     log_step: usize,
     rows: usize,
@@ -1861,7 +1598,7 @@ fn stage_copies(
 /// - One tile is 8 words of 8 lane blocks, so each 64 byte line of a lane block is read once, whole.
 /// - A lane of tile `i` with its bit set in the octet's [`StageCopies`] is copied from the tile `back` rows
 ///   before, which is already in the stage, and its line is not read.
-fn fill_stage(
+pub(super) fn fill_stage(
     stage: &mut [F64],
     msg: *const F64,
     t0: usize,
