@@ -388,18 +388,10 @@ where
 {
     let total_words = (1usize << n_blocks_log) * WORDS;
     let ab_words = ab_words::<WORDS>(initial_states.len(), n_blocks_log);
-    // SAFETY (x3): `drive_witness_packed_into` writes every word of `z`, `a` and `b`.
-    let mut z = unsafe { primitives::uninit_vec::<u64>(total_words) };
-    let mut a = unsafe { primitives::uninit_vec::<u64>(ab_words) };
-    let mut b = unsafe { primitives::uninit_vec::<u64>(ab_words) };
-    drive_witness_packed_into::<WORDS, S, F>(
-        initial_states,
-        padding,
-        n_blocks_log,
-        &mut z,
-        Some((&mut a, &mut b)),
-        build_group,
-    );
+    // `drive_witness_packed_into` writes every word of `z`, `a` and `b`.
+    let [z, a, b] = primitives::filled_vecs([total_words, ab_words, ab_words], |[z, a, b]| {
+        drive_witness_packed_into::<WORDS, S, F>(initial_states, padding, n_blocks_log, z, Some((a, b)), build_group);
+    });
     (z, a, b)
 }
 
@@ -447,11 +439,9 @@ pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
     // Up to three output tables, indexed by the same group, each taking the group's blocks' packed words.
     let group_words = group_blocks * WORDS;
     let scratch_words = LANES * WORDS;
-    let z_chunks = parallel::Chunks::new(z, group_words);
-    let ab_chunks = ab.map(|(a, b)| {
-        assert!(a.len() == ab_groups * group_words && b.len() == a.len(), "a and b hold their groups");
-        (parallel::Chunks::new(a, group_words), parallel::Chunks::new(b, group_words))
-    });
+    let has_ab = ab.is_some();
+    let (a, b) = ab.unwrap_or_default();
+    assert!(!has_ab || a.len() == ab_groups * group_words && b.len() == a.len(), "a and b hold their groups");
 
     // Each group builds in its worker's scratch, which stays in cache, then streams out.
     //
@@ -466,28 +456,27 @@ pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
     //
     // Groups past the last real block are identical, so a worker builds one and streams it again
     // while `template` says the buf it last built still holds it.
-    parallel::map_reduce_with_state(
-        n_groups.div_ceil(TASK_GROUPS),
+    parallel::map_reduce_chunks_mut(
+        [z, a, b],
+        [TASK_GROUPS * group_words; 3],
         || {
             let buf = || vec![0u64; 3 * scratch_words];
             (vec![V64::ZERO; 3 * WORDS], [buf(), buf()], 0usize, false)
         },
         || (),
-        |(rows, bufs, last, template), (), task| {
+        |(rows, bufs, last, template), (), task, [z_out, a_out, b_out]| {
             let stream = Stream::new();
             // Stream the part `from..to` of `of` of group `g`'s tables out of `buf`, whole lines at a time.
-            // SAFETY: each group `g` takes chunk `g` of each table, one slice at a time, and
-            // all three tables stay borrowed for the whole dispatch.
-            let emit = |g: usize, buf: &[u64], from: usize, to: usize, of: usize| unsafe {
+            // Group `g` is the `g - task * TASK_GROUPS`th of this task's chunks.
+            let mut emit = |g: usize, buf: &[u64], from: usize, to: usize, of: usize| {
                 let (lo, hi) = (group_words / 8 * from / of * 8, group_words / 8 * to / of * 8);
+                let at = (g - task * TASK_GROUPS) * group_words;
                 let (z, ab) = buf.split_at(scratch_words);
                 let (a, b) = ab.split_at(scratch_words);
-                stream.copy(&mut z_chunks.get(g)[lo..hi], &z[lo..hi]);
-                if let Some((a_chunks, b_chunks)) = &ab_chunks
-                    && g < ab_groups
-                {
-                    stream.copy(&mut a_chunks.get(g)[lo..hi], &a[lo..hi]);
-                    stream.copy(&mut b_chunks.get(g)[lo..hi], &b[lo..hi]);
+                stream.copy(&mut z_out[at + lo..at + hi], &z[lo..hi]);
+                if has_ab && g < ab_groups {
+                    stream.copy(&mut a_out[at + lo..at + hi], &a[lo..hi]);
+                    stream.copy(&mut b_out[at + lo..at + hi], &b[lo..hi]);
                 }
             };
             let mut pending = None;
@@ -505,7 +494,7 @@ pub(crate) fn drive_witness_packed_into<const WORDS: usize, S: Sync, F>(
                 let prev = pending.take();
                 let (mut sent, mut of) = (0, 1);
                 let states = std::array::from_fn(|l| initial_states.get(LANES * g + l).unwrap_or(padding));
-                let n_tables = if ab_chunks.is_some() { 3 } else { 1 };
+                let n_tables = if has_ab { 3 } else { 1 };
                 // Each tile of rows is transposed into `cur_buf` once final, while it is in L1.
                 let mut tiles = |rows: &[V64], tiles: Range<usize>| {
                     for t in tiles {

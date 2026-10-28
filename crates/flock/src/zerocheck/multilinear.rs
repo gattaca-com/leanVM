@@ -99,19 +99,18 @@ fn fold_at_z_naive(witness: &[bool], m: usize, k_skip: usize, weights: &[F192]) 
     assert_eq!(witness.len(), 1usize << m);
     assert_eq!(weights.len(), ell);
 
-    // SAFETY: the loop below writes every one of the `n_rest` slots.
-    let mut folded = unsafe { primitives::uninit_vec::<F192>(n_rest) };
-    for x_rest in 0..n_rest {
-        let base = x_rest * ell;
-        let mut acc = F192::ZERO;
-        for s in 0..ell {
-            if witness[base + s] {
-                acc += weights[s];
+    (0..n_rest)
+        .map(|x_rest| {
+            let base = x_rest * ell;
+            let mut acc = F192::ZERO;
+            for s in 0..ell {
+                if witness[base + s] {
+                    acc += weights[s];
+                }
             }
-        }
-        folded[x_rest] = acc;
-    }
-    folded
+            acc
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -562,35 +561,33 @@ fn bit_round_store_kernel<const CHUNKS: usize>(
     } else {
         n_pos
     };
-    // SAFETY (x3): every slot is written below, padding included.
-    let mut out: [Vec<F192>; 3] = std::array::from_fn(|_| unsafe { primitives::uninit_vec(n_out) });
-    let [out_a, out_b, out_c] = &mut out;
-    let chunks = [out_a, out_b, out_c].map(|o| parallel::Chunks::new(o, 2 * lo_size));
-
-    let (g1, ginf) = parallel::map_reduce_with_state(
-        chunks[0].count(),
-        || bits.scratch(BLOCK * CHUNKS),
-        || (F192::ZERO, F192::ZERO),
-        |scratch, (total1, total_inf), hi| {
-            // SAFETY: task `hi` takes chunk `hi` of each output once, and the buffers outlive the dispatch.
-            let outs = chunks.map(|ch| unsafe { ch.get(hi) });
-            let first = hi * lo_size;
-            let n_live = n_live_pairs.saturating_sub(first).min(lo_size);
-            let mut halves = outs.map(|o| o.split_at_mut(2 * n_live));
-            let (g1, ginf) = fold_run(scratch, first, n_live, &eq_lo, halves.each_mut().map(|h| &mut *h.0));
-            if let Some((t, _)) = &template {
-                for ((_, rest), t) in halves.iter_mut().zip(t) {
-                    let at = 2 * (first + n_live);
-                    for (k, d) in rest.iter_mut().enumerate() {
-                        *d = t[(at + k) & (t.len() - 1)];
+    // Every slot is written below, padding included.
+    let (mut g1, mut ginf) = (F192::ZERO, F192::ZERO);
+    let out = primitives::filled_vecs([n_out; 3], |outs| {
+        (g1, ginf) = parallel::map_reduce_chunks_mut(
+            outs,
+            [2 * lo_size; 3],
+            || bits.scratch(BLOCK * CHUNKS),
+            || (F192::ZERO, F192::ZERO),
+            |scratch, (total1, total_inf), hi, outs| {
+                let first = hi * lo_size;
+                let n_live = n_live_pairs.saturating_sub(first).min(lo_size);
+                let mut halves = outs.map(|o| o.split_at_mut(2 * n_live));
+                let (g1, ginf) = fold_run(scratch, first, n_live, &eq_lo, halves.each_mut().map(|h| &mut *h.0));
+                if let Some((t, _)) = &template {
+                    for ((_, rest), t) in halves.iter_mut().zip(t) {
+                        let at = 2 * (first + n_live);
+                        for (k, d) in rest.iter_mut().enumerate() {
+                            *d = t[(at + k) & (t.len() - 1)];
+                        }
                     }
                 }
-            }
-            *total1 += eq_hi[hi] * g1.reduce();
-            *total_inf += eq_hi[hi] * ginf.reduce();
-        },
-        |(s1, si), (t1, ti)| (s1 + t1, si + ti),
-    );
+                *total1 += eq_hi[hi] * g1.reduce();
+                *total_inf += eq_hi[hi] * ginf.reduce();
+            },
+            |(s1, si), (t1, ti)| (s1 + t1, si + ti),
+        );
+    });
     let (t1, ti) = template.map_or((F192::ZERO, F192::ZERO), |(_, w)| w);
     ((g1 + t1, ginf + ti), out)
 }
@@ -669,16 +666,15 @@ fn prefetch(p: *const F192, lines: usize) {
 /// `outs` hold `m` positions, a multiple of 32, and `ins` at least `2 m`. `r_eq` has a variable per pair index bit.
 fn fold_and_compute_round_into(ins: [&[F192]; 3], outs: [&mut [F192]; 3], r_fold: F192, r_eq: &[F192]) -> (F192, F192) {
     let (eq_lo, eq_hi, lo_size) = split_eq(r_eq);
-    let chunks = outs.map(|o| parallel::Chunks::new(o, 2 * lo_size));
     let r = F192x8::splat(r_fold);
-    let stream_out = 3 * chunks[0].count() * 2 * lo_size * size_of::<F192>() >= STREAM_OUT_BYTES;
+    let stream_out = 3 * outs[0].len().div_ceil(2 * lo_size) * 2 * lo_size * size_of::<F192>() >= STREAM_OUT_BYTES;
 
-    parallel::map_reduce(
-        chunks[0].count(),
+    parallel::map_reduce_chunks_mut(
+        outs,
+        [2 * lo_size; 3],
+        || (),
         || (F192::ZERO, F192::ZERO),
-        |hi| {
-            // SAFETY: task `hi` takes chunk `hi` of each output once, and the buffers stay borrowed for the dispatch.
-            let outs = chunks.each_ref().map(|ch| unsafe { ch.get(hi) });
+        |(), (total1, total_inf), hi, outs| {
             let steps = outs[0].len() / 16;
             let mut acc = [Prod8::ZERO; 2];
             // Eight pairs of folded positions: thirty-two input positions and sixteen output ones per table.
@@ -711,7 +707,8 @@ fn fold_and_compute_round_into(ins: [&[F192]; 3], outs: [&mut [F192]; 3], r_fold
                 acc[1] ^= eq.mul_unreduced((a0 + a1) * (b0 + b1));
             }
             let [g1, ginf] = acc;
-            (eq_hi[hi] * g1.reduce(), eq_hi[hi] * ginf.reduce())
+            *total1 += eq_hi[hi] * g1.reduce();
+            *total_inf += eq_hi[hi] * ginf.reduce();
         },
         |(s1, si), (t1, ti)| (s1 + t1, si + ti),
     )
