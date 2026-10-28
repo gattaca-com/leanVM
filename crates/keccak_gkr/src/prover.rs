@@ -411,25 +411,28 @@ impl Layer<'_> {
         // Rows of segments that do not exist are zero, and so is their product.
         table[self.rounds.len() * layout.live * ROW..layout.len() * ROW].fill(0);
         pads[self.rounds.len() * ROW..].fill(0);
-        let (ptr, pads) = (
-            parallel::SendPtr(table.as_mut_ptr()),
-            parallel::SendPtr(pads.as_mut_ptr()),
-        );
-        let sums = parallel::map_reduce_with_state(
-            self.n_tasks(),
+        // Task `held * segment + g` owns its rows: a written block's two, or its segment's padding row.
+        let (held, written) = (self.held(), self.witness.written());
+        let mut parts: Vec<&mut [u64]> = Vec::with_capacity(self.n_tasks());
+        let mut rest = &mut table[..self.rounds.len() * layout.live * ROW];
+        let mut pad_rows = &mut pads[..];
+        for _ in 0..self.rounds.len() {
+            let (segment, tail) = rest.split_at_mut(layout.live * ROW);
+            let (pad, pad_tail) = pad_rows.split_at_mut(ROW);
+            (rest, pad_rows) = (tail, pad_tail);
+            parts.extend(segment.chunks_mut(2 * ROW));
+            if held > written {
+                parts.push(pad);
+            }
+        }
+        let sums = parallel::map_reduce_chunks_mut(
+            [&mut parts[..]],
+            [1],
             || (vec![0u64; 4 * ROW], vec![0u64; 8 * BITS]),
             RoundSums::default,
-            |(scratch, wide), sums, task| {
-                let (segment, g, block) = self.block(task);
-                // SAFETY: each task owns its rows: a written block's two, or its segment's padding row.
-                let out = unsafe {
-                    if 2 * g < layout.live {
-                        ptr.slice((layout.live * segment + 2 * g) * ROW, 2 * ROW)
-                    } else {
-                        pads.slice(segment * ROW, ROW)
-                    }
-                };
-                let rows = out;
+            |(scratch, wide), sums, task, [part]| {
+                let (_, _, block) = self.block(task);
+                let rows = &mut *part[0];
                 let halves = rows.len() / ROW;
                 // Both groups' unreduced sums, four words each and laid out by word.
                 for j in 0..BITS {
@@ -555,7 +558,6 @@ impl<'a> Round<'a> {
         eq: &[F192],
     ) -> (F192, F192) {
         let to = from.next();
-        let ptr = parallel::SendPtr(dst.as_mut_ptr());
         let fold = |out: &mut [u64], segment: usize, r: usize| {
             let (low, high) = if from.m == 1 {
                 (
@@ -584,15 +586,20 @@ impl<'a> Round<'a> {
         }
         // A task per pair of rows written, the second of a ragged one being the padding row.
         let (pairs, half) = (to.live.div_ceil(2), to.m / 2);
-        let mut sums = parallel::map_reduce_with_state(
-            to.segments * pairs,
+        // Task `pairs * segment + t` owns rows `2t` and `2t + 1` of its segment, the last one alone if it is ragged.
+        let mut parts: Vec<&mut [u64]> = dst[..to.len() * ROW]
+            .chunks_mut(to.live * ROW)
+            .flat_map(|segment| segment.chunks_mut(2 * ROW))
+            .collect();
+        let mut sums = parallel::map_reduce_chunks_mut(
+            [&mut parts[..]],
+            [1],
             || vec![0u64; 4 * ROW],
             RoundSums::default,
-            |scratch, sums, task| {
+            |scratch, sums, task, [part]| {
                 let (segment, t) = (task / pairs, task % pairs);
-                let n = (to.live - 2 * t).min(2);
-                // SAFETY: each task owns its rows of `dst`.
-                let rows = unsafe { ptr.slice((to.live * segment + 2 * t) * ROW, n * ROW) };
+                let rows = &mut *part[0];
+                let n = rows.len() / ROW;
                 for (i, row) in rows.as_chunks_mut::<ROW>().0.iter_mut().enumerate() {
                     fold(row, segment, 2 * t + i);
                 }
