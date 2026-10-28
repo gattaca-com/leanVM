@@ -3,4 +3,4 @@
 
 pub mod additive_ntt_f64;
 mod gathered;
-pub use additive_ntt_f64::{AdditiveNttF64, DeepRows, Encoded, Keep, RowSink, transpose_lane_major};
+pub use additive_ntt_f64::{AdditiveNttF64, DeepRows, Encoded, Keep, RowSink};

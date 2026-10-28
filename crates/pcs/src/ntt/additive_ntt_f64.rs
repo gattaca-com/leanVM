@@ -121,12 +121,16 @@ fn span_get(basis: &[F64], idx: usize) -> F64 {
 }
 
 /// Receives a finished block of codeword rows, as `(first_row, rows)`.
+///
+/// - It is called from pool tasks.
+/// - Each row is handed over exactly once.
+/// - Blocks are aligned, and all of one power-of-two size.
+/// - A block is handed over while its rows are still in cache.
 pub type RowSink<'a> = dyn Fn(usize, &[F64]) + Sync + 'a;
 
 /// Additive NTT over F_{2^64} with the standard polynomial-basis subspace
 /// `{1, x, x², …}`: the F_2-subspace is `{0, 1, …, 2^ℓ−1}` under the natural
-/// integer encoding, exactly as in the extension-field version (whose domain already
-/// lived inside this very subfield).
+/// integer encoding.
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF64 {
     /// The rows of [`generate_evals_from_subspace`], end to end.
@@ -218,30 +222,14 @@ impl AdditiveNttF64 {
     /// - It is row-major: word `row * n + lane` for `n` interleaved lanes.
     /// - The buffer ends as `2^r` copies of it, each transformed from layer `r` on.
     ///
-    /// # Why the replication is free
-    ///
-    /// - A butterfly whose bottom input is zero copies its top input to both outputs.
-    /// - So the first `r` layers on the zero-padded message leave `2^r` copies of it.
-    /// - The first pass therefore reads its rows from the message itself.
-    /// - No pass fills the replicas only to read them back.
-    ///
-    /// # Why the transpose stays separate
-    ///
-    /// - A lane-major caller transposes its message into place first.
-    /// - The transpose wants one long contiguous run per lane.
-    /// - The first pass wants hundreds of scattered rows at once.
+    /// The replication is free: the first pass reads its rows from the message itself, see [`Self::transform`].
     pub fn encode_interleaved_in_place(&self, data: &mut [F64], num_ntts: usize, log_inv_rate: usize) {
         // The message is the buffer's own first replica.
         let msg = parallel::SendPtr(data.as_mut_ptr());
         self.transform(data, num_ntts, log_inv_rate, Some(msg), None);
     }
 
-    /// Encode in place, handing `on_rows` every finished block of rows.
-    ///
-    /// - It is called as `on_rows(first_row, rows)`, from pool tasks.
-    /// - Each row is handed over exactly once.
-    /// - Blocks are aligned, and all of one power-of-two size.
-    /// - A block is handed over while its rows are still in cache.
+    /// Encode in place, handing `on_rows` every finished block of rows, see [`RowSink`].
     #[timed]
     pub fn encode_interleaved_in_place_with(
         &self,
@@ -257,7 +245,7 @@ impl AdditiveNttF64 {
     /// [`Self::encode_interleaved_in_place_with`] without writing the deep pass back.
     ///
     /// - Each deep sub-block is finished in scratch and handed to `on_rows` from there.
-    /// - The buffer keeps what the gathered passes left, and [`DeepRows::rows`] finishes any row again.
+    /// - The buffer keeps what the gathered passes left, and [`Self::finish_rows`] finishes any row again.
     /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
     ///
     /// A queried row costs one sub-block transform, against a write of the whole codeword saved.
@@ -1321,11 +1309,8 @@ fn copy_rows<const N: usize>(src: Option<[&[F64]; N]>, rows: &mut [&mut [F64]; N
 ///
 /// # Why descending
 ///
-/// - A Merkle leaf reads its lanes from the top index down.
-/// - So the absent all-zero lanes lead every leaf image.
-/// - Their whole 136-byte blocks are then one sponge state that every leaf shares.
-/// - The proof can leave them out.
-/// - Each lane is an independent codeword, so the order costs nothing.
+/// - The absent all-zero lanes lead every Merkle leaf image, so the proof can leave them out.
+/// - `whir::commit` has the full reason.
 ///
 /// # Performance
 ///
@@ -1334,7 +1319,7 @@ fn copy_rows<const N: usize>(src: Option<[&[F64]; N]>, rows: &mut [&mut [F64]; N
 /// - The finished tile goes out as one contiguous run.
 /// - That keeps an n-way gather at a `2^rows_log` stride near memory bandwidth.
 #[timed]
-pub fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, row_words: usize, log_rows: usize) {
+pub(super) fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, row_words: usize, log_rows: usize) {
     let rows = 1usize << log_rows;
     assert!(n_lanes > 0, "a commitment needs at least one lane");
     assert!(n_lanes <= row_words, "a row holds its lanes");
@@ -1846,10 +1831,8 @@ fn butterfly_interleaved_block(
 /// Butterfly all `num_ntts` lanes of one (top row, bottom row) pair with a
 /// shared twiddle: new_u = u + v*t; new_v = v + new_u.
 ///
-/// On NEON this processes eight lanes per iteration. Four independent pair
-/// reductions stay in the vector register file, exposing their PMULL chains
-/// in parallel and amortizing the loop branch and constant setup. The pair
-/// kernel handles a short even tail, and the scalar path handles an odd tail.
+/// On NEON this processes eight lanes per iteration. The pair kernel handles a short even tail,
+/// and the scalar path handles an odd tail.
 #[inline]
 fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
     debug_assert_eq!(top.len(), bot.len());
@@ -2261,8 +2244,7 @@ fn transpose_butterfly_lanes_avx512(top: &mut [F64], bot: &mut [F64], twiddle: u
 /// Two F64 butterflies with a shared twiddle, NEON-resident end to end.
 /// The two products issue as PMULL/PMULL2 on the loaded row (no lane
 /// extraction) and reduce through the all-PMULL lane-pair fold
-/// ([`primitives::field::gf2_64::aarch64::reduce_pair_pmull4`]), replacing the
-/// old 10-op shift-XOR fold chain.
+/// ([`primitives::field::gf2_64::aarch64::reduce_pair_pmull4`]).
 ///
 /// `top` and `bot` are two words each.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
