@@ -145,23 +145,23 @@ pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     }
     // `packed[j * (padded / 8) + g]` holds the weights `w_i · high_i(j)` of the queries `8g..8g + 8`.
     let groups = padded / 8;
-    // SAFETY: every entry is written before it is read.
-    let mut packed = unsafe { primitives::uninit_vec::<Weights8>(groups << (log_msg_cols - lo)) };
-    parallel::chunks_mut(&mut packed, groups, |j, row| {
-        let scaled = |i: usize| match weights.get(i) {
-            Some(w) => w.mul_base(high[(i << (log_msg_cols - lo)) | j]),
-            None => F192::ZERO,
-        };
-        for (g, slot) in row.iter_mut().enumerate() {
-            *slot = Weights8::new(&std::array::from_fn(|t| scaled(8 * g + t)));
-        }
+    let packed = primitives::filled_vec(groups << (log_msg_cols - lo), |packed| {
+        parallel::chunks_mut(packed, groups, |j, row| {
+            let scaled = |i: usize| match weights.get(i) {
+                Some(w) => w.mul_base(high[(i << (log_msg_cols - lo)) | j]),
+                None => F192::ZERO,
+            };
+            for (g, slot) in row.iter_mut().enumerate() {
+                *slot = Weights8::new(&std::array::from_fn(|t| scaled(8 * g + t)));
+            }
+        });
     });
-    // SAFETY: every element is written below.
-    let mut basis = unsafe { primitives::uninit_vec::<F192>(1 << log_msg_cols) };
-    parallel::chunks_mut(&mut basis, 1 << lo, |j, out: &mut [F192]| {
-        for (out, low) in out.iter_mut().zip(low.chunks_exact(padded)) {
-            *out = dot_base(&packed[j * groups..][..groups], low).reduce();
-        }
+    let basis = primitives::filled_vec(1 << log_msg_cols, |basis| {
+        parallel::chunks_mut(basis, 1 << lo, |j, out: &mut [F192]| {
+            for (out, low) in out.iter_mut().zip(low.chunks_exact(padded)) {
+                *out = dot_base(&packed[j * groups..][..groups], low).reduce();
+            }
+        });
     });
     (basis, enforced_sum)
 }

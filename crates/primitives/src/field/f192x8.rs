@@ -31,6 +31,10 @@ pub type Prod8 = Acc8;
 pub struct F192x8([F192; 8]);
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+// SAFETY: one field, an array of plain elements.
+unsafe impl crate::Plain for F192x8 {}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 impl F192x8 {
     pub const ZERO: Self = Self([F192::ZERO; 8]);
     pub const ONE: Self = Self([F192::ONE; 8]);
@@ -127,6 +131,10 @@ impl core::ops::Add for F192x8 {
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[derive(Clone, Copy, Debug)]
 pub struct F64x8([F64; 8]);
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+// SAFETY: one field, an array of plain elements.
+unsafe impl crate::Plain for F64x8 {}
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 impl F64x8 {
@@ -432,6 +440,9 @@ mod avx512 {
         c2: __m512i,
     }
 
+    // SAFETY: `repr(C)` over three vectors, which have no padding and no invalid bit pattern.
+    unsafe impl crate::Plain for F192x8 {}
+
     /// The unreduced products of eight elements: the 128-bit coefficients of the even elements, lane
     /// by lane, then those of the odd ones.
     #[derive(Clone, Copy, Debug)]
@@ -473,6 +484,9 @@ mod avx512 {
     #[derive(Clone, Copy, Debug)]
     #[repr(transparent)]
     pub struct F64x8(__m512i);
+
+    // SAFETY: `repr(transparent)` over a vector, which has no invalid bit pattern.
+    unsafe impl crate::Plain for F64x8 {}
 
     impl F64x8 {
         pub const ZERO: Self = Self(from_words([0; 8]));

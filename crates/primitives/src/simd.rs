@@ -8,18 +8,7 @@ use core::arch::x86_64::*;
 
 use crate::field::{F64, F192};
 
-/// Plain data: no padding, and every bit pattern is a valid value.
-///
-/// # Safety
-///
-/// Implement it only for such types.
-pub unsafe trait Plain: Copy {}
-
-// SAFETY: integers, and `repr(transparent)` and `repr(C)` structs of them.
-unsafe impl Plain for u8 {}
-unsafe impl Plain for u64 {}
-unsafe impl Plain for F64 {}
-unsafe impl Plain for F192 {}
+pub use crate::Plain;
 
 /// The vector of eight words, the first in the low qword.
 pub const fn from_words(w: [u64; 8]) -> __m512i {

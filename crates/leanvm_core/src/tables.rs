@@ -811,28 +811,28 @@ impl Table for JumpTable {
         // and `acc` ends as their full product (nonzero, hence invertible). The taken indicator is
         // `c ≠ 0`, which is `w ≠ 0`.
         let cond = |r: &Jrow| F64(cell(r, ins(r).0).c0);
-        // SAFETY: the chunks tile `w` and each writes every slot of `w` before it is read.
-        let mut w = unsafe { primitives::uninit_vec::<F64>(rows.len()) };
-        parallel::chunks_mut(&mut w, FILL_TASK, |t, w| {
-            let first = t * FILL_TASK;
-            let mut acc = F64::ONE;
-            for (j, wi) in w.iter_mut().enumerate() {
-                let ci = cond(rows.get(first + j));
-                *wi = acc;
-                if !ci.is_zero() {
-                    acc *= ci;
+        let w = primitives::filled_vec(rows.len(), |w| {
+            parallel::chunks_mut(w, FILL_TASK, |t, w| {
+                let first = t * FILL_TASK;
+                let mut acc = F64::ONE;
+                for (j, wi) in w.iter_mut().enumerate() {
+                    let ci = cond(rows.get(first + j));
+                    *wi = acc;
+                    if !ci.is_zero() {
+                        acc *= ci;
+                    }
                 }
-            }
-            let mut inv = acc.inv();
-            for (j, wi) in w.iter_mut().enumerate().rev() {
-                let ci = cond(rows.get(first + j));
-                if ci.is_zero() {
-                    *wi = F64::ZERO;
-                } else {
-                    *wi = inv * *wi;
-                    inv *= ci;
+                let mut inv = acc.inv();
+                for (j, wi) in w.iter_mut().enumerate().rev() {
+                    let ci = cond(rows.get(first + j));
+                    if ci.is_zero() {
+                        *wi = F64::ZERO;
+                    } else {
+                        *wi = inv * *wi;
+                        inv *= ci;
+                    }
                 }
-            }
+            });
         });
         // One pass. The three offsets and the three cells they name come out of one decode.
         // Those cells are K-valued on every row, taken or not (`cpu::execute` rejects

@@ -115,7 +115,7 @@ fn live(ones: &[Range<usize>], range: Range<usize>) -> impl Iterator<Item = usiz
 pub type KBlock = [F64x8; 8];
 
 /// A block of table values: what a tree's first round reads, whichever field holds them.
-pub trait TableBlock: Copy + Send + Sync {
+pub trait TableBlock: primitives::Plain + Send + Sync {
     /// `quartic_summand` of the block's eight row pairs, one pair per lane, weighted by `equality` and
     /// left as four unreduced lane-wise sums.
     fn summand(&self, equality: F192x8) -> [Prod8; 4];
@@ -127,7 +127,7 @@ pub trait TableBlock: Copy + Send + Sync {
 /// The field a product tree's values live in: `E`, or `K` for a tree that the first fold lifts to
 /// `E`. The two share every level's shape, so a tree is built and proved once, generically, and
 /// only the arithmetic differs.
-pub trait TreeField: Copy + Send + Sync + std::ops::Mul<Output = Self> + 'static {
+pub trait TreeField: primitives::Plain + Send + Sync + std::ops::Mul<Output = Self> + 'static {
     type Block: TableBlock;
     const ONE: Self;
 
@@ -348,11 +348,6 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
                 .and_then(Option::take)
                 .filter(|tier| !tier.is_empty());
             let from_builder = tier.is_some();
-            let mut next: Vec<F> = tier.unwrap_or_else(|| {
-                // SAFETY: the vector rows and the scalar rows after them cover every slot.
-                unsafe { primitives::uninit_vec(full_rows) }
-            });
-            next.truncate(full_rows);
             let vector_rows = full_rows / 8 * 8;
             const CHUNK: usize = 512;
             // Eight products come from 32 children, which lie in one block of 64 or none, and
@@ -371,15 +366,25 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
                     }
                 }
             };
-            if vector_rows >= PAR_THRESHOLD {
-                parallel::chunks_mut(&mut next[..vector_rows], CHUNK, fill);
-            } else {
-                fill(0, &mut next[..vector_rows]);
+            // The vector rows and the scalar rows after them cover every slot.
+            let fill_rows = |next: &mut [F]| {
+                if vector_rows >= PAR_THRESHOLD {
+                    parallel::chunks_mut(&mut next[..vector_rows], CHUNK, fill);
+                } else {
+                    fill(0, &mut next[..vector_rows]);
+                }
+                for row in vector_rows..full_rows {
+                    next[row] = product(row);
+                }
+            };
+            match tier {
+                Some(mut next) => {
+                    next.truncate(full_rows);
+                    fill_rows(&mut next);
+                    next
+                }
+                None => primitives::filled_vec(full_rows, fill_rows),
             }
-            for row in vector_rows..full_rows {
-                next[row] = product(row);
-            }
-            next
         };
         if !current.len().is_multiple_of(4) && current.len() > 2 {
             let row = full_rows;
@@ -444,8 +449,6 @@ fn window_blocks(total: usize) -> usize {
 /// The values as blocks, the missing tail of the last block being the identity.
 pub(crate) fn blocks_from_values<F: TreeField>(values: &[F]) -> Vec<F::Block> {
     let count = values.len().div_ceil(BLOCK_VALUES);
-    // SAFETY: `fill` writes every block before any read.
-    let mut blocks: Vec<F::Block> = unsafe { primitives::uninit_vec(count) };
     let fill = |index: usize, destination: &mut [F::Block]| {
         for (offset, block) in destination.iter_mut().enumerate() {
             let base = (index * WINDOW + offset) * BLOCK_VALUES;
@@ -453,12 +456,13 @@ pub(crate) fn blocks_from_values<F: TreeField>(values: &[F]) -> Vec<F::Block> {
         }
     };
     const WINDOW: usize = 64;
-    if count * BLOCK_PAIRS >= PAR_THRESHOLD {
-        parallel::chunks_mut(&mut blocks, WINDOW, fill);
-    } else {
-        fill(0, &mut blocks);
-    }
-    blocks
+    primitives::filled_vec(count, |blocks| {
+        if count * BLOCK_PAIRS >= PAR_THRESHOLD {
+            parallel::chunks_mut(blocks, WINDOW, fill);
+        } else {
+            fill(0, blocks);
+        }
+    })
 }
 
 /// The weights `eq(r, x)` of a sumcheck round, split as `hi[x >> k] * lo[x & (2^k - 1)]`.

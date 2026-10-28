@@ -323,15 +323,15 @@ impl LaneLift for Terms {
             })
             .collect();
         let n_patterns = self.patterns.len();
-        // SAFETY: every entry is written before the blocks read it.
-        let mut gs = unsafe { primitives::uninit_vec::<F192>((1 << (self.lane_vars - self.low_vars)) * n_patterns) };
-        parallel::chunks_mut(&mut gs, n_patterns.max(1), |h, row| {
-            for (g, pattern) in row.iter_mut().zip(&self.patterns) {
-                *g = pattern
-                    .claims
-                    .iter()
-                    .fold(F192::ZERO, |sum, &c| sum + a[c] * self.gamma(c)[h]);
-            }
+        let gs = primitives::filled_vec((1 << (self.lane_vars - self.low_vars)) * n_patterns, |gs| {
+            parallel::chunks_mut(gs, n_patterns.max(1), |h, row| {
+                for (g, pattern) in row.iter_mut().zip(&self.patterns) {
+                    *g = pattern
+                        .claims
+                        .iter()
+                        .fold(F192::ZERO, |sum, &c| sum + a[c] * self.gamma(c)[h]);
+                }
+            });
         });
         Box::new(move |h, f, out| {
             let live = || {

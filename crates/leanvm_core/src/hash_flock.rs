@@ -226,17 +226,17 @@ pub(crate) fn build_qflock_prepared(
     // SAFETY: `F64` is `repr(transparent)` over `u64`, so the two slices are the same bytes.
     let words: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(q_flock.as_mut_ptr().cast(), q_flock.len()) };
     let n_log = n_blocks_log(n_blocks);
-    let mut ab = (!rebuilds()).then(|| {
+    // `generate_witness_into_z` writes every word of `a` and `b`.
+    let ab = if rebuilds() {
+        generate_witness_into_z(blocks, n_log, words, None);
+        None
+    } else {
         let len = witness_ab_words(n_blocks, n_log);
-        // SAFETY (x2): `generate_witness_into_z` writes every word of `a` and `b`.
-        unsafe { (primitives::uninit_vec::<u64>(len), primitives::uninit_vec::<u64>(len)) }
-    });
-    generate_witness_into_z(
-        blocks,
-        n_log,
-        words,
-        ab.as_mut().map(|(a, b)| (&mut a[..], &mut b[..])),
-    );
+        let [a, b] = primitives::filled_vecs([len; 2], |[a, b]| {
+            generate_witness_into_z(blocks, n_log, words, Some((a, b)));
+        });
+        Some((a, b))
+    };
     PreparedReductionWitness { n_blocks, ab }
 }
 
