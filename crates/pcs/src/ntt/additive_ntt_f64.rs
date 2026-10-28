@@ -391,7 +391,8 @@ impl AdditiveNttF64 {
 
     /// Coset `coset` of the codeword, built into `buf` (one message long) from the message.
     fn build_coset(&self, buf: &mut [F64], msg: &[F64], num_ntts: usize, log_d: usize, log_inv_rate: usize, coset: usize) {
-        self.run_layers_from(msg, buf, log_d, num_ntts, log_inv_rate, log_d, log_inv_rate, coset, no_hook);
+        let (first, end) = (log_inv_rate, log_d);
+        self.run_layers_to(buf, Some(msg), log_d, num_ntts, first, end, log_inv_rate, coset, None, no_hook);
     }
 
     /// Codeword rows `positions` (sorted) of a buffer left by [`Self::encode_interleaved_in_place_without_deep`],
@@ -433,21 +434,15 @@ impl AdditiveNttF64 {
             let (dst, run) = &mut part[0];
             let sub_idx = run[0] >> log_sub;
             with_scratch(sub_len, |sub| {
-                self.finish_sub_block(Some(src(i, sub_idx)), sub, deep, sub_idx);
+                let src = Some(src(i, sub_idx));
+                let (log_d, start) = (deep.log_d, deep.deep_start);
+                self.run_layers_to(sub, src, log_d, n, start, log_d, start, sub_idx, None, no_hook);
                 for (dst, &q) in dst.chunks_exact_mut(n).zip(run.iter()) {
                     dst.copy_from_slice(&sub[(q & ((1 << log_sub) - 1)) * n..][..n]);
                 }
             });
         });
         out
-    }
-
-    /// The deep layers over sub-block `sub_idx` of the codeword, which `src` holds as the gathered pass left it.
-    ///
-    /// With no `src`, `sub` holds it and the layers run in place.
-    fn finish_sub_block(&self, src: Option<&[F64]>, sub: &mut [F64], deep: &DeepRows, sub_idx: usize) {
-        let DeepRows { log_d, num_ntts, deep_start, .. } = *deep;
-        self.run_layers_to(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
     }
 
     /// The deep sub-blocks `subs` (sorted, distinct) of an encode that kept no buffer, back to back, before their deep layers.
@@ -783,14 +778,15 @@ impl AdditiveNttF64 {
                     if defer_deep && deep_rows.is_some() {
                         // The rows are hashed from scratch and the buffer keeps its pre-deep state.
                         with_scratch(sub_len, |scratch| {
-                            self.run_layers_from(sub, scratch, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
+                            let (src, end) = (Some(&*sub), log_d);
+                            self.run_layers_to(scratch, src, log_d, num_ntts, deep_start, end, outer, sub_idx, None, hook);
                             if let Some(f) = deep_rows {
                                 f(sub_idx << log_sub, scratch);
                             }
                         });
                     } else {
                         // The replicas are already in place: run the layers where they are.
-                        self.run_layers(sub, log_d, num_ntts, deep_start, log_d, outer, sub_idx, hook);
+                        self.run_layers_to(sub, None, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, hook);
                         if let Some(f) = deep_rows {
                             f(sub_idx << log_sub, sub);
                         }
@@ -813,45 +809,14 @@ impl AdditiveNttF64 {
         })
     }
 
-    /// Run a range of layers in place over one sub-block of the domain.
+    /// Run a range of layers over one sub-block of the domain.
     ///
     /// - The domain has `2^d` rows and splits into `2^o` equal sub-blocks.
     /// - The buffer is one of them; its index fixes the global block index, and so the twiddle, of each block.
     /// - Layers fuse into radix-8 sweeps, with radix-4 sweeps where a lone radix-2 would be left over.
     /// - `hook` runs once after each row group of each sweep.
-    #[allow(clippy::too_many_arguments)]
-    fn run_layers(
-        &self,
-        buf: &mut [F64],
-        log_d: usize,
-        num_ntts: usize,
-        first_layer: usize,
-        end_layer: usize,
-        outer_log: usize,
-        sub_idx: usize,
-        hook: impl FnMut(),
-    ) {
-        self.run_layers_to(buf, None, log_d, num_ntts, first_layer, end_layer, outer_log, sub_idx, None, hook);
-    }
-
-    /// [`Self::run_layers`] over a copy of `src` that lands in `buf`: the first sweep reads `src` and writes `buf`.
-    #[allow(clippy::too_many_arguments)]
-    fn run_layers_from(
-        &self,
-        src: &[F64],
-        buf: &mut [F64],
-        log_d: usize,
-        num_ntts: usize,
-        first_layer: usize,
-        end_layer: usize,
-        outer_log: usize,
-        sub_idx: usize,
-        hook: impl FnMut(),
-    ) {
-        self.run_layers_to(buf, Some(src), log_d, num_ntts, first_layer, end_layer, outer_log, sub_idx, None, hook);
-    }
-
-    /// [`Self::run_layers`] that leaves the blocks alone which hold none of the buffer rows `live` (sorted).
+    ///
+    /// With `live` (sorted), blocks that hold none of those buffer rows are left alone.
     ///
     /// - Only those rows come out right: a block feeds only the rows inside it, in every later layer.
     /// - A fused sweep skips whole blocks of its first layer, so a sparse `live` prunes coarsely.
@@ -1019,7 +984,7 @@ fn for_each_block(num_blocks: usize, log_rows: usize, live: Option<&[usize]>, mu
     }
 }
 
-/// How many times [`AdditiveNttF64::run_layers`] calls its hook over `first_layer..end_layer`.
+/// How many times [`AdditiveNttF64::run_layers_to`] calls its hook over `first_layer..end_layer`.
 pub(super) fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usize) -> usize {
     let (mut layer, mut calls) = (first_layer, 0);
     while layer < end_layer {
