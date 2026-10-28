@@ -43,7 +43,7 @@ pub fn run(n: usize, depth: usize, log_inv_rate: usize, plan: Plan) -> Report {
 
         let mut ps = batch_transcript(LABEL, shape, log_inv_rate);
         let t = Instant::now();
-        let (commitment, prover_data) = commit(&committed, mu, INITIAL_FOLDING_FACTOR, log_inv_rate);
+        let (commitment, prover_data) = commit(&committed, &[], mu, INITIAL_FOLDING_FACTOR, log_inv_rate);
         ps.add_root(&commitment.root);
         let commit_s = t.elapsed().as_secs_f64();
 
@@ -58,7 +58,7 @@ pub fn run(n: usize, depth: usize, log_inv_rate: usize, plan: Plan) -> Report {
         let gkr_s = t.elapsed().as_secs_f64();
 
         let t = Instant::now();
-        open_commitment(&mut ps, shape, &committed, &prover_data, &config, openings);
+        open_commitment(&mut ps, shape, committed, prover_data, &config, openings);
         let open_s = t.elapsed().as_secs_f64();
 
         (
@@ -97,7 +97,7 @@ pub fn run(n: usize, depth: usize, log_inv_rate: usize, plan: Plan) -> Report {
     let merkle_bytes = transcript
         .merkle
         .iter()
-        .map(|m| 8 * m.leaf_data.iter().map(Vec::len).sum::<usize>() + 32 * m.sibling_hashes.len())
+        .map(|m| 8 * m.leaf_data.len() + 32 * m.sibling_hashes.len())
         .sum();
     Report {
         shape,
@@ -175,14 +175,14 @@ pub(crate) fn batch_transcript(label: &[u8], shape: Shape, log_inv_rate: usize) 
 pub(crate) fn open_commitment(
     ps: &mut ProverState,
     shape: Shape,
-    stack: &[F64],
-    prover_data: &ProverData,
+    stack: Vec<F64>,
+    prover_data: ProverData,
     config: &ProverConfig,
     openings: Openings,
 ) {
     let (ring, outputs) = openings.into_pcs_claims(0);
     let points: Vec<_> = outputs.into_iter().collect();
-    pcs::stack_open::open_batch_mixed_whir_stacked(ps, shape.stack_log(), stack, prover_data, config, &points, &ring);
+    pcs::stack_open::open_batch_mixed_whir_stacked(ps, shape.stack_log(), stack, Vec::new(), prover_data, config, &points, &ring);
 }
 
 /// The wire proof in the `verifier` crate's types: the same limbs, digests and row words.

@@ -10,3 +10,6 @@ workspace = true
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
 libc.workspace = true
+
+[dependencies]
+flux-profiler = { git = "https://github.com/gattaca-com/flux", rev = "cb55dcb7fd31d525b09317f98ed0e47fac4ea60a" }

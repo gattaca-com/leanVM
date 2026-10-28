@@ -12,13 +12,18 @@
 //! ```
 //!
 //! The cost is resident memory: the process holds its peak until it exits.
+//!
+//! The kernel's transparent huge pages are on request only (`madvise`), so jemalloc is told to ask
+//! for them: a pass over a table of hundreds of megabytes then walks 2 MiB pages, and first touch
+//! faults once per huge page rather than once per 4 KiB.
 
 pub use tikv_jemallocator::Jemalloc;
 
 /// jemalloc's configuration, which it reads before its first allocation.
 ///
 /// - Dirty pages never decay, so freed memory never returns to the kernel.
+/// - Its extents are advised as huge pages.
 /// - jemalloc reads a C string pointer here.
 /// - A reference to a byte array is that pointer, with no length beside it.
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 18] = b"dirty_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 29] = b"dirty_decay_ms:-1,thp:always\0";

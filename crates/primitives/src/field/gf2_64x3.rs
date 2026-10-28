@@ -366,9 +366,21 @@ pub struct F192Unreduced {
 impl F192Unreduced {
     pub const ZERO: Self = Self { coeffs: [[0; 2]; 3] };
 
+    /// The three 128-bit coefficients as `[low, high]` words.
+    #[inline]
+    pub(crate) const fn coeffs(self) -> [[u64; 2]; 3] {
+        self.coeffs
+    }
+
+    /// Build from three 128-bit coefficients given as `[low, high]` words.
+    #[inline]
+    pub(crate) const fn from_coeffs(coeffs: [[u64; 2]; 3]) -> Self {
+        Self { coeffs }
+    }
+
     /// Build from three 128-bit coefficients.
     #[inline]
-    pub(crate) fn from_wide(coeffs: [u128; 3]) -> Self {
+    fn from_wide(coeffs: [u128; 3]) -> Self {
         Self {
             coeffs: coeffs.map(|c| [c as u64, (c >> 64) as u64]),
         }
@@ -633,7 +645,7 @@ pub mod x86_64 {
 
     /// Two 64-bit words as one register, `lo` in the low qword.
     #[inline(always)]
-    fn pair(lo: u64, hi: u64) -> __m128i {
+    pub(crate) fn pair(lo: u64, hi: u64) -> __m128i {
         // SAFETY: SSE2 is part of the x86-64 baseline.
         unsafe { _mm_set_epi64x(hi as i64, lo as i64) }
     }
@@ -753,28 +765,40 @@ pub mod x86_64 {
         // SAFETY: the cfg enables avx2.
         unsafe { reduce_lanes256(_mm256_unpacklo_epi64(even, odd), _mm256_unpackhi_epi64(even, odd)) }
     }
+    /// `g(spill)` per top nibble `n` of a high word: `spill = n ^ n>>1 ^ n>>3` are the bits that
+    /// `g(hi) = hi * (x^4 + x^3 + x + 1)` pushes past x^63, and `g(spill)` fits a byte.
+    #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    const G_SPILL: [u8; 16] = {
+        let mut table = [0u8; 16];
+        let mut n = 0;
+        while n < 16 {
+            let spill = n ^ (n >> 1) ^ (n >> 3);
+            table[n] = (spill ^ (spill << 1) ^ (spill << 3) ^ (spill << 4)) as u8;
+            n += 1;
+        }
+        table
+    };
 
     /// Lane-wise base reduction on eight qwords; see the four-qword version.
     ///
+    /// `lo ^ g(hi) ^ g(spill)`, with `g(y) = y ^ y<<1 ^ y<<3 ^ y<<4 = z ^ z<<3` for `z = y ^ y<<1`, and
+    /// `g(spill)` one in-lane byte lookup on the top nibble of `hi`.
+    ///
     /// # Safety
     ///
-    /// Requires the `avx512f` target feature.
+    /// Requires the `avx512f` and `avx512bw` target features.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
-    #[target_feature(enable = "avx512f")]
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
     pub(crate) unsafe fn reduce_lanes512(lo: __m512i, hi: __m512i) -> __m512i {
-        // The bits of `hi * 0x1B` shifted past x^63.
-        let spill = _mm512_xor_si512(
-            _mm512_xor_si512(_mm512_srli_epi64::<63>(hi), _mm512_srli_epi64::<61>(hi)),
-            _mm512_srli_epi64::<60>(hi),
-        );
-        // lo ^ f(hi ^ spill), with f(v) = v ^ v<<1 ^ v<<3 ^ v<<4.
-        let v = _mm512_xor_si512(hi, spill);
-        let f = _mm512_xor_si512(
-            _mm512_xor_si512(v, _mm512_slli_epi64::<1>(v)),
-            _mm512_xor_si512(_mm512_slli_epi64::<3>(v), _mm512_slli_epi64::<4>(v)),
-        );
-        _mm512_xor_si512(lo, f)
+        // SAFETY: the table is sixteen bytes, one 128-bit load.
+        let table = _mm512_broadcast_i32x4(unsafe { _mm_loadu_si128(G_SPILL.as_ptr().cast()) });
+        let g_spill = _mm512_shuffle_epi8(table, _mm512_srli_epi64::<60>(hi));
+        let z = _mm512_xor_si512(hi, _mm512_slli_epi64::<1>(hi));
+        _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(lo, z, g_spill),
+            _mm512_slli_epi64::<3>(z),
+        )
     }
 
     /// [`reduce_halves256`] on eight qwords.
@@ -925,7 +949,7 @@ pub mod x86_64 {
     /// Requires the `vpclmulqdq` and `avx512f` target features.
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    unsafe fn mul_by_pairs(lo: __m512i, hi: __m512i, c2: __m512i, k: __m512i) -> [__m512i; 6] {
+    pub(crate) unsafe fn mul_by_pairs(lo: __m512i, hi: __m512i, c2: __m512i, k: __m512i) -> [__m512i; 6] {
         // Immediate bit 0 picks the qword of the first operand, bit 4 that of the second.
         [
             _mm512_clmulepi64_epi128::<0x00>(lo, k),

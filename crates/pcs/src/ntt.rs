@@ -2,5 +2,4 @@
 //! The additive NTT (Lin-Chung-Han novel polynomial basis) WHIR commits with.
 
 pub mod additive_ntt_f64;
-pub use additive_ntt_f64::{AdditiveNttF64, RowSink, transpose_lane_major};
-pub(crate) use additive_ntt_f64::{prefetch, transposed_butterfly_lanes};
+pub use additive_ntt_f64::{AdditiveNttF64, DeepRows, Encoded, Keep, RowSink, transpose_lane_major};

@@ -8,9 +8,9 @@
 //! is discharged by the Keccak reduction (see [`crate::keccak`]). All
 //! challenges and transcript scalars live in the same tower E.
 
+use flux_profiler::timed;
 use std::collections::HashMap;
 
-use crate::colval::ColVal;
 use crate::constraints;
 use crate::leaf::{self, Block, ColumnClaim, Coord};
 use crate::pcs;
@@ -19,15 +19,15 @@ use crate::tables::{
 };
 use crate::transcript::ProverState;
 use crate::witness;
-use primitives::field::{F64, F192, g_pow};
+use primitives::field::{F64, F192, F192Unreduced, g_pow};
 
 mod execute;
 pub mod hints;
 mod isa;
 pub mod layout;
 mod trace;
-pub(crate) use execute::Cell;
 pub use execute::{ExecError, Execution, Fault, Memory};
+pub use hints::GPow;
 pub use isa::{DerefMode, Op};
 pub use layout::*;
 pub(crate) use trace::{Drow, Jrow, Krow, Rows, Srow, Trace, Xrow};
@@ -106,6 +106,69 @@ fn announce_public(ps: &mut ProverState, log_mem: usize, rows: [usize; tables::N
     ps.add_scalar(F192::new(log_inv_rate as u64, 0, 0));
 }
 
+/// One witness stream: its entries back to back in `data`, entry `i` ending at `ends[i]`.
+#[derive(Clone, Default)]
+pub struct WitnessStream {
+    data: Vec<F192>,
+    ends: Vec<u32>,
+}
+
+impl WitnessStream {
+    fn push_iter(&mut self, entry: impl IntoIterator<Item = F192>) {
+        self.data.extend(entry);
+        self.ends.push(self.data.len() as u32);
+    }
+
+    /// Entry `i`, if the stream has one.
+    fn entry(&self, i: usize) -> Option<&[F192]> {
+        let end = *self.ends.get(i)? as usize;
+        Some(&self.data[self.start(i)..end])
+    }
+
+    fn entry_mut(&mut self, i: usize) -> &mut [F192] {
+        let (start, end) = (self.start(i), self.ends[i] as usize);
+        &mut self.data[start..end]
+    }
+
+    fn start(&self, i: usize) -> usize {
+        i.checked_sub(1).map_or(0, |j| self.ends[j] as usize)
+    }
+}
+
+/// Named witness streams: per stream, the entries its `hint_witness` calls pop.
+#[derive(Clone, Default)]
+pub struct Witness(HashMap<String, WitnessStream>);
+
+impl Witness {
+    /// Append `entry` to stream `name`.
+    pub fn push(&mut self, name: &str, entry: &[F192]) {
+        self.push_iter(name, entry.iter().copied());
+    }
+
+    /// [`Self::push`] of an entry the iterator yields, with no buffer in between.
+    pub fn push_iter(&mut self, name: &str, entry: impl IntoIterator<Item = F192>) {
+        match self.0.get_mut(name) {
+            Some(stream) => stream.push_iter(entry),
+            None => self.0.entry(name.to_string()).or_default().push_iter(entry),
+        }
+    }
+
+    /// Append every stream of `other` to the stream of the same name.
+    pub fn append(&mut self, other: Self) {
+        for (name, stream) in other.0 {
+            let ours = self.0.entry(name).or_default();
+            let shift = ours.data.len() as u32;
+            ours.data.extend(stream.data);
+            ours.ends.extend(stream.ends.into_iter().map(|end| end + shift));
+        }
+    }
+
+    /// Entry `i` of stream `name`, for a test to forge.
+    pub fn entry_mut(&mut self, name: &str, i: usize) -> &mut [F192] {
+        self.0.get_mut(name).expect("a stream").entry_mut(i)
+    }
+}
+
 #[derive(Clone)]
 pub struct Program {
     pub prog: Vec<Op>, // bytecode (size B, power of two)
@@ -115,17 +178,23 @@ pub struct Program {
     /// `prog`: always set by [`Program::assemble`] from the bytecode, so a
     /// `Program` cannot carry a hash inconsistent with its own `prog`.
     pub(crate) bytecode_hash: [u8; 32],
+    /// The public bytecode columns [`layout::layout`] puts in the seed and finalize
+    /// blocks, built once at assembly. Same trust as `bytecode_hash`.
+    pub(crate) bytecode_cols: layout::BytecodeColumns,
+    /// The largest operand offset in `prog`, so that every instruction access of a run is
+    /// within the cells it bounds. Same trust as `bytecode_hash`.
+    pub(crate) max_offset: usize,
     /// Prover-side frame/buffer allocation hints (keyed by global pc) and the
     /// size of `main`'s frame: the nondeterminism [`Program::execute`] needs to
     /// run the program. Public verification ([`verify`]) ignores them.
-    pub(crate) hints: HashMap<u32, Vec<hints::RHint>>,
+    pub(crate) hints: hints::HintPlan,
     pub(crate) main_frame: u32,
     /// Named prover witness streams for the program's `hint_witness` calls
     /// ([`Program::set_witness`]): a stream is a sequence of *entries* (one
     /// slice of values per `hint_witness` call; the same symbol may be
     /// hinted many times); each call pops the next entry, whose length must
     /// match its destination. Prover-side only; verification ignores them.
-    pub(crate) witness: HashMap<String, Vec<Vec<F192>>>,
+    pub(crate) witness: Witness,
     /// Function pc-ranges `(name, entry, len)` from the compiler, for the
     /// `DBG_PROF=1` per-function cycle profile ([`Program::execute`]). Purely
     /// diagnostic; empty for hand-assembled programs.
@@ -156,8 +225,9 @@ impl Program {
     /// from `prog`. The single funnel for construction, so the digest is always
     /// consistent with the bytecode.
     pub fn assemble(prog: Vec<Op>, hints: HashMap<u32, Vec<hints::RHint>>, main_frame: u32) -> Self {
+        let bytecode_cols = layout::bytecode_columns(&prog);
         let bytecode_hash = {
-            let table = layout::bytecode_table(&prog);
+            let table = layout::stacked_columns(&bytecode_cols);
             // SAFETY: F64 is #[repr(transparent)] over u64, so the slice's byte image is
             // exactly the concatenation of its `to_le_bytes` on little-endian targets.
             let bytes: &[u8] =
@@ -165,15 +235,22 @@ impl Program {
             primitives::hash::Hasher::new().update(bytes).finalize()
         };
         Self {
+            max_offset: prog.iter().map(Op::max_offset).max().unwrap_or(0) as usize,
+            hints: hints::HintPlan::new(hints, prog.len()),
             prog,
             bytecode_hash,
-            hints,
+            bytecode_cols,
             main_frame,
-            witness: HashMap::new(),
+            witness: Witness::default(),
             fn_ranges: Vec::new(),
             src_lines: Vec::new(),
             min_log_committed: 0,
         }
+    }
+
+    /// The public bytecode columns, for [`layout::layout`].
+    pub fn bytecode_cols(&self) -> &layout::BytecodeColumns {
+        &self.bytecode_cols
     }
 
     /// Where `pc` came from: `"verify_sub (line 2204)"` when the compiler left a
@@ -210,7 +287,16 @@ impl Program {
     /// may be hinted many times). Prover-side data: entirely unconstrained,
     /// invisible to verification.
     pub fn set_witness(&mut self, name: impl Into<String>, entries: Vec<Vec<F192>>) {
-        self.witness.insert(name.into(), entries);
+        let mut stream = WitnessStream::default();
+        for entry in entries {
+            stream.push_iter(entry);
+        }
+        self.witness.0.insert(name.into(), stream);
+    }
+
+    /// Replace every witness stream with `witness`.
+    pub fn set_witnesses(&mut self, witness: Witness) {
+        self.witness = witness;
     }
 
     /// Assemble a program directly from a fixed bytecode vector, starting at
@@ -324,107 +410,30 @@ fn table_spans() -> TableSpans {
 /// coefficients once rather than multiplied onto every row's form value.
 fn airs(
     taus: &[usize; tables::N_TABLES],
+    rows: &[usize; tables::N_TABLES],
     forms: &[Vec<leaf::BusForm>; 3],
     form_pows: [F192; 3],
 ) -> Vec<constraints::Air<'static>> {
     tables::tables()
         .iter()
-        .zip(taus)
+        .zip(taus.iter().zip(rows))
         .enumerate()
-        .map(|(t, (&table, &tau))| {
+        .map(|(t, (&table, (&tau, &rows)))| {
             // One form, not three: the batch adds the three sides' evaluations
             // anyway, and summing them here is a setup cost against a dot product
             // and a product list per row per node.
-            let bus = RowForm::new(&leaf::BusForm::sum((0..3).map(|s| forms[s][t].scaled(form_pows[s]))));
-            let bus_k = bus.clone();
+            let bus = leaf::BusForm::sum((0..3).map(|s| forms[s][t].scaled(form_pows[s])));
             constraints::Air {
                 tau,
+                rows,
                 n_constraints: table.n_constraints(),
                 eval: Box::new(move |p, vals, quadratic| {
-                    let air = <F192 as ColVal>::lift(table.eval_constraint(p, vals, quadratic));
-                    <F192 as ColVal>::reduce(air ^ bus.eval_unreduced(vals, quadratic))
-                }),
-                // The same expression over K columns: the identity's K-only products
-                // stay 64-bit and the bus form becomes a mixed dot product.
-                eval_k: Box::new(move |p, vals, quadratic| {
-                    let air = <F64 as ColVal>::lift(table.eval_constraint_k(p, vals, quadratic));
-                    <F64 as ColVal>::reduce(air ^ bus_k.eval_unreduced(vals, quadratic))
+                    let air = F192Unreduced::from(table.eval_constraint(p, vals, quadratic));
+                    (air ^ bus.eval_unreduced(vals, quadratic)).reduce()
                 }),
             }
         })
         .collect()
-}
-
-/// A table's bus form as the batch evaluates it on every row of every round: its
-/// nonzero coefficients, and its products grouped by a column they share,
-/// `Σ_a v_a·(Σ_b c_ab·v_b)`, so a column that several products share multiplies
-/// once rather than once per product. The arithmetic is exact, so the value is the form's.
-#[derive(Clone)]
-struct RowForm {
-    linear: Vec<(usize, F192)>,
-    constant: F192,
-    groups: Vec<(usize, Vec<(usize, F192)>)>,
-}
-
-impl RowForm {
-    fn new(form: &leaf::BusForm) -> Self {
-        let n = form.coeffs.len();
-        let linear = (0..n)
-            .filter(|&i| !form.coeffs[i].is_zero())
-            .map(|i| (i, form.coeffs[i]))
-            .collect();
-        let mut prods = form.prods.clone();
-        let mut groups: Vec<(usize, Vec<(usize, F192)>)> = Vec::new();
-        // Greedily factor out the column the most remaining products share.
-        while !prods.is_empty() {
-            let mut shared = vec![0usize; n];
-            for &(a, b, _) in &prods {
-                shared[a] += 1;
-                if b != a {
-                    shared[b] += 1;
-                }
-            }
-            let col = (0..n)
-                .max_by_key(|&c| (shared[c], std::cmp::Reverse(c)))
-                .expect("a column");
-            let (with, rest): (Vec<_>, Vec<_>) = prods.into_iter().partition(|&(a, b, _)| a == col || b == col);
-            groups.push((
-                col,
-                with.into_iter()
-                    .map(|(a, b, c)| (if a == col { b } else { a }, c))
-                    .collect(),
-            ));
-            prods = rest;
-        }
-        Self {
-            linear,
-            constant: form.constant,
-            groups,
-        }
-    }
-
-    /// The form at one row, unreduced, or only its degree-two terms when `quadratic`.
-    #[inline(always)]
-    fn eval_unreduced<T: ColVal>(&self, vals: &[T], quadratic: bool) -> T::Unreduced {
-        let mut acc = if quadratic {
-            T::lift(F192::ZERO)
-        } else {
-            self.linear
-                .iter()
-                .fold(T::lift(self.constant), |acc, &(i, c)| acc ^ vals[i].mul_e_unreduced(c))
-        };
-        for (a, terms) in &self.groups {
-            if let [(b, c)] = terms[..] {
-                acc ^= (vals[*a] * vals[b]).mul_e_unreduced(c);
-                continue;
-            }
-            let inner = terms
-                .iter()
-                .fold(T::lift(F192::ZERO), |acc, &(b, c)| acc ^ vals[b].mul_e_unreduced(c));
-            acc ^= vals[*a].mul_e_unreduced(T::reduce(inner));
-        }
-        acc
-    }
 }
 
 /// Each table's claimed sum: its identities vanish, so what its summand comes to
@@ -525,15 +534,34 @@ impl Stats {
 /// run [`Stats`], or why no proof was made ([`ProveError`]). `log_inv_rate`
 /// selects the PCS rate and is announced in the Fiat-Shamir transcript before
 /// the commitment.
-#[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
 pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
+    prove_with(program, &program.witness, public_input, log_inv_rate, &mut GPow::new())
+}
+
+/// [`prove`] with the witness streams `witness` in place of the program's own, so a shared
+/// program is proved without a clone.
+///
+/// The g-power table the run needs is owned by the caller. A run starts from
+/// `gpow` and leaves it grown, so a caller that proves again, even another program, passes
+/// the same table back and skips growing it. On an error `gpow` is left as a fresh table.
+#[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
+#[timed]
+pub fn prove_with(
+    program: &Program,
+    witness: &Witness,
+    public_input: [F192; 2],
+    log_inv_rate: usize,
+    gpow: &mut GPow,
+) -> Result<(Proof, Stats), ProveError> {
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
-    let (exec, keccak_blocks) = crate::stage!("Execute program", || {
-        crate::keccak::while_executing(|step| program.execute_with(public_input, step))
+    let (execution, keccak_blocks) = crate::stage!("Execute program", || {
+        crate::keccak::while_executing(|step| {
+            program.execute_with(witness, public_input, std::mem::take(gpow), step)
+        })
     });
-    let exec = exec.map_err(ProveError::Execution)?;
+    let mut exec = execution.map_err(ProveError::Execution)?;
     // A live value that came from outside the constraint system would make the proof
     // about a weaker statement than the program text, so it is refused here, on the one
     // path every proof takes, rather than left to whichever test happens to look.
@@ -542,6 +570,9 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     }
     let cycles = exec.cycles;
     let mut w = crate::stage!("Build witness", || program.build(&exec, keccak_blocks));
+    *gpow = std::mem::take(&mut exec.gpow);
+    // Build witness was the last reader of the cells.
+    gpow.cells = Some(exec.mem.into_cells());
     if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&w.layout.shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
             log_committed: w.layout.shape.mu,
@@ -558,8 +589,10 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
 
     // Announce the prover's sizes, then commit, before sampling any challenge.
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
+    // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
+    pcs::reserve_level1(w.layout.shape.mu, log_inv_rate);
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
+        pcs::commit(&mut ps, &w.q, &w.repeats, w.layout.shape, log_inv_rate)
     });
 
     // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
@@ -577,25 +610,23 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
         let l = &w.layout;
         let cols = w.columns();
         let bus = crate::stage!("Prove bus", || {
-            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &mut ps)
+            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &l.rows, &mut ps)
         });
         let table_claims = crate::stage!("Prove constraints", || {
             // One sumcheck for all six tables (§constraints).
-            let table_cols: Vec<Vec<&[F64]>> = spans
-                .iter()
-                .map(|&(base, n)| (0..n).map(|c| cols[base + c]).collect())
-                .collect();
             // The eq point is the bus GKR's ζ, not a fresh one: that is what lets the
             // batch settle the bus forms alongside the constraints.
             let xi = ps.sample();
             let form_pows = xi_form_pows(xi);
             let sigma = sigmas(&bus.sigmas, form_pows);
             constraints::prove(
-                &airs(&l.taus, &bus.forms, form_pows),
-                &table_cols,
+                &airs(&l.taus, &l.rows, &bus.forms, form_pows),
+                &cols,
+                &spans,
                 xi,
                 &bus.point,
                 &sigma,
+                &bus.blocks,
                 &mut ps,
             )
         });
@@ -629,7 +660,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     drop(keccak_reduction);
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
-    crate::stage!("PCS open", || { pcs::open(&mut ps, &committed, &w.q, &slots, &ring) });
+    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, w.repeats, &slots, &ring) });
     Ok((
         ps.into_proof(),
         Stats {
@@ -648,6 +679,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
 /// `KECCAK` output lanes', which go to the reduction), then the three public-input limb
 /// claims, each located in its committed slot. Every verifier assembles the same list in
 /// the same order.
+#[timed]
 fn finish_claims(
     l: &Layout,
     bus_claims: Vec<ColumnClaim>,
@@ -739,7 +771,7 @@ pub fn verify(program: &Program, public_input: &[F192; 2], proof: &Proof) -> Res
     if public_input.iter().any(|half| half.c2 != 0) || !program.prog.len().is_power_of_two() {
         return Err(CpuError::PublicInput);
     }
-    let table: Vec<u64> = layout::bytecode_table(&program.prog)
+    let table: Vec<u64> = layout::stacked_columns(&program.bytecode_cols)
         .iter()
         .map(|word| word.0)
         .collect();
@@ -939,5 +971,59 @@ mod tests {
         let pi = [w(1), w(2)];
         let exec = program.execute(pi).unwrap();
         assert_eq!(exec.mem.word(4), x * y, "MUL computes the E product");
+    }
+
+    /// The producer's repeat map of the stack tags real repeats only, and finds the padding: a program whose
+    /// tables end in whole padded blocks, each tagged, with the proof still valid.
+    #[test]
+    fn witness_repeat_map_tags_real_repeats() {
+        let steps = 17usize;
+        let mut prog = vec![Op::Set { o: 2, k: w(1) }, Op::Set { o: 3, k: w(2) }];
+        for c in 4..13u32 {
+            prog.push(Op::Set { o: c, k: F192::ZERO });
+        }
+        // A chain of KECCAK rows, each reading the output of the one before in its layout.
+        for j in 0..steps as u32 {
+            let out = 20_000 + 13 * j;
+            prog.push(if j == 0 {
+                Op::Keccak { m: [2, 3, 2, 3], tail: 4, b8: 8, cap: 9, out, in_odd: false, out_odd: true }
+            } else {
+                let inp = out - 13;
+                Op::Keccak {
+                    m: [inp, inp + 1, inp + 2, inp + 3],
+                    tail: inp + 4,
+                    b8: inp + 8,
+                    cap: inp + 9,
+                    out,
+                    in_odd: j % 2 == 1,
+                    out_odd: j % 2 == 0,
+                }
+            });
+        }
+        // 4150 SETs in all, so the SET table pads from row 4150 to 8192: past 4 blocks.
+        let n_set = 4150;
+        while prog.len() < n_set + steps + 11 {
+            prog.push(Op::Set { o: 16 + prog.len() as u32, k: w(prog.len() as u64) });
+        }
+        while prog.len() < 8191 {
+            prog.push(Op::Xor { a: 2, b: 3, c: 16 + prog.len() as u32 });
+        }
+        prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
+        let program = Program::from_bytecode(prog, 20_300);
+        let pi = [w(3), w(5)];
+        let (exec, blocks) = crate::keccak::while_executing(|step| {
+            program.execute_with(&program.witness, pi, GPow::new(), step)
+        });
+        let witness = program.build(&exec.unwrap(), blocks);
+        let real = ::pcs::stack_open::equal_blocks(&witness.q);
+        assert_eq!(witness.repeats.len(), real.len());
+        assert!(
+            witness.repeats.iter().zip(&real).all(|(&tagged, &real)| real || !tagged),
+            "a tagged block is a repeat"
+        );
+        let tagged = witness.repeats.iter().filter(|&&t| t).count();
+        assert!(tagged >= 6, "the padding is found: {tagged} blocks tagged");
+        let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &proof).expect("the proof verifies");
     }
 }

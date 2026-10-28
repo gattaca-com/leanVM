@@ -4,6 +4,8 @@
 //! `q̂(ζ, sel_i) = c` on the stack, where `sel_i` is the high-bit selector of
 //! the column's offset.
 
+use crate::tables::ColumnOut;
+use ::pcs::stack_open::EQUAL_BLOCK_LOG;
 use primitives::field::F64;
 
 /// Where a column sits in the stacked witness. A [`Placement::VIRTUAL`] column has no
@@ -113,9 +115,18 @@ pub unsafe fn alloc_stack(shape: StackShape) -> Vec<F64> {
     unsafe { primitives::uninit_vec::<F64>(shape.committed_len()) }
 }
 
+/// The stack's repeat map, all false: one tag per block of `2^EQUAL_BLOCK_LOG` words.
+pub fn alloc_repeats(shape: StackShape) -> Vec<bool> {
+    vec![false; shape.committed_len() >> EQUAL_BLOCK_LOG]
+}
+
 /// Carve the stack into one mutable window per committed column, in column order,
 /// and zero the pad tail past the last one. A virtual column gets an empty window:
 /// it is not in the stack, so its values need storage of their own.
+///
+/// `repeats` is the stack's repeat map ([`::pcs::stack_open::equal_blocks`] is its reference): each column
+/// gets its blocks' tags to set, and the zero pad tail is tagged here. A block shared by columns smaller
+/// than a block stays untagged, as does the first block of a column.
 ///
 /// Writing each column into its final place is what lets the whole witness be
 /// written once. Copying columns in afterwards would move the entire stack a
@@ -125,25 +136,35 @@ pub unsafe fn alloc_stack(shape: StackShape) -> Vec<F64> {
 /// Safe despite [`alloc_stack`]'s uninitialized allocation: [`placements_of`]
 /// tiles the columns from offset 0, checked here, so consecutive `split_at_mut`
 /// hands out disjoint windows covering `[0, placed)` and this zeroes the rest.
-pub fn split_stack<'a>(q: &'a mut [F64], placements: &[Placement]) -> Vec<&'a mut [F64]> {
+pub fn split_stack<'a>(q: &'a mut [F64], repeats: &'a mut [bool], placements: &[Placement]) -> Vec<ColumnOut<'a>> {
     let mut order: Vec<usize> = (0..placements.len()).filter(|&i| !placements[i].is_virtual()).collect();
     order.sort_unstable_by_key(|&i| placements[i].offset);
 
-    let mut windows: Vec<&mut [F64]> = Vec::with_capacity(placements.len());
-    windows.resize_with(placements.len(), || &mut []);
-    let mut rest = q;
+    let mut windows: Vec<ColumnOut> = Vec::with_capacity(placements.len());
+    windows.resize_with(placements.len(), || ColumnOut {
+        words: &mut [],
+        repeats: &mut [],
+    });
+    let total = repeats.len();
+    let (mut rest, mut tags) = (q, repeats);
     let mut placed = 0usize;
     for &i in &order {
         assert_eq!(
             placements[i].offset, placed,
             "the stacked columns must tile from 0 with no gap"
         );
-        let (window, tail) = rest.split_at_mut(1 << placements[i].n_vars);
-        windows[i] = window;
-        rest = tail;
+        let (words, tail) = rest.split_at_mut(1 << placements[i].n_vars);
+        let (repeats, tag_tail) = tags.split_at_mut(words.len() >> EQUAL_BLOCK_LOG);
+        windows[i] = ColumnOut { words, repeats };
+        (rest, tags) = (tail, tag_tail);
         placed += 1 << placements[i].n_vars;
     }
     parallel::chunks_mut(rest, FILL_CHUNK, |_, pad| pad.fill(F64::ZERO));
+    // The pad's blocks are zeros, so a block repeats its predecessor once that is in the pad too.
+    let first = total - tags.len();
+    for (b, tag) in (first..).zip(tags.iter_mut()) {
+        *tag = b > 0 && (b - 1) << EQUAL_BLOCK_LOG >= placed;
+    }
     windows
 }
 

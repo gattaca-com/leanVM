@@ -14,6 +14,8 @@ doc = false
 workspace = true
 
 [dependencies]
+flux-profiler = { git = "https://github.com/gattaca-com/flux", rev = "cb55dcb7fd31d525b09317f98ed0e47fac4ea60a", features = ["perf", "alloc-profile"] }
+tracing-subscriber.workspace = true
 rec_aggregation = { workspace = true, features = ["signers-cache"] }
 leanvm_core.workspace = true
 lean_compiler.workspace = true

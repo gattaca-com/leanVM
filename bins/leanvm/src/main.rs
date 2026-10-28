@@ -1,11 +1,13 @@
 //! Benchmark CLI for signature and blob proofs, recursion, batched Keccak, and the Fibonacci demo.
 
 #[global_allocator]
-static ALLOCATOR: bench::Jemalloc = bench::Jemalloc;
+static ALLOCATOR: flux_profiler::allocator::CountingAllocator<bench::Jemalloc> =
+    flux_profiler::allocator::CountingAllocator(bench::Jemalloc);
 
 use clap::{Parser, Subcommand};
 
 mod benchmark;
+mod flux_bridge;
 mod fibonacci;
 mod report;
 
@@ -36,6 +38,14 @@ struct Cli {
     /// Idle seconds before each measured pass.
     #[arg(long, global = true, default_value_t = 2)]
     cooldown: u64,
+
+    /// Skip the warmup pass, to time a fresh process's first pass.
+    #[arg(long, global = true)]
+    cold: bool,
+
+    /// Publish flux-profiler rings, for scripts/flux-trace.sh.
+    #[arg(long, global = true)]
+    flux: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -78,6 +88,9 @@ enum Command {
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=lean_da::DA_MAX_ROWS as u64)
         )]
         blobs_per_leaf: usize,
+        /// Write the serialized aggregate proof to this file.
+        #[arg(long)]
+        proof_out: Option<std::path::PathBuf>,
     },
     /// Prove and verify a batch of Keccak-f permutations with the VM's GKR, outside the VM.
     Hash {
@@ -104,8 +117,9 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     leanvm_core::init_prover();
-    let plan = bench::Plan::new(cli.repeat, cli.cooldown);
-    if cli.tracing && !matches!(&cli.command, Command::Recursion { .. }) {
+    let flux = flux_bridge::init(cli.flux);
+    let plan = bench::Plan::new(cli.repeat, cli.cooldown).cold(cli.cold);
+    if !flux && cli.tracing && !matches!(&cli.command, Command::Recursion { .. }) {
         bench::init_tracing();
     }
     match cli.command {
@@ -117,6 +131,7 @@ fn main() {
             xmss_per_leaf,
             sphincs_per_leaf,
             blobs_per_leaf,
+            proof_out,
         } => {
             benchmark::run_recursion(
                 n,
@@ -125,6 +140,7 @@ fn main() {
                 blobs_per_leaf,
                 cli.log_inv_rate,
                 cli.tracing,
+                proof_out.as_deref(),
                 plan,
             );
         }

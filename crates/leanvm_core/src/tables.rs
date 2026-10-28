@@ -11,50 +11,39 @@
 //! the `DEREF` store, the `JUMP` successors are each written out as the degree-2
 //! bus coordinate that carries them (§sec:m3), which leaves `JUMP`'s is-nonzero
 //! indicator as the one identity any table still has. Every identity is `K`-valued,
-//! so a relation on machine words is written out lane by lane; after the round a
-//! table joins the batch its columns are `E`-valued, which is what
-//! `eval_constraint` takes.
+//! so a relation on machine words is written out lane by lane. `eval_constraint`
+//! reads the columns as `E`-valued, which embeds `K`.
 
-use crate::colval::ColVal;
 use crate::cpu::{Drow, Jrow, Krow, Memory, Op, Rows, Srow, Trace};
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
+use ::pcs::stack_open::EQUAL_BLOCK_LOG;
 use primitives::field::{F64, F192, mul_by_g};
+use primitives::stream::Stream;
 
 // ---- the identities ----------------------------------------------------------
-//
-// Each is written ONCE, generic over the column type: `F64` in the round a table
-// joins the batch, `F192` afterwards (see [`ColVal`]). Products of two `K`
-// columns stay 64-bit and an `η`-power multiplies through `mul_e`.
 //
 // EVERY identity is `K`-valued, like the columns it reads and like the bus
 // coordinates (§sec:air). A relation between machine WORDS is therefore written out
 // lane by lane, with the tower multiplication unrolled by hand ([`TOWER_LANES`]),
-// rather than assembled into one `E` equation. A table's identity slice is then a
-// mixed dot product against its `η`-range: in the round a table joins the batch (the
-// batch's largest) that is one 64-bit product per identity plus three PMULL for its
-// `η`-power, with ONE reduction for the whole slice ([`ColVal::dot`]). One `E`-valued
-// identity would instead cost a full `E×E` product against its `η`-power, plus a
-// reduction of its own, and the lanes it bundles are the same lane polynomials
-// either way.
+// rather than assembled into one `E` equation.
 
 /// The tower product `x·y` in `E = K[y]/(y³+y+1)` as three lane sums: lane `i` is
 /// `Σ x_j·y_k` over `TOWER_LANES[i]`. The five partial sums of §sec:tab-mul fold
-/// into `c0 = p0+p3`, `c1 = p1+p3+p4`, `c2 = p2+p4`; written once here because both
-/// `MUL`'s result coordinate ([`arith_result`]) and `JUMP`'s inverse identity need
-/// the same unrolling.
+/// into `c0 = p0+p3`, `c1 = p1+p3+p4`, `c2 = p2+p4`. `MUL`'s result coordinate
+/// ([`arith_result`]) is built from it.
 const TOWER_LANES: [&[(usize, usize)]; 3] = [
     &[(0, 0), (1, 2), (2, 1)],
     &[(0, 1), (1, 0), (1, 2), (2, 1), (2, 2)],
     &[(0, 2), (1, 1), (2, 0), (2, 2)],
 ];
 
-/// One lane of the tower product, in the columns' own field. Only the test that
+/// One lane of the tower product, over `K`. Only the test that
 /// checks [`TOWER_LANES`] against the field needs it: `MUL`'s result rides the bus
 /// as a coordinate ([`arith_result`]), and `JUMP`'s condition is `K`-valued, so no
 /// identity assembles a tower product any more.
 #[cfg(test)]
-fn tower_lane<T: ColVal>(lane: usize, x: [T; 3], y: [T; 3]) -> T {
-    TOWER_LANES[lane].iter().fold(T::ZERO, |acc, &(j, k)| acc + x[j] * y[k])
+fn tower_lane(lane: usize, x: [F64; 3], y: [F64; 3]) -> F64 {
+    TOWER_LANES[lane].iter().fold(F64::ZERO, |acc, &(j, k)| acc + x[j] * y[k])
 }
 
 /// `JUMP`'s two identities: `b = cond·w` and `cond·(b+1) = 0` (§sec:tab-jump).
@@ -67,14 +56,14 @@ fn tower_lane<T: ColVal>(lane: usize, x: [T; 3], y: [T; 3]) -> T {
 /// The condition is `K`-valued, so both identities are single-lane. Its memory
 /// flush carries literal zeros above the low limb (`memory_k`), so a word outside
 /// `K` cannot balance the bus; the interpreter rejects one outright.
-fn jump_identity<T: ColVal>(pows: &[F192], cols: &[T], quadratic: bool) -> F192 {
+fn jump_identity(pows: &[F192], cols: &[F192], quadratic: bool) -> F192 {
     use jump::*;
     let (b, b1) = if quadratic {
-        (T::ZERO, cols[B])
+        (F192::ZERO, cols[B])
     } else {
-        (cols[B], cols[B] + T::ONE)
+        (cols[B], cols[B] + F192::ONE)
     };
-    T::dot(pows, &[b + cols[V_COND] * cols[W], cols[V_COND] * b1], F192::ZERO)
+    pows[0] * (b + cols[V_COND] * cols[W]) + pows[1] * (cols[V_COND] * b1)
 }
 
 // ---- shared bus vocabulary ---------------------------------------------------
@@ -201,8 +190,13 @@ pub struct FillCtx<'a> {
 }
 
 /// Where one column's values go: its window in the stacked witness, or a private
-/// buffer if the column is virtual.
-pub type ColumnOut<'a> = &'a mut [F64];
+/// buffer if the column is virtual, and the window's slice of the stack's repeat map
+/// ([`crate::witness::split_stack`]), which is empty for a virtual column or a window under one block.
+#[derive(Default)]
+pub struct ColumnOut<'a> {
+    pub words: &'a mut [F64],
+    pub repeats: &'a mut [bool],
+}
 
 impl<'a> FillCtx<'a> {
     pub(crate) fn new(
@@ -269,38 +263,15 @@ impl<'a> FillCtx<'a> {
         f: impl Fn(usize) -> [F64; N] + Sync,
     ) {
         let n = self.height;
-        let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| {
-            assert_eq!(out[at + k].len(), n, "column {} has the wrong window length", at + k);
+        for k in 0..N {
+            assert_eq!(out[at + k].words.len(), n, "column {} has the wrong window length", at + k);
             let col = at + k;
             self.written[col / 64].fetch_or(1 << (col % 64), std::sync::atomic::Ordering::Relaxed);
-            parallel::SendPtr(out[at + k].as_mut_ptr())
-        });
+        }
         assert!(n_rows <= n, "a table's rows must fit its cube");
         let padding: [F64; N] = std::array::from_fn(|k| self.padding[at + k]);
-        // A cache line of rows is gathered column by column, then streamed out: the
-        // stack is read by a later pass, so its lines need not be fetched.
-        const LINE: usize = 8;
-        parallel::for_each_chunk(n.div_ceil(LINE), |first, end| {
-            let stream = primitives::stream::Stream::new();
-            for b in first..end {
-                let start = b * LINE;
-                let len = LINE.min(n - start);
-                let mut buf = [[F64::ZERO; LINE]; N];
-                for j in 0..len {
-                    let i = start + j;
-                    let v = if i < n_rows { f(i) } else { padding };
-                    for k in 0..N {
-                        buf[k][j] = v[k];
-                    }
-                }
-                for (p, column) in dst.iter().zip(&buf) {
-                    // SAFETY: block `b` writes rows `start..start + len` of each of the
-                    // `N` windows, in bounds and disjoint from every other block's, and
-                    // the dispatch blocks until every write is finished.
-                    unsafe { stream.copy_uninit(p.add(start), &column[..len]) };
-                }
-            }
-        });
+        let windows: &mut [ColumnOut; N] = (&mut out[at..at + N]).try_into().unwrap();
+        fill_columns(windows, n_rows, padding, f);
     }
 
     /// The three `K`-lanes of the 192-bit word in memory cell `addr`.
@@ -308,6 +279,58 @@ impl<'a> FillCtx<'a> {
         let w = self.mem.word(addr as usize);
         [F64(w.c0), F64(w.c1), F64(w.c2)]
     }
+}
+
+/// Rows a streamed fill gathers per column before publishing them: whole cache lines.
+const FILL_ROWS: usize = 64;
+/// Rows one task of a streamed fill covers.
+const FILL_TASK: usize = 1 << 12;
+
+/// Write `f(i)` to row `i` of the `N` windows for `i < n_rows`, then `padding` to the end of each.
+/// Rows are gathered into line-sized runs per column and streamed out: the windows are the stacked
+/// witness, which nothing reads until the commit, so a fetch of a line before its write is wasted.
+/// The windows are equal and a power of two long.
+///
+/// A padded block whose predecessor is also padded repeats it, and is tagged so in the window's `repeats`.
+pub(crate) fn fill_columns<const N: usize>(
+    windows: &mut [ColumnOut; N],
+    n_rows: usize,
+    padding: [F64; N],
+    f: impl Fn(usize) -> [F64; N] + Sync,
+) {
+    let n = windows[0].words.len();
+    assert!(n.is_power_of_two() && windows.iter().all(|w| w.words.len() == n));
+    assert!(n_rows <= n);
+    for window in windows.iter_mut() {
+        for (b, repeat) in window.repeats.iter_mut().enumerate() {
+            *repeat = b > 0 && (b - 1) << EQUAL_BLOCK_LOG >= n_rows;
+        }
+    }
+    let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| parallel::SendPtr(windows[k].words.as_mut_ptr()));
+    let (task, run) = (n.min(FILL_TASK), n.min(FILL_ROWS));
+    parallel::for_each(n / task, |t| {
+        let stream = Stream::new();
+        let padded: [[F64; FILL_ROWS]; N] = std::array::from_fn(|k| [padding[k]; FILL_ROWS]);
+        let mut gathered = [[F64::ZERO; FILL_ROWS]; N];
+        for base in (t * task..(t + 1) * task).step_by(run) {
+            let run_rows = if base >= n_rows {
+                &padded
+            } else {
+                for j in 0..run {
+                    let row = if base + j < n_rows { f(base + j) } else { padding };
+                    for k in 0..N {
+                        gathered[k][j] = row[k];
+                    }
+                }
+                &gathered
+            };
+            for k in 0..N {
+                // SAFETY: tasks cover disjoint rows, so each window slot is written once, in bounds,
+                // and the dispatch returns after every task's stream has fenced.
+                unsafe { stream.copy_uninit(dst[k].0.add(base), &run_rows[k][..run]) };
+            }
+        }
+    });
 }
 
 /// Fill one table's columns and check that every window was written. The stack is
@@ -323,7 +346,7 @@ pub(crate) fn fill_table(table: &dyn Table, ctx: &FillCtx, out: &mut [ColumnOut]
         .map(|w| w.load(std::sync::atomic::Ordering::Relaxed));
     let written = written[0] as u128 | (written[1] as u128) << 64;
     // A column with no window is held elsewhere (a KECCAK input lane, by `q_keccak`).
-    let windows = (0..n).filter(|&c| !out[c].is_empty()).fold(0u128, |m, c| m | 1 << c);
+    let windows = (0..n).filter(|&c| !out[c].words.is_empty()).fold(0u128, |m, c| m | 1 << c);
     assert_eq!(written, windows, "a table left one of its columns unwritten");
 }
 
@@ -367,19 +390,12 @@ pub trait Table: Sync {
         assert!(pows.is_empty(), "a table with constraints must evaluate them");
         F192::ZERO
     }
-    /// The same identity over `K`-valued columns, for the round a table joins the
-    /// batch, before its columns have been folded into `E` (§sec:air). Both entry
-    /// points delegate to one generic definition per table, so they cannot drift.
-    fn eval_constraint_k(&self, pows: &[F192], _cols: &[F64], _quadratic: bool) -> F192 {
-        assert!(pows.is_empty(), "a table with constraints must evaluate them");
-        F192::ZERO
-    }
     /// Declare the table's bus interactions.
     fn flushes(&self, f: &mut FlushBuilder);
     /// Fill this table's columns from the trace: `out[i]` is local column `i`'s
     /// window, already at its padded length. Every window must be written in full;
-    /// use `FillCtx::col` / `FillCtx::cols`, which append the column's pad value
-    /// past the last trace row and record the coverage `fill_table` checks.
+    /// use `FillCtx::cols`, which appends the columns' pad values
+    /// past the last trace row and records the coverage `fill_table` checks.
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]);
 }
 
@@ -550,14 +566,13 @@ impl Table for Arith {
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]) {
         use arith::*;
         let rows = if self.is_xor { &ctx.trace.xor } else { &ctx.trace.mul };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // The offsets and both operand words come out of ONE bytecode decode: split
-        // across passes, the row's instruction is fetched once per pass.
-        ctx.cols(out, rows, OA, |r| {
+        // One pass: the row's instruction is decoded once, and every column is written from it.
+        ctx.cols(out, rows, PC, |r| {
             let (a, b, c) = ctx.ternary_operands(r.pc);
             let (va, vb) = (ctx.limbs(r.fp + a), ctx.limbs(r.fp + b));
             [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
                 ctx.g_at(a),
                 ctx.g_at(b),
                 ctx.g_at(c),
@@ -567,10 +582,12 @@ impl Table for Arith {
                 vb[0],
                 vb[1],
                 vb[2],
+                ctx.g_at(r.ra),
+                ctx.g_at(r.rb),
+                ctx.g_at(r.rc),
+                ctx.g_at(r.bytecode_read),
             ]
         });
-        ctx.cols(out, rows, RA, |r| [r.ra, r.rb, r.rc].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -621,15 +638,19 @@ impl Table for SetTable {
             Op::Set { o, k } => (o, k),
             op => unreachable!("a SET row's pc {} holds {op:?}", r.pc),
         };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        ctx.col(out, rows, O, |r| ctx.g_at(imm(r).0));
-        ctx.cols(out, rows, K_LO, |r| {
-            let k = imm(r).1;
-            [F64(k.c0), F64(k.c1), F64(k.c2)]
+        ctx.cols(out, rows, PC, |r| {
+            let (o, k) = imm(r);
+            [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
+                ctx.g_at(o),
+                F64(k.c0),
+                F64(k.c1),
+                F64(k.c2),
+                ctx.g_at(r.r),
+                ctx.g_at(r.bytecode_read),
+            ]
         });
-        ctx.col(out, rows, R, |r| ctx.g_at(r.r));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -704,8 +725,6 @@ impl Table for DerefTable {
             Op::Deref { o1, o2, o3, mode } => (o1, o2, o3, mode),
             op => unreachable!("a DEREF row's pc {} holds {op:?}", r.pc),
         };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
         debug_assert!(
             rows.iter().all(|r| {
                 let p = ctx.mem.word((r.fp + ins(r).0) as usize);
@@ -713,12 +732,14 @@ impl Table for DerefTable {
             }),
             "deref pointer must be K-valued"
         );
-        // The three offsets, the two mode flags, the pointer lane and the local
-        // word all follow from ONE bytecode decode.
-        ctx.cols(out, rows, O1, |r| {
+        // One pass: the offsets, the two mode flags, the pointer lane and the local
+        // word all follow from one bytecode decode.
+        ctx.cols(out, rows, PC, |r| {
             let (o1, o2, o3, mode) = ins(r);
             let v3 = ctx.limbs(r.fp + o3);
             [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
                 ctx.g_at(o1),
                 ctx.g_at(o2),
                 ctx.g_at(o3),
@@ -728,10 +749,12 @@ impl Table for DerefTable {
                 v3[0],
                 v3[1],
                 v3[2],
+                ctx.g_at(r.r1),
+                ctx.g_at(r.r2),
+                ctx.g_at(r.r3),
+                ctx.g_at(r.bytecode_read),
             ]
         });
-        ctx.cols(out, rows, R1, |r| [r.r1, r.r2, r.r3].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -779,9 +802,6 @@ impl Table for JumpTable {
     fn eval_constraint(&self, pows: &[F192], cols: &[F192], quadratic: bool) -> F192 {
         jump_identity(pows, cols, quadratic)
     }
-    fn eval_constraint_k(&self, pows: &[F192], cols: &[F64], quadratic: bool) -> F192 {
-        jump_identity(pows, cols, quadratic)
-    }
     fn flushes(&self, f: &mut FlushBuilder) {
         use jump::*;
         // The successor state is DERIVED: `b·d + (b+1)·g·pc` and `b·f + (b+1)·fp`,
@@ -811,55 +831,55 @@ impl Table for JumpTable {
             op => unreachable!("a JUMP row's pc {} holds {op:?}", r.pc),
         };
         let cell = |r: &Jrow, o: u32| ctx.mem.word((r.fp + o) as usize);
-        let cond = |r: &Jrow| cell(r, ins(r).0);
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // The three offsets and the three cells they name come out of ONE decode.
-        // Those cells are K-valued on every row, taken or not (`cpu::execute`
-        // rejects anything else), so each is one lane and the memory flush carries
-        // literal zeros above it.
-        ctx.cols(out, rows, OC, |r| {
+        // The condition is K-valued, so its inverse is one F64 inversion. `c` decodes it once. The
+        // is-nonzero witness `w = c⁻¹` (0 where c = 0) comes from one batched Montgomery inversion:
+        // the forward pass leaves in `w[i]` the running product of the nonzero conditions before row
+        // `i`, and `acc` ends as their full product (nonzero, hence invertible). The taken indicator
+        // is `c ≠ 0`.
+        let mut c: Vec<F64> = Vec::with_capacity(rows.len());
+        let mut w: Vec<F64> = Vec::with_capacity(rows.len());
+        let mut acc = F64::ONE;
+        for r in rows.iter() {
+            let ci = F64(cell(r, ins(r).0).c0);
+            c.push(ci);
+            w.push(acc);
+            if !ci.is_zero() {
+                acc *= ci;
+            }
+        }
+        let mut inv = acc.inv();
+        for (wi, &ci) in w.iter_mut().zip(&c).rev() {
+            if ci.is_zero() {
+                *wi = F64::ZERO;
+            } else {
+                *wi = inv * *wi;
+                inv *= ci;
+            }
+        }
+        // One pass. The three offsets and the three cells they name come out of one decode.
+        // Those cells are K-valued on every row, taken or not (`cpu::execute` rejects
+        // anything else), so each is one lane and the memory flush carries literal zeros
+        // above it.
+        ctx.cols_at(out, rows.len(), PC, |i| {
+            let r = rows.get(i);
             let (oc, od, of) = ins(r);
             [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
                 ctx.g_at(oc),
                 ctx.g_at(od),
                 ctx.g_at(of),
                 F64(cell(r, oc).c0),
                 F64(cell(r, od).c0),
                 F64(cell(r, of).c0),
+                ctx.g_at(r.rc),
+                ctx.g_at(r.rd),
+                ctx.g_at(r.rf),
+                ctx.g_at(r.bytecode_read),
+                w[i],
+                F64(!c[i].is_zero() as u64),
             ]
         });
-        // The is-nonzero witness `w = c⁻¹` (0 where c = 0) for every row, in one
-        // batched Montgomery inversion. `prefix[i]` is the
-        // running product of the nonzero conditions before row `i`, so `acc` ends
-        // as their full product (nonzero, hence invertible). The taken indicator
-        // `b = [c ≠ 0]` falls out of the same pass, so it costs no extra decode.
-        let (w, b) = {
-            let mut acc = F192::ONE;
-            let mut prefix: Vec<F192> = Vec::with_capacity(rows.len());
-            let mut b = vec![F64::ZERO; rows.len()];
-            for (i, r) in rows.iter().enumerate() {
-                prefix.push(acc);
-                let c = cond(r);
-                if !c.is_zero() {
-                    acc *= c;
-                    b[i] = F64::ONE;
-                }
-            }
-            let mut inv = acc.inv();
-            let mut w = vec![F192::ZERO; rows.len()];
-            for i in (0..rows.len()).rev() {
-                let c = cond(rows.get(i));
-                if !c.is_zero() {
-                    w[i] = inv * prefix[i];
-                    inv *= c;
-                }
-            }
-            (w, b)
-        };
-        ctx.cols_at(out, rows.len(), W, |i| [F64(w[i].c0), b[i]]);
-        ctx.cols(out, rows, RC, |r| [r.rc, r.rd, r.rf].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -1029,6 +1049,7 @@ mod tests {
             row[jump::V_COND] = cond;
             row[jump::W] = w;
             row[jump::B] = if cond.is_zero() { F64::ZERO } else { F64::ONE };
+            let row: Vec<F192> = row.into_iter().map(F192::from).collect();
             assert_eq!(jump_identity(&pows, &row, false), F192::ZERO, "cond = {cond:?}");
         }
     }

@@ -2,7 +2,8 @@
 //! resolved hint ops a [`super::Program`] carries ([`RHint`]), and the g-power
 //! table + reverse index the hint interpreter grows on demand.
 
-use primitives::field::F64;
+use primitives::field::{F64, mul_by_g};
+use std::collections::HashMap;
 
 /// Frame-relative offset operand (matches the compiler's `ir::Off`).
 pub type Off = u32;
@@ -15,7 +16,7 @@ pub(crate) const MAX_CELLS: u32 = 1 << 28;
 ///
 /// The interpreter needs both directions: a cell index becomes the address `g^k`,
 /// and a pointer word read back out of memory must be inverted to the index it
-/// addresses. Two things keep this cheap.
+/// addresses. Three things keep this cheap.
 ///
 /// The reverse index holds nothing but the exponent, confirming a candidate slot
 /// against the forward table, so a slot is four bytes where a `HashMap` bucket is
@@ -23,13 +24,16 @@ pub(crate) const MAX_CELLS: u32 = 1 << 28;
 /// uniform, which is all the placement asks for: one multiplicative mix, then
 /// linear probing. The table stays at most half full to keep probing short.
 ///
-/// And it indexes only the exponents [`Self::note`] announces: a run addresses
-/// millions of cells but stores only the few thousand bases of its frames and
-/// buffers, and one random write per addressable cell into a table far too large
-/// for cache is what building the whole inverse costs. A lookup that misses the
-/// announced set indexes everything and retries, so an address arriving by a
-/// route the interpreter cannot label is slow, never wrong.
-#[derive(Default)]
+/// It indexes only the exponents [`Self::note`] announces, or a lookup resolved:
+/// a run addresses millions of cells but stores only the few thousand bases of
+/// its frames and buffers, and one random write per addressable cell into a table
+/// far too large for cache is what building the whole inverse costs.
+///
+/// A lookup that misses falls back on a coarse index of every [`STRIDE`]th
+/// exponent: it divides the address by `g` up to `STRIDE - 1` times until a
+/// multiple of `STRIDE` appears, then announces the result. An address that
+/// arrives by a route the interpreter cannot label, a pointer into the middle of
+/// a buffer, costs a few probes once and is a plain hit afterwards.
 pub struct GPow {
     pow: Vec<F64>,
     /// The announced exponents, so widening rebuilds from them rather than
@@ -38,19 +42,42 @@ pub struct GPow {
     /// `k + 1` at the slot `g^k` mixes to; 0 marks an empty slot. Power-of-two
     /// length.
     index: Vec<u32>,
-    /// Set once a lookup missed: every exponent is announced from then on.
-    dense: bool,
+    /// `k / STRIDE + 1` at the slot `g^k` mixes to, for the `coarsed` multiples
+    /// `k` of `STRIDE`. Power-of-two length, at most half full.
+    coarse: Vec<u32>,
+    coarsed: usize,
+    /// The last run's cell mapping, all zero again, for the next run to take.
+    pub(crate) cells: Option<super::execute::Cells>,
+}
+
+/// Spacing of the coarse index, and so the most probes a missed lookup costs.
+const STRIDE: usize = 16;
+
+impl Default for GPow {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GPow {
-    /// Seeded with `g^0 = 1`, grown to cover index `upto`, every exponent up to
-    /// there announced.
-    pub fn new(upto: usize) -> Self {
-        let mut g = Self::default();
-        g.pow.push(F64::ONE);
+    /// Seeded with `g^0 = 1`, nothing announced.
+    pub fn new() -> Self {
+        Self {
+            pow: vec![F64::ONE],
+            noted: Vec::new(),
+            index: vec![0; 1 << 13],
+            coarse: Vec::new(),
+            coarsed: 0,
+            cells: None,
+        }
+    }
+
+    /// Covering index `upto`, every exponent up to there announced, so that
+    /// [`Self::lookup`] alone finds any of them.
+    pub fn dense(upto: usize) -> Self {
+        let mut g = Self::new();
         g.grow_to(upto);
-        g.index = vec![0; (2 * (upto + 1)).next_power_of_two().max(1 << 13)];
-        g.noted.reserve((upto + 1).next_power_of_two());
+        g.noted.reserve(upto + 1);
         for k in 0..=upto {
             g.note(k);
         }
@@ -64,28 +91,43 @@ impl GPow {
         self.pow[k]
     }
 
-    /// One past the largest index the forward table covers.
-    #[inline(always)]
-    pub fn covered(&self) -> usize {
-        self.pow.len()
-    }
-
     /// The forward table, `g^0` to `g^{covered - 1}`.
-    pub(crate) fn into_powers(self) -> Vec<F64> {
-        self.pow
+    pub(crate) fn powers(&self) -> &[F64] {
+        &self.pow
     }
 
     /// Extend the forward table to cover index `upto`.
+    #[inline]
     pub fn grow_to(&mut self, upto: usize) {
-        assert!(upto < MAX_CELLS as usize, "address space overflow (program too large)");
-        while self.pow.len() <= upto {
-            // ×g is ×x = `mul_by_g` (shift+fold), not a PMULL.
-            let next = primitives::field::mul_by_g(*self.pow.last().unwrap());
-            self.pow.push(next);
-            if self.dense {
-                self.note(self.pow.len() - 1);
-            }
+        if upto >= self.pow.len() {
+            self.extend(upto);
         }
+    }
+
+    #[cold]
+    fn extend(&mut self, upto: usize) {
+        assert!(upto < MAX_CELLS as usize, "address space overflow (program too large)");
+        // ×g is ×x = `mul_by_g` (shift+fold), not a PMULL.
+        let mut p = *self.pow.last().unwrap();
+        let n = self.pow.len();
+        self.pow.extend((n..=upto).map(|_| {
+            p = mul_by_g(p);
+            p
+        }));
+        let want = self.pow.len().div_ceil(STRIDE);
+        if want * 2 > self.coarse.len() {
+            self.coarse = vec![0; (want * 2).next_power_of_two().max(1 << 12)];
+            self.coarsed = 0;
+        }
+        let mask = self.coarse.len() - 1;
+        for j in self.coarsed..want {
+            let mut i = slot_of(self.pow[j * STRIDE].0, mask);
+            while self.coarse[i] != 0 {
+                i = (i + 1) & mask;
+            }
+            self.coarse[i] = j as u32 + 1;
+        }
+        self.coarsed = want;
     }
 
     /// Announce that `g^k` may come back for inversion, because the interpreter
@@ -116,24 +158,36 @@ impl GPow {
     /// The discrete log of `x`, if it is a covered g-power.
     #[inline]
     pub fn log(&mut self, x: F64) -> Option<u32> {
-        if let Some(k) = self.lookup(x) {
-            return Some(k);
-        }
-        // Announced exponents are distinct and below `pow.len()`, so an equal
-        // count means the whole range is already announced and there is nothing
-        // a dense pass could add.
-        if self.dense || self.noted.len() == self.pow.len() {
-            return None;
-        }
-        // An address the interpreter never announced: index the lot and retry.
-        self.dense = true;
-        self.noted = (0..self.pow.len() as u32).collect();
-        self.widen();
-        self.lookup(x)
+        self.lookup(x).or_else(|| self.resolve(x))
     }
 
+    /// `log` for an address that is not announced: divide by `g` down to a
+    /// multiple of `STRIDE`, then announce the exponent.
+    #[cold]
+    fn resolve(&mut self, x: F64) -> Option<u32> {
+        let mask = self.coarse.len() - 1;
+        let mut y = x;
+        for j in 0..STRIDE {
+            let mut i = slot_of(y.0, mask);
+            while self.coarse[i] != 0 {
+                let k = (self.coarse[i] as usize - 1) * STRIDE;
+                if self.pow[k] == y {
+                    let k = k + j;
+                    return (k < self.pow.len()).then(|| {
+                        self.note(k);
+                        k as u32
+                    });
+                }
+                i = (i + 1) & mask;
+            }
+            y = div_by_g(y);
+        }
+        None
+    }
+
+    /// The exponent of `x` if announced.
     #[inline]
-    fn lookup(&self, x: F64) -> Option<u32> {
+    pub fn lookup(&self, x: F64) -> Option<u32> {
         let mask = self.index.len() - 1;
         let mut i = slot_of(x.0, mask);
         loop {
@@ -164,6 +218,12 @@ impl GPow {
     }
 }
 
+/// The inverse of [`mul_by_g`]: bit 0 of its output says whether it folded.
+#[inline(always)]
+fn div_by_g(a: F64) -> F64 {
+    F64(if a.0 & 1 == 1 { (a.0 ^ 0x1B) >> 1 | 1 << 63 } else { a.0 >> 1 })
+}
+
 /// Bits 32..64 of the mix are the well-distributed ones; the mask keeps as many
 /// of them as the table is wide.
 #[inline(always)]
@@ -180,6 +240,69 @@ pub enum BitsDest {
     Stack(Off),
     /// Heap cells `m[fp+ptr]·g^k`, the pointer read at run time.
     Heap(Off),
+}
+
+/// The hints of a program flattened into a dense per-pc index, built once at assembly.
+///
+/// A map keyed by pc would be probed each step for what is almost always a miss, so
+/// `at` holds, per pc, 0 for no hints or `1 + i` for list `i`. List `i` is
+/// `hints[starts[i]..starts[i + 1]]`, and `streams` holds per hint the index into
+/// `named` of its witness stream (`u32::MAX` for a hint that has none).
+#[derive(Clone)]
+pub(crate) struct HintPlan {
+    pub(crate) at: Vec<u32>,
+    starts: Vec<u32>,
+    hints: Vec<RHint>,
+    streams: Vec<u32>,
+    /// Per distinct witness stream, a hint that names it, so a run resolves each name once.
+    named: Vec<u32>,
+}
+
+impl HintPlan {
+    pub(crate) fn new(hints: HashMap<u32, Vec<RHint>>, code_len: usize) -> Self {
+        let mut plan = Self {
+            at: vec![0; code_len],
+            starts: vec![0],
+            hints: Vec::new(),
+            streams: Vec::new(),
+            named: Vec::new(),
+        };
+        for (pc, hs) in hints {
+            for h in hs {
+                let id = stream_name(&h).map_or(u32::MAX, |name| {
+                    let same = |&i: &u32| stream_name(&plan.hints[i as usize]) == Some(name);
+                    plan.named.iter().position(same).unwrap_or_else(|| {
+                        plan.named.push(plan.hints.len() as u32);
+                        plan.named.len() - 1
+                    }) as u32
+                });
+                plan.hints.push(h);
+                plan.streams.push(id);
+            }
+            plan.starts.push(plan.hints.len() as u32);
+            plan.at[pc as usize] = plan.starts.len() as u32 - 1;
+        }
+        plan
+    }
+
+    /// The hints at list `at - 1` (`at` from [`Self::at`]), each with its stream index.
+    pub(crate) fn list(&self, at: u32) -> impl Iterator<Item = (&RHint, u32)> {
+        let r = self.starts[at as usize - 1] as usize..self.starts[at as usize] as usize;
+        self.hints[r.clone()].iter().zip(self.streams[r].iter().copied())
+    }
+
+    /// The names of the distinct witness streams, in stream index order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.named.iter().filter_map(|&i| stream_name(&self.hints[i as usize]))
+    }
+}
+
+/// The witness stream a hint pops, if any.
+fn stream_name(h: &RHint) -> Option<&str> {
+    match h {
+        RHint::WitnessStack { name, .. } | RHint::WitnessHeap { name, .. } => Some(name),
+        _ => None,
+    }
 }
 
 /// A hint resolved to concrete offsets/sizes, keyed by global program counter.

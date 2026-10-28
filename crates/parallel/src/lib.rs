@@ -1,5 +1,6 @@
 //! Fixed-size thread pool for flat data-parallel kernels. Workers claim ranges from one shared counter, which also balances heterogeneous cores. Dispatches cannot nest. Task panics are resumed on the dispatcher after all workers stop.
 
+use flux_profiler::timed;
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -11,7 +12,7 @@ use std::thread::Thread;
 mod topology;
 
 use topology::{Qos, set_qos};
-pub use topology::{Topology, num_threads, topology};
+pub use topology::{Topology, num_threads, smt_width, topology};
 
 /// Idle spins before a worker parks: long enough to stay hot across back-to-back
 /// dispatches, short enough to yield the core during a sequential stretch.
@@ -193,6 +194,7 @@ fn wait_for_dispatch(pool: &Pool, id: usize, last_generation: usize) -> usize {
 /// `remaining / (2·workers)`, clamped to `1..=`[`MAX_CLAIM_BATCH`]: big early
 /// claims cut counter contention, and the proportional shrink keeps the tail
 /// balanced across cores of different speeds.
+#[timed]
 fn drain(pool: &Pool) {
     // SAFETY: the dispatcher published `Some(job)` before the generation bump
     // this worker observed, and overwrites it only on the next dispatch (gated on
@@ -238,6 +240,7 @@ fn drain(pool: &Pool) {
 /// If called from inside a pool task: that would deadlock on the dispatch lock, so
 /// it panics rather than silently serializing. Fan out over the outermost
 /// independent unit and keep the levels below it sequential.
+#[timed]
 pub fn for_each_chunk<F: Fn(usize, usize) + Sync>(n_tasks: usize, f: F) {
     assert!(!IN_TASK.get(), "nested parallel dispatch from inside a pool task");
 

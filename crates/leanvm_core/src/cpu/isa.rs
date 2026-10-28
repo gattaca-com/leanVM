@@ -54,6 +54,22 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// The largest memory offset among the instruction's operands.
+    pub(crate) fn max_offset(&self) -> u32 {
+        match *self {
+            Self::Xor { a, b, c } | Self::Mul { a, b, c } => a.max(b).max(c),
+            Self::Set { o, .. } => o,
+            Self::Deref { o1, o2, o3, .. } => o1.max(o2).max(o3),
+            Self::Jump { oc, od, of } => oc.max(od).max(of),
+            Self::Keccak { m, tail, b8, cap, out, .. } => {
+                // The last cell of each run of consecutive cells, as `KeccakOp::cell` steps.
+                m.into_iter().chain([tail + 3, b8, cap + 3, out + (crate::keccak::STATE_CELLS as u32 - 1)]).max().unwrap_or(0)
+            }
+        }
+    }
+}
+
 /// The source `DEREF` stores at `mem[loc_o1·o2]`: a local cell, the return
 /// address `g²·pc`, or the frame pointer. Encoded as two boolean flags `(f_pc,
 /// f_fp)`: `Cell=(0,0)`, `Pc=(1,0)`, `Fp=(0,1)`, keeping the store constraint degree 2.

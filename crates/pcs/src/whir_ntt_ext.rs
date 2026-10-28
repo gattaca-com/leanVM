@@ -21,7 +21,8 @@
 //!
 //! Every butterfly acts on each coefficient alone, so the encode runs as the base transform over `3n` lanes.
 
-use crate::ntt::{AdditiveNttF64, RowSink};
+use flux_profiler::timed;
+use crate::ntt::{AdditiveNttF64, DeepRows, RowSink};
 use primitives::field::{F64, F192};
 
 // An E element is exactly three K words, with no padding, so the two views line up.
@@ -38,6 +39,7 @@ const _: () = assert!(align_of::<F192>() == align_of::<F64>());
 /// # Panics
 ///
 /// Panics unless the lane count is a power of two.
+#[timed]
 pub(crate) fn encode_interleaved_ext(
     ntt: &AdditiveNttF64,
     mat: &mut [F192],
@@ -46,19 +48,53 @@ pub(crate) fn encode_interleaved_ext(
     log_inv_rate: usize,
     on_rows: &RowSink<'_>,
 ) {
+    let (mat, msg) = k_words(mat, msg, num_ntts);
+    ntt.encode_interleaved_with(mat, msg, 3 * num_ntts, log_inv_rate, on_rows);
+}
+
+/// [`encode_interleaved_ext`] without writing the deep pass back: see
+/// [`AdditiveNttF64::encode_interleaved_without_deep`]. Rows come back as K words.
+pub(crate) fn encode_interleaved_ext_without_deep(
+    ntt: &AdditiveNttF64,
+    mat: &mut [F192],
+    msg: &[F192],
+    num_ntts: usize,
+    log_inv_rate: usize,
+    on_rows: &RowSink<'_>,
+) -> Option<DeepRows> {
+    let (mat, msg) = k_words(mat, msg, num_ntts);
+    ntt.encode_interleaved_without_deep(mat, msg, 3 * num_ntts, log_inv_rate, on_rows)
+}
+
+/// [`encode_interleaved_ext`] coset by coset, with no codeword: see [`AdditiveNttF64::encode_cosets`].
+pub(crate) fn encode_cosets_ext(
+    ntt: &AdditiveNttF64,
+    msg: &[F192],
+    num_ntts: usize,
+    log_inv_rate: usize,
+    on_rows: &RowSink<'_>,
+) {
+    ntt.encode_cosets(words(msg), 3 * num_ntts, log_inv_rate, on_rows);
+}
+
+/// Both buffers as K words: each row of n E lanes becomes 3n K lanes.
+fn k_words<'a>(mat: &'a mut [F192], msg: &'a [F192], num_ntts: usize) -> (&'a mut [F64], &'a [F64]) {
     assert!(num_ntts.is_power_of_two());
-    // View both buffers as K words: each row of n E lanes becomes 3n K lanes.
-    //
+    (words_mut(mat), words(msg))
+}
+
+/// A slice of E elements as its K words, shared.
+pub(crate) fn words(v: &[F192]) -> &[F64] {
+    // SAFETY: as in `words_mut`, for the shared view.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<F64>(), 3 * v.len()) }
+}
+
+/// A slice of E elements as its K words.
+pub(crate) fn words_mut(v: &mut [F192]) -> &mut [F64] {
     // SAFETY:
     // - An E element is laid out as three K words, and a K element as one word.
-    // - So each view covers exactly the same memory as the slice it came from.
-    let (mat, msg) = unsafe {
-        (
-            std::slice::from_raw_parts_mut(mat.as_mut_ptr().cast::<F64>(), 3 * mat.len()),
-            std::slice::from_raw_parts(msg.as_ptr().cast::<F64>(), 3 * msg.len()),
-        )
-    };
-    ntt.encode_interleaved_with(mat, msg, 3 * num_ntts, log_inv_rate, on_rows);
+    // - So the view covers exactly the same memory as the slice it came from.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<F64>(), 3 * v.len()) }
 }
 
 #[cfg(test)]
