@@ -306,9 +306,8 @@ pub(crate) fn fill_columns<const N: usize>(
             *repeat = b > 0 && (b - 1) << EQUAL_BLOCK_LOG >= n_rows;
         }
     }
-    let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| parallel::SendPtr(windows[k].words.as_mut_ptr()));
     let (task, run) = (n.min(FILL_TASK), n.min(FILL_ROWS));
-    parallel::for_each(n / task, |t| {
+    parallel::for_each_chunks_mut(windows.each_mut().map(|w| &mut *w.words), [task; N], |t, dst| {
         let stream = Stream::new();
         let padded: [[F64; FILL_ROWS]; N] = std::array::from_fn(|k| [padding[k]; FILL_ROWS]);
         let mut gathered = [[F64::ZERO; FILL_ROWS]; N];
@@ -325,9 +324,7 @@ pub(crate) fn fill_columns<const N: usize>(
                 &gathered
             };
             for k in 0..N {
-                // SAFETY: tasks cover disjoint rows, so each window slot is written once, in bounds,
-                // and the dispatch returns after every task's stream has fenced.
-                unsafe { stream.copy_uninit(dst[k].0.add(base), &run_rows[k][..run]) };
+                stream.copy(&mut dst[k][base - t * task..][..run], &run_rows[k][..run]);
             }
         }
     });

@@ -353,15 +353,15 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
         row
     };
     // One pass writes all eleven columns.
-    // SAFETY: the pass below writes every slot of every column.
-    let mut columns: [Vec<F64>; 1 + BYTECODE_OPERANDS] =
-        std::array::from_fn(|_| unsafe { primitives::uninit_vec(prog.len()) });
-    let dst = columns.each_mut().map(|c| parallel::SendPtr(c.as_mut_ptr()));
-    parallel::for_each(prog.len(), |i| {
-        for (column, value) in dst.iter().zip(row(&prog[i])) {
-            // SAFETY: instruction `i` writes slot `i` of each column, in bounds and once.
-            unsafe { column.add(i).write(value) };
-        }
+    let chunk = parallel::recommended_chunk_size(prog.len());
+    let columns = primitives::filled_vecs([prog.len(); 1 + BYTECODE_OPERANDS], |columns| {
+        parallel::for_each_chunks_mut(columns, [chunk; 1 + BYTECODE_OPERANDS], |t, mut columns| {
+            for (i, op) in prog[t * chunk..].iter().take(chunk).enumerate() {
+                for (column, value) in columns.iter_mut().zip(row(op)) {
+                    column[i] = value;
+                }
+            }
+        });
     });
     columns.map(std::sync::Arc::new)
 }
@@ -591,36 +591,35 @@ impl Program {
             const LINE: usize = 8;
             const BLOCK: usize = 1 << 10;
             let written = exec.mem.cells(BLOCK);
-            let image = [MEM_LO, MEM_HI, MEM_TOP, MFCNT].map(|c| {
-                assert_eq!(windows[c].words.len(), cells, "a memory column spans the image");
-                // Blocks past the written cells are all `unwritten`, so each repeats the block before it.
-                for (b, repeat) in windows[c].repeats.iter_mut().enumerate() {
-                    *repeat = b > 0 && (b - 1) * BLOCK >= written.len();
-                }
-                parallel::SendPtr(windows[c].words.as_mut_ptr())
-            });
-            parallel::for_each_chunk(cells / BLOCK, |first, end| {
+            let image = windows
+                .get_disjoint_mut([MEM_LO, MEM_HI, MEM_TOP, MFCNT])
+                .expect("the image columns are distinct")
+                .map(|window| {
+                    assert_eq!(window.words.len(), cells, "a memory column spans the image");
+                    // Blocks past the written cells are all `unwritten`, so each repeats the block before it.
+                    for (b, repeat) in window.repeats.iter_mut().enumerate() {
+                        *repeat = b > 0 && (b - 1) * BLOCK >= written.len();
+                    }
+                    &mut *window.words
+                });
+            parallel::for_each_chunks_mut(image, [BLOCK; 4], |b, mut image| {
                 let stream = primitives::stream::Stream::new();
                 // Cells past the written ones are unwritten and never accessed.
                 let unwritten = [F64::ZERO, F64::ZERO, F64::ZERO, gpow[0]].map(|v| [v; LINE]);
-                for b in first..end {
-                    let at = b * BLOCK;
-                    for line in (at..at + BLOCK).step_by(LINE) {
-                        let mut buf = unwritten;
-                        if let Some(cells) = written.get(line..line + LINE) {
-                            for (j, cell) in cells.iter().enumerate() {
-                                // counts ended at g^{A[i]}
-                                buf[0][j] = F64(cell.word.c0);
-                                buf[1][j] = F64(cell.word.c1);
-                                buf[2][j] = F64(cell.word.c2);
-                                buf[3][j] = gpow[cell.count as usize];
-                            }
+                let at = b * BLOCK;
+                for line in (at..at + BLOCK).step_by(LINE) {
+                    let mut buf = unwritten;
+                    if let Some(cells) = written.get(line..line + LINE) {
+                        for (j, cell) in cells.iter().enumerate() {
+                            // counts ended at g^{A[i]}
+                            buf[0][j] = F64(cell.word.c0);
+                            buf[1][j] = F64(cell.word.c1);
+                            buf[2][j] = F64(cell.word.c2);
+                            buf[3][j] = gpow[cell.count as usize];
                         }
-                        for (column, values) in image.iter().zip(&buf) {
-                            // SAFETY: block `b` owns cells `b·BLOCK..(b+1)·BLOCK` of every
-                            // column, in bounds as `cells` is a whole number of blocks.
-                            unsafe { stream.copy_uninit(column.add(line), values) };
-                        }
+                    }
+                    for (column, values) in image.iter_mut().zip(&buf) {
+                        stream.copy(&mut column[line - at..][..LINE], values);
                     }
                 }
             });
