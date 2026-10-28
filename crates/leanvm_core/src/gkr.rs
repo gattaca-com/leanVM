@@ -822,31 +822,36 @@ fn fold_block_pairs<S: Source + ?Sized>(
 ) -> [F192; 4] {
     let count = next_blocks.len();
     let next_ones = halve(ones, count);
-    let dst = parallel::SendPtr(next_blocks.as_mut_ptr());
     let challenge = F192x8::splat(challenge);
     let window = window_blocks(count);
-    let task = |index: usize| {
+    let task = |index: usize, out: &mut [Block]| {
         // The next round reads the destination; this round reads only the stage.
         let stream = Stream::new();
+        let first = index * window;
         let mut message = [Prod8::ZERO; 4];
-        for k in live(&next_ones, index * window..((index + 1) * window).min(count)) {
+        for k in live(&next_ones, first..first + out.len()) {
             source.prefetch(2 * (k + PREFETCH_FOLD));
             source.prefetch(2 * (k + PREFETCH_FOLD) + 1);
             let block = fold_block_pair(source, ones, k, challenge);
             // The stores go before the summand, so they overlap its products.
-            // SAFETY: tasks own disjoint blocks of the output, which covers every one.
-            unsafe { stream.copy_lines(dst.add(k), &block) };
+            stream.copy_lines_into(&mut out[k - first], &block);
             if let Some(equality) = equality {
                 message = xor_coefficients(message, block.summand(equality.block(k)));
             }
         }
         message
     };
-    let tasks = count.div_ceil(window);
     let message = if BLOCK_PAIRS * count >= PAR_THRESHOLD {
-        parallel::map_reduce(tasks, || [Prod8::ZERO; 4], task, xor_coefficients)
+        parallel::map_reduce_chunks_mut(
+            [next_blocks],
+            [window],
+            || (),
+            || [Prod8::ZERO; 4],
+            |(), acc, index, [out]| *acc = xor_coefficients(*acc, task(index, out)),
+            xor_coefficients,
+        )
     } else {
-        (0..tasks).map(task).fold([Prod8::ZERO; 4], xor_coefficients)
+        next_blocks.chunks_mut(window).enumerate().map(|(index, out)| task(index, out)).fold([Prod8::ZERO; 4], xor_coefficients)
     };
     message.map(Prod8::reduce)
 }
@@ -1105,10 +1110,9 @@ impl QuaternaryLayerState {
         let rows = stored_rows.div_ceil(2);
         self.next.truncate(4 * rows);
         let values = &self.values;
-        let dst = parallel::SendPtr(self.next.as_mut_ptr());
         const PAIRS: usize = 16;
         let pairs = rows.div_ceil(2);
-        let task = |index: usize| {
+        let task = |index: usize, out: &mut [F192]| {
             let first = index * PAIRS;
             let end = (first + PAIRS).min(pairs);
             let mut stage = [F192::ZERO; 8 * PAIRS];
@@ -1141,8 +1145,7 @@ impl QuaternaryLayerState {
             // The next round reads the destination; this round reads only the local stage.
             let stream = Stream::new();
             let len = 4 * (end_row - 2 * first);
-            // SAFETY: tasks own disjoint initialized prefixes of the output, covering every row.
-            unsafe { stream.copy(dst.slice(8 * first, len), &stage[..len]) };
+            stream.copy(out, &stage[..len]);
             message
         };
         let xor = |mut a: [F192Unreduced; 4], b: [F192Unreduced; 4]| {
@@ -1151,11 +1154,19 @@ impl QuaternaryLayerState {
             }
             a
         };
-        let tasks = pairs.div_ceil(PAIRS);
+        // A task's rows are the `8 * PAIRS` values of its chunk, fewer in the last.
+        let out = &mut self.next[..4 * rows];
         let message = if rows >= PAR_THRESHOLD {
-            parallel::map_reduce(tasks, || [F192Unreduced::ZERO; 4], task, xor)
+            parallel::map_reduce_chunks_mut(
+                [out],
+                [8 * PAIRS],
+                || (),
+                || [F192Unreduced::ZERO; 4],
+                |(), acc, index, [out]| *acc = xor(*acc, task(index, out)),
+                xor,
+            )
         } else {
-            (0..tasks).map(task).fold([F192Unreduced::ZERO; 4], xor)
+            out.chunks_mut(8 * PAIRS).enumerate().map(|(index, out)| task(index, out)).fold([F192Unreduced::ZERO; 4], xor)
         };
         std::mem::swap(&mut self.values, &mut self.next);
         self.logical_rows /= 2;

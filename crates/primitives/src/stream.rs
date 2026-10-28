@@ -45,6 +45,13 @@ impl Stream {
 }
 
 impl Stream {
+    /// [`copy_lines`](Self::copy_lines) into a borrowed destination, which is valid, aligned and disjoint from `src`.
+    #[inline(always)]
+    pub fn copy_lines_into<T: Copy>(&self, dst: &mut T, src: &T) {
+        // SAFETY: `dst` is a unique reference, so it is valid, aligned for `T` and disjoint from `src`.
+        unsafe { self.copy_lines(dst, src) }
+    }
+
     /// Copy one value of whole, aligned cache lines to `dst`, which must not be fetched first.
     /// The size and alignment are compile-time facts, so no head or tail is left to store normally.
     ///
