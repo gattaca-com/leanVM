@@ -5,7 +5,8 @@ use primitives::field::F64;
 use primitives::stream::Stream;
 
 use super::additive_ntt_f64::{AdditiveNttF64, Msg, with_scratch};
-use super::deep::{Drain, hook_calls};
+use super::deep::Drain;
+use super::layers::Layers;
 use super::stage::{BATCH, StageCopies, fill_stage, stage_copies, stage_subs};
 
 impl AdditiveNttF64 {
@@ -69,6 +70,7 @@ impl AdditiveNttF64 {
         let blocks = first_block..first_block + (data.len() / num_ntts) / block_rows;
         let row = |block: usize, r: usize| ((block - first_block) * block_rows + r) * num_ntts;
         let base = parallel::SendPtr(data.as_mut_ptr());
+        let layers = self.layers();
         // A lane-major group is 64 lanes of a batch of residues, transposed into a stage: one line per residue in each row.
         let staged = matches!(msg, Msg::Lanes { .. });
         let subs = stage_subs(staged, log_step);
@@ -83,7 +85,7 @@ impl AdditiveNttF64 {
         let stream = stream && num_ntts.is_multiple_of(8) && base.0.align_offset(64) == 0;
         let piece = if staged || stream { 8 } else { num_ntts };
         let piece_stride = if staged { num_ntts } else { piece };
-        let per_hook = (group_len / piece).div_ceil(hook_calls(layer + g, layer, layer + g, layer));
+        let per_hook = (group_len / piece).div_ceil(Layers::hook_calls(layer + g, layer, layer + g, layer));
         parallel::for_each_chunk(step / batch, |lo, hi| {
             // One fence at the end of the task covers all its streaming stores.
             with_scratch(stage_len + 2 * group_len, |all| {
@@ -110,7 +112,7 @@ impl AdditiveNttF64 {
                         }
                     }
                     let hook = || drain.step(stream.as_ref(), per_hook);
-                    self.run_layers_to(scratch, from, layer + g, width, layer, layer + g, layer, block, None, hook);
+                    layers.run(scratch, from, layer + g, width, layer, layer + g, layer, block, None, hook);
                     drain.step(stream.as_ref(), usize::MAX);
                     drain = Drain {
                         // SAFETY: the group's first row lies inside the buffer.

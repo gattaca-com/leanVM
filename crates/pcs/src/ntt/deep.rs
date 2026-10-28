@@ -3,21 +3,9 @@
 use primitives::field::F64;
 use primitives::stream::Stream;
 
-use super::additive_ntt_f64::{AdditiveNttF64, Line, Msg, RowSink, no_hook, radix_layers, with_scratch};
+use super::additive_ntt_f64::{AdditiveNttF64, Line, Msg, RowSink, with_scratch};
+use super::layers::{Layers, no_hook};
 use super::plan::Plan;
-
-/// How many times [`AdditiveNttF64::run_layers_to`] calls its hook over `first_layer..end_layer`.
-pub(super) fn hook_calls(log_d: usize, first_layer: usize, end_layer: usize, outer_log: usize) -> usize {
-    let (mut layer, mut calls) = (first_layer, 0);
-    while layer < end_layer {
-        let block_size = 1usize << (log_d - layer);
-        let radix = radix_layers(end_layer - layer);
-        // Every block of the sweep calls once per row group, and a group takes `2^radix` rows.
-        calls += (1usize << (layer - outer_log)) * (block_size >> radix);
-        layer += radix;
-    }
-    calls
-}
 
 /// A finished row group, leaving its scratch for the buffer a piece at a time.
 ///
@@ -133,10 +121,11 @@ impl AdditiveNttF64 {
         stream: bool,
     ) {
         let Plan { log_d, num_ntts, start, deep_start, .. } = *plan;
+        let layers = self.layers();
         let sub_len = num_ntts << log_sub;
         let outer = log_d - log_sub;
         let (base, total) = (parallel::SendPtr(data.as_mut_ptr()), data.len());
-        let hooks = hook_calls(log_d, deep_start, log_d, outer);
+        let hooks = Layers::hook_calls(log_d, deep_start, log_d, outer);
         match msg {
             // A separate message: build each sub-block in scratch, hash it, then write it out once.
             //
@@ -165,12 +154,12 @@ impl AdditiveNttF64 {
                             if late {
                                 // The previous sub-block drains while this one transforms.
                                 let hook = || drain.step(stream.as_ref(), per_hook);
-                                self.run_layers_to(
+                                layers.run(
                                     scratch, from, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, hook,
                                 );
                                 drain.step(stream.as_ref(), usize::MAX);
                             } else {
-                                self.run_layers_to(
+                                layers.run(
                                     scratch, from, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, no_hook,
                                 );
                             }
@@ -218,14 +207,14 @@ impl AdditiveNttF64 {
                         // The rows are hashed from scratch and the buffer keeps its pre-deep state.
                         with_scratch(sub_len, |scratch| {
                             let (src, end) = (Some(&*sub), log_d);
-                            self.run_layers_to(scratch, src, log_d, num_ntts, deep_start, end, outer, sub_idx, None, hook);
+                            layers.run(scratch, src, log_d, num_ntts, deep_start, end, outer, sub_idx, None, hook);
                             if let Some(f) = deep_rows {
                                 f(sub_idx << log_sub, scratch);
                             }
                         });
                     } else {
                         // The replicas are already in place: run the layers where they are.
-                        self.run_layers_to(sub, None, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, hook);
+                        layers.run(sub, None, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, hook);
                         if let Some(f) = deep_rows {
                             f(sub_idx << log_sub, sub);
                         }

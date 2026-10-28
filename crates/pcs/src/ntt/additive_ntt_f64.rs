@@ -13,9 +13,7 @@ use std::cell::RefCell;
 use primitives::field::F64;
 use primitives::log2_strict_usize;
 
-use super::kernels::{
-    butterfly_interleaved_block, butterfly_interleaved_fused_2layer, butterfly_interleaved_fused_3layer,
-};
+use super::layers::{Layers, no_hook};
 use super::plan::{L2_WORDS, Plan, l2_words};
 use super::rows::built_rows;
 use super::twiddles::Twiddles;
@@ -76,6 +74,11 @@ pub struct AdditiveNttF64 {
 }
 
 impl AdditiveNttF64 {
+    /// The layer sweeps over this domain.
+    pub(super) fn layers(&self) -> Layers<'_> {
+        Layers::new(&self.tw)
+    }
+
     /// Standard NTT with basis `{1, x, …, x^(dim-1)}`. Requires `dim ≤ 63` so
     /// the evaluation domain (and the twiddles) stay inside F_{2^64} without
     /// wrap; far beyond any codeword size in use.
@@ -203,7 +206,7 @@ impl AdditiveNttF64 {
     /// Coset `coset` of the codeword, built into `buf` (one message long) from the message.
     fn build_coset(&self, buf: &mut [F64], msg: &[F64], num_ntts: usize, log_d: usize, log_inv_rate: usize, coset: usize) {
         let (first, end) = (log_inv_rate, log_d);
-        self.run_layers_to(buf, Some(msg), log_d, num_ntts, first, end, log_inv_rate, coset, None, no_hook);
+        self.layers().run(buf, Some(msg), log_d, num_ntts, first, end, log_inv_rate, coset, None, no_hook);
     }
 
     /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.
@@ -345,132 +348,6 @@ impl AdditiveNttF64 {
         }
         (defer_deep && deep_rows.is_some() && matches!(msg, Msg::Buffer)).then_some(plan)
     }
-
-    /// Run a range of layers over one sub-block of the domain.
-    ///
-    /// - The domain has `2^d` rows and splits into `2^o` equal sub-blocks.
-    /// - The buffer is one of them; its index fixes the global block index, and so the twiddle, of each block.
-    /// - Layers fuse into radix-8 sweeps, with radix-4 sweeps where a lone radix-2 would be left over.
-    /// - `hook` runs once after each row group of each sweep.
-    ///
-    /// With `live` (sorted), blocks that hold none of those buffer rows are left alone.
-    ///
-    /// - Only those rows come out right: a block feeds only the rows inside it, in every later layer.
-    /// - A fused sweep skips whole blocks of its first layer, so a sparse `live` prunes coarsely.
-    ///
-    /// With a `src` as long as `buf`, the layers run over a copy of it, which the first sweep makes.
-    /// That sweep loads from `src` and stores to `buf`, and the blocks it skips are not copied.
-    /// Later sweeps work inside the blocks of the first, so they never read a word that was not copied.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_layers_to(
-        &self,
-        buf: &mut [F64],
-        mut src: Option<&[F64]>,
-        log_d: usize,
-        num_ntts: usize,
-        first_layer: usize,
-        end_layer: usize,
-        outer_log: usize,
-        sub_idx: usize,
-        live: Option<&[usize]>,
-        mut hook: impl FnMut(),
-    ) {
-        if let Some(src) = src.filter(|_| first_layer >= end_layer) {
-            buf.copy_from_slice(src);
-        }
-        let mut layer = first_layer;
-        while layer < end_layer {
-            // This layer's blocks inside the buffer: how many, and their size in rows and words.
-            let num_blocks_in_buf = 1usize << (layer - outer_log);
-            let block_size = 1usize << (log_d - layer);
-            let block_elems = block_size * num_ntts;
-            // A block's index in the whole domain, which picks its twiddle.
-            let global = |block_in_buf: usize| sub_idx * num_blocks_in_buf + block_in_buf;
-
-            let radix = radix_layers(end_layer - layer);
-            if radix == 3 {
-                // One radix-8 sweep.
-                let eighth = block_size >> 3;
-                for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
-                    let t = self.tw.radix8(layer, global(block_in_buf));
-                    let start = block_in_buf * block_elems;
-                    butterfly_interleaved_fused_3layer(
-                        &mut buf[start..start + block_elems],
-                        src.map(|s| &s[start..start + block_elems]),
-                        &t,
-                        eighth,
-                        num_ntts,
-                        &mut hook,
-                    );
-                });
-                layer += 3;
-            } else if radix == 2 {
-                // One radix-4 sweep.
-                let quarter = block_size >> 2;
-                for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
-                    let global_block = global(block_in_buf);
-                    let t = [
-                        self.tw.twiddle(layer, global_block),
-                        self.tw.twiddle(layer + 1, 2 * global_block),
-                        self.tw.twiddle(layer + 1, 2 * global_block + 1),
-                    ];
-                    let start = block_in_buf * block_elems;
-                    butterfly_interleaved_fused_2layer(
-                        &mut buf[start..start + block_elems],
-                        src.map(|s| &s[start..start + block_elems]),
-                        &t,
-                        quarter,
-                        num_ntts,
-                        &mut hook,
-                    );
-                });
-                layer += 2;
-            } else {
-                // One layer: a plain butterfly sweep.
-                let block_size_half = block_size >> 1;
-                for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
-                    let twiddle = self.tw.twiddle(layer, global(block_in_buf));
-                    let start = block_in_buf * block_elems;
-                    // A lone layer is rare: its block is copied before it runs, not fused with it.
-                    if let Some(src) = src {
-                        buf[start..start + block_elems].copy_from_slice(&src[start..start + block_elems]);
-                    }
-                    butterfly_interleaved_block(
-                        &mut buf[start..start + block_elems],
-                        twiddle,
-                        block_size_half,
-                        num_ntts,
-                        &mut hook,
-                    );
-                });
-                layer += 1;
-            }
-            src = None;
-        }
-    }
-}
-
-/// Call `f` with each block of `1 << log_rows` rows that holds a row of `live` (sorted), or with every block of `num_blocks`.
-fn for_each_block(num_blocks: usize, log_rows: usize, live: Option<&[usize]>, mut f: impl FnMut(usize)) {
-    match live {
-        None => (0..num_blocks).for_each(f),
-        Some(rows) => rows.chunk_by(|a, b| a >> log_rows == b >> log_rows).for_each(|run| f(run[0] >> log_rows)),
-    }
-}
-
-/// The hook of a sweep nobody listens to.
-///
-/// One named function, so every such caller shares one instance of the sweeps.
-pub(super) fn no_hook() {}
-
-/// How many layers the next sweep fuses, with `left` layers still to run.
-///
-/// - Radix 8 while three or more remain, but never leave one layer for a lone radix-2 sweep.
-/// - A radix-2 sweep costs about twice a radix-8 layer, a radix-4 sweep about 1.4 times.
-/// - So when one layer would be left over, a radix-4 sweep goes first and another ends the run.
-/// - A block of the next sweep's first layer has `2^left` rows or more, so it always fits the radix.
-pub(super) fn radix_layers(left: usize) -> usize {
-    if left >= 4 && left % 3 == 1 { 2 } else { left.min(3) }
 }
 
 /// Words of one coset a coset-major encode may span.

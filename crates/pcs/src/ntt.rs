@@ -5,6 +5,7 @@ pub mod additive_ntt_f64;
 mod deep;
 mod gathered;
 mod kernels;
+mod layers;
 mod plan;
 mod rows;
 mod stage;

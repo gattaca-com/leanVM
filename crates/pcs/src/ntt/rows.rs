@@ -3,7 +3,8 @@
 use flux_profiler::timed;
 use primitives::field::F64;
 
-use super::additive_ntt_f64::{AdditiveNttF64, no_hook, with_scratch};
+use super::additive_ntt_f64::{AdditiveNttF64, with_scratch};
+use super::layers::no_hook;
 use super::plan::Plan;
 use super::stage::{BATCH, LOG_BATCH, fill_stage, stage_copies};
 
@@ -79,9 +80,10 @@ impl AdditiveNttF64 {
         src: impl Fn(usize, usize) -> &'a [F64] + Sync,
     ) -> Vec<F64> {
         let Plan { log_d, num_ntts, deep_start, .. } = *deep;
+        let layers = self.layers();
         built_rows(num_ntts, log_d - deep_start, positions, |i, sub_idx, sub| {
             let src = Some(src(i, sub_idx));
-            self.run_layers_to(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
+            layers.run(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
         })
     }
 
@@ -122,6 +124,7 @@ impl AdditiveNttF64 {
             })
             .collect();
         let copies = stage_copies(repeats, log_step, rows, msg_rows, n_lanes, num_ntts);
+        let layers = self.layers();
         // A group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
         primitives::filled_vec(subs.len() * sub_len, |built| {
             let out = parallel::SendPtr(built.as_mut_ptr());
@@ -137,7 +140,18 @@ impl AdditiveNttF64 {
                             fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet, &copies, 1);
                             for (coset, run, live) in &cosets {
                                 let live_rows = Some(&live[..]);
-                                self.run_layers_to(scratch, Some(stage), deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
+                                layers.run(
+                                    scratch,
+                                    Some(stage),
+                                    deep_start,
+                                    BATCH * 8,
+                                    start,
+                                    deep_start,
+                                    start,
+                                    *coset,
+                                    live_rows,
+                                    no_hook,
+                                );
                                 for (pos, &i) in run.clone().zip(live) {
                                     for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8].chunks_exact(8).enumerate() {
                                         // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block,
