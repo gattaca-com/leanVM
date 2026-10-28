@@ -109,22 +109,57 @@ pub fn log2_ceil_usize(n: usize) -> usize {
     if n <= 1 { 0 } else { (n - 1).ilog2() as usize + 1 }
 }
 
-/// A vector of `len` uninitialized elements, to be filled in place.
+/// Plain data: no padding, and every bit pattern is a valid value.
 ///
-/// It skips the zero-fill, which would cost one more pass over memory.
+/// # Safety
+///
+/// Implement it only for such types.
+pub unsafe trait Plain: Copy {}
+
+// SAFETY: integers, and `repr(transparent)` and `repr(C)` structs of them.
+unsafe impl Plain for u8 {}
+unsafe impl Plain for u64 {}
+// SAFETY: an array of plain elements has no padding.
+unsafe impl<T: Plain, const N: usize> Plain for [T; N] {}
+// SAFETY: `repr(transparent)` over `u64`.
+unsafe impl Plain for field::F64 {}
+// SAFETY: `repr(C)` over three `u64`.
+unsafe impl Plain for field::F192 {}
+
+/// `N` vectors of the given lengths, filled in place by `fill`.
+///
+/// It skips the zero-fill, which would cost one more pass over memory. `fill` receives one slice per
+/// vector and must write every element before it reads it. Only plain data is allowed, so an unwritten
+/// element holds no invalid value and dropping it runs no code:
+///
+/// ```compile_fail
+/// primitives::filled_vecs([1], |_: [&mut [String]; 1]| {});
+/// ```
+#[must_use]
+pub fn filled_vecs<T: Plain, const N: usize>(lens: [usize; N], fill: impl FnOnce([&mut [T]; N])) -> [Vec<T>; N] {
+    // SAFETY: `fill` writes each element before reading it, by its contract.
+    let mut vs = lens.map(|len| unsafe { uninit_vec(len) });
+    fill(vs.each_mut().map(|v| &mut v[..]));
+    vs
+}
+
+/// One vector of `len` elements, filled in place by `fill`: [`filled_vecs`] with `N = 1`.
+#[must_use]
+pub fn filled_vec<T: Plain>(len: usize, fill: impl FnOnce(&mut [T])) -> Vec<T> {
+    let [v] = filled_vecs([len], |[s]| fill(s));
+    v
+}
+
+/// A vector of `len` uninitialized elements, for a fill that outlives one scope.
+///
+/// Prefer [`filled_vec`], which keeps the fill next to the allocation.
 ///
 /// # Safety
 ///
 /// Every element must be written before it is read.
-///
-/// Only plain-data elements are allowed, so dropping an unwritten one runs no code:
-///
-/// ```compile_fail
-/// unsafe { crate::uninit_vec::<String>(1) };
-/// ```
 #[must_use]
 #[expect(clippy::uninit_vec, reason = "the caller writes every element before reading it")]
-pub unsafe fn uninit_vec<T: Copy>(len: usize) -> Vec<T> {
+pub unsafe fn uninit_vec<T: Plain>(len: usize) -> Vec<T> {
     // Exactly `len` slots, so the vector never reallocates while it is filled.
     let mut v = Vec::with_capacity(len);
 

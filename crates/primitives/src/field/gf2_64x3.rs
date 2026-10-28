@@ -302,6 +302,9 @@ pub struct Weights8 {
     c2: [u64; 8],
 }
 
+// SAFETY: `repr(C)` over arrays of `u64` that fill its alignment, so there is no padding.
+unsafe impl crate::Plain for Weights8 {}
+
 impl Weights8 {
     /// Pack eight weights.
     pub fn new(w: &[F192; 8]) -> Self {

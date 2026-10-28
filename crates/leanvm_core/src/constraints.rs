@@ -163,41 +163,40 @@ pub fn partial_evals(cols: &[&[F64]], eqh: &[F192], real: usize) -> Vec<F192> {
     const AHEAD: usize = 16;
     let real = real.min(eqh.len());
     let mass = eqh[real..].iter().fold(F192::ZERO, |acc, &e| acc + e);
-    // SAFETY: the tasks below write every entry.
-    let mut out = unsafe { primitives::uninit_vec::<F192>(cols.len() * BLOCK) };
-    parallel::chunks_mut(&mut out, BLOCK, |c, out| {
-        let col = cols[c];
-        let padding = (real < eqh.len()).then(|| {
-            F192x8::splat(mass).mul_base_unreduced(F64x8::from_array(&[col[real * BLOCK]; 8]))
-        });
-        for x in (0..BLOCK).step_by(STEP) {
-            let mut acc = [Prod8::ZERO; VECS];
-            // The reads of all columns in order: by column, then set of accumulators, then block.
-            let ahead = (c * STEPS + x / STEP) * real + AHEAD;
-            let (mut set, mut block) = (ahead / real.max(1), ahead % real.max(1));
-            for (h, &e) in eqh[..real].iter().enumerate() {
-                if let Some(next_col) = cols.get(set / STEPS) {
-                    let p = next_col.as_ptr().wrapping_add(block * BLOCK + set % STEPS * STEP);
-                    prefetch_lines(p.cast(), 64 * VECS);
+    primitives::filled_vec(cols.len() * BLOCK, |out| {
+        parallel::chunks_mut(out, BLOCK, |c, out| {
+            let col = cols[c];
+            let padding = (real < eqh.len()).then(|| {
+                F192x8::splat(mass).mul_base_unreduced(F64x8::from_array(&[col[real * BLOCK]; 8]))
+            });
+            for x in (0..BLOCK).step_by(STEP) {
+                let mut acc = [Prod8::ZERO; VECS];
+                // The reads of all columns in order: by column, then set of accumulators, then block.
+                let ahead = (c * STEPS + x / STEP) * real + AHEAD;
+                let (mut set, mut block) = (ahead / real.max(1), ahead % real.max(1));
+                for (h, &e) in eqh[..real].iter().enumerate() {
+                    if let Some(next_col) = cols.get(set / STEPS) {
+                        let p = next_col.as_ptr().wrapping_add(block * BLOCK + set % STEPS * STEP);
+                        prefetch_lines(p.cast(), 64 * VECS);
+                    }
+                    block += 1;
+                    if block == real {
+                        (set, block) = (set + 1, 0);
+                    }
+                    let w = F192x8::splat(e);
+                    for (v, a) in acc.iter_mut().enumerate() {
+                        *a ^= w.mul_base_unreduced(load_k(col, h * BLOCK + x + 8 * v));
+                    }
                 }
-                block += 1;
-                if block == real {
-                    (set, block) = (set + 1, 0);
-                }
-                let w = F192x8::splat(e);
                 for (v, a) in acc.iter_mut().enumerate() {
-                    *a ^= w.mul_base_unreduced(load_k(col, h * BLOCK + x + 8 * v));
+                    if let Some(padding) = padding {
+                        *a ^= padding;
+                    }
+                    out[x + 8 * v..][..8].copy_from_slice(&a.reduce_lanes().to_array());
                 }
             }
-            for (v, a) in acc.iter_mut().enumerate() {
-                if let Some(padding) = padding {
-                    *a ^= padding;
-                }
-                out[x + 8 * v..][..8].copy_from_slice(&a.reduce_lanes().to_array());
-            }
-        }
-    });
-    out
+        });
+    })
 }
 
 /// Each column's evaluation at `chi`, for a table of at most `BLOCK` rows.
