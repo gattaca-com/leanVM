@@ -64,7 +64,7 @@ impl AdditiveNttF64 {
         layer: usize,
         g: usize,
         msg: Option<parallel::SendPtr<F64>>,
-        lane_major: Option<(usize, &[bool])>,
+        lane_major: Option<(&[F64], usize, &[bool])>,
         stream: bool,
         first_block: usize,
     ) {
@@ -81,7 +81,7 @@ impl AdditiveNttF64 {
         let batch = if staged { BATCH * subs } else { 1 };
         let width = if staged { BATCH * 8 } else { num_ntts };
         let (group_len, stage_len) = (rows * width, if staged { subs * rows * width } else { 0 });
-        let copies = lane_major.map_or_else(StageCopies::none, |(n_lanes, repeats)| {
+        let copies = lane_major.map_or_else(StageCopies::none, |(_, n_lanes, repeats)| {
             stage_copies(repeats, log_step, rows, block_rows, n_lanes, num_ntts)
         });
         // Whole aligned cache lines in every row stream out a line at a time; other rows are stored whole.
@@ -131,10 +131,9 @@ impl AdditiveNttF64 {
                 };
                 for t in lo..hi {
                     match (msg, lane_major) {
-                        (Some(m), Some((n_lanes, _))) => {
+                        (Some(_), Some((words, n_lanes, _))) => {
                             for octet in 0..num_ntts / 8 {
-                                let m = m.0.cast_const();
-                                fill_stage(stage, m, t * batch, log_step, block_rows, n_lanes, num_ntts, octet, &copies, subs);
+                                fill_stage(stage, words, t * batch, log_step, block_rows, n_lanes, num_ntts, octet, &copies, subs);
                                 for block in blocks.clone().rev() {
                                     for (u, staged) in stage.chunks_exact(group_len).enumerate() {
                                         let r = t * batch + u * BATCH;

@@ -323,23 +323,24 @@ impl AdditiveNttF64 {
         let defer_deep = by_halves || keep == Keep::BeforeDeep;
         // The cosets one pass holds: half of them when the opening rebuilds the rows.
         let held = (1usize << log_inv_rate) >> usize::from(by_halves);
-        // SAFETY: every word is written by the gathered pass before the deep pass reads it.
-        let mut data = unsafe { primitives::uninit_vec::<F64>((held * msg_rows) * num_ntts) };
         // Read-only from here on: the pointer only feeds the first pass's reads.
-        let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
+        let msg_ptr = parallel::SendPtr(msg.as_ptr().cast_mut());
         let mut deep = None;
-        for first in (0..1usize << log_inv_rate).step_by(held).rev() {
-            let cosets = (n_lanes, first..first + held, repeats);
-            deep = self.transform_deferring_deep(
-                &mut data,
-                num_ntts,
-                log_inv_rate,
-                Some(msg),
-                Some(on_rows),
-                defer_deep,
-                Some(cosets),
-            );
-        }
+        // Every word is written by the gathered pass before the deep pass reads it.
+        let data = primitives::filled_vec((held * msg_rows) * num_ntts, |data| {
+            for first in (0..1usize << log_inv_rate).step_by(held).rev() {
+                let cosets = (msg, first..first + held, repeats);
+                deep = self.transform_deferring_deep(
+                    data,
+                    num_ntts,
+                    log_inv_rate,
+                    Some(msg_ptr),
+                    Some(on_rows),
+                    defer_deep,
+                    Some(cosets),
+                );
+            }
+        });
         Encoded { words: if by_halves { Vec::new() } else { data }, deep }
     }
 
@@ -497,37 +498,37 @@ impl AdditiveNttF64 {
                 (run[0] >> g, next - run.len()..next, run.iter().map(|sub| sub & (rows - 1)).collect())
             })
             .collect();
-        // SAFETY: a group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
-        let mut built = unsafe { primitives::uninit_vec::<F64>(subs.len() * sub_len) };
-        let (out, msg) = (parallel::SendPtr(built.as_mut_ptr()), parallel::SendPtr(msg.as_ptr().cast_mut()));
         let copies = stage_copies(repeats, log_step, rows, msg_rows, n_lanes, num_ntts);
-        parallel::for_each_chunk((1usize << log_step) / BATCH, |lo, hi| {
-            // One octet of lanes of a batch of residues is 64 lanes of one transform.
-            let stage_len = rows * BATCH * 8;
-            // `built` is far larger than a node's L3 share and is read only after every task: its lines stream.
-            let stream = primitives::stream::Stream::new();
-            with_scratch(2 * stage_len, |all| {
-                let (stage, scratch) = all.split_at_mut(stage_len);
-                for t in lo..hi {
-                    for octet in 0..num_ntts / 8 {
-                        let msg = unsafe { msg.add(0) }.cast_const();
-                        fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet, &copies, 1);
-                        for (coset, run, live) in &cosets {
-                            let live_rows = Some(&live[..]);
-                            self.run_layers_to(scratch, Some(stage), deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
-                            for (pos, &i) in run.clone().zip(live) {
-                                for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8].chunks_exact(8).enumerate() {
-                                    // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block.
-                                    let dst = unsafe { out.slice(pos * sub_len + (t * BATCH + s) * num_ntts + 8 * octet, 8) };
-                                    stream.copy(dst, line);
+        // A group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
+        primitives::filled_vec(subs.len() * sub_len, |built| {
+            let out = parallel::SendPtr(built.as_mut_ptr());
+            parallel::for_each_chunk((1usize << log_step) / BATCH, |lo, hi| {
+                // One octet of lanes of a batch of residues is 64 lanes of one transform.
+                let stage_len = rows * BATCH * 8;
+                // `built` is far larger than a node's L3 share and is read only after every task: its lines stream.
+                let stream = primitives::stream::Stream::new();
+                with_scratch(2 * stage_len, |all| {
+                    let (stage, scratch) = all.split_at_mut(stage_len);
+                    for t in lo..hi {
+                        for octet in 0..num_ntts / 8 {
+                            fill_stage(stage, msg, t * BATCH, log_step, msg_rows, n_lanes, num_ntts, octet, &copies, 1);
+                            for (coset, run, live) in &cosets {
+                                let live_rows = Some(&live[..]);
+                                self.run_layers_to(scratch, Some(stage), deep_start, BATCH * 8, start, deep_start, start, *coset, live_rows, no_hook);
+                                for (pos, &i) in run.clone().zip(live) {
+                                    for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8].chunks_exact(8).enumerate() {
+                                        // SAFETY: this task alone owns row `t * BATCH + s` of every sub-block,
+                                        // and `built` outlives the tasks.
+                                        let dst = unsafe { out.slice(pos * sub_len + (t * BATCH + s) * num_ntts + 8 * octet, 8) };
+                                        stream.copy(dst, line);
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                });
             });
-        });
-        built
+        })
     }
 
     /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.
@@ -619,11 +620,11 @@ impl AdditiveNttF64 {
         msg: Option<parallel::SendPtr<F64>>,
         on_rows: Option<&RowSink<'_>>,
         defer_deep: bool,
-        lane_major: Option<(usize, std::ops::Range<usize>, &[bool])>,
+        lane_major: Option<(&[F64], std::ops::Range<usize>, &[bool])>,
     ) -> Option<DeepRows> {
         // The buffer is 2^log_d rows of `num_ntts` words, or the layer-`start` blocks `cosets` of them.
-        let (mut lane_major, cosets, repeats) = match lane_major {
-            Some((n_lanes, cosets, repeats)) => (Some(n_lanes), cosets, repeats),
+        let (lane_major, cosets, repeats) = match lane_major {
+            Some((words, cosets, repeats)) => (Some(words), cosets, repeats),
             None => (None, 0..1 << start, &[][..]),
         };
         assert!(num_ntts > 0);
@@ -631,6 +632,8 @@ impl AdditiveNttF64 {
         let log_d = log2_strict_usize(data.len() / num_ntts / cosets.len()) + start;
         assert!(log_d <= self.log_domain_size());
         assert!(start <= log_d);
+        // The message is `n_lanes` lane blocks of `2^(log_d - start)` words.
+        let mut lane_major = lane_major.map(|words| (words, words.len() >> (log_d - start)));
 
         let l2_words = l2_words(lane_major.is_some());
         let (par_log, deep_start) = (par_log(log_d), deep_start(log_d, num_ntts, start, l2_words));
@@ -645,11 +648,9 @@ impl AdditiveNttF64 {
         let mut msg = msg;
         // A lane-major message is read by the first gathered pass, a batch of residues at a time.
         // Without such a pass, or with too few residues to batch, it is transposed into block 0 first.
-        if let (Some(n_lanes), Some(m)) = (lane_major, msg) && lane_major_deep_start(log_d, num_ntts, start).is_none() {
+        if let (Some((words, n_lanes)), Some(_)) = (lane_major, msg) && lane_major_deep_start(log_d, num_ntts, start).is_none() {
             assert_eq!(cosets.len(), 1 << start, "a partial buffer needs the gathered pass");
             let log_rows = log_d - start;
-            // SAFETY: the message is `n_lanes` lane blocks of `2^log_rows` words, disjoint from the buffer.
-            let words = unsafe { std::slice::from_raw_parts(m.0.cast_const(), n_lanes << log_rows) };
             transpose_lane_major(&mut data[..num_ntts << log_rows], words, n_lanes, num_ntts, log_rows);
             msg = Some(parallel::SendPtr(data.as_mut_ptr()));
             lane_major = None;
@@ -657,7 +658,7 @@ impl AdditiveNttF64 {
         let mut layer = start;
         while layer < deep_start {
             let g = (deep_start - layer).min(fit2);
-            let lane_major = lane_major.take().map(|n_lanes| (n_lanes, repeats));
+            let lane_major = lane_major.take().map(|(words, n_lanes)| (words, n_lanes, repeats));
             self.gathered_pass(data, log_d, num_ntts, layer, g, msg.take(), lane_major, stream, cosets.start);
             layer += g;
         }
@@ -1600,7 +1601,30 @@ pub(super) fn stage_copies(
 ///   before, which is already in the stage, and its line is not read.
 pub(super) fn fill_stage(
     stage: &mut [F64],
-    msg: *const F64,
+    msg: &[F64],
+    t0: usize,
+    log_step: usize,
+    msg_rows: usize,
+    n_lanes: usize,
+    row_words: usize,
+    octet: usize,
+    copies: &StageCopies,
+    subs: usize,
+) {
+    // SAFETY: AVX-512F is enabled at compile time.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    unsafe {
+        fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, copies, subs)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, copies, subs);
+}
+
+/// [`fill_stage`], a target-feature function where AVX-512 is enabled, so its tiles move through registers.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512f"), target_feature(enable = "avx512f"), inline)]
+fn fill_stage_tiles(
+    stage: &mut [F64],
+    msg: &[F64],
     t0: usize,
     log_step: usize,
     msg_rows: usize,
@@ -1614,131 +1638,98 @@ pub(super) fn fill_stage(
     let sub_words = stage.len() / subs;
     let rows = sub_words / (BATCH * 8);
     let pad = row_words - n_lanes;
-    let out = stage.as_mut_ptr();
     // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
     let block = |k: usize| row_words - 1 - (8 * octet + k);
+    // The lines of a tile that are padding lanes.
+    let pad_lines = (0..8).filter(|k| 8 * octet + k < pad).fold(0u8, |m, k| m | 1 << k);
     let masks: [&[u8]; STAGE_SUBS] = std::array::from_fn(|u| if u < subs { copies.octet(octet, t0 + u * BATCH) } else { &[] });
     for i in 0..rows {
         // The sub-batches' lines of one lane are adjacent: a row's tiles go together.
         for (u, masks) in masks.iter().enumerate().take(subs) {
             let j = t0 + u * BATCH + (i << log_step);
-            let out = out.wrapping_add(u * sub_words);
+            let sub = &mut stage[u * sub_words..][..sub_words];
             let copy = masks.get(i).copied().unwrap_or(0);
-            if 8 * octet >= pad && copy == 0 {
-                // No padding lane: the tile needs no null check.
-                let src: [*const F64; 8] = std::array::from_fn(|k| msg.wrapping_add(block(k) * msg_rows + j));
-                // SAFETY: as in the padded case below, and no source is null.
-                unsafe { transpose_tile::<false>(&src, |s| out.add((i * BATCH + s) * 8)) };
-                continue;
+            if copy != 0xFF {
+                // Line `k` of the tile: 8 residues of one lane block, or zeros for a padding lane or a copy.
+                let src: [usize; 8] = std::array::from_fn(|k| block(k) * msg_rows + j);
+                fill_tile(sub, i * BATCH, msg, src, pad_lines | copy);
             }
-            // SAFETY: tile `i - back` is a tile of the stage, and `copies` has no bit before row `back`.
-            if copy == 0xFF {
-                unsafe { copy_lanes(out, i, i - back, copy) };
-                continue;
-            }
-            // Line `k` of the tile: 8 residues of one lane block, or null for a padding lane or a copy.
-            let src: [*const F64; 8] = std::array::from_fn(|k| {
-                if 8 * octet + k < pad || copy >> k & 1 == 1 {
-                    std::ptr::null()
-                } else {
-                    msg.wrapping_add(block(k) * msg_rows + j)
-                }
-            });
-            // SAFETY:
-            // - Every non-null source is `BATCH` words inside lane block `row_words - 1 - w`, as the caller's rows are.
-            // - Every destination is a whole line of the stage: `s < BATCH`, `i < rows`.
-            unsafe { transpose_tile::<true>(&src, |s| out.add((i * BATCH + s) * 8)) };
             if copy != 0 {
-                // SAFETY: as above.
-                unsafe { copy_lanes(out, i, i - back, copy) };
+                // Tile `i - back` is a tile of the stage, and `copies` has no bit before row `back`.
+                copy_tile(sub, i, i - back, copy);
             }
+        }
+    }
+}
+
+/// Write `sub[tile + s][k] = msg[src[k] + s]` for the 8 x 8 words of eight lines, a line in `zeros` being zeros.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+fn fill_tile(sub: &mut [F64], tile: usize, msg: &[F64], src: [usize; 8], zeros: u8) {
+    use core::arch::x86_64::*;
+    use primitives::simd::{load, store};
+    let r: [__m512i; 8] =
+        std::array::from_fn(|k| if zeros >> k & 1 == 1 { _mm512_setzero_si512() } else { load(&msg[src[k]..], 0) });
+    // Pairs of columns: lanes `[(r0, r1), (r2, r3)]`, then 128-bit lane picks to finish.
+    let (a0, a1) = (_mm512_unpacklo_epi64(r[0], r[1]), _mm512_unpackhi_epi64(r[0], r[1]));
+    let (a2, a3) = (_mm512_unpacklo_epi64(r[2], r[3]), _mm512_unpackhi_epi64(r[2], r[3]));
+    let (a4, a5) = (_mm512_unpacklo_epi64(r[4], r[5]), _mm512_unpackhi_epi64(r[4], r[5]));
+    let (a6, a7) = (_mm512_unpacklo_epi64(r[6], r[7]), _mm512_unpackhi_epi64(r[6], r[7]));
+    let b0 = _mm512_shuffle_i64x2::<0x88>(a0, a2);
+    let b1 = _mm512_shuffle_i64x2::<0x88>(a1, a3);
+    let b2 = _mm512_shuffle_i64x2::<0xDD>(a0, a2);
+    let b3 = _mm512_shuffle_i64x2::<0xDD>(a1, a3);
+    let b4 = _mm512_shuffle_i64x2::<0x88>(a4, a6);
+    let b5 = _mm512_shuffle_i64x2::<0x88>(a5, a7);
+    let b6 = _mm512_shuffle_i64x2::<0xDD>(a4, a6);
+    let b7 = _mm512_shuffle_i64x2::<0xDD>(a5, a7);
+    let cols = [
+        _mm512_shuffle_i64x2::<0x88>(b0, b4),
+        _mm512_shuffle_i64x2::<0x88>(b1, b5),
+        _mm512_shuffle_i64x2::<0x88>(b2, b6),
+        _mm512_shuffle_i64x2::<0x88>(b3, b7),
+        _mm512_shuffle_i64x2::<0xDD>(b0, b4),
+        _mm512_shuffle_i64x2::<0xDD>(b1, b5),
+        _mm512_shuffle_i64x2::<0xDD>(b2, b6),
+        _mm512_shuffle_i64x2::<0xDD>(b3, b7),
+    ];
+    for (s, col) in cols.into_iter().enumerate() {
+        store(sub, tile + s, col);
+    }
+}
+
+/// [`fill_tile`] word by word.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline(always)]
+fn fill_tile(sub: &mut [F64], tile: usize, msg: &[F64], src: [usize; 8], zeros: u8) {
+    for s in 0..8 {
+        for k in 0..8 {
+            sub[(tile + s) * 8 + k] = if zeros >> k & 1 == 1 { F64::ZERO } else { msg[src[k] + s] };
         }
     }
 }
 
 /// Copy the lanes of tile `from` of a stage into tile `i`, for the bits set in `mask`.
-///
-/// # Safety
-///
-/// Both tiles lie inside the stage at `out`, and `from < i`.
-#[inline(always)]
-unsafe fn copy_lanes(out: *mut F64, i: usize, from: usize, mask: u8) {
-    for s in 0..BATCH {
-        // SAFETY: the caller's bounds.
-        unsafe {
-            let (dst, src) = (out.add((i * BATCH + s) * 8), out.add((from * BATCH + s) * 8));
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-            {
-                use core::arch::x86_64::*;
-                _mm512_mask_storeu_epi64(dst.cast(), mask, _mm512_loadu_si512(src.cast()));
-            }
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-            for k in (0..8).filter(|k| mask >> k & 1 == 1) {
-                *dst.add(k) = *src.add(k);
-            }
-        }
-    }
-}
-
-/// Write `dst(s)[k] = src[k][s]` for the 8 x 8 words of eight lines, a null line being zeros when `PAD`.
-///
-/// # Safety
-///
-/// Every non-null `src[k]` is valid for 8 reads, and every `dst(s)` for 8 writes, apart from the sources.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline(always)]
-unsafe fn transpose_tile<const PAD: bool>(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
+#[inline]
+#[target_feature(enable = "avx512f")]
+fn copy_tile(sub: &mut [F64], i: usize, from: usize, mask: u8) {
     use core::arch::x86_64::*;
-    // SAFETY: the caller's bounds; AVX-512F is enabled at compile time.
-    unsafe {
-        let r: [__m512i; 8] = std::array::from_fn(|k| {
-            if PAD && src[k].is_null() {
-                _mm512_setzero_si512()
-            } else {
-                _mm512_loadu_si512(src[k].cast())
-            }
-        });
-        // Pairs of columns: lanes `[(r0, r1), (r2, r3)]`, then 128-bit lane picks to finish.
-        let (a0, a1) = (_mm512_unpacklo_epi64(r[0], r[1]), _mm512_unpackhi_epi64(r[0], r[1]));
-        let (a2, a3) = (_mm512_unpacklo_epi64(r[2], r[3]), _mm512_unpackhi_epi64(r[2], r[3]));
-        let (a4, a5) = (_mm512_unpacklo_epi64(r[4], r[5]), _mm512_unpackhi_epi64(r[4], r[5]));
-        let (a6, a7) = (_mm512_unpacklo_epi64(r[6], r[7]), _mm512_unpackhi_epi64(r[6], r[7]));
-        let b0 = _mm512_shuffle_i64x2::<0x88>(a0, a2);
-        let b1 = _mm512_shuffle_i64x2::<0x88>(a1, a3);
-        let b2 = _mm512_shuffle_i64x2::<0xDD>(a0, a2);
-        let b3 = _mm512_shuffle_i64x2::<0xDD>(a1, a3);
-        let b4 = _mm512_shuffle_i64x2::<0x88>(a4, a6);
-        let b5 = _mm512_shuffle_i64x2::<0x88>(a5, a7);
-        let b6 = _mm512_shuffle_i64x2::<0xDD>(a4, a6);
-        let b7 = _mm512_shuffle_i64x2::<0xDD>(a5, a7);
-        let cols = [
-            _mm512_shuffle_i64x2::<0x88>(b0, b4),
-            _mm512_shuffle_i64x2::<0x88>(b1, b5),
-            _mm512_shuffle_i64x2::<0x88>(b2, b6),
-            _mm512_shuffle_i64x2::<0x88>(b3, b7),
-            _mm512_shuffle_i64x2::<0xDD>(b0, b4),
-            _mm512_shuffle_i64x2::<0xDD>(b1, b5),
-            _mm512_shuffle_i64x2::<0xDD>(b2, b6),
-            _mm512_shuffle_i64x2::<0xDD>(b3, b7),
-        ];
-        for (s, col) in cols.into_iter().enumerate() {
-            _mm512_storeu_si512(dst(s).cast(), col);
-        }
+    use primitives::simd::{load, store};
+    for s in 0..BATCH {
+        let (kept, copied) = (load(sub, i * BATCH + s), load(sub, from * BATCH + s));
+        store(sub, i * BATCH + s, _mm512_mask_blend_epi64(mask, kept, copied));
     }
 }
 
-/// [`transpose_tile`] word by word.
+/// [`copy_tile`] word by word.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 #[inline(always)]
-unsafe fn transpose_tile<const PAD: bool>(src: &[*const F64; 8], dst: impl Fn(usize) -> *mut F64) {
-    for s in 0..8 {
-        for (k, line) in src.iter().enumerate() {
-            // SAFETY: the caller's bounds.
-            unsafe {
-                dst(s)
-                    .add(k)
-                    .write(if PAD && line.is_null() { F64::ZERO } else { line.add(s).read() })
-            };
+fn copy_tile(sub: &mut [F64], i: usize, from: usize, mask: u8) {
+    for s in 0..BATCH {
+        for k in (0..8).filter(|k| mask >> k & 1 == 1) {
+            sub[(i * BATCH + s) * 8 + k] = sub[(from * BATCH + s) * 8 + k];
         }
     }
 }
