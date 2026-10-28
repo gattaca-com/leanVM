@@ -337,32 +337,38 @@ pub(crate) fn ligero_commit_ext(
     let row_words = 3 * num_interleaved;
     let builder = merkle::MerkleBuilder::new(block_len, row_words, row_words);
     let by_cosets = parallel::num_threads() >= DEFER_DEEP_MIN_THREADS && AdditiveNttF64::encodes_by_coset(3 * poly.len());
-    // Without a codeword, `mat` is the message, kept for the openings.
-    let mut mat = if by_cosets {
-        poly.to_vec()
-    } else {
-        // SAFETY: the encode writes every matrix element before reading it.
-        unsafe { primitives::uninit_vec::<F192>(block_len * num_interleaved) }
+    // The encode writes every matrix element before reading it.
+    let encode = |mat: &mut [F192]| {
+        tracing::info_span!(
+            "NTT",
+            kind = "extension encode",
+            log_domain = log_block_len,
+            lanes = num_interleaved
+        )
+        .in_scope(|| {
+            let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
+            if by_cosets {
+                encode_cosets_ext(&ntt, mat, num_interleaved, log_inv_rate, &on_rows);
+                Some(Deferred::Cosets(ntt, log_inv_rate))
+            } else if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
+                encode_interleaved_ext_without_deep(&ntt, mat, poly, num_interleaved, log_inv_rate, &on_rows)
+                    .map(|rows| Deferred::Deep(ntt, rows))
+            } else {
+                encode_interleaved_ext(&ntt, mat, poly, num_interleaved, log_inv_rate, &on_rows);
+                None
+            }
+        })
     };
-    let deferred = tracing::info_span!(
-        "NTT",
-        kind = "extension encode",
-        log_domain = log_block_len,
-        lanes = num_interleaved
-    )
-    .in_scope(|| {
-        let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
-        if by_cosets {
-            encode_cosets_ext(&ntt, &mat, num_interleaved, log_inv_rate, &on_rows);
-            Some(Deferred::Cosets(ntt, log_inv_rate))
-        } else if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
-            encode_interleaved_ext_without_deep(&ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows)
-                .map(|rows| Deferred::Deep(ntt, rows))
-        } else {
-            encode_interleaved_ext(&ntt, &mut mat, poly, num_interleaved, log_inv_rate, &on_rows);
-            None
-        }
-    });
+    // Without a codeword, `mat` is the message, kept for the openings.
+    let (mat, deferred) = if by_cosets {
+        let mut mat = poly.to_vec();
+        let deferred = encode(&mut mat);
+        (mat, deferred)
+    } else {
+        let mut deferred = None;
+        let mat = primitives::filled_vec(block_len * num_interleaved, |mat| deferred = encode(mat));
+        (mat, deferred)
+    };
     let tree = tracing::info_span!("Merkle").in_scope(|| builder.finish());
 
     LigeroWitness {
@@ -569,17 +575,6 @@ fn round_msg_and_eval_lsb_ext(f: &[F192], b: &Basis) -> (SumcheckMessage, F192) 
     )
 }
 
-/// Uninitialized output for an initial-sumcheck fold.
-///
-/// # Safety
-/// Every element must be written before it is read, which every fold kernel
-/// below does: one output slot per input pair.
-#[inline]
-unsafe fn fold_out_buf(n: usize) -> Vec<F192> {
-    // SAFETY: forwarded to the caller's obligation, documented above.
-    unsafe { primitives::uninit_vec(n) }
-}
-
 /// Outputs a fused fold folds before it multiplies them, so the message reads values written a
 /// while ago rather than stores still in flight.
 const FOLD_STAGE: usize = 256;
@@ -607,22 +602,12 @@ fn fold_and_msg_lsb(
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
 
-    // SAFETY (x2): every slot of `nf`/`nb` is written by the loop below
-    // (one output per input pair) before any is read.
-    let mut nf = unsafe { fold_out_buf(half) };
-    let mut nb = unsafe { fold_out_buf(half) };
-    let nf_base = parallel::SendPtr(nf.as_mut_ptr());
-    let nb_base = parallel::SendPtr(nb.as_mut_ptr());
     // `half` is a power of two and so are `ROUND_CHUNK` and `FOLD_STAGE`: every window has even
     // length and starts at an even index, so no message pair straddles one.
     let stream = half >= STREAM_FOLD_MIN;
-    let task = |ci: usize| {
+    let task = |ci: usize, fc: &mut [F192], bc: &mut [F192]| {
         let base = ci * ROUND_CHUNK;
-        let len = ROUND_CHUNK.min(half - base);
-        // SAFETY: distinct `ci` own disjoint in-bounds `ROUND_CHUNK`-windows of
-        // `nf`/`nb`, and both buffers stay borrowed for the whole dispatch.
-        let fc = unsafe { nf_base.slice(base, len) };
-        let bc = unsafe { nb_base.slice(base, len) };
+        let len = fc.len();
         let mut acc = (Acc8::ZERO, Acc8::ZERO);
         let mut sum = [F192::ZERO; 2 * FOLD_STAGE];
         let mut fold = |fo: &mut [F192], bo: &mut [F192], at: std::ops::Range<usize>| {
@@ -658,7 +643,10 @@ fn fold_and_msg_lsb(
         }
         acc
     };
-    let (u_0, u_2) = accumulate_msg(half.div_ceil(ROUND_CHUNK), half, task);
+    // One output per input pair, so the tasks write every slot of `nf` and `nb`.
+    let mut msg = (Acc8::ZERO, Acc8::ZERO);
+    let [nf, nb] = primitives::filled_vecs([half; 2], |[nf, nb]| msg = accumulate_msg_chunks(nf, nb, ROUND_CHUNK, task));
+    let (u_0, u_2) = msg;
     (
         nf,
         nb,
@@ -706,6 +694,43 @@ pub(crate) fn accumulate_msg(n_tasks: usize, n_pairs: usize, task: impl Fn(usize
             n_tasks,
             || (Acc8::ZERO, Acc8::ZERO),
             task,
+            |(mut a0, mut a2), (c0, c2)| {
+                a0 ^= c0;
+                a2 ^= c2;
+                (a0, a2)
+            },
+        )
+    }
+}
+
+/// [`accumulate_msg`] over the chunks of two output tables, which `task(i, ..)` fills.
+#[inline]
+fn accumulate_msg_chunks(
+    f: &mut [F192],
+    b: &mut [F192],
+    chunk: usize,
+    task: impl Fn(usize, &mut [F192], &mut [F192]) -> (Acc8, Acc8) + Sync,
+) -> (Acc8, Acc8) {
+    const PAR_THRESHOLD: usize = 4096;
+    if f.len() < PAR_THRESHOLD {
+        let (mut u_0, mut u_2) = (Acc8::ZERO, Acc8::ZERO);
+        for (t, (fc, bc)) in f.chunks_mut(chunk).zip(b.chunks_mut(chunk)).enumerate() {
+            let (t0, t2) = task(t, fc, bc);
+            u_0 ^= t0;
+            u_2 ^= t2;
+        }
+        (u_0, u_2)
+    } else {
+        parallel::map_reduce_chunks_mut(
+            [f, b],
+            [chunk; 2],
+            || (),
+            || (Acc8::ZERO, Acc8::ZERO),
+            |(), acc, t, [fc, bc]| {
+                let (t0, t2) = task(t, fc, bc);
+                acc.0 ^= t0;
+                acc.1 ^= t2;
+            },
             |(mut a0, mut a2), (c0, c2)| {
                 a0 ^= c0;
                 a2 ^= c2;
@@ -1179,7 +1204,7 @@ impl SumcheckProver {
         let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, &glued, r);
         drop(glued);
         // Swap the freshly folded buffers in and drop the consumed ones, so the
-        // allocator serves the next round's `fold_out_buf` from their memory.
+        // allocator serves the next round's `filled_vecs` from their memory.
         drop(std::mem::replace(&mut self.f, nf));
         drop(std::mem::replace(&mut self.combined_basis, nb));
         self.quad = RoundQuad::from_msg(msg, self.t_r);
