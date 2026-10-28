@@ -38,21 +38,30 @@ LEANVM_NUM_THREADS=16 target/release/leanvm --repeat 1 --cooldown 0 --log-inv-ra
 sha256sum p2.bin p8.bin   # macOS: shasum -a 256
 ```
 
-| Proof | sha256 (same as upstream Keccak main dd51f0f5e) |
-|---|---|
-| `--n 2` | `f1a49548cdd222fc7dc0e10341ad5a777b6fc81ef6deea72a096415d7cf90e65` |
-| `--n 8` | `d1f40512b5eb5c2378aa04edb6e6d27cff3a3af8feaf9dab4f3661d8b48ae297` |
+| Proof | sha256, `--log-inv-rate 2` | sha256, `--log-inv-rate 1` (production default) |
+|---|---|---|
+| `--n 2` | `f1a49548cdd222fc7dc0e10341ad5a777b6fc81ef6deea72a096415d7cf90e65` | `025790d2235563ed3e754d66dc1f82df505c76001d4bf9ec9a6663e3a694cc31` |
+| `--n 8` | `d1f40512b5eb5c2378aa04edb6e6d27cff3a3af8feaf9dab4f3661d8b48ae297` | `19d343e52f6a3de7a1a0ff1729b0d573c87defc5c4eb2dd8a2578a5e4afdadd6` |
+
+All four equal upstream Keccak main dd51f0f5e's proofs from the same children.
 
 The proof does not depend on the thread count or the machine (checked at 1 and 16 threads).
 
-## Reference numbers (BLAKE2s merge-main 2026-10-27, not re-measured on Keccak; Ryzen 9 9950X, 16 cores, 2-channel DDR5)
+## Reference numbers (Keccak, Ryzen 9 9950X, 16 cores, 2-channel DDR5 at ~55 GB/s, 2026-10-27)
+
+8:1 node unless noted; `--log-inv-rate 2` unless noted; warm.
 
 | Shape | Proving time | Peak memory |
 |---|---|---|
-| 2:1, 1 thread | 0.563 s | 1.79 GiB |
-| 8:1, 2 threads | 1.44 s | 3.02 GiB |
-| 8:1, 16 threads | 0.55-0.60 s | 3.15 GiB |
-| 8 concurrent 8:1 x 2 threads | 3.75-3.93 s per node | 3.02 GiB per node |
+| 2:1, 1 thread | 0.945 s | 1.69 GiB |
+| 8:1, 1 thread | 2.85 s | 3.40 GiB |
+| 8:1, 4 cores | 0.976 s (1.20 s at `--log-inv-rate 1`) | 3.43 GiB |
+| 8:1, 8 cores | 0.683 s | 3.46 GiB |
+| 8:1, 16 cores | 0.613 s | 3.49 GiB |
+| 8 concurrent 8:1 x 2 threads | ~3.5 s per node | ~3.4 GiB per node |
+
+8:1 on 4 cores by stage: Commit 303, PCS open 240, Prove bus 175, Keccak reduction 134 ms.
+At `--log-inv-rate 1` Keccak's 64 stack lanes are full, so the stack rows double: that is the largest rate-1 loss.
 
 On this machine the concurrent shape is bound by DRAM bandwidth (~55 GB/s): an 8:1 proof moves ~24.7 GB
 (15.3 read, 9.4 written). Machines with more memory bandwidth per core (e.g. Apple M-series) change which
