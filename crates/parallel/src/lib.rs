@@ -3,6 +3,7 @@
 use flux_profiler::timed;
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -307,8 +308,16 @@ pub fn for_each<F: Fn(usize) + Sync>(n_tasks: usize, f: F) {
 /// A base `*mut` that can cross into the task closures. Sound only because
 /// callers partition the allocation by item index; every dereference site
 /// restates that.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct SendPtr<T>(pub *mut T);
+
+// By hand: the derives would demand `T: Clone` and `T: Copy`.
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SendPtr<T> {}
 
 // SAFETY: `SendPtr` grants no access by itself; every dereference is inside an
 // `unsafe` block whose comment establishes that the range being touched belongs
@@ -479,6 +488,104 @@ unsafe fn task_chunks<'a, T, const N: usize>(views: &[Chunks<T>; N], i: usize) -
     // SAFETY: by the caller's contract, chunk `i` of each buffer is taken once, so the slices are disjoint.
     views.each_ref().map(|view| if i < view.count() { unsafe { view.get(i) } } else { &mut [] })
 }
+
+/// A buffer of rows that tasks share by residue: task `r < step` owns rows `r + i * step` of every block.
+///
+/// Blocks are `block_rows` rows of `row_len` words, and `step` divides `block_rows`. A residue owns the same
+/// number of rows in every block, so a task's rows are a plain iterator of `&mut [T]`, in block order.
+#[derive(Debug)]
+pub struct Strided<'a, T> {
+    data: &'a mut [T],
+    row_len: usize,
+    step: usize,
+    block_rows: usize,
+}
+
+impl<'a, T: Send> Strided<'a, T> {
+    /// View `data` as whole blocks of `block_rows` rows of `row_len`, the residues `step` rows apart.
+    #[must_use]
+    pub fn new(data: &'a mut [T], row_len: usize, step: usize, block_rows: usize) -> Self {
+        assert!(row_len > 0 && step > 0, "row length and step must be non-zero");
+        assert!(block_rows.is_multiple_of(step), "the step must divide the block");
+        let block_len = row_len * block_rows;
+        assert!(data.is_empty() || data.len().is_multiple_of(block_len), "data must hold whole blocks");
+        Self { data, row_len, step, block_rows }
+    }
+
+    /// Run `f(r, rows)` for every residue `r < step`, in parallel, over [`for_each_chunk`] ranges.
+    pub fn for_each<F: Fn(usize, Rows<'a, T>) + Sync>(self, f: F) {
+        let Self { data, row_len, step, block_rows } = self;
+        let (len, base) = (data.len(), SendPtr(data.as_mut_ptr()));
+        let per_block = block_rows / step;
+        let end = len.checked_div(row_len * block_rows).unwrap_or(0) * per_block;
+        for_each_chunk(step, |lo, hi| {
+            for r in lo..hi {
+                // SAFETY: `data` stays borrowed until the dispatch returns, and each residue runs once.
+                // Residue `r` owns rows `b * block_rows + r + i * step`, and no other residue owns one of those.
+                let rows = Rows { base, len, row_len, step, block_rows, per_block, r, next: 0, end, _data: PhantomData };
+                f(r, rows);
+            }
+        });
+    }
+}
+
+/// [`Strided::for_each`] with one block: `f(r, rows)` for every residue `r < step`, over rows `r, r + step, ...`.
+/// `step` must divide the row count.
+pub fn for_each_strided<T: Send, F: Fn(usize, Rows<'_, T>) + Sync>(data: &mut [T], row_len: usize, step: usize, f: F) {
+    let n_rows = data.len() / row_len.max(1);
+    Strided::new(data, row_len, step, n_rows).for_each(f);
+}
+
+/// The rows of one residue of a [`Strided`] view, in block order. Double-ended, so blocks can go last to first.
+#[derive(Debug)]
+pub struct Rows<'a, T> {
+    base: SendPtr<T>,
+    len: usize,
+    row_len: usize,
+    step: usize,
+    block_rows: usize,
+    per_block: usize,
+    r: usize,
+    next: usize,
+    end: usize,
+    _data: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> Rows<'a, T> {
+    /// Row `k` of this residue, for `k < self.end`.
+    fn row(&self, k: usize) -> &'a mut [T] {
+        let row = (k / self.per_block) * self.block_rows + self.r + (k % self.per_block) * self.step;
+        debug_assert!(self.r < self.step && (row + 1) * self.row_len <= self.len);
+        // SAFETY: the row is inside the buffer, and the iterator yields each `k` once, so no live slice overlaps this one.
+        unsafe { self.base.slice(row * self.row_len, self.row_len) }
+    }
+}
+
+impl<'a, T> Iterator for Rows<'a, T> {
+    type Item = &'a mut [T];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.next < self.end).then(|| {
+            self.next += 1;
+            self.row(self.next - 1)
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.end - self.next, Some(self.end - self.next))
+    }
+}
+
+impl<T> DoubleEndedIterator for Rows<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        (self.next < self.end).then(|| {
+            self.end -= 1;
+            self.row(self.end)
+        })
+    }
+}
+
+impl<T> ExactSizeIterator for Rows<'_, T> {}
 
 /// Parallel `dst.chunks_mut(chunk).zip(src.chunks(chunk))`, for a kernel that
 /// writes one table while reading another of the same length.

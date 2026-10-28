@@ -167,3 +167,53 @@ fn default_topology_reserves_no_worker_on_a_homogeneous_host() {
         assert_eq!(topo.perf, cores, "nothing may be reserved without efficiency workers");
     }
 }
+
+#[test]
+fn strided_rows_are_visited_once_and_land_in_place() {
+    // 12 rows of 3 words, step 4: residue r owns rows r, r + 4, r + 8.
+    let (row_len, step, n_rows) = (3, 4, 12);
+    let mut data = vec![u32::MAX; n_rows * row_len];
+    parallel::for_each_strided(&mut data, row_len, step, |r, rows| {
+        assert_eq!(rows.len(), n_rows / step);
+        for (i, row) in rows.enumerate() {
+            assert_eq!(row.len(), row_len);
+            for (j, w) in row.iter_mut().enumerate() {
+                assert_eq!(*w, u32::MAX, "row visited twice");
+                *w = ((r + i * step) * row_len + j) as u32;
+            }
+        }
+    });
+    assert!(data.iter().enumerate().all(|(i, &w)| w == i as u32));
+}
+
+#[test]
+fn strided_blocks_go_in_block_order_and_in_reverse() {
+    // 3 blocks of 8 rows of 2 words, step 4: a residue owns 2 rows in each block.
+    let (row_len, step, block_rows, n_blocks) = (2, 4, 8, 3);
+    let mut data = vec![0usize; n_blocks * block_rows * row_len];
+    parallel::Strided::new(&mut data, row_len, step, block_rows).for_each(|r, mut rows| {
+        assert_eq!(rows.len(), 2 * n_blocks);
+        // The last block's rows first, then the rest in order.
+        let last: Vec<usize> = (0..2).filter_map(|_| rows.next_back().map(|row| row[0])).collect();
+        assert_eq!(last.len(), 2);
+        for (k, row) in rows.enumerate() {
+            row.fill(1 + (k / 2) * block_rows + r + (k % 2) * step);
+        }
+    });
+    for (row, words) in data.chunks(row_len).enumerate() {
+        let block = row / block_rows;
+        let expect = if block == n_blocks - 1 { 0 } else { 1 + row };
+        assert!(words.iter().all(|&w| w == expect), "row {row}");
+    }
+}
+
+#[test]
+fn strided_without_rows_runs_nothing() {
+    let mut data: Vec<u8> = Vec::new();
+    let calls = AtomicUsize::new(0);
+    parallel::for_each_strided(&mut data, 4, 3, |_, rows| {
+        assert_eq!(rows.count(), 0);
+        calls.fetch_add(1, Ordering::Relaxed);
+    });
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+}
