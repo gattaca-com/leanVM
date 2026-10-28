@@ -86,13 +86,12 @@ fn try_load_cache(path: &Path, message_id: u32) -> Option<Vec<CachedSignature>> 
         return None;
     }
     let msg = message_for(message_id);
-    let valid = signers
-        .iter()
-        .enumerate()
-        .take_while(|(i, (pk, sig))| {
-            sig.leaf_index == leaf_index_of(*i, message_id) && lean_xmss::verify(pk, &msg, sig).is_ok()
-        })
-        .count();
+    // One dispatch over all signers: the first one that fails ends the valid prefix.
+    let valid = parallel::find_first(signers.len(), |i| {
+        let (pk, sig) = &signers[i];
+        sig.leaf_index != leaf_index_of(i, message_id) || lean_xmss::verify(pk, &msg, sig).is_err()
+    })
+    .unwrap_or(signers.len());
     if valid < signers.len() {
         eprintln!(
             "warning: signers cache {} is stale (signer {valid} of {} no longer verifies); regenerating from there",
