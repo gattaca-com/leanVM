@@ -1,6 +1,8 @@
 //! The butterfly sweeps of [`AdditiveNttF64`](super::AdditiveNttF64): portable, AVX2, AVX-512 and NEON.
 
 use primitives::field::F64;
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+use core::arch::x86_64::__m512i;
 
 /// Visit every row group of a fused multi-layer block.
 ///
@@ -48,6 +50,41 @@ fn fused_rows<const N: usize>(
     }
 }
 
+/// The twelve butterflies of one radix-8 row group, as `butterfly(top row, bottom row, twiddle)` calls in order.
+///
+/// - Layer L: rows 4 apart, one twiddle for the whole block.
+/// - Layer L+1: rows 2 apart, one twiddle per half.
+/// - Layer L+2: adjacent rows, one twiddle per quarter.
+///
+/// The twiddles are breadth-first, as in [`butterfly_interleaved_fused_3layer`].
+#[inline(always)]
+fn radix8_schedule(mut butterfly: impl FnMut(usize, usize, usize)) {
+    butterfly(0, 4, 0);
+    butterfly(1, 5, 0);
+    butterfly(2, 6, 0);
+    butterfly(3, 7, 0);
+    butterfly(0, 2, 1);
+    butterfly(1, 3, 1);
+    butterfly(4, 6, 2);
+    butterfly(5, 7, 2);
+    butterfly(0, 1, 3);
+    butterfly(2, 3, 4);
+    butterfly(4, 5, 5);
+    butterfly(6, 7, 6);
+}
+
+/// The four butterflies of one radix-4 row group, as `butterfly(top row, bottom row, twiddle)` calls in order.
+///
+/// - Layer L: rows 2 apart, one twiddle for the block.
+/// - Layer L+1: adjacent rows, one twiddle per half.
+#[inline(always)]
+fn radix4_schedule(mut butterfly: impl FnMut(usize, usize, usize)) {
+    butterfly(0, 2, 0);
+    butterfly(1, 3, 0);
+    butterfly(0, 1, 1);
+    butterfly(2, 3, 2);
+}
+
 /// Layers L, L+1 and L+2 fused into one sweep over a layer-L block.
 ///
 /// ```text
@@ -83,21 +120,7 @@ pub(super) fn butterfly_interleaved_fused_3layer(
             hook: impl FnMut(),
         ) {
             fused_sweep_avx512::<8, 7>(block, src, eighth, num_ntts, t, hook, #[inline(always)] |v, t| {
-                // Layer L: rows 4 apart, one twiddle for the whole block.
-                butterfly_regs(v, 0, 4, t[0]);
-                butterfly_regs(v, 1, 5, t[0]);
-                butterfly_regs(v, 2, 6, t[0]);
-                butterfly_regs(v, 3, 7, t[0]);
-                // Layer L+1: rows 2 apart, one twiddle per half.
-                butterfly_regs(v, 0, 2, t[1]);
-                butterfly_regs(v, 1, 3, t[1]);
-                butterfly_regs(v, 4, 6, t[2]);
-                butterfly_regs(v, 5, 7, t[2]);
-                // Layer L+2: adjacent rows, one twiddle per quarter.
-                butterfly_regs(v, 0, 1, t[3]);
-                butterfly_regs(v, 2, 3, t[4]);
-                butterfly_regs(v, 4, 5, t[5]);
-                butterfly_regs(v, 6, 7, t[6]);
+                radix8_schedule(#[inline(always)] |top, bot, k| butterfly_regs(v, top, bot, t[k]));
             });
         }
         // SAFETY: this code is compiled only where VPCLMULQDQ and AVX-512F are enabled, and every such
@@ -136,22 +159,15 @@ fn fused_sweep_avx512<const N: usize, const T: usize>(
 #[inline(always)]
 fn radix8_butterflies(src: Option<[&[F64]; 8]>, rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
     copy_rows(src, rows);
-    let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
-    // Layer L: rows 4 apart, one twiddle for the whole block.
-    butterfly_lanes(r0, r4, t[0]);
-    butterfly_lanes(r1, r5, t[0]);
-    butterfly_lanes(r2, r6, t[0]);
-    butterfly_lanes(r3, r7, t[0]);
-    // Layer L+1: rows 2 apart, one twiddle per half.
-    butterfly_lanes(r0, r2, t[1]);
-    butterfly_lanes(r1, r3, t[1]);
-    butterfly_lanes(r4, r6, t[2]);
-    butterfly_lanes(r5, r7, t[2]);
-    // Layer L+2: adjacent rows, one twiddle per quarter.
-    butterfly_lanes(r0, r1, t[3]);
-    butterfly_lanes(r2, r3, t[4]);
-    butterfly_lanes(r4, r5, t[5]);
-    butterfly_lanes(r6, r7, t[6]);
+    radix8_schedule(|top, bot, k| butterfly_rows(rows, top, bot, t[k]));
+}
+
+/// [`butterfly_lanes`] on rows `top` and `bot` of a row group.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[inline(always)]
+fn butterfly_rows<const N: usize>(rows: &mut [&mut [F64]; N], top: usize, bot: usize, twiddle: F64) {
+    let [top, bot] = rows.get_disjoint_mut([top, bot]).unwrap();
+    butterfly_lanes(top, bot, twiddle);
 }
 
 /// Copy the rows that are read from a source into the rows that are written, where the two differ.
@@ -188,12 +204,7 @@ pub(super) fn butterfly_interleaved_fused_2layer(
             hook: impl FnMut(),
         ) {
             fused_sweep_avx512::<4, 3>(block, src, quarter, num_ntts, t, hook, #[inline(always)] |v, t| {
-                // Layer L: rows 2 apart, one twiddle for the block.
-                butterfly_regs(v, 0, 2, t[0]);
-                butterfly_regs(v, 1, 3, t[0]);
-                // Layer L+1: adjacent rows, one twiddle per half.
-                butterfly_regs(v, 0, 1, t[1]);
-                butterfly_regs(v, 2, 3, t[2]);
+                radix4_schedule(#[inline(always)] |top, bot, k| butterfly_regs(v, top, bot, t[k]));
             });
         }
         // SAFETY: as in `butterfly_interleaved_fused_3layer`.
@@ -208,13 +219,7 @@ pub(super) fn butterfly_interleaved_fused_2layer(
 #[inline(always)]
 fn radix4_butterflies(src: Option<[&[F64]; 4]>, rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
     copy_rows(src, rows);
-    let [r0, r1, r2, r3] = rows;
-    // Layer L: rows 2 apart, one twiddle for the block.
-    butterfly_lanes(r0, r2, t[0]);
-    butterfly_lanes(r1, r3, t[0]);
-    // Layer L+1: adjacent rows, one twiddle per half.
-    butterfly_lanes(r0, r1, t[1]);
-    butterfly_lanes(r2, r3, t[2]);
+    radix4_schedule(|top, bot, k| butterfly_rows(rows, top, bot, t[k]));
 }
 
 #[inline]
@@ -511,16 +516,33 @@ fn mul_xor_avx512(
 #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
 fn butterfly_lanes_avx512(top: &mut [F64], bot: &mut [F64], twiddle: u64) {
     use core::arch::x86_64::*;
-    use primitives::simd::{load_prefix, store_prefix, xor};
+    use primitives::simd::xor;
 
     let tw = _mm512_set1_epi64(twiddle as i64);
-    let step = |top: &mut [F64], bot: &mut [F64], i: usize, n: usize| {
-        let u = load_prefix(top, i, n);
-        let v = load_prefix(bot, i, n);
-        // Butterfly top: u' = u + v * t. Bottom: v' = v + u'.
+    // Butterfly top: u' = u + v * t. Bottom: v' = v + u'.
+    pair_lanes_avx512(top, bot, #[inline(always)] |u, v| {
         let new_u = mul_xor_avx512(u, v, tw);
-        store_prefix(top, i, n, new_u);
-        store_prefix(bot, i, n, xor(v, new_u));
+        (new_u, xor(v, new_u))
+    });
+}
+
+/// Map `op(u, v)` over a pair of equal-length rows, eight lanes per AVX-512 register, and store its two results.
+///
+/// The last register is masked to the rows' end.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[inline]
+#[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+fn pair_lanes_avx512(
+    top: &mut [F64],
+    bot: &mut [F64],
+    op: impl Fn(__m512i, __m512i) -> (__m512i, __m512i),
+) {
+    use primitives::simd::{load_prefix, store_prefix};
+
+    let step = |top: &mut [F64], bot: &mut [F64], i: usize, n: usize| {
+        let (new_top, new_bot) = op(load_prefix(top, i, n), load_prefix(bot, i, n));
+        store_prefix(top, i, n, new_top);
+        store_prefix(bot, i, n, new_bot);
     };
     let vectors = top.len() / 8;
     for i in 0..vectors {
@@ -627,24 +649,13 @@ fn fused_lanes_avx512<const N: usize, const T: usize>(
 #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
 fn transpose_butterfly_lanes_avx512(top: &mut [F64], bot: &mut [F64], twiddle: u64) {
     use core::arch::x86_64::*;
-    use primitives::simd::{load_prefix, store_prefix, xor};
+    use primitives::simd::xor;
 
     let tw = _mm512_set1_epi64(twiddle as i64);
-    let step = |top: &mut [F64], bot: &mut [F64], i: usize, n: usize| {
-        let u = load_prefix(top, i, n);
-        let v = load_prefix(bot, i, n);
+    pair_lanes_avx512(top, bot, #[inline(always)] |u, v| {
         let s = xor(u, v);
-        store_prefix(top, i, n, s);
-        store_prefix(bot, i, n, mul_xor_avx512(v, s, tw));
-    };
-    let vectors = top.len() / 8;
-    for i in 0..vectors {
-        step(top, bot, i, 8);
-    }
-    let tail = top.len() - 8 * vectors;
-    if tail > 0 {
-        step(top, bot, vectors, tail);
-    }
+        (s, mul_xor_avx512(v, s, tw))
+    });
 }
 
 /// Two F64 butterflies with a shared twiddle, NEON-resident end to end.
