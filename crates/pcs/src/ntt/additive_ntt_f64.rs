@@ -260,25 +260,6 @@ impl AdditiveNttF64 {
         self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true, None)
     }
 
-    /// [`Self::encode_interleaved_with`] without writing the deep pass back, as
-    /// [`Self::encode_interleaved_in_place_without_deep`] does.
-    pub fn encode_interleaved_without_deep(
-        &self,
-        data: &mut [F64],
-        msg: &[F64],
-        num_ntts: usize,
-        log_inv_rate: usize,
-        on_rows: &RowSink<'_>,
-    ) -> Option<DeepRows> {
-        assert_eq!(
-            msg.len() << log_inv_rate,
-            data.len(),
-            "the codeword is 2^log_inv_rate messages"
-        );
-        let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
-        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), true, None)
-    }
-
     /// Encode a lane-major message, handing `on_rows` every finished block, and keep what `keep` asks for.
     ///
     /// - The result equals [`transpose_lane_major`] into block 0 followed by the in-place encode.
@@ -395,7 +376,7 @@ impl AdditiveNttF64 {
         self.run_layers_to(buf, Some(msg), log_d, num_ntts, first, end, log_inv_rate, coset, None, no_hook);
     }
 
-    /// Codeword rows `positions` (sorted) of a buffer left by [`Self::encode_interleaved_in_place_without_deep`],
+    /// Codeword rows `positions` (sorted) of a buffer left by [`Self::encode_interleaved_with`] with `defer_deep`,
     /// back to back.
     pub fn finish_rows(&self, data: &[F64], deep: &DeepRows, positions: &[usize]) -> Vec<F64> {
         let sub_len = deep.sub_len();
@@ -519,6 +500,10 @@ impl AdditiveNttF64 {
     /// - The result equals encoding in place.
     /// - Every codeword word is written before it is read, so the codeword may start uninitialized.
     /// - The blocks are as for the in-place encode.
+    /// - With `defer_deep`, the deep pass is not written back: each deep sub-block is finished in scratch
+    ///   and handed to `on_rows` from there.
+    /// - The buffer then keeps what the gathered passes left, and [`Self::finish_rows`] finishes any row again.
+    /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
     ///
     /// # Panics
     ///
@@ -530,8 +515,9 @@ impl AdditiveNttF64 {
         msg: &[F64],
         num_ntts: usize,
         log_inv_rate: usize,
+        defer_deep: bool,
         on_rows: &RowSink<'_>,
-    ) {
+    ) -> Option<DeepRows> {
         assert_eq!(
             msg.len() << log_inv_rate,
             data.len(),
@@ -539,7 +525,7 @@ impl AdditiveNttF64 {
         );
         // Read-only from here on: the pointer only feeds the first pass's reads.
         let msg = parallel::SendPtr(msg.as_ptr().cast_mut());
-        self.transform(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows));
+        self.transform_deferring_deep(data, num_ntts, log_inv_rate, Some(msg), Some(on_rows), defer_deep, None)
     }
 
     /// Run layers `start..d` of a `2^d`-row transform in as few sweeps of the buffer as possible.

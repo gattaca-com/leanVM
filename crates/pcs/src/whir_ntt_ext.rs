@@ -35,6 +35,7 @@ const _: () = assert!(align_of::<F192>() == align_of::<F64>());
 /// - Here `r` is the log inverse rate.
 /// - The codeword may start uninitialized.
 /// - `on_rows` gets every finished block of rows, as K words.
+/// - With `defer_deep`, the deep pass is not written back: see [`AdditiveNttF64::encode_interleaved_with`].
 ///
 /// # Panics
 ///
@@ -46,24 +47,11 @@ pub(crate) fn encode_interleaved_ext(
     msg: &[F192],
     num_ntts: usize,
     log_inv_rate: usize,
-    on_rows: &RowSink<'_>,
-) {
-    let (mat, msg) = k_words(mat, msg, num_ntts);
-    ntt.encode_interleaved_with(mat, msg, 3 * num_ntts, log_inv_rate, on_rows);
-}
-
-/// [`encode_interleaved_ext`] without writing the deep pass back: see
-/// [`AdditiveNttF64::encode_interleaved_without_deep`]. Rows come back as K words.
-pub(crate) fn encode_interleaved_ext_without_deep(
-    ntt: &AdditiveNttF64,
-    mat: &mut [F192],
-    msg: &[F192],
-    num_ntts: usize,
-    log_inv_rate: usize,
+    defer_deep: bool,
     on_rows: &RowSink<'_>,
 ) -> Option<DeepRows> {
     let (mat, msg) = k_words(mat, msg, num_ntts);
-    ntt.encode_interleaved_without_deep(mat, msg, 3 * num_ntts, log_inv_rate, on_rows)
+    ntt.encode_interleaved_with(mat, msg, 3 * num_ntts, log_inv_rate, defer_deep, on_rows)
 }
 
 /// [`encode_interleaved_ext`] coset by coset, with no codeword: see [`AdditiveNttF64::encode_cosets`].
@@ -157,7 +145,7 @@ mod tests {
             forward_scalar(&ntt, &mut want, lanes, rate);
             // Under test: a zeroed codeword, filled by the encode alone.
             let mut got = vec![F192::ZERO; want.len()];
-            encode_interleaved_ext(&ntt, &mut got, &msg, lanes, rate, &|_, _| {});
+            encode_interleaved_ext(&ntt, &mut got, &msg, lanes, rate, false, &|_, _| {});
             assert_eq!(got, want, "log_d={log_d}, lanes={lanes}, rate={rate}");
         }
     }

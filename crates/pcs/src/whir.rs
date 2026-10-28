@@ -350,12 +350,10 @@ pub(crate) fn ligero_commit_ext(
             if by_cosets {
                 encode_cosets_ext(&ntt, mat, num_interleaved, log_inv_rate, &on_rows);
                 Some(Deferred::Cosets(ntt, log_inv_rate))
-            } else if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
-                encode_interleaved_ext_without_deep(&ntt, mat, poly, num_interleaved, log_inv_rate, &on_rows)
-                    .map(|rows| Deferred::Deep(ntt, rows))
             } else {
-                encode_interleaved_ext(&ntt, mat, poly, num_interleaved, log_inv_rate, &on_rows);
-                None
+                let defer_deep = parallel::num_threads() >= DEFER_DEEP_MIN_THREADS;
+                encode_interleaved_ext(&ntt, mat, poly, num_interleaved, log_inv_rate, defer_deep, &on_rows)
+                    .map(|rows| Deferred::Deep(ntt, rows))
             }
         })
     };
