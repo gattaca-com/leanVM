@@ -156,6 +156,23 @@ pub fn cast_slice_mut<A: Plain, B: Plain>(a: &mut [A]) -> &mut [B] {
     unsafe { core::slice::from_raw_parts_mut(ptr, bytes / core::mem::size_of::<B>()) }
 }
 
+/// The `A` whose bytes start at element `i` of `src`, read unaligned.
+#[inline(always)]
+pub fn load_at<T: Plain, A: Plain>(src: &[T], i: usize) -> A {
+    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(src));
+    // SAFETY: the assert keeps the bytes inside `src`, and any bytes of a `Plain` type are
+    // readable and a valid `A`.
+    unsafe { src.as_ptr().wrapping_add(i).cast::<A>().read_unaligned() }
+}
+
+/// Write `v` over the bytes from element `i` of `dst` on, unaligned.
+#[inline(always)]
+pub fn store_at<T: Plain, A: Plain>(dst: &mut [T], i: usize, v: A) {
+    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(dst));
+    // SAFETY: the assert keeps the bytes inside `dst`, and any bytes are a valid `Plain` value.
+    unsafe { dst.as_mut_ptr().add(i).cast::<A>().write_unaligned(v) }
+}
+
 /// `N` vectors of the given lengths, filled in place by `fill`.
 ///
 /// It skips the zero-fill, which would cost one more pass over memory. `fill` receives one slice per

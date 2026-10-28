@@ -4,11 +4,11 @@
 //!
 //! A trait method cannot carry `#[target_feature]`, so each intrinsic call is unsafe. The module is
 //! compiled only where its features are, which is the safety of every call below.
-//! Memory moves go through [`load_at`] and [`store_at`], which check their bounds.
+//! Memory moves go through [`load_at`] and [`store_at`] of `primitives`, which check their bounds.
 
 use core::arch::x86_64::*;
 
-use primitives::Plain;
+use primitives::{Plain, load_at, store_at};
 
 cfg_select! {
     all(target_feature = "avx512f", target_feature = "vpclmulqdq") => {
@@ -20,23 +20,6 @@ cfg_select! {
     _ => {
         pub type V = __m128i;
     }
-}
-
-/// The `A` whose bytes start at element `i` of `src`, read unaligned.
-#[inline(always)]
-pub fn load_at<T: Plain, A: Plain>(src: &[T], i: usize) -> A {
-    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(src));
-    // SAFETY: the assert keeps the bytes inside `src`, and any bytes of a `Plain` type are
-    // readable and a valid `A`.
-    unsafe { src.as_ptr().wrapping_add(i).cast::<A>().read_unaligned() }
-}
-
-/// Write `v` over the bytes from element `i` of `dst` on, unaligned.
-#[inline(always)]
-pub fn store_at<T: Plain, A: Plain>(dst: &mut [T], i: usize, v: A) {
-    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(dst));
-    // SAFETY: the assert keeps the bytes inside `dst`, and any bytes are a valid `Plain` value.
-    unsafe { dst.as_mut_ptr().add(i).cast::<A>().write_unaligned(v) }
 }
 
 pub trait Vector: Copy {

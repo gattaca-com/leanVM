@@ -331,8 +331,8 @@ mod x86 {
 
     use super::*;
     pub use super::{embed_extend_portable as embed_extend, products_clmul as products, skip_row_portable as skip_row};
-    use crate::clmul::load_at;
     use crate::keccak::BITS;
+    use primitives::load_at;
 
     /// The matrices sending a pack's low and high byte to each byte of its embedding. An affine
     /// byte map reads output bit `t` off matrix byte `7 - t`.
@@ -627,7 +627,8 @@ mod avx2 {
 
     pub use super::products_clmul as products;
     use super::*;
-    use crate::clmul::{V, Vector, load_at, store_at};
+    use crate::clmul::{V, Vector};
+    use primitives::{load_at, store_at};
 
     /// The 32 packs of a block position, embedded, four to a register.
     #[target_feature(enable = "avx2")]
