@@ -61,7 +61,8 @@ impl F192 {
     pub fn mul_unreduced(self, rhs: Self) -> F192Unreduced {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
-            aarch64::mul_unreduced(self, rhs)
+            // SAFETY: aes is enabled at compile time.
+            unsafe { aarch64::mul_unreduced(self, rhs) }
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
@@ -84,7 +85,8 @@ impl F192 {
     pub fn mul_base(self, k: F64) -> Self {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
-            aarch64::mul_base(self, k)
+            // SAFETY: aes is enabled at compile time.
+            unsafe { aarch64::mul_base(self, k) }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
         {
@@ -97,7 +99,8 @@ impl F192 {
     pub fn mul_base_unreduced(self, k: F64) -> F192Unreduced {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
-            aarch64::mul_base_unreduced(self, k)
+            // SAFETY: aes is enabled at compile time.
+            unsafe { aarch64::mul_base_unreduced(self, k) }
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
@@ -125,7 +128,8 @@ impl F192 {
     pub fn square(self) -> Self {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
-            aarch64::square(self)
+            // SAFETY: aes is enabled at compile time.
+            unsafe { aarch64::square(self) }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
         {
@@ -201,7 +205,8 @@ impl Mul for F192 {
     fn mul(self, rhs: Self) -> Self {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
-            aarch64::mul(self, rhs)
+            // SAFETY: aes is enabled at compile time.
+            unsafe { aarch64::mul(self, rhs) }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
         {
@@ -394,7 +399,8 @@ impl F192Unreduced {
     pub fn reduce(self) -> F192 {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
-            aarch64::reduce(self)
+            // SAFETY: aes is enabled at compile time.
+            unsafe { aarch64::reduce(self) }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
         {
@@ -456,57 +462,55 @@ pub mod aarch64 {
     use super::{F192, F192Unreduced};
     use crate::field::gf2_64::{F64, R64};
     use crate::field::neon::xor3_u64;
+    use crate::{load_at, store_at};
     use core::arch::aarch64::*;
-    use core::mem::transmute;
 
     /// Carry-less product of the low qwords.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn lo(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-        // SAFETY: the module's cfg enables aes, and both sides of the reinterpret are 128 bits.
-        unsafe { transmute::<u128, uint64x2_t>(vmull_p64(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b))) }
+        vreinterpretq_u64_p128(vmull_p64(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b)))
     }
 
     /// Carry-less product of the high qwords.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-        // SAFETY: the module's cfg enables aes, and both sides of the reinterpret are 128 bits.
-        unsafe { transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(a), vreinterpretq_p64_u64(b))) }
+        vreinterpretq_u64_p128(vmull_high_p64(vreinterpretq_p64_u64(a), vreinterpretq_p64_u64(b)))
     }
 
     /// Two-way XOR.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn xor(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-        // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe { veorq_u64(a, b) }
+        veorq_u64(a, b)
     }
 
     /// Three-way XOR.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn xor3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-        // SAFETY: the helper issues `EOR3` only where the cfg enables it.
-        unsafe { xor3_u64(a, b, c) }
+        xor3_u64(a, b, c)
     }
 
     /// An element as its two registers.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn split(e: F192) -> (uint64x2_t, uint64x2_t) {
-        // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe { (vcombine_u64(vcreate_u64(e.c0), vcreate_u64(e.c1)), vdupq_n_u64(e.c2)) }
+        (vcombine_u64(vcreate_u64(e.c0), vcreate_u64(e.c1)), vdupq_n_u64(e.c2))
     }
 
     /// The element whose coefficients are the low qwords of `c0`, `c1`, `c2`.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn join(c0: uint64x2_t, c1: uint64x2_t, c2: uint64x2_t) -> F192 {
-        // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe {
-            // One zip puts c0 and c1 side by side, so a store of the element is two stores.
-            let c01 = vzip1q_u64(c0, c1);
-            F192::new(
-                vgetq_lane_u64::<0>(c01),
-                vgetq_lane_u64::<1>(c01),
-                vgetq_lane_u64::<0>(c2),
-            )
-        }
+        // One zip puts c0 and c1 side by side, so a store of the element is two stores.
+        let c01 = vzip1q_u64(c0, c1);
+        F192::new(
+            vgetq_lane_u64::<0>(c01),
+            vgetq_lane_u64::<1>(c01),
+            vgetq_lane_u64::<0>(c2),
+        )
     }
 
     /// Reduce one 128-bit coefficient into its low qword.
@@ -520,17 +524,18 @@ pub mod aarch64 {
     /// ```
     ///
     /// Two high-lane products and one three-way XOR.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn reduce_lane(d: uint64x2_t, r: uint64x2_t) -> uint64x2_t {
         let t = hi(d, r);
         xor3(d, t, hi(t, r))
     }
 
     /// Reduce the three coefficients of an unreduced element.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn reduce3([d0, d1, d2]: [uint64x2_t; 3]) -> F192 {
-        // SAFETY: NEON is part of the aarch64 baseline.
-        let r = unsafe { vdupq_n_u64(R64) };
+        let r = vdupq_n_u64(R64);
         join(reduce_lane(d0, r), reduce_lane(d1, r), reduce_lane(d2, r))
     }
 
@@ -547,11 +552,11 @@ pub mod aarch64 {
     ///     y^1:  a0 b1 + a1 b0 + a1 b2 + a2 b1 + a2 b2         (y^4 = y^2 + y)
     ///     y^2:  a0 b2 + a1 b1 + a2 b0 + a2 b2
     /// ```
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn schoolbook(a: F192, b: F192) -> [uint64x2_t; 3] {
         let ((a01, a22), (b01, b22)) = (split(a), split(b));
-        // SAFETY: NEON is part of the aarch64 baseline.
-        let a10 = unsafe { vextq_u64::<1>(a01, a01) };
+        let a10 = vextq_u64::<1>(a01, a01);
         // a_i b_j for every pair, named by (i, j).
         let (m00, m11) = (lo(a01, b01), hi(a01, b01));
         let (m10, m01) = (lo(a10, b01), hi(a10, b01));
@@ -568,49 +573,78 @@ pub mod aarch64 {
     }
 
     /// The product, reduced.
-    #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// Requires the `aes` target feature, which the module's cfg gate enables.
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     pub fn mul(a: F192, b: F192) -> F192 {
         reduce3(schoolbook(a, b))
     }
 
     /// Three 128-bit coefficients as an unreduced element.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn unreduced(d: [uint64x2_t; 3]) -> F192Unreduced {
-        // SAFETY: a 128-bit register and a `[u64; 2]` hold the same bits.
         F192Unreduced {
-            coeffs: d.map(|d| unsafe { transmute::<uint64x2_t, [u64; 2]>(d) }),
+            coeffs: d.map(|d| {
+                let mut c = [0u64; 2];
+                store_at(&mut c, 0, d);
+                c
+            }),
         }
     }
 
     /// The product without the base-field reduction.
-    #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// Requires the `aes` target feature, which the module's cfg gate enables.
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     pub fn mul_unreduced(a: F192, b: F192) -> F192Unreduced {
         unreduced(schoolbook(a, b))
     }
 
     /// The mixed product by a base-field scalar, without the reduction: three base products.
-    #[inline(always)]
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     fn mul_base_lanes(a: F192, k: F64) -> [uint64x2_t; 3] {
         let (a01, a22) = split(a);
-        // SAFETY: NEON is part of the aarch64 baseline.
-        let kk = unsafe { vdupq_n_u64(k.0) };
+        let kk = vdupq_n_u64(k.0);
         [lo(a01, kk), hi(a01, kk), lo(a22, kk)]
     }
 
     /// The mixed product by a base-field scalar, reduced.
-    #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// Requires the `aes` target feature, which the module's cfg gate enables.
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     pub fn mul_base(a: F192, k: F64) -> F192 {
         reduce3(mul_base_lanes(a, k))
     }
 
     /// The mixed product by a base-field scalar, without the reduction.
-    #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// Requires the `aes` target feature, which the module's cfg gate enables.
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     pub fn mul_base_unreduced(a: F192, k: F64) -> F192Unreduced {
         unreduced(mul_base_lanes(a, k))
     }
 
     /// The square: three base squares, then the y-fold `y^4 = y^2 + y`.
-    #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// Requires the `aes` target feature, which the module's cfg gate enables.
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     pub fn square(a: F192) -> F192 {
         let (a01, a22) = split(a);
         let (s0, s1, s2) = (lo(a01, a01), hi(a01, a01), lo(a22, a22));
@@ -618,10 +652,14 @@ pub mod aarch64 {
     }
 
     /// Reduce an unreduced element.
-    #[inline(always)]
+    ///
+    /// # Safety
+    ///
+    /// Requires the `aes` target feature, which the module's cfg gate enables.
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     pub fn reduce(u: F192Unreduced) -> F192 {
-        // SAFETY: a `[u64; 2]` and a 128-bit register hold the same bits.
-        reduce3(u.coeffs.map(|c| unsafe { transmute::<[u64; 2], uint64x2_t>(c) }))
+        reduce3(u.coeffs.map(|c| load_at(&c, 0)))
     }
 }
 
@@ -642,9 +680,9 @@ pub mod aarch64 {
 #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
 pub mod x86_64 {
     use super::{F192, F192Unreduced};
+    use crate::Plain;
     use crate::field::gf2_64::F64;
     use core::arch::x86_64::*;
-    use crate::Plain;
 
     /// The bits of a vector as plain words of the same size.
     #[inline(always)]

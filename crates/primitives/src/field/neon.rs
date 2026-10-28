@@ -14,23 +14,24 @@ use core::arch::aarch64::*;
 
 /// Three-way XOR of 64-bit-lane vectors.
 ///
-/// # Safety
-/// Requires the `sha3` target feature on the EOR3 arm (statically satisfied by
-/// the `cfg` gate); the fallback arm has no requirement.
-#[cfg(target_feature = "sha3")]
+/// `EOR3` where the build enables `sha3`, two `EOR`s otherwise.
+/// The kernel is a `#[target_feature]` fn, so this plain wrapper is the one place that calls it.
 #[inline(always)]
-pub unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    // SAFETY: `sha3` is statically enabled by the cfg gate.
-    unsafe { veor3q_u64(a, b, c) }
+pub fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    // SAFETY: the kernel needs `neon`, which aarch64 has, and `sha3`, which the cfg gate on its arm enables.
+    unsafe { xor3_kernel(a, b, c) }
 }
 
-/// Two-`EOR` fallback for targets without the SHA3 extension.
-///
-/// # Safety
-/// No requirements; `unsafe` only to match the EOR3 arm's signature.
+#[cfg(target_feature = "sha3")]
+#[target_feature(enable = "neon,sha3")]
+#[inline]
+fn xor3_kernel(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    veor3q_u64(a, b, c)
+}
+
 #[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-pub unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe { veorq_u64(a, veorq_u64(b, c)) }
+#[target_feature(enable = "neon")]
+#[inline]
+fn xor3_kernel(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    veorq_u64(a, veorq_u64(b, c))
 }

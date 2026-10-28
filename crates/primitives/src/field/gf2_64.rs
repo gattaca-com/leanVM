@@ -201,7 +201,6 @@ pub mod aarch64 {
     use super::{F64, R64};
     use crate::field::neon::xor3_u64;
     use core::arch::aarch64::*;
-    use core::mem::transmute;
 
     /// 64x64 carry-less product as a 128-bit NEON vector.
     ///
@@ -210,8 +209,7 @@ pub mod aarch64 {
     #[inline]
     #[target_feature(enable = "aes")]
     pub fn pmull(a: u64, b: u64) -> uint64x2_t {
-        // SAFETY: u128 and uint64x2_t are both 128-bit values.
-        unsafe { transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+        vreinterpretq_u64_p128(vmull_p64(a, b))
     }
 
     /// Carry-less product of the two *high* lanes: PMULL2 on the register
@@ -223,13 +221,7 @@ pub mod aarch64 {
     #[inline]
     #[target_feature(enable = "aes")]
     pub fn pmull_hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-        // SAFETY: bit-level reinterprets between 128-bit vector types.
-        unsafe {
-            transmute::<u128, uint64x2_t>(vmull_high_p64(
-                transmute::<uint64x2_t, poly64x2_t>(a),
-                transmute::<uint64x2_t, poly64x2_t>(b),
-            ))
-        }
+        vreinterpretq_u64_p128(vmull_high_p64(vreinterpretq_p64_u64(a), vreinterpretq_p64_u64(b)))
     }
 
     /// The product of the low lanes, written out: `vmull_p64` takes the lanes as scalars, so
@@ -287,24 +279,24 @@ pub mod aarch64 {
     /// Requires the `aes` target feature; see [`pmull`].
     #[inline]
     #[target_feature(enable = "aes")]
-    pub unsafe fn reduce_pair_pmull4(p0: uint64x2_t, p1: uint64x2_t) -> uint64x2_t {
-        // SAFETY: function carries the aes target feature.
+    pub fn reduce_pair_pmull4(p0: uint64x2_t, p1: uint64x2_t) -> uint64x2_t {
+        let r = vdupq_n_u64(R64);
+        let (t0, t1) = (pmull_hi(p0, r), pmull_hi(p1, r));
+        let (u0, u1) = (pmull_hi(t0, r), pmull_hi(t1, r));
+        let (mut e0, mut e1) = (xor3_u64(p0, t0, u0), xor3_u64(p1, t1, u1));
+        // Why: only lane 0 of each sum survives the zip.
+        // LLVM would gather the six low lanes with three inserts and XOR once: one instruction more.
+        // An empty asm block hides the lanes from it, and emits nothing.
+        // SAFETY: the block is empty and only names two registers.
         unsafe {
-            let r = vdupq_n_u64(R64);
-            let (t0, t1) = (pmull_hi(p0, r), pmull_hi(p1, r));
-            let (u0, u1) = (pmull_hi(t0, r), pmull_hi(t1, r));
-            let (mut e0, mut e1) = (xor3_u64(p0, t0, u0), xor3_u64(p1, t1, u1));
-            // Why: only lane 0 of each sum survives the zip.
-            // LLVM would gather the six low lanes with three inserts and XOR once: one instruction more.
-            // An empty asm block hides the lanes from it, and emits nothing.
             core::arch::asm!(
                 "/* {0:v} {1:v} */",
                 inout(vreg) e0,
                 inout(vreg) e1,
                 options(pure, nomem, nostack, preserves_flags)
             );
-            vzip1q_u64(e0, e1)
         }
+        vzip1q_u64(e0, e1)
     }
 
     /// The default `Mul` kernel on aarch64. 3-PMULL multiply: product, then two
@@ -318,7 +310,7 @@ pub mod aarch64 {
     /// Requires the `aes` target feature; see [`pmull`].
     #[inline]
     #[target_feature(enable = "aes")]
-    pub unsafe fn mul_shift_tail(a: F64, b: F64) -> F64 {
+    pub fn mul_shift_tail(a: F64, b: F64) -> F64 {
         let r = vdupq_n_u64(R64);
         let p = pmull(a.0, b.0);
         let t = pmull_hi(p, r);
