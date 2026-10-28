@@ -3,6 +3,7 @@
 
 pub mod additive_ntt_f64;
 mod deep;
+mod drain;
 mod gathered;
 mod kernels;
 mod layers;

@@ -2,10 +2,9 @@
 
 use flux_profiler::timed;
 use primitives::field::F64;
-use primitives::stream::Stream;
 
 use super::additive_ntt_f64::{AdditiveNttF64, with_scratch};
-use super::deep::Drain;
+use super::drain::{Drain, LateDrain};
 use super::layers::Layers;
 use super::source::Source;
 use super::stage::{BATCH, Stage, stage_subs};
@@ -80,19 +79,16 @@ impl AdditiveNttF64 {
         let piece_stride = if staged { num_ntts } else { piece };
         let per_hook = (group_len / piece).div_ceil(Layers::hook_calls(layer + g, layer, layer + g, layer));
         parallel::for_each_chunk(step / batch, |lo, hi| {
-            // One fence at the end of the task covers all its streaming stores.
             with_scratch(stage_len + 2 * group_len, |all| {
-                let stream = stream.then(Stream::new);
                 let (stage, both) = all.split_at_mut(stage_len);
-                let (mut scratch, mut idle) = both.split_at_mut(group_len);
-                let mut drain = Drain::default();
+                let mut late = LateDrain::new(both, group_len, stream, true, per_hook);
                 // Transform residue `r`'s group as layer-`layer` block `block`, and send it back to word `dst` on.
                 // The rows are `from` the stage, or gathered from the message or the buffer.
                 let mut group = |block: usize, r: usize, from: Option<&[F64]>, dst: usize| {
                     if from.is_none() {
                         // Every block copies the message's rows, which the buffer's block 0 may hold, or its own rows.
                         let src = src.group_src(base.0.cast_const(), row(block, r), row(first_block, r));
-                        for (i, dst) in scratch.chunks_exact_mut(num_ntts).enumerate() {
+                        for (i, dst) in late.scratch().chunks_exact_mut(num_ntts).enumerate() {
                             // SAFETY:
                             // - The message and the buffer both cover every row addressed here.
                             // - Tasks own disjoint residues, so no other task writes these rows.
@@ -100,21 +96,30 @@ impl AdditiveNttF64 {
                             dst.copy_from_slice(unsafe { std::slice::from_raw_parts(src.add(i * step * num_ntts), num_ntts) });
                         }
                     }
-                    let hook = || drain.step(stream.as_ref(), per_hook);
-                    layers.run(scratch, from, layer + g, width, layer, layer + g, layer, block, None, hook);
-                    drain.step(stream.as_ref(), usize::MAX);
-                    drain = Drain {
+                    late.transform(|scratch, mut hook| {
+                        layers.run(
+                            scratch,
+                            from,
+                            layer + g,
+                            width,
+                            layer,
+                            layer + g,
+                            layer,
+                            block,
+                            None,
+                            move || hook.step(),
+                        )
+                    });
+                    late.send(Drain {
                         // SAFETY: the group's first row lies inside the buffer.
                         dst: unsafe { base.add(dst) },
-                        src: scratch.as_ptr(),
                         row_len: width,
                         dst_stride: step * num_ntts,
                         piece,
                         piece_stride,
                         rows,
                         ..Drain::default()
-                    };
-                    std::mem::swap(&mut scratch, &mut idle);
+                    });
                 };
                 for t in lo..hi {
                     match (src, &staging) {
@@ -132,7 +137,7 @@ impl AdditiveNttF64 {
                         _ => blocks.clone().rev().for_each(|block| group(block, t, None, row(block, t))),
                     }
                 }
-                drain.step(stream.as_ref(), usize::MAX);
+                late.finish();
             });
         });
     }

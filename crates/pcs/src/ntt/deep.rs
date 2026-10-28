@@ -1,83 +1,13 @@
 //! The deep pass of [`AdditiveNttF64`], and the drain that writes a finished group back late.
 
 use primitives::field::F64;
-use primitives::stream::Stream;
 
-use super::additive_ntt_f64::{AdditiveNttF64, Line, RowSink, with_scratch};
+use super::additive_ntt_f64::{AdditiveNttF64, RowSink, with_scratch};
+use super::drain::{Drain, LateDrain};
 use super::layers::{Layers, no_hook};
 use super::plan::Plan;
 use super::source::Source;
 use super::window::Window;
-
-/// A finished row group, leaving its scratch for the buffer a piece at a time.
-///
-/// - `dst` is the group's first row in the buffer, `dst_stride` words before its next.
-/// - A scratch row is `row_len` words and lands in pieces of `piece` words, `piece_stride` words apart.
-/// - `src` is the group's contiguous scratch, and `row`, `k` are the next piece to move.
-/// - A streaming drain moves whole aligned cache lines: `piece` is 8, and the caller checks the alignment.
-///
-/// # Draining late
-///
-/// - A burst of streaming stores after each group saturates the write-combining buffers and overlaps nothing.
-/// - So a task keeps two scratches, and the previous group drains during this group's transform.
-/// - The sweeps call a hook once per row group, and each call moves an equal share of the previous group.
-/// - The shares round up, so the group is out by the last call, and the task's last group drains at its end.
-/// - Group k+2 gathers into the scratch group k drained, and that drain ended with group k+1's transform.
-/// - Only whole aligned cache lines stream; other rows take ordinary stores, whole, on the same schedule.
-pub(super) struct Drain {
-    pub(super) dst: *mut F64,
-    pub(super) src: *const F64,
-    pub(super) row_len: usize,
-    pub(super) dst_stride: usize,
-    pub(super) piece: usize,
-    pub(super) piece_stride: usize,
-    pub(super) rows: usize,
-    pub(super) row: usize,
-    pub(super) k: usize,
-}
-
-impl Default for Drain {
-    /// A group with no rows left to move, in whole lines.
-    fn default() -> Self {
-        Self {
-            dst: std::ptr::null_mut(),
-            src: std::ptr::null(),
-            row_len: 0,
-            dst_stride: 0,
-            piece: 8,
-            piece_stride: 8,
-            rows: 0,
-            row: 0,
-            k: 0,
-        }
-    }
-}
-
-impl Drain {
-    /// Move up to `pieces` more pieces: streamed, or stored normally without a stream.
-    #[inline(always)]
-    pub(super) fn step(&mut self, stream: Option<&Stream>, pieces: usize) {
-        let per_row = self.row_len / self.piece;
-        for _ in 0..pieces.min((self.rows - self.row) * per_row - self.k) {
-            // SAFETY:
-            // - The cursor is inside the group, so both pieces are in bounds, and line-aligned when streamed.
-            // - Only this group's owner writes these rows of the buffer.
-            // - The scratch is neither written nor gathered into until its group has drained.
-            unsafe {
-                let dst = self.dst.add(self.row * self.dst_stride + self.k * self.piece_stride);
-                let src = self.src.add(self.row * self.row_len + self.k * self.piece);
-                match stream {
-                    Some(s) => s.copy_lines(dst.cast::<Line>(), &*src.cast::<Line>()),
-                    None => dst.copy_from_nonoverlapping(src, self.piece),
-                }
-            }
-            self.k += 1;
-            if self.k == per_row {
-                (self.row, self.k) = (self.row + 1, 0);
-            }
-        }
-    }
-}
 
 /// A hook that prefetches `words` words at `base + start` into L2, evenly over `calls` calls.
 ///
@@ -138,9 +68,7 @@ impl AdditiveNttF64 {
                 parallel::for_each_chunk(1 << outer, |lo, hi| {
                     with_scratch(sub_len << usize::from(late), |both| {
                         // One fence at the end of the task covers all its streaming stores.
-                        let stream = stream.then(Stream::new);
-                        let (mut scratch, mut idle) = both.split_at_mut(sub_len);
-                        let mut drain = Drain::default();
+                        let mut ld = LateDrain::new(both, sub_len, stream, late, per_hook);
                         for sub_idx in lo..hi {
                             // A task sits at the same offset in every replica, or covers whole replicas.
                             //
@@ -149,47 +77,52 @@ impl AdditiveNttF64 {
                             // Inside one replica the first sweep reads the message; across several it is copied in.
                             let from = (sub_len <= block_len).then(|| &m[off..][..sub_len]);
                             if from.is_none() {
-                                scratch.chunks_mut(block_len).for_each(|part| part.copy_from_slice(&m[..part.len()]));
+                                let copy = |part: &mut [F64]| part.copy_from_slice(&m[..part.len()]);
+                                ld.scratch().chunks_mut(block_len).for_each(copy);
                             }
-                            if late {
+                            if ld.is_late() {
                                 // The previous sub-block drains while this one transforms.
-                                let hook = || drain.step(stream.as_ref(), per_hook);
-                                layers.run(
-                                    scratch, from, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, hook,
-                                );
-                                drain.step(stream.as_ref(), usize::MAX);
+                                ld.transform(|scratch, mut hook| {
+                                    layers.run(
+                                        scratch,
+                                        from,
+                                        log_d,
+                                        num_ntts,
+                                        deep_start,
+                                        log_d,
+                                        outer,
+                                        sub_idx,
+                                        None,
+                                        move || hook.step(),
+                                    )
+                                });
                             } else {
                                 layers.run(
-                                    scratch, from, log_d, num_ntts, deep_start, log_d, outer, sub_idx, None, no_hook,
+                                    ld.scratch(),
+                                    from,
+                                    log_d,
+                                    num_ntts,
+                                    deep_start,
+                                    log_d,
+                                    outer,
+                                    sub_idx,
+                                    None,
+                                    no_hook,
                                 );
                             }
                             if let Some(f) = deep_rows {
-                                f(sub_idx << log_sub, scratch);
+                                f(sub_idx << log_sub, ld.scratch());
                             }
-                            match &stream {
-                                Some(_) if late => {
-                                    // This one drains during the next transform, while the other scratch is filled.
-                                    drain = Drain {
-                                        // SAFETY: the sub-block lies inside the codeword.
-                                        dst: unsafe { base.add(sub_idx * sub_len) },
-                                        src: scratch.as_ptr(),
-                                        row_len: sub_len,
-                                        rows: 1,
-                                        ..Drain::default()
-                                    };
-                                    std::mem::swap(&mut scratch, &mut idle);
-                                }
-                                other => {
-                                    // SAFETY: this task alone owns the sub-block of the codeword.
-                                    let dst = unsafe { base.slice(sub_idx * sub_len, sub_len) };
-                                    match other {
-                                        Some(s) => s.copy(dst, scratch),
-                                        None => dst.copy_from_slice(scratch),
-                                    }
-                                }
-                            }
+                            // A late one drains during the next transform, while the other scratch is filled.
+                            ld.send(Drain {
+                                // SAFETY: the sub-block lies inside the codeword, and this task alone owns it.
+                                dst: unsafe { base.add(sub_idx * sub_len) },
+                                row_len: sub_len,
+                                rows: 1,
+                                ..Drain::default()
+                            });
                         }
-                        drain.step(stream.as_ref(), usize::MAX);
+                        ld.finish();
                     });
                 });
             }
