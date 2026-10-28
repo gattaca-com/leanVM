@@ -558,49 +558,50 @@ mod avx2 {
 mod neon {
     use core::arch::aarch64::*;
 
+    use primitives::{load_at, store_at};
+
     /// The portable form's swaps, two rows to a register: rows `k` and `k + j` exchange the
     /// `j`-bit halves of each `2j`-bit field. For `j` of 8 and more that is a lane transpose of
     /// the two registers at width `j`; below, a masked swap by shifts.
-    #[inline(always)]
-    pub unsafe fn transpose64(a: &mut [u64; 64]) {
-        unsafe {
-            let mut v: [uint64x2_t; 32] = std::array::from_fn(|i| vld1q_u64(a.as_ptr().add(2 * i)));
-            // Registers `i` and `i + d` hold rows `2i, 2i + 1` and `2i + 2d, 2i + 2d + 1`.
-            macro_rules! lanes {
-                ($d:expr, $trn1:ident, $trn2:ident, $as:ident, $back:ident) => {
-                    for i in (0..32).filter(|i| i & $d == 0) {
-                        let (x, y) = ($as(v[i]), $as(v[i + $d]));
-                        (v[i], v[i + $d]) = ($back($trn1(x, y)), $back($trn2(x, y)));
-                    }
-                };
-            }
-            lanes!(16, vtrn1q_u32, vtrn2q_u32, vreinterpretq_u32_u64, vreinterpretq_u64_u32);
-            lanes!(8, vtrn1q_u16, vtrn2q_u16, vreinterpretq_u16_u64, vreinterpretq_u64_u16);
-            lanes!(4, vtrn1q_u8, vtrn2q_u8, vreinterpretq_u8_u64, vreinterpretq_u64_u8);
-            macro_rules! swap {
-                ($d:expr, $j:expr, $mask:expr) => {
-                    let mask = vdupq_n_u64($mask);
-                    for i in (0..32).filter(|i| i & $d == 0) {
-                        let t = vandq_u64(veorq_u64(vshrq_n_u64::<$j>(v[i]), v[i + $d]), mask);
-                        v[i + $d] = veorq_u64(v[i + $d], t);
-                        v[i] = veorq_u64(v[i], vshlq_n_u64::<$j>(t));
-                    }
-                };
-            }
-            swap!(2, 4, 0x0f0f_0f0f_0f0f_0f0f);
-            swap!(1, 2, 0x3333_3333_3333_3333);
-            // Rows `2i` and `2i + 1` share a register: swap its halves to pair them across.
-            let mask = vdupq_n_u64(0x5555_5555_5555_5555);
-            for x in &mut v {
-                let partner = vextq_u64::<1>(*x, *x);
-                let t = vandq_u64(veorq_u64(vshrq_n_u64::<1>(*x), partner), mask);
-                // Lane 0 is row `k`, taking `t << 1`; lane 1 is row `k + 1`, taking `t`.
-                let t = vcombine_u64(vget_low_u64(vshlq_n_u64::<1>(t)), vget_low_u64(t));
-                *x = veorq_u64(*x, t);
-            }
-            for (i, x) in v.iter().enumerate() {
-                vst1q_u64(a.as_mut_ptr().add(2 * i), *x);
-            }
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub fn transpose64(a: &mut [u64; 64]) {
+        let mut v: [uint64x2_t; 32] = std::array::from_fn(|i| load_at(&a[..], 2 * i));
+        // Registers `i` and `i + d` hold rows `2i, 2i + 1` and `2i + 2d, 2i + 2d + 1`.
+        macro_rules! lanes {
+            ($d:expr, $trn1:ident, $trn2:ident, $as:ident, $back:ident) => {
+                for i in (0..32).filter(|i| i & $d == 0) {
+                    let (x, y) = ($as(v[i]), $as(v[i + $d]));
+                    (v[i], v[i + $d]) = ($back($trn1(x, y)), $back($trn2(x, y)));
+                }
+            };
+        }
+        lanes!(16, vtrn1q_u32, vtrn2q_u32, vreinterpretq_u32_u64, vreinterpretq_u64_u32);
+        lanes!(8, vtrn1q_u16, vtrn2q_u16, vreinterpretq_u16_u64, vreinterpretq_u64_u16);
+        lanes!(4, vtrn1q_u8, vtrn2q_u8, vreinterpretq_u8_u64, vreinterpretq_u64_u8);
+        macro_rules! swap {
+            ($d:expr, $j:expr, $mask:expr) => {
+                let mask = vdupq_n_u64($mask);
+                for i in (0..32).filter(|i| i & $d == 0) {
+                    let t = vandq_u64(veorq_u64(vshrq_n_u64::<$j>(v[i]), v[i + $d]), mask);
+                    v[i + $d] = veorq_u64(v[i + $d], t);
+                    v[i] = veorq_u64(v[i], vshlq_n_u64::<$j>(t));
+                }
+            };
+        }
+        swap!(2, 4, 0x0f0f_0f0f_0f0f_0f0f);
+        swap!(1, 2, 0x3333_3333_3333_3333);
+        // Rows `2i` and `2i + 1` share a register: swap its halves to pair them across.
+        let mask = vdupq_n_u64(0x5555_5555_5555_5555);
+        for x in &mut v {
+            let partner = vextq_u64::<1>(*x, *x);
+            let t = vandq_u64(veorq_u64(vshrq_n_u64::<1>(*x), partner), mask);
+            // Lane 0 is row `k`, taking `t << 1`; lane 1 is row `k + 1`, taking `t`.
+            let t = vcombine_u64(vget_low_u64(vshlq_n_u64::<1>(t)), vget_low_u64(t));
+            *x = veorq_u64(*x, t);
+        }
+        for (i, x) in v.iter().enumerate() {
+            store_at(&mut a[..], 2 * i, *x);
         }
     }
 }

@@ -134,6 +134,15 @@ unsafe impl Plain for core::arch::x86_64::__m128i {}
 unsafe impl Plain for core::arch::x86_64::__m256i {}
 #[cfg(target_arch = "x86_64")]
 unsafe impl Plain for core::arch::x86_64::__m512i {}
+// SAFETY: vectors of 8 and 16 bytes with no padding, and every bit pattern is a valid vector.
+#[cfg(target_arch = "aarch64")]
+unsafe impl Plain for core::arch::aarch64::uint32x2_t {}
+#[cfg(target_arch = "aarch64")]
+unsafe impl Plain for core::arch::aarch64::uint8x16_t {}
+#[cfg(target_arch = "aarch64")]
+unsafe impl Plain for core::arch::aarch64::uint32x4_t {}
+#[cfg(target_arch = "aarch64")]
+unsafe impl Plain for core::arch::aarch64::uint64x2_t {}
 
 /// The same bytes as a slice of another plain type.
 ///

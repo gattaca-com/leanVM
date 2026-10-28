@@ -811,175 +811,198 @@ mod avx2 {
     }
 }
 
-/// Compiled only where its feature is, so its kernels are safe to call.
+/// Compiled only where its feature is. The kernels are safe `target_feature` functions, and the
+/// entry points call them with `unsafe`.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 mod neon {
     use core::arch::aarch64::*;
-    use core::mem::transmute;
 
     use primitives::field::gf2_64::aarch64::{
         pmull, pmull_hi as mul_hi_scheduled, pmull_hi_asm as mul_hi, pmull_lo_asm as mul_lo,
     };
+    use primitives::{cast_slice, load_at, store_at};
 
     use super::*;
 
-    /// A linear map is the sum of its nibbles' images, so each byte of sixteen embeddings is four
-    /// table lookups.
     #[inline(always)]
     pub fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
-        unsafe {
-            let t: [uint8x16_t; 12] = std::array::from_fn(|i| vld1q_u8(NIBBLES[i].as_ptr()));
-            let mask = vdupq_n_u8(0x0f);
-            let mut out = [0u32; PACKS];
-            for half in 0..2 {
-                // Pack `q` is bytes `2q` and `2q + 1`: the low bytes and the high bytes of sixteen.
-                let bytes = vld2q_u8(words.as_ptr().cast::<u8>().add(32 * half));
-                let nibbles = [
-                    vandq_u8(bytes.0, mask),
-                    vshrq_n_u8(bytes.0, 4),
-                    vandq_u8(bytes.1, mask),
-                    vshrq_n_u8(bytes.1, 4),
-                ];
-                let byte = |k: usize| {
-                    let look = |n: usize| vqtbl1q_u8(t[4 * k + n], nibbles[n]);
-                    veorq_u8(veorq_u8(look(0), look(1)), veorq_u8(look(2), look(3)))
-                };
-                let (b0, b1, b2) = (byte(0), byte(1), byte(2));
-                let zero = vdupq_n_u8(0);
-                let (lo, hi) = (vzip1q_u8(b0, b1), vzip2q_u8(b0, b1));
-                let (top_lo, top_hi) = (vzip1q_u8(b2, zero), vzip2q_u8(b2, zero));
-                let dst = out.as_mut_ptr().add(16 * half);
-                for (i, (l, h)) in [(lo, top_lo), (hi, top_hi)].into_iter().enumerate() {
-                    let (l, h) = (vreinterpretq_u16_u8(l), vreinterpretq_u16_u8(h));
-                    vst1q_u32(dst.add(8 * i), vreinterpretq_u32_u16(vzip1q_u16(l, h)));
-                    vst1q_u32(dst.add(8 * i + 4), vreinterpretq_u32_u16(vzip2q_u16(l, h)));
-                }
+        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
+        unsafe { embed_vectors(words) }
+    }
+
+    /// Sixteen bytes' even and odd bytes, two registers.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn load_deinterleaved(src: &[u8; 32]) -> uint8x16x2_t {
+        // SAFETY: the array is the 32 bytes `vld2q_u8` reads.
+        unsafe { vld2q_u8(src.as_ptr()) }
+    }
+
+    /// A linear map is the sum of its nibbles' images, so each byte of sixteen embeddings is four
+    /// table lookups.
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
+    fn embed_vectors(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
+        let t: [uint8x16_t; 12] = std::array::from_fn(|i| load_at(&NIBBLES[i][..], 0));
+        let mask = vdupq_n_u8(0x0f);
+        let mut out = [0u32; PACKS];
+        for half in 0..2 {
+            // Pack `q` is bytes `2q` and `2q + 1`: the low bytes and the high bytes of sixteen.
+            let bytes = load_deinterleaved(cast_slice(&words[4 * half..][..4]).try_into().unwrap());
+            let nibbles = [
+                vandq_u8(bytes.0, mask),
+                vshrq_n_u8(bytes.0, 4),
+                vandq_u8(bytes.1, mask),
+                vshrq_n_u8(bytes.1, 4),
+            ];
+            let byte = |k: usize| {
+                let look = |n: usize| vqtbl1q_u8(t[4 * k + n], nibbles[n]);
+                veorq_u8(veorq_u8(look(0), look(1)), veorq_u8(look(2), look(3)))
+            };
+            let (b0, b1, b2) = (byte(0), byte(1), byte(2));
+            let zero = vdupq_n_u8(0);
+            let (lo, hi) = (vzip1q_u8(b0, b1), vzip2q_u8(b0, b1));
+            let (top_lo, top_hi) = (vzip1q_u8(b2, zero), vzip2q_u8(b2, zero));
+            for (i, (l, h)) in [(lo, top_lo), (hi, top_hi)].into_iter().enumerate() {
+                let (l, h) = (vreinterpretq_u16_u8(l), vreinterpretq_u16_u8(h));
+                store_at(&mut out[..], 16 * half + 8 * i, vreinterpretq_u32_u16(vzip1q_u16(l, h)));
+                store_at(&mut out[..], 16 * half + 8 * i + 4, vreinterpretq_u32_u16(vzip2q_u16(l, h)));
             }
-            out
         }
+        out
     }
 
     /// Two packs, a lane each.
-    #[inline(always)]
-    unsafe fn load(p: *const u32) -> uint64x2_t {
-        unsafe { vmovl_u32(vld1_u32(p)) }
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn load(src: &[u32], i: usize) -> uint64x2_t {
+        vmovl_u32(load_at::<u32, uint32x2_t>(src, i))
     }
 
     /// [`extend_group`] on the four vectors of a group, the values staying in registers: a
     /// vector's low mixed points are two table lookups, and its lane sum is returned for the last
     /// one, which [`embed_extend`] stores with the other group's.
-    #[inline(always)]
-    unsafe fn extend_vectors(v: [uint32x4_t; 4], out: *mut u32) -> uint32x4_t {
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn extend_vectors(v: [uint32x4_t; 4], out: &mut [u32]) -> uint32x4_t {
         const FIRST: [u8; 16] = [0, 1, 2, 3, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
         const SECOND: [u8; 16] = [4, 5, 6, 7, 12, 13, 14, 15, 8, 9, 10, 11, 12, 13, 14, 15];
-        unsafe {
-            let (first, second) = (vld1q_u8(FIRST.as_ptr()), vld1q_u8(SECOND.as_ptr()));
-            let (w4, w5) = (veorq_u32(v[0], v[1]), veorq_u32(v[2], v[3]));
-            let w = [
-                v[0],
-                v[1],
-                v[2],
-                v[3],
-                w4,
-                w5,
-                veorq_u32(v[0], v[2]),
-                veorq_u32(v[1], v[3]),
-                veorq_u32(w4, w5),
-            ];
-            for (k, &w) in w[4..].iter().enumerate() {
-                vst1q_u32(out.add(4 * k), w);
-            }
-            let low: [uint32x4_t; 9] = std::array::from_fn(|k| {
-                let b = vreinterpretq_u8_u32(w[k]);
-                vreinterpretq_u32_u8(veorq_u8(vqtbl1q_u8(b, first), vqtbl1q_u8(b, second)))
-            });
-            for (k, &l) in low.iter().enumerate() {
-                vst1q_u32(out.add(20 + 4 * k), l);
-            }
-            // Lanes 0 and 1 of a vector's low mixed points add to its lane sum: two vectors at a time.
-            let pair = |a: uint32x4_t, b: uint32x4_t| {
-                let z = vzip1q_u32(a, b);
-                veorq_u32(z, vextq_u32::<2>(z, z))
-            };
-            for k in (0..8).step_by(4) {
-                let (p, q) = (pair(low[k], low[k + 1]), pair(low[k + 2], low[k + 3]));
-                vst1q_u32(
-                    out.add(56 + k),
-                    vreinterpretq_u32_u64(vzip1q_u64(vreinterpretq_u64_u32(p), vreinterpretq_u64_u32(q))),
-                );
-            }
-            low[8]
+        let (first, second) = (load_at::<u8, uint8x16_t>(&FIRST, 0), load_at::<u8, uint8x16_t>(&SECOND, 0));
+        let (w4, w5) = (veorq_u32(v[0], v[1]), veorq_u32(v[2], v[3]));
+        let w = [
+            v[0],
+            v[1],
+            v[2],
+            v[3],
+            w4,
+            w5,
+            veorq_u32(v[0], v[2]),
+            veorq_u32(v[1], v[3]),
+            veorq_u32(w4, w5),
+        ];
+        for (k, &w) in w[4..].iter().enumerate() {
+            store_at(out, 4 * k, w);
         }
+        let low: [uint32x4_t; 9] = std::array::from_fn(|k| {
+            let b = vreinterpretq_u8_u32(w[k]);
+            vreinterpretq_u32_u8(veorq_u8(vqtbl1q_u8(b, first), vqtbl1q_u8(b, second)))
+        });
+        for (k, &l) in low.iter().enumerate() {
+            store_at(out, 20 + 4 * k, l);
+        }
+        // Lanes 0 and 1 of a vector's low mixed points add to its lane sum: two vectors at a time.
+        let pair = |a: uint32x4_t, b: uint32x4_t| {
+            let z = vzip1q_u32(a, b);
+            veorq_u32(z, vextq_u32::<2>(z, z))
+        };
+        for k in (0..8).step_by(4) {
+            let (p, q) = (pair(low[k], low[k + 1]), pair(low[k + 2], low[k + 3]));
+            store_at(
+                out,
+                56 + k,
+                vreinterpretq_u32_u64(vzip1q_u64(vreinterpretq_u64_u32(p), vreinterpretq_u64_u32(q))),
+            );
+        }
+        low[8]
     }
 
     #[inline(always)]
     pub fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
-        unsafe {
-            let e = embed(words);
-            let v = |half: usize| -> [uint32x4_t; 4] {
-                std::array::from_fn(|k| vld1q_u32(e.as_ptr().add(16 * half + 4 * k)))
-            };
-            let last0 = extend_vectors(v(0), out.as_mut_ptr());
-            let last1 = extend_vectors(v(1), out.as_mut_ptr().add(64));
-            let z = vzip1q_u32(last0, last1);
-            vst1_u32(
-                out.as_mut_ptr().add(128),
-                vget_low_u32(veorq_u32(z, vextq_u32::<2>(z, z))),
-            );
-        }
+        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
+        unsafe { embed_extend_vectors(words, out) }
+    }
+
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
+    fn embed_extend_vectors(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
+        let e = embed_vectors(words);
+        let v = |half: usize| -> [uint32x4_t; 4] {
+            std::array::from_fn(|k| load_at::<u32, uint32x4_t>(&e, 16 * half + 4 * k))
+        };
+        let last0 = extend_vectors(v(0), &mut out[..64]);
+        let last1 = extend_vectors(v(1), &mut out[64..128]);
+        let z = vzip1q_u32(last0, last1);
+        store_at(&mut out[..], 128, vget_low_u32(veorq_u32(z, vextq_u32::<2>(z, z))));
     }
 
     /// The low lanes' product through the intrinsics, as [`mul_hi_scheduled`] is, for [`skip_row`]:
     /// its products are the bound there, and the compiler schedules them better around the rest of
     /// the loop than written-out ones.
-    #[inline(always)]
-    unsafe fn mul_lo_scheduled(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-        unsafe { pmull(vgetq_lane_u64(a, 0), vgetq_lane_u64(b, 0)) }
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
+    fn mul_lo_scheduled(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        pmull(vgetq_lane_u64(a, 0), vgetq_lane_u64(b, 0))
     }
 
     #[inline(always)]
     pub fn products(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
-        unsafe {
-            let ones = vdupq_n_u64(RMFE.ones as u64);
-            let mut out = [0u64; PACKS];
-            for q in (0..PACKS).step_by(2) {
-                let (za, zb, zc) = (
-                    load(a.as_ptr().add(q)),
-                    load(b.as_ptr().add(q)),
-                    load(c.as_ptr().add(q)),
-                );
-                let linear = veorq_u64(za, zc);
-                let even = veorq_u64(mul_lo(zb, zc), mul_lo(linear, ones));
-                let odd = veorq_u64(mul_hi(zb, zc), mul_hi(linear, ones));
-                vst1q_u64(out.as_mut_ptr().add(q), vzip1q_u64(even, odd));
-            }
-            out
+        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
+        unsafe { products_vectors(a, b, c) }
+    }
+
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
+    fn products_vectors(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
+        let ones = vdupq_n_u64(RMFE.ones as u64);
+        let mut out = [0u64; PACKS];
+        for q in (0..PACKS).step_by(2) {
+            let (za, zb, zc) = (load(a, q), load(b, q), load(c, q));
+            let linear = veorq_u64(za, zc);
+            let even = veorq_u64(mul_lo(zb, zc), mul_lo(linear, ones));
+            let odd = veorq_u64(mul_hi(zb, zc), mul_hi(linear, ones));
+            store_at(&mut out[..], q, vzip1q_u64(even, odd));
         }
+        out
+    }
+
+    #[inline(always)]
+    pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
+        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
+        unsafe { skip_row_vectors(acc, e, weights) }
     }
 
     /// Two slots at a time, their sums over the row kept in registers. The padding slots are
     /// skipped: [`extend`] never writes them, and nothing reads their sums.
-    #[inline(always)]
-    pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
-        unsafe {
-            let w: [[uint64x2_t; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| vdupq_n_u64(weights[x][k])));
-            for p in (0..2 * MIXED).step_by(2) {
-                let z: [uint64x2_t; 5] = std::array::from_fn(|x| load(e[x].as_ptr().add(p)));
-                let mut sums = [[vdupq_n_u64(0); 2]; 3];
-                for x in 0..5 {
-                    let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
-                    let pair = vzip1q_u64(mul_lo_scheduled(zb, zc), mul_hi_scheduled(zb, zc));
-                    for k in 0..3 {
-                        sums[k][0] = veorq_u64(sums[k][0], mul_lo_scheduled(pair, w[x][k]));
-                        sums[k][1] = veorq_u64(sums[k][1], mul_hi_scheduled(pair, w[x][k]));
-                    }
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
+    fn skip_row_vectors(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
+        let w: [[uint64x2_t; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| vdupq_n_u64(weights[x][k])));
+        for p in (0..2 * MIXED).step_by(2) {
+            let z: [uint64x2_t; 5] = std::array::from_fn(|x| load(&e[x], p));
+            let mut sums = [[vdupq_n_u64(0); 2]; 3];
+            for x in 0..5 {
+                let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
+                let pair = vzip1q_u64(mul_lo_scheduled(zb, zc), mul_hi_scheduled(zb, zc));
+                for k in 0..3 {
+                    sums[k][0] = veorq_u64(sums[k][0], mul_lo_scheduled(pair, w[x][k]));
+                    sums[k][1] = veorq_u64(sums[k][1], mul_hi_scheduled(pair, w[x][k]));
                 }
-                for (k, sums) in sums.iter().enumerate() {
-                    for (h, &sum) in sums.iter().enumerate() {
-                        let (v, l) = lane(p + h);
-                        let slot = (&mut acc.0[k][v].0[l] as *mut u128).cast::<u64>();
-                        vst1q_u64(slot, veorq_u64(vld1q_u64(slot), sum));
-                    }
+            }
+            for (k, sums) in sums.iter().enumerate() {
+                for (h, &sum) in sums.iter().enumerate() {
+                    let (v, l) = lane(p + h);
+                    let slot = &mut acc.0[k][v].0[l..];
+                    store_at(slot, 0, veorq_u64(load_at::<u128, uint64x2_t>(slot, 0), sum));
                 }
             }
         }
@@ -987,21 +1010,23 @@ mod neon {
 
     #[inline(always)]
     pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-        unsafe {
-            std::array::from_fn(|half| {
-                std::array::from_fn(|k| {
-                    let mut acc = vdupq_n_u64(0);
-                    for q in (0..GROUP).step_by(2) {
-                        let (ze, zw) = (
-                            load(e.as_ptr().add(GROUP * half + q)),
-                            vld1q_u64(weights[k].as_ptr().add(q)),
-                        );
-                        acc = veorq_u64(acc, veorq_u64(mul_lo(ze, zw), mul_hi(ze, zw)));
-                    }
-                    transmute::<uint64x2_t, u128>(acc)
-                })
+        // SAFETY: this module is compiled only where `aes` is enabled, and aarch64 always has NEON.
+        unsafe { fold_groups_vectors(e, weights) }
+    }
+
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
+    fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
+        std::array::from_fn(|half| {
+            std::array::from_fn(|k| {
+                let mut acc = vdupq_n_u64(0);
+                for q in (0..GROUP).step_by(2) {
+                    let (ze, zw) = (load(e, GROUP * half + q), load_at::<u64, uint64x2_t>(&weights[k], q));
+                    acc = veorq_u64(acc, veorq_u64(mul_lo(ze, zw), mul_hi(ze, zw)));
+                }
+                vgetq_lane_u64::<0>(acc) as u128 | (vgetq_lane_u64::<1>(acc) as u128) << 64
             })
-        }
+        })
     }
 }
 

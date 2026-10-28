@@ -206,11 +206,10 @@ pub mod aarch64 {
     /// 64x64 carry-less product as a 128-bit NEON vector.
     ///
     /// # Safety
-    /// Requires the `aes` target feature (compiles to PMULL); only call where
-    /// `aes` is statically enabled or has been runtime-detected.
+    /// Requires the `aes` target feature (compiles to PMULL). A caller that carries it calls this safely.
     #[inline]
     #[target_feature(enable = "aes")]
-    pub unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
+    pub fn pmull(a: u64, b: u64) -> uint64x2_t {
         // SAFETY: u128 and uint64x2_t are both 128-bit values.
         unsafe { transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
     }
@@ -223,7 +222,7 @@ pub mod aarch64 {
     /// Requires the `aes` target feature; see [`pmull`].
     #[inline]
     #[target_feature(enable = "aes")]
-    pub unsafe fn pmull_hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    pub fn pmull_hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
         // SAFETY: bit-level reinterprets between 128-bit vector types.
         unsafe {
             transmute::<u128, uint64x2_t>(vmull_high_p64(
@@ -238,8 +237,9 @@ pub mod aarch64 {
     ///
     /// # Safety
     /// Requires the `aes` target feature; see [`pmull`].
-    #[inline(always)]
-    pub unsafe fn pmull_lo_asm(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub fn pmull_lo_asm(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
         let out;
         // SAFETY: one PMULL on vector registers.
         unsafe {
@@ -256,8 +256,9 @@ pub mod aarch64 {
     ///
     /// # Safety
     /// Requires the `aes` target feature; see [`pmull`].
-    #[inline(always)]
-    pub unsafe fn pmull_hi_asm(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub fn pmull_hi_asm(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
         let out;
         // SAFETY: one PMULL2 on vector registers.
         unsafe {
@@ -318,14 +319,11 @@ pub mod aarch64 {
     #[inline]
     #[target_feature(enable = "aes")]
     pub unsafe fn mul_shift_tail(a: F64, b: F64) -> F64 {
-        // SAFETY: function carries the aes target feature.
-        unsafe {
-            let r = vdupq_n_u64(R64);
-            let p = pmull(a.0, b.0);
-            let t = pmull_hi(p, r);
-            let u = pmull_hi(t, r);
-            F64(vgetq_lane_u64::<0>(veorq_u64(veorq_u64(p, t), u)))
-        }
+        let r = vdupq_n_u64(R64);
+        let p = pmull(a.0, b.0);
+        let t = pmull_hi(p, r);
+        let u = pmull_hi(t, r);
+        F64(vgetq_lane_u64::<0>(veorq_u64(veorq_u64(p, t), u)))
     }
 }
 
