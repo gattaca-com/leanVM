@@ -102,19 +102,6 @@ pub fn placements_of(kappas: &[Option<usize>]) -> (Vec<Placement>, StackShape) {
 /// small enough to spread one column across cores.
 const FILL_CHUNK: usize = 1 << 16;
 
-/// The uninitialized stacked witness: [`StackShape::committed_len`] slots, the
-/// placed columns rounded up to a whole lane rather than all the way to `2^mu`.
-///
-/// # Safety
-/// Every slot must be written before it is read. [`split_stack`] hands out one
-/// window per committed column and zeroes the pad tail, which together cover the
-/// whole allocation, so the obligation reduces to each column's fill writing its
-/// own window.
-pub unsafe fn alloc_stack(shape: StackShape) -> Vec<F64> {
-    // SAFETY: forwarded to the caller by the contract above.
-    unsafe { primitives::uninit_vec::<F64>(shape.committed_len()) }
-}
-
 /// The stack's repeat map, all false: one tag per block of `2^EQUAL_BLOCK_LOG` words.
 pub fn alloc_repeats(shape: StackShape) -> Vec<bool> {
     vec![false; shape.committed_len() >> EQUAL_BLOCK_LOG]
@@ -133,7 +120,7 @@ pub fn alloc_repeats(shape: StackShape) -> Vec<bool> {
 /// second time (a gigabyte at scale) for nothing, and allocating the stack zeroed
 /// would memset all `2^m` slots only for the columns to overwrite them.
 ///
-/// Safe despite [`alloc_stack`]'s uninitialized allocation: [`placements_of`]
+/// Safe over an unwritten stack: [`placements_of`]
 /// tiles the columns from offset 0, checked here, so consecutive `split_at_mut`
 /// hands out disjoint windows covering `[0, placed)` and this zeroes the rest.
 pub fn split_stack<'a>(q: &'a mut [F64], repeats: &'a mut [bool], placements: &[Placement]) -> Vec<ColumnOut<'a>> {
