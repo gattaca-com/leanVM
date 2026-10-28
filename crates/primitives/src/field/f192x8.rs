@@ -375,14 +375,10 @@ pub fn mul_f64x8(a: &[F64; 8], b: &[F64; 8]) -> [F64; 8] {
 #[inline]
 pub fn xor_into8(out: &mut [F192; 8], add: &[F192; 8]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    // SAFETY: the feature is enabled at compile time; both arrays are 24 qwords.
-    unsafe {
-        use core::arch::x86_64::*;
-        let (o, a) = (out.as_mut_ptr().cast::<i64>(), add.as_ptr().cast::<i64>());
-        for i in [0, 8, 16] {
-            let v = _mm512_xor_si512(_mm512_loadu_si512(o.add(i).cast()), _mm512_loadu_si512(a.add(i).cast()));
-            _mm512_storeu_si512(o.add(i).cast(), v);
-        }
+    for i in 0..3 {
+        use crate::simd::{load, store, xor};
+        let sum = xor(load(out, i), load(add, i));
+        store(out, i, sum);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
     for (o, a) in out.iter_mut().zip(add) {
@@ -421,6 +417,11 @@ mod avx512 {
 
     use super::{F64, F192, F192Unreduced};
     use crate::field::gf2_64x3::x86_64::{fold, mul_by_pairs, pair, reduce_lanes512};
+    use crate::simd::{from_words, load, store, to_words, xor};
+
+    // The kernels enable avx512bw for `reduce_lanes512`, so the build must have it.
+    #[cfg(not(target_feature = "avx512bw"))]
+    compile_error!("the F192x8 kernels need avx512bw, which every CPU with avx512f and vpclmulqdq has");
 
     /// Eight elements in their three planes.
     #[derive(Clone, Copy, Debug)]
@@ -440,34 +441,32 @@ mod avx512 {
     }
 
     /// The 8x8 transpose of qwords: qword `j` of `out[p]` is qword `p` of `r[j]`.
-    #[inline(always)]
-    unsafe fn transpose_qwords(r: [__m512i; 8]) -> [__m512i; 8] {
-        // SAFETY: the module is compiled only with avx512f enabled.
-        unsafe {
-            // Pair rows with `unpack`, then pair the pairs by 128-bit lane, twice.
-            let t = [0, 2, 4, 6].map(|i| {
-                [
-                    _mm512_unpacklo_epi64(r[i], r[i + 1]),
-                    _mm512_unpackhi_epi64(r[i], r[i + 1]),
-                ]
-            });
-            let u = |a: usize, b: usize| {
-                let (x, y) = (t[a], t[b]);
-                [
-                    _mm512_shuffle_i64x2::<0x88>(x[0], y[0]),
-                    _mm512_shuffle_i64x2::<0x88>(x[1], y[1]),
-                    _mm512_shuffle_i64x2::<0xDD>(x[0], y[0]),
-                    _mm512_shuffle_i64x2::<0xDD>(x[1], y[1]),
-                ]
-            };
-            let (low, high) = (u(0, 1), u(2, 3));
-            let mut out = [_mm512_setzero_si512(); 8];
-            for q in 0..4 {
-                out[q] = _mm512_shuffle_i64x2::<0x88>(low[q], high[q]);
-                out[q + 4] = _mm512_shuffle_i64x2::<0xDD>(low[q], high[q]);
-            }
-            out
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn transpose_qwords(r: [__m512i; 8]) -> [__m512i; 8] {
+        // Pair rows with `unpack`, then pair the pairs by 128-bit lane, twice.
+        let t = [0, 2, 4, 6].map(|i| {
+            [
+                _mm512_unpacklo_epi64(r[i], r[i + 1]),
+                _mm512_unpackhi_epi64(r[i], r[i + 1]),
+            ]
+        });
+        let u = |a: usize, b: usize| {
+            let (x, y) = (t[a], t[b]);
+            [
+                _mm512_shuffle_i64x2::<0x88>(x[0], y[0]),
+                _mm512_shuffle_i64x2::<0x88>(x[1], y[1]),
+                _mm512_shuffle_i64x2::<0xDD>(x[0], y[0]),
+                _mm512_shuffle_i64x2::<0xDD>(x[1], y[1]),
+            ]
+        };
+        let (low, high) = (u(0, 1), u(2, 3));
+        let mut out = [_mm512_setzero_si512(); 8];
+        for q in 0..4 {
+            out[q] = _mm512_shuffle_i64x2::<0x88>(low[q], high[q]);
+            out[q + 4] = _mm512_shuffle_i64x2::<0xDD>(low[q], high[q]);
         }
+        out
     }
 
     /// Eight base-field elements, one per qword.
@@ -476,22 +475,17 @@ mod avx512 {
     pub struct F64x8(__m512i);
 
     impl F64x8 {
-        // SAFETY: the all-zero bit pattern is a valid vector.
-        pub const ZERO: Self = Self(unsafe { core::mem::transmute::<[u64; 8], __m512i>([0; 8]) });
-
-        // SAFETY: every bit pattern is a valid vector.
-        pub const ONE: Self = Self(unsafe { core::mem::transmute::<[u64; 8], __m512i>([1; 8]) });
+        pub const ZERO: Self = Self(from_words([0; 8]));
+        pub const ONE: Self = Self(from_words([1; 8]));
 
         #[inline(always)]
         pub fn from_array(k: &[F64; 8]) -> Self {
-            // SAFETY: eight words are one register.
-            Self(unsafe { _mm512_loadu_si512(k.as_ptr().cast()) })
+            Self(load(k, 0))
         }
 
         #[inline(always)]
         pub fn to_array(self) -> [F64; 8] {
-            // SAFETY: eight words are one register.
-            unsafe { core::mem::transmute::<__m512i, [F64; 8]>(self.0) }
+            to_words(self.0).map(F64)
         }
 
         #[inline]
@@ -509,15 +503,16 @@ mod avx512 {
         /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
         #[inline(always)]
         pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
-            // SAFETY: the module is compiled only with avx512f enabled.
-            unsafe {
+            #[inline]
+            #[target_feature(enable = "avx512f")]
+            fn kernel(a: __m512i, b: __m512i) -> (__m512i, __m512i) {
                 let evens = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
                 let odds = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-                (
-                    Self(_mm512_permutex2var_epi64(a.0, evens, b.0)),
-                    Self(_mm512_permutex2var_epi64(a.0, odds, b.0)),
-                )
+                (_mm512_permutex2var_epi64(a, evens, b), _mm512_permutex2var_epi64(a, odds, b))
             }
+            // SAFETY: the module is compiled only with avx512f enabled.
+            let (even, odd) = unsafe { kernel(a.0, b.0) };
+            (Self(even), Self(odd))
         }
 
         /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
@@ -533,8 +528,7 @@ mod avx512 {
 
         #[inline(always)]
         fn add(self, rhs: Self) -> Self {
-            // SAFETY: the module is compiled only with avx512f enabled.
-            Self(unsafe { _mm512_xor_si512(self.0, rhs.0) })
+            Self(xor(self.0, rhs.0))
         }
     }
 
@@ -564,23 +558,29 @@ mod avx512 {
         #[inline(always)]
         fn from(k: F64x8) -> Self {
             // SAFETY: the module is compiled only with avx512f enabled.
-            unsafe { embed(k.0) }
+            unsafe {
+                let zero = _mm512_setzero_si512();
+                // Each word is its element's `c0`.
+                Self {
+                    lo: _mm512_unpacklo_epi64(k.0, zero),
+                    hi: _mm512_unpackhi_epi64(k.0, zero),
+                    c2: zero,
+                }
+            }
         }
     }
 
     impl Acc8 {
-        // SAFETY: the all-zero bit pattern is a valid vector.
         pub const ZERO: Self = Self {
-            even: [unsafe { core::mem::transmute::<[u64; 8], __m512i>([0; 8]) }; 3],
-            odd: [unsafe { core::mem::transmute::<[u64; 8], __m512i>([0; 8]) }; 3],
+            even: [from_words([0; 8]); 3],
+            odd: [from_words([0; 8]); 3],
         };
 
         /// The same sum with the odd elements' products moved onto the even ones: a running sum then
         /// keeps three vectors, not six.
         #[inline(always)]
         pub fn merge_parities(self) -> Self {
-            // SAFETY: the module is compiled only with avx512f enabled.
-            let even = unsafe { core::array::from_fn(|i| _mm512_xor_si512(self.even[i], self.odd[i])) };
+            let even = core::array::from_fn(|i| xor(self.even[i], self.odd[i]));
             Self { even, ..Self::ZERO }
         }
 
@@ -604,8 +604,7 @@ mod avx512 {
         #[inline]
         fn from(u: F192Unreduced) -> Self {
             let [c0, c1, c2] = u.coeffs();
-            // SAFETY: the module is compiled only with avx512f enabled.
-            let lane = |[lo, hi]: [u64; 2]| unsafe { _mm512_setr_epi64(lo as i64, hi as i64, 0, 0, 0, 0, 0, 0) };
+            let lane = |[lo, hi]: [u64; 2]| from_words([lo, hi, 0, 0, 0, 0, 0, 0]);
             Self {
                 even: [lane(c0), lane(c1), lane(c2)],
                 odd: Self::ZERO.odd,
@@ -616,12 +615,9 @@ mod avx512 {
     impl core::ops::BitXorAssign for Acc8 {
         #[inline(always)]
         fn bitxor_assign(&mut self, rhs: Self) {
-            // SAFETY: the module is compiled only with avx512f enabled.
-            unsafe {
-                for i in 0..3 {
-                    self.even[i] = _mm512_xor_si512(self.even[i], rhs.even[i]);
-                    self.odd[i] = _mm512_xor_si512(self.odd[i], rhs.odd[i]);
-                }
+            for i in 0..3 {
+                self.even[i] = xor(self.even[i], rhs.even[i]);
+                self.odd[i] = xor(self.odd[i], rhs.odd[i]);
             }
         }
     }
@@ -638,13 +634,12 @@ mod avx512 {
 
     #[inline]
     #[target_feature(enable = "avx512f")]
-    unsafe fn reduce_sum(acc: Acc8) -> F192 {
+    fn reduce_sum(acc: Acc8) -> F192 {
         let coeffs = core::array::from_fn(|i| {
             let a = _mm512_xor_si512(acc.even[i], acc.odd[i]);
             let half = _mm256_xor_si256(_mm512_castsi512_si256(a), _mm512_extracti64x4_epi64::<1>(a));
             let q = _mm_xor_si128(_mm256_castsi256_si128(half), _mm256_extracti128_si256::<1>(half));
-            // SAFETY: a 128-bit register and two words hold the same bits.
-            unsafe { core::mem::transmute::<__m128i, [u64; 2]>(q) }
+            [_mm_cvtsi128_si64(q) as u64, _mm_extract_epi64::<1>(q) as u64]
         });
         F192Unreduced::from_coeffs(coeffs).reduce()
     }
@@ -652,12 +647,8 @@ mod avx512 {
     /// Eight consecutive elements, 24 qwords, into their planes: three loads, six permutes.
     #[inline]
     #[target_feature(enable = "avx512f")]
-    unsafe fn load(e: &[F192; 8]) -> F192x8 {
-        // SAFETY: eight elements are 24 qwords, three registers.
-        let [z0, z1, z2] = unsafe {
-            let p = e.as_ptr().cast::<i64>();
-            [0, 8, 16].map(|o| _mm512_loadu_si512(p.add(o).cast()))
-        };
+    fn load_planes(e: &[F192; 8]) -> F192x8 {
+        let [z0, z1, z2] = [0, 1, 2].map(|i| load(e, i));
         // Element i is qwords 3i..3i+3; a permute index 8 + j names qword 8 + j, the third register fills the rest.
         let lo = _mm512_permutex2var_epi64(z0, _mm512_setr_epi64(0, 1, 6, 7, 12, 13, 0, 0), z1);
         let lo = _mm512_mask_permutexvar_epi64(lo, 0b1100_0000, _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 2, 3), z2);
@@ -668,10 +659,10 @@ mod avx512 {
         F192x8 { lo, hi, c2 }
     }
 
-    /// The inverse of [`load`]: six permutes, three stores.
+    /// The inverse of [`load_planes`]: six permutes, three stores.
     #[inline]
     #[target_feature(enable = "avx512f")]
-    unsafe fn store(p: F192x8, out: &mut [F192; 8]) {
+    fn store_planes(p: F192x8, out: &mut [F192; 8]) {
         let F192x8 { lo, hi, c2 } = p;
         let v0 = _mm512_permutex2var_epi64(lo, _mm512_setr_epi64(0, 1, 0, 8, 9, 0, 2, 3), hi);
         let v0 = _mm512_mask_permutexvar_epi64(v0, 0b0010_0100, _mm512_setr_epi64(0, 0, 0, 0, 0, 1, 0, 0), c2);
@@ -679,41 +670,41 @@ mod avx512 {
         let v1 = _mm512_mask_permutexvar_epi64(v1, 0b0100_1001, _mm512_setr_epi64(2, 0, 0, 3, 0, 0, 4, 0), c2);
         let v2 = _mm512_permutex2var_epi64(lo, _mm512_setr_epi64(13, 0, 6, 7, 0, 14, 15, 0), hi);
         let v2 = _mm512_mask_permutexvar_epi64(v2, 0b1001_0010, _mm512_setr_epi64(0, 5, 0, 0, 6, 0, 0, 7), c2);
-        // SAFETY: the three stores write the 24 qwords of `out`.
-        unsafe {
-            let p = out.as_mut_ptr().cast::<i64>();
-            _mm512_storeu_si512(p.cast(), v0);
-            _mm512_storeu_si512(p.add(8).cast(), v1);
-            _mm512_storeu_si512(p.add(16).cast(), v2);
-        }
+        [v0, v1, v2].into_iter().enumerate().for_each(|(i, v)| store(out, i, v));
     }
 
     impl F192x8 {
-        // SAFETY: the all-zero bit pattern is a valid vector.
         pub const ZERO: Self = Self {
-            lo: unsafe { core::mem::transmute::<[u64; 8], __m512i>([0; 8]) },
-            hi: unsafe { core::mem::transmute::<[u64; 8], __m512i>([0; 8]) },
-            c2: unsafe { core::mem::transmute::<[u64; 8], __m512i>([0; 8]) },
+            lo: from_words([0; 8]),
+            hi: from_words([0; 8]),
+            c2: from_words([0; 8]),
         };
 
-        // SAFETY: every bit pattern is a valid vector. Element `i` has `c0 = 1` and no other bit.
+        /// Element `i` has `c0 = 1` and no other bit.
         pub const ONE: Self = Self {
-            lo: unsafe { core::mem::transmute::<[u64; 8], __m512i>([1, 0, 1, 0, 1, 0, 1, 0]) },
-            hi: unsafe { core::mem::transmute::<[u64; 8], __m512i>([1, 0, 1, 0, 1, 0, 1, 0]) },
-            c2: unsafe { core::mem::transmute::<[u64; 8], __m512i>([0; 8]) },
+            lo: from_words([1, 0, 1, 0, 1, 0, 1, 0]),
+            hi: from_words([1, 0, 1, 0, 1, 0, 1, 0]),
+            c2: from_words([0; 8]),
         };
 
         /// One scalar in every element.
         #[inline(always)]
         pub fn splat(r: F192) -> Self {
-            // SAFETY: the module is compiled only with the features enabled.
-            unsafe { splat(r) }
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe {
+                let lo = _mm512_broadcast_i32x4(pair(r.c0, r.c1));
+                Self {
+                    lo,
+                    hi: lo,
+                    c2: _mm512_set1_epi64(r.c2 as i64),
+                }
+            }
         }
 
         #[inline(always)]
         pub fn from_array(e: &[F192; 8]) -> Self {
             // SAFETY: the module is compiled only with the features enabled.
-            unsafe { load(e) }
+            unsafe { load_planes(e) }
         }
 
         /// Eight elements from their coefficient registers: qword `i` of `c0`, `c1` and `c2` is that coefficient of element `i`.
@@ -733,7 +724,7 @@ mod avx512 {
         pub fn to_array(self) -> [F192; 8] {
             let mut out = [F192::ZERO; 8];
             // SAFETY: the module is compiled only with the features enabled.
-            unsafe { store(self, &mut out) };
+            unsafe { store_planes(self, &mut out) };
             out
         }
 
@@ -776,35 +767,37 @@ mod avx512 {
         /// 128-bit lane shuffle of two inputs, and `c2` is one two-source qword permute.
         #[inline(always)]
         pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
-            // SAFETY: the module is compiled only with avx512f enabled.
-            unsafe {
+            #[inline]
+            #[target_feature(enable = "avx512f")]
+            fn kernel(a: F192x8, b: F192x8) -> (F192x8, F192x8) {
                 let evens = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
                 let odds = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
                 (
-                    Self {
+                    F192x8 {
                         lo: _mm512_shuffle_i64x2::<0x88>(a.lo, b.lo),
                         hi: _mm512_shuffle_i64x2::<0xDD>(a.lo, b.lo),
                         c2: _mm512_permutex2var_epi64(a.c2, evens, b.c2),
                     },
-                    Self {
+                    F192x8 {
                         lo: _mm512_shuffle_i64x2::<0x88>(a.hi, b.hi),
                         hi: _mm512_shuffle_i64x2::<0xDD>(a.hi, b.hi),
                         c2: _mm512_permutex2var_epi64(a.c2, odds, b.c2),
                     },
                 )
             }
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe { kernel(a, b) }
         }
-    }
 
-    impl F192x8 {
         /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
         ///
         /// Even elements sit in `lo` and odd ones in `hi`, so each source plane splits by the parity
         /// of `j` into a 4x4 transpose of 128-bit lanes, and `c2` is an 8x8 transpose of qwords.
         #[inline(always)]
         pub fn transpose(g: [Self; 8]) -> [Self; 8] {
-            // SAFETY: the module is compiled only with avx512f enabled.
-            unsafe {
+            #[inline]
+            #[target_feature(enable = "avx512f")]
+            fn kernel(g: [F192x8; 8]) -> [F192x8; 8] {
                 // The 128-bit lanes of four registers, out[m] lane i = r[i] lane m.
                 let lanes = |r: [__m512i; 4]| {
                     let t0 = _mm512_shuffle_i64x2::<0x88>(r[0], r[1]);
@@ -818,7 +811,7 @@ mod avx512 {
                         _mm512_shuffle_i64x2::<0xDD>(t1, t3),
                     ]
                 };
-                let mut out = [Self::ZERO; 8];
+                let mut out = [F192x8::ZERO; 8];
                 // Source plane `lo` feeds the even outputs and `hi` the odd; even `j` feed `lo`.
                 let from_lo_even = lanes([g[0].lo, g[2].lo, g[4].lo, g[6].lo]);
                 let from_lo_odd = lanes([g[1].lo, g[3].lo, g[5].lo, g[7].lo]);
@@ -836,6 +829,8 @@ mod avx512 {
                 }
                 out
             }
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe { kernel(g) }
         }
     }
 
@@ -844,7 +839,11 @@ mod avx512 {
 
         #[inline(always)]
         fn add(self, rhs: Self) -> Self {
-            xor(self, rhs)
+            Self {
+                lo: xor(self.lo, rhs.lo),
+                hi: xor(self.hi, rhs.hi),
+                c2: xor(self.c2, rhs.c2),
+            }
         }
     }
 
@@ -862,81 +861,41 @@ mod avx512 {
     impl core::ops::AddAssign for F192x8 {
         #[inline]
         fn add_assign(&mut self, rhs: Self) {
-            *self = xor(*self, rhs);
-        }
-    }
-
-    #[inline(always)]
-    fn xor(a: F192x8, b: F192x8) -> F192x8 {
-        // SAFETY: the module is compiled only with avx512f enabled.
-        unsafe {
-            F192x8 {
-                lo: _mm512_xor_si512(a.lo, b.lo),
-                hi: _mm512_xor_si512(a.hi, b.hi),
-                c2: _mm512_xor_si512(a.c2, b.c2),
-            }
-        }
-    }
-
-    /// One scalar in every lane of the planes.
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    unsafe fn splat(r: F192) -> F192x8 {
-        let lo = _mm512_broadcast_i32x4(pair(r.c0, r.c1));
-        F192x8 {
-            lo,
-            hi: lo,
-            c2: _mm512_set1_epi64(r.c2 as i64),
-        }
-    }
-
-    /// Eight base-field words as planes: the embedding puts each word in its element's `c0`.
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    unsafe fn embed(k: __m512i) -> F192x8 {
-        let zero = _mm512_setzero_si512();
-        F192x8 {
-            lo: _mm512_unpacklo_epi64(k, zero),
-            hi: _mm512_unpackhi_epi64(k, zero),
-            c2: zero,
+            *self = *self + rhs;
         }
     }
 
     /// The Karatsuba operands of one parity: the pair plane, `c0 + c1` in both qwords, and the pair
     /// plane with that parity's `c2` added to both qwords.
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
     fn karatsuba_operands(pairs: __m512i, c2_dup: __m512i) -> (__m512i, __m512i, __m512i) {
-        // SAFETY: the module is compiled only with avx512f enabled.
-        unsafe {
-            let swapped = _mm512_shuffle_epi32::<0x4E>(pairs);
-            (pairs, _mm512_xor_si512(pairs, swapped), _mm512_xor_si512(pairs, c2_dup))
-        }
+        let swapped = _mm512_shuffle_epi32::<0x4E>(pairs);
+        (pairs, _mm512_xor_si512(pairs, swapped), _mm512_xor_si512(pairs, c2_dup))
     }
 
     /// The six Karatsuba products of one parity, y-folded.
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
     fn karatsuba_lanes(
         (ap, a_s, a_t): (__m512i, __m512i, __m512i),
         a2: __m512i,
         (bp, b_s, b_t): (__m512i, __m512i, __m512i),
         b2: __m512i,
     ) -> [__m512i; 3] {
-        // SAFETY: the module is compiled only with vpclmulqdq and avx512f enabled.
-        unsafe {
-            let p0 = _mm512_clmulepi64_epi128::<0x00>(ap, bp);
-            let p1 = _mm512_clmulepi64_epi128::<0x11>(ap, bp);
-            let p2 = _mm512_clmulepi64_epi128::<0x00>(a2, b2);
-            let p01 = _mm512_clmulepi64_epi128::<0x00>(a_s, b_s);
-            let p02 = _mm512_clmulepi64_epi128::<0x00>(a_t, b_t);
-            let p12 = _mm512_clmulepi64_epi128::<0x11>(a_t, b_t);
-            fold(p0, p1, p2, p01, p02, p12, |x, y| _mm512_xor_si512(x, y))
-        }
+        let p0 = _mm512_clmulepi64_epi128::<0x00>(ap, bp);
+        let p1 = _mm512_clmulepi64_epi128::<0x11>(ap, bp);
+        let p2 = _mm512_clmulepi64_epi128::<0x00>(a2, b2);
+        let p01 = _mm512_clmulepi64_epi128::<0x00>(a_s, b_s);
+        let p02 = _mm512_clmulepi64_epi128::<0x00>(a_t, b_t);
+        let p12 = _mm512_clmulepi64_epi128::<0x11>(a_t, b_t);
+        fold(p0, p1, p2, p01, p02, p12, |x, y| _mm512_xor_si512(x, y))
     }
 
     /// The eight lane-wise products, unreduced: twelve carry-less multiplications.
     #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    unsafe fn mul(a: F192x8, b: F192x8) -> Acc8 {
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    fn mul(a: F192x8, b: F192x8) -> Acc8 {
         // Each parity's c2 in both qwords of its lane.
         let (a2e, a2o) = (_mm512_shuffle_epi32::<0x44>(a.c2), _mm512_shuffle_epi32::<0xEE>(a.c2));
         let (b2e, b2o) = (_mm512_shuffle_epi32::<0x44>(b.c2), _mm512_shuffle_epi32::<0xEE>(b.c2));
@@ -948,10 +907,9 @@ mod avx512 {
 
     /// The eight mixed products by the words of `k`, unreduced: six carry-less multiplications.
     #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    unsafe fn mul_base(a: F192x8, k: __m512i) -> Acc8 {
-        // SAFETY: the function carries both features.
-        let [e0, e1, o0, o1, e2, o2] = unsafe { mul_by_pairs(a.lo, a.hi, a.c2, k) };
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    fn mul_base(a: F192x8, k: __m512i) -> Acc8 {
+        let [e0, e1, o0, o1, e2, o2] = mul_by_pairs(a.lo, a.hi, a.c2, k);
         Acc8 {
             even: [e0, e1, e2],
             odd: [o0, o1, o2],
@@ -960,99 +918,77 @@ mod avx512 {
 
     /// Reduce every lane back to planes.
     #[inline]
-    #[target_feature(enable = "avx512f")]
-    unsafe fn reduce_planes(acc: Acc8) -> F192x8 {
+    #[target_feature(enable = "avx512f,avx512bw")]
+    fn reduce_planes(acc: Acc8) -> F192x8 {
         let [d0e, d1e, d2e] = acc.even;
         let [d0o, d1o, d2o] = acc.odd;
-        // SAFETY: the function carries the feature.
-        unsafe {
-            let red = |x, y| reduce_lanes512(_mm512_unpacklo_epi64(x, y), _mm512_unpackhi_epi64(x, y));
-            F192x8 {
-                lo: red(d0e, d1e),
-                hi: red(d0o, d1o),
-                c2: red(d2e, d2o),
-            }
+        let red = |x, y| reduce_lanes512(_mm512_unpacklo_epi64(x, y), _mm512_unpackhi_epi64(x, y));
+        F192x8 {
+            lo: red(d0e, d1e),
+            hi: red(d0o, d1o),
+            c2: red(d2e, d2o),
         }
     }
 
     /// Eight base-field products: one carry-less multiplication per parity of word, then the lane-wise
     /// reduction of both.
     #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    unsafe fn mul_words(a: __m512i, b: __m512i) -> __m512i {
-        // SAFETY: the function carries both features.
-        unsafe {
-            let (even, odd) = (_mm512_clmulepi64_epi128::<0x00>(a, b), _mm512_clmulepi64_epi128::<0x11>(a, b));
-            reduce_lanes512(_mm512_unpacklo_epi64(even, odd), _mm512_unpackhi_epi64(even, odd))
-        }
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    fn mul_words(a: __m512i, b: __m512i) -> __m512i {
+        let (even, odd) = (_mm512_clmulepi64_epi128::<0x00>(a, b), _mm512_clmulepi64_epi128::<0x11>(a, b));
+        reduce_lanes512(_mm512_unpacklo_epi64(even, odd), _mm512_unpackhi_epi64(even, odd))
     }
 
     #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn mul_f64x8(a: &[F64; 8], b: &[F64; 8]) -> [F64; 8] {
-        // SAFETY: the function carries both features; eight words are one register.
-        unsafe {
-            let (a, b) = (_mm512_loadu_si512(a.as_ptr().cast()), _mm512_loadu_si512(b.as_ptr().cast()));
-            core::mem::transmute::<__m512i, [F64; 8]>(mul_words(a, b))
-        }
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    pub fn mul_f64x8(a: &[F64; 8], b: &[F64; 8]) -> [F64; 8] {
+        to_words(mul_words(load(a, 0), load(b, 0))).map(F64)
     }
 
     #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn fold_pairs_ext(x0: &[F192; 8], x1: &[F192; 8], r: F192) -> [F192; 8] {
-        // SAFETY: the function carries both features.
-        unsafe {
-            let (a, b) = (load(x0), load(x1));
-            let p = reduce_planes(mul(xor(a, b), splat(r)));
-            let mut out = [F192::ZERO; 8];
-            store(xor(a, p), &mut out);
-            out
-        }
-    }
-
-    #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn fold_lones_ext(x0: &[F192; 8], r: F192) -> [F192; 8] {
-        // SAFETY: the function carries both features.
-        unsafe {
-            let a = load(x0);
-            let p = reduce_planes(mul(a, splat(r)));
-            let mut out = [F192::ZERO; 8];
-            store(xor(a, p), &mut out);
-            out
-        }
-    }
-
-    #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn msg_terms_ext(x0: &[F192; 8], x1: &[F192; 8], y0: &[F192; 8], y1: &[F192; 8]) -> (Acc8, Acc8) {
-        // SAFETY: the function carries both features.
-        unsafe {
-            let (a0, a1, b0, b1) = (load(x0), load(x1), load(y0), load(y1));
-            (mul(a0, b0), mul(xor(a0, a1), xor(b0, b1)))
-        }
-    }
-
-    #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn dot_ext(x0: &[F192; 8], y0: &[F192; 8]) -> Acc8 {
-        // SAFETY: the function carries both features.
-        unsafe { mul(load(x0), load(y0)) }
-    }
-
-    #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn mul_base_splat(c: F192, k: &[F64; 8]) -> Acc8 {
-        // SAFETY: the function carries both features; eight words are one register.
-        unsafe { mul_base(splat(c), _mm512_loadu_si512(k.as_ptr().cast())) }
-    }
-
-    #[inline]
-    #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub unsafe fn reduce_each(acc: Acc8) -> [F192; 8] {
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    pub fn fold_pairs_ext(x0: &[F192; 8], x1: &[F192; 8], r: F192) -> [F192; 8] {
+        let (a, b) = (load_planes(x0), load_planes(x1));
+        let p = reduce_planes(mul(a + b, F192x8::splat(r)));
         let mut out = [F192::ZERO; 8];
-        // SAFETY: the function carries both features.
-        unsafe { store(reduce_planes(acc), &mut out) };
+        store_planes(a + p, &mut out);
+        out
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    pub fn fold_lones_ext(x0: &[F192; 8], r: F192) -> [F192; 8] {
+        let a = load_planes(x0);
+        let p = reduce_planes(mul(a, F192x8::splat(r)));
+        let mut out = [F192::ZERO; 8];
+        store_planes(a + p, &mut out);
+        out
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub fn msg_terms_ext(x0: &[F192; 8], x1: &[F192; 8], y0: &[F192; 8], y1: &[F192; 8]) -> (Acc8, Acc8) {
+        let (a0, a1, b0, b1) = (load_planes(x0), load_planes(x1), load_planes(y0), load_planes(y1));
+        (mul(a0, b0), mul(a0 + a1, b0 + b1))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub fn dot_ext(x0: &[F192; 8], y0: &[F192; 8]) -> Acc8 {
+        mul(load_planes(x0), load_planes(y0))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub fn mul_base_splat(c: F192, k: &[F64; 8]) -> Acc8 {
+        mul_base(F192x8::splat(c), load(k, 0))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub fn reduce_each(acc: Acc8) -> [F192; 8] {
+        let mut out = [F192::ZERO; 8];
+        store_planes(reduce_planes(acc), &mut out);
         out
     }
 }

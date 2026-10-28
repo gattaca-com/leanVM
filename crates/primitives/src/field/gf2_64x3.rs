@@ -744,15 +744,34 @@ pub mod x86_64 {
     /// `g(spill)` per top nibble `n` of a high word: `spill = n ^ n>>1 ^ n>>3` are the bits that
     /// `g(hi) = hi * (x^4 + x^3 + x + 1)` pushes past x^63, and `g(spill)` fits a byte.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    const G_SPILL: [u8; 16] = {
-        let mut table = [0u8; 16];
+    const G_SPILL: __m512i = {
+        let mut table = [0u8; 64];
         let mut n = 0;
         while n < 16 {
             let spill = n ^ (n >> 1) ^ (n >> 3);
+            // The table fills each 128-bit lane, as the in-lane byte shuffle reads it.
             table[n] = (spill ^ (spill << 1) ^ (spill << 3) ^ (spill << 4)) as u8;
+            table[16 + n] = table[n];
+            table[32 + n] = table[n];
+            table[48 + n] = table[n];
             n += 1;
         }
-        table
+        let mut words = [0u64; 8];
+        let mut w = 0;
+        while w < 8 {
+            words[w] = u64::from_le_bytes([
+                table[8 * w],
+                table[8 * w + 1],
+                table[8 * w + 2],
+                table[8 * w + 3],
+                table[8 * w + 4],
+                table[8 * w + 5],
+                table[8 * w + 6],
+                table[8 * w + 7],
+            ]);
+            w += 1;
+        }
+        crate::simd::from_words(words)
     };
 
     /// Lane-wise base reduction on eight qwords; see the four-qword version.
@@ -760,16 +779,11 @@ pub mod x86_64 {
     /// `lo ^ g(hi) ^ g(spill)`, with `g(y) = y ^ y<<1 ^ y<<3 ^ y<<4 = z ^ z<<3` for `z = y ^ y<<1`, and
     /// `g(spill)` one in-lane byte lookup on the top nibble of `hi`.
     ///
-    /// # Safety
-    ///
-    /// Requires the `avx512f` and `avx512bw` target features.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "avx512f", enable = "avx512bw")]
-    pub(crate) unsafe fn reduce_lanes512(lo: __m512i, hi: __m512i) -> __m512i {
-        // SAFETY: the table is sixteen bytes, one 128-bit load.
-        let table = _mm512_broadcast_i32x4(unsafe { _mm_loadu_si128(G_SPILL.as_ptr().cast()) });
-        let g_spill = _mm512_shuffle_epi8(table, _mm512_srli_epi64::<60>(hi));
+    pub(crate) fn reduce_lanes512(lo: __m512i, hi: __m512i) -> __m512i {
+        let g_spill = _mm512_shuffle_epi8(G_SPILL, _mm512_srli_epi64::<60>(hi));
         let z = _mm512_xor_si512(hi, _mm512_slli_epi64::<1>(hi));
         _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(lo, z, g_spill),
@@ -911,13 +925,9 @@ pub mod x86_64 {
     /// `a` lane `j` meets `k_2j` through `lo` and `k_2j+1` through `hi`.
     /// Returns the products of `(a_lo, a_hi)` by `k_2j`, then by `k_2j+1`.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    ///
-    /// # Safety
-    ///
-    /// Requires the `vpclmulqdq` and `avx512f` target features.
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx512f")]
-    pub(crate) unsafe fn mul_by_pairs(lo: __m512i, hi: __m512i, c2: __m512i, k: __m512i) -> [__m512i; 6] {
+    pub(crate) fn mul_by_pairs(lo: __m512i, hi: __m512i, c2: __m512i, k: __m512i) -> [__m512i; 6] {
         // Immediate bit 0 picks the qword of the first operand, bit 4 that of the second.
         [
             _mm512_clmulepi64_epi128::<0x00>(lo, k),
