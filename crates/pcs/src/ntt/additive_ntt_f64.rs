@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::ntt::encode::{Encoded, Encoder, Keep};
+    use crate::ntt::openings::Kept;
     use crate::ntt::facade::AdditiveNttF64;
     use crate::ntt::source::Source;
     use crate::ntt::stage::transpose_lane_major;
@@ -277,8 +278,11 @@ mod tests {
                 let mut positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
                 positions.sort_unstable();
                 let rows = match deep {
-                    Some(deep) if words.is_empty() => ntt.rebuild_rows(&msg, &repeats, n_lanes, &deep, &positions),
-                    Some(deep) => ntt.finish_rows(&words, &deep, &positions),
+                    Some(plan) if words.is_empty() => {
+                        let kept = Kept::Nothing { msg: &msg, repeats: &repeats, n_lanes, plan };
+                        ntt.openings().rows(kept, &positions)
+                    }
+                    Some(deep) => ntt.openings().rows(Kept::BeforeDeep { words: &words, plan: deep }, &positions),
                     None => {
                         assert_eq!(words, want, "codeword, {context}");
                         positions.iter().flat_map(|&q| words[q * row_words..][..row_words].iter().copied()).collect()
@@ -319,7 +323,7 @@ mod tests {
             let mut positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
             positions.sort_unstable();
             let rows = match deep {
-                Some(deep) => ntt.finish_rows(&got, &deep, &positions),
+                Some(deep) => ntt.openings().rows(Kept::BeforeDeep { words: &got, plan: deep }, &positions),
                 None => positions.iter().flat_map(|&q| got[q * lanes..][..lanes].iter().copied()).collect(),
             };
             for (&q, row) in positions.iter().zip(rows.chunks_exact(lanes)) {
@@ -350,7 +354,7 @@ mod tests {
             let mut positions: Vec<usize> = (0..60).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
             positions.extend_from_within(..5);
             positions.sort_unstable();
-            let rows = ntt.coset_rows(&msg, lanes, log_inv_rate, &positions);
+            let rows = ntt.openings().rows(Kept::Cosets { msg: &msg, row_words: lanes, log_inv_rate }, &positions);
             for (&q, row) in positions.iter().zip(rows.chunks_exact(lanes)) {
                 assert_eq!(row[..], want[q * lanes..][..lanes], "row {q}, log_rows={log_rows}, lanes={lanes}");
             }

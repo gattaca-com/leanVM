@@ -3,12 +3,33 @@
 use flux_profiler::timed;
 use primitives::field::F64;
 
-use super::facade::AdditiveNttF64;
-use super::scratch::with_scratch;
-use super::layers::no_hook;
+use super::cosets::CosetEncoder;
+use super::layers::{Layers, no_hook};
 use super::plan::Plan;
+use super::scratch::with_scratch;
 use super::source::Lanes;
 use super::stage::{BATCH, LOG_BATCH, Stage};
+
+/// What an encode kept of its codeword, for the openings to read rows from.
+///
+/// A codeword kept whole needs no layers: [`gather_rows`] reads it.
+pub enum Kept<'a> {
+    /// The buffer as the gathered passes left it: the deep layers run again on each row read.
+    BeforeDeep { words: &'a [F64], plan: Plan },
+    /// No buffer: each row is recomputed from the lane-major message, which `plan` says how to encode.
+    Nothing { msg: &'a [F64], repeats: &'a [bool], n_lanes: usize, plan: Plan },
+    /// A coset-major encode: each row is recomputed from the message, coset by coset.
+    Cosets { msg: &'a [F64], row_words: usize, log_inv_rate: usize },
+}
+
+/// The rows at the sorted `positions` of a codeword kept whole, `row_words` words each, back to back.
+pub fn gather_rows(words: &[F64], row_words: usize, positions: &[usize]) -> Vec<F64> {
+    let mut out = Vec::with_capacity(positions.len() * row_words);
+    for &q in positions {
+        out.extend_from_slice(&words[q * row_words..][..row_words]);
+    }
+    out
+}
 
 /// The rows at the sorted `positions`, `n` words each, back to back.
 ///
@@ -45,30 +66,38 @@ pub(super) fn built_rows(
     out
 }
 
-impl AdditiveNttF64 {
-    /// Codeword rows `positions` (sorted) of a buffer left by [`Self::encode_interleaved_with`] with `defer_deep`,
-    /// back to back.
-    pub fn finish_rows(&self, data: &[F64], deep: &Plan, positions: &[usize]) -> Vec<F64> {
-        let sub_len = deep.sub_len();
-        self.finished_rows(deep, positions, |_, sub| &data[sub * sub_len..][..sub_len])
+/// Codeword rows of an encode that left rows out of its codeword.
+///
+/// - It owns the [`Layers`] that finish a deep sub-block or rebuild a coset.
+/// - [`Openings::rows`] says which rows are read, and [`Kept`] says what the encode left to read them from.
+pub struct Openings<'t> {
+    layers: Layers<'t>,
+}
+
+impl<'t> Openings<'t> {
+    pub(super) fn new(layers: Layers<'t>) -> Self {
+        Self { layers }
     }
 
-    /// Codeword rows `positions` (sorted) of an encode that kept no buffer, recomputed from its lane-major message,
-    /// back to back.
-    pub fn rebuild_rows(
-        &self,
-        msg: &[F64],
-        repeats: &[bool],
-        n_lanes: usize,
-        deep: &Plan,
-        positions: &[usize],
-    ) -> Vec<F64> {
-        let log_sub = deep.log_d - deep.deep_start;
-        let mut subs: Vec<usize> = positions.iter().map(|q| q >> log_sub).collect();
-        subs.dedup();
-        let built = self.rebuild_sub_blocks(msg, repeats, n_lanes, deep, &subs);
-        let sub_len = deep.sub_len();
-        self.finished_rows(deep, positions, |i, _| &built[i * sub_len..][..sub_len])
+    /// The rows at the sorted `positions`, back to back, each as the words of one codeword row.
+    pub fn rows(&self, kept: Kept<'_>, positions: &[usize]) -> Vec<F64> {
+        match kept {
+            Kept::BeforeDeep { words, plan } => {
+                let sub_len = plan.sub_len();
+                self.finished_rows(&plan, positions, |_, sub| &words[sub * sub_len..][..sub_len])
+            }
+            Kept::Nothing { msg, repeats, n_lanes, plan } => {
+                let log_sub = plan.log_d - plan.deep_start;
+                let mut subs: Vec<usize> = positions.iter().map(|q| q >> log_sub).collect();
+                subs.dedup();
+                let built = Rebuild::new(&plan, Lanes { words: msg, repeats, n_lanes }, &subs).run(self.layers);
+                let sub_len = plan.sub_len();
+                self.finished_rows(&plan, positions, |i, _| &built[i * sub_len..][..sub_len])
+            }
+            Kept::Cosets { msg, row_words, log_inv_rate } => {
+                CosetEncoder::new(self.layers, msg.len(), row_words, log_inv_rate).rows(msg, positions)
+            }
+        }
     }
 
     /// The rows at `positions` (sorted), back to back, from the sub-blocks before their deep layers.
@@ -77,58 +106,69 @@ impl AdditiveNttF64 {
     /// scratch, so only the queried rows are written.
     fn finished_rows<'a>(
         &self,
-        deep: &Plan,
+        plan: &Plan,
         positions: &[usize],
         src: impl Fn(usize, usize) -> &'a [F64] + Sync,
     ) -> Vec<F64> {
-        let Plan { log_d, num_ntts, deep_start, .. } = *deep;
-        let layers = self.layers();
+        let Plan { log_d, num_ntts, deep_start, .. } = *plan;
+        let layers = self.layers;
         built_rows(num_ntts, log_d - deep_start, positions, |i, sub_idx, sub| {
             let src = Some(src(i, sub_idx));
             layers.run(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
         })
     }
+}
 
-    /// The deep sub-blocks `subs` (sorted, distinct) of an encode that kept no buffer, back to back, before their deep layers.
-    ///
-    /// - The encode ran one gathered pass over its lane-major message: a group is one residue of one coset,
-    ///   and its transform leaves row `i` of the group as row `r` of sub-block `coset << g | i`, `g` layers deep.
-    /// - So each group transforms again here, skipping the blocks that feed no row of `subs`,
-    ///   and keeps only the rows that fall in a sub-block of `subs`.
-    /// - Those rows are every word of the sub-blocks before their deep layers, which [`Self::rebuild_rows`] runs.
+/// The re-run of the gathered pass of an encode that kept no buffer, for the sub-blocks a query reads.
+///
+/// - The encode ran one gathered pass over its lane-major message: a group is one residue of one coset,
+///   and its transform leaves row `i` of the group as row `r` of sub-block `coset << g | i`, `g` layers deep.
+/// - So each group transforms again here, skipping the blocks that feed no row of the sub-blocks,
+///   and keeps only the rows that fall in one of them.
+/// - It owns the [`Stage`] of that pass and, per coset with queried sub-blocks, the rows it keeps.
+struct Rebuild<'a> {
+    plan: Plan,
+    lanes: Lanes<'a>,
+    stage: Stage,
+    /// Each coset with queried sub-blocks: its index, those sub-blocks' places in `subs`, and their group rows.
+    cosets: Vec<(usize, std::ops::Range<usize>, Vec<usize>)>,
+    n_subs: usize,
+}
+
+impl<'a> Rebuild<'a> {
+    /// The rebuild of the deep sub-blocks `subs` (sorted, distinct).
     ///
     /// # Panics
     ///
     /// Panics unless the encode had the plan this reads back: one lane-major gathered pass.
-    #[timed]
-    fn rebuild_sub_blocks(
-        &self,
-        msg: &[F64],
-        repeats: &[bool],
-        n_lanes: usize,
-        deep: &Plan,
-        subs: &[usize],
-    ) -> Vec<F64> {
-        let Plan { log_d, num_ntts, start, deep_start, .. } = *deep;
+    fn new(plan: &Plan, lanes: Lanes<'a>, subs: &[usize]) -> Self {
+        let Plan { log_d, num_ntts, start, deep_start, .. } = *plan;
         let g = deep_start - start;
         let (rows, log_step) = (1usize << g, log_d - deep_start);
-        let (sub_len, msg_rows) = (deep.sub_len(), 1usize << (log_d - start));
-        assert!(deep.single_gathered_pass(), "one gathered pass");
+        let msg_rows = 1usize << (log_d - start);
+        assert!(plan.single_gathered_pass(), "one gathered pass");
         assert!(num_ntts.is_multiple_of(8) && log_step >= LOG_BATCH, "the gathered pass is lane-major");
-        assert_eq!(msg.len(), n_lanes * msg_rows);
-        // Each coset with queried sub-blocks: its index, those sub-blocks' places in `subs`, and their group rows.
+        assert_eq!(lanes.words.len(), lanes.n_lanes * msg_rows);
         let mut next = 0;
-        let cosets: Vec<(usize, std::ops::Range<usize>, Vec<usize>)> = subs
+        let cosets = subs
             .chunk_by(|a, b| a >> g == b >> g)
             .map(|run| {
                 next += run.len();
                 (run[0] >> g, next - run.len()..next, run.iter().map(|sub| sub & (rows - 1)).collect())
             })
             .collect();
-        let staging = Stage::new(&Lanes { words: msg, repeats, n_lanes }, log_step, rows, msg_rows, num_ntts, 1);
-        let layers = self.layers();
+        let stage = Stage::new(&lanes, log_step, rows, msg_rows, num_ntts, 1);
+        Self { plan: *plan, lanes, stage, cosets, n_subs: subs.len() }
+    }
+
+    /// The sub-blocks back to back, before their deep layers.
+    #[timed]
+    fn run(&self, layers: Layers) -> Vec<F64> {
+        let Plan { log_d, num_ntts, start, deep_start, .. } = self.plan;
+        let (rows, log_step) = (1usize << (deep_start - start), log_d - deep_start);
+        let sub_len = self.plan.sub_len();
         // A group writes row `r` of every queried sub-block, and the groups cover every residue `r`.
-        primitives::filled_vec(subs.len() * sub_len, |built| {
+        primitives::filled_vec(self.n_subs * sub_len, |built| {
             let out = parallel::SendPtr(built.as_mut_ptr());
             parallel::for_each_chunk((1usize << log_step) / BATCH, |lo, hi| {
                 // One octet of lanes of a batch of residues is 64 lanes of one transform.
@@ -139,8 +179,8 @@ impl AdditiveNttF64 {
                     let (stage, scratch) = all.split_at_mut(stage_len);
                     for t in lo..hi {
                         for octet in 0..num_ntts / 8 {
-                            staging.fill(stage, msg, t * BATCH, octet);
-                            for (coset, run, live) in &cosets {
+                            self.stage.fill(stage, self.lanes.words, t * BATCH, octet);
+                            for (coset, run, live) in &self.cosets {
                                 let live_rows = Some(&live[..]);
                                 layers.run(
                                     scratch,

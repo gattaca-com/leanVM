@@ -6,9 +6,8 @@ use primitives::log2_strict_usize;
 use super::encode::RowSink;
 use super::layers::{Layers, no_hook};
 use super::plan::L2_WORDS;
-use super::rows::built_rows;
+use super::openings::built_rows;
 use super::scratch::with_scratch;
-use super::twiddles::Twiddles;
 
 /// The coset-major encode of a codeword that is `2^r` cosets, each a transform of one copy of the message.
 ///
@@ -25,11 +24,11 @@ pub(super) struct CosetEncoder<'t> {
 
 impl<'t> CosetEncoder<'t> {
     /// The encode of a message of `msg_words` words, `num_ntts` a row.
-    pub(super) fn new(twiddles: &'t Twiddles, msg_words: usize, num_ntts: usize, log_inv_rate: usize) -> Self {
+    pub(super) fn new(layers: Layers<'t>, msg_words: usize, num_ntts: usize, log_inv_rate: usize) -> Self {
         assert!(num_ntts > 0 && msg_words.is_multiple_of(num_ntts));
         let log_d = log2_strict_usize(msg_words / num_ntts) + log_inv_rate;
-        assert!(log_d <= twiddles.log_domain_size());
-        Self { layers: Layers::new(twiddles), log_d, num_ntts, log_inv_rate }
+        assert!(log_d <= layers.log_domain_size());
+        Self { layers, log_d, num_ntts, log_inv_rate }
     }
 
     /// Whether a message of `msg_words` words encodes coset by coset: one coset fits the cache budget [`COSET_WORDS`].

@@ -5,7 +5,7 @@ use primitives::field::F64;
 use primitives::log2_strict_usize;
 
 #[cfg(doc)]
-use super::facade::AdditiveNttF64;
+use super::openings::Openings;
 use super::deep::DeepPass;
 use super::gathered::GatheredPass;
 use super::layers::Layers;
@@ -28,9 +28,9 @@ pub enum Keep {
     /// All of it: the deep pass is written back.
     Whole,
     /// The buffer as the gathered passes leave it.
-    /// [`AdditiveNttF64::finish_rows`] runs the deep pass again on a row read.
+    /// [`Openings::rows`] runs the deep pass again on a row read.
     BeforeDeep,
-    /// None of it, if the plan allows: [`AdditiveNttF64::rebuild_rows`] recomputes a row from the message.
+    /// None of it, if the plan allows: [`Openings::rows`] recomputes a row from the message.
     Nothing,
 }
 
@@ -124,7 +124,7 @@ impl<'t> Encoder<'t> {
     /// - With `defer_deep`, the deep pass is not written back: each deep sub-block is finished in scratch
     ///   and handed to `on_rows` from there.
     /// - The buffer then keeps what the gathered passes left.
-    ///   [`AdditiveNttF64::finish_rows`] finishes any row again.
+    ///   [`Openings::rows`] finishes any row again.
     /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
     ///
     /// # Panics

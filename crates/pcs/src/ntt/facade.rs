@@ -5,6 +5,9 @@ use primitives::field::F64;
 use super::cosets::CosetEncoder;
 use super::encode::{Encoded, Encoder, Keep, RowSink};
 use super::layers::Layers;
+#[cfg(doc)]
+use super::openings::Kept;
+use super::openings::Openings;
 use super::plan::Plan;
 use super::twiddles::Twiddles;
 
@@ -84,7 +87,8 @@ impl AdditiveNttF64 {
     /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.
     ///
     /// - The result equals encoding in place, and the codeword may start uninitialized.
-    /// - With `defer_deep`, the deep pass is not written back, and [`Self::finish_rows`] finishes any row again.
+    /// - With `defer_deep`, the deep pass is not written back.
+    ///   [`Openings::rows`] with [`Kept::BeforeDeep`] finishes any row again.
     /// - With no separate deep pass in the plan, the buffer is the whole codeword and this returns `None`.
     ///
     /// # Panics
@@ -107,18 +111,18 @@ impl AdditiveNttF64 {
     ///
     /// - The codeword is `2^r` cosets, each an independent transform of one copy of the message, from layer `r` on.
     /// - A task builds each of its cosets in scratch and hashes it there, so no codeword is ever written.
-    /// - [`Self::coset_rows`] recomputes any row from the message.
+    /// - [`Openings::rows`] with [`Kept::Cosets`] recomputes any row from the message.
     ///
     /// Use it when [`Self::encodes_by_coset`] holds: the scratch is then cache-resident.
     #[inline]
     pub fn encode_cosets(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, on_rows: &RowSink<'_>) {
-        CosetEncoder::new(&self.tw, msg.len(), num_ntts, log_inv_rate).encode(msg, on_rows)
+        CosetEncoder::new(self.layers(), msg.len(), num_ntts, log_inv_rate).encode(msg, on_rows)
     }
 
-    /// Codeword rows `positions` (sorted) of the encode [`Self::encode_cosets`] ran, back to back.
+    /// The reads of codeword rows that an encode left out of its codeword.
     #[inline]
-    pub fn coset_rows(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, positions: &[usize]) -> Vec<F64> {
-        CosetEncoder::new(&self.tw, msg.len(), num_ntts, log_inv_rate).rows(msg, positions)
+    pub fn openings(&self) -> Openings<'_> {
+        Openings::new(self.layers())
     }
 
     /// Whether a message of `msg_words` words encodes coset by coset: one coset fits the cache budget.

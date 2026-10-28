@@ -22,7 +22,7 @@
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
 use crate::merkle::{self, Hash};
-use crate::ntt::{AdditiveNttF64, Encoded, Keep, Plan};
+use crate::ntt::{AdditiveNttF64, Encoded, Keep, Kept, Plan, gather_rows};
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use flux_profiler::timed;
@@ -162,8 +162,14 @@ impl L0Codeword<'_> {
     /// The rows at the sorted `positions`, `row_words` words each, back to back.
     fn rows(&self, positions: &[usize]) -> Vec<F64> {
         match self.deep {
-            Some((ntt, deep)) if self.words.is_empty() => ntt.rebuild_rows(self.stack, self.repeats, self.n_lanes, deep, positions),
-            Some((ntt, deep)) => ntt.finish_rows(self.words, deep, positions),
+            Some((ntt, plan)) => {
+                let kept = if self.words.is_empty() {
+                    Kept::Nothing { msg: self.stack, repeats: self.repeats, n_lanes: self.n_lanes, plan: *plan }
+                } else {
+                    Kept::BeforeDeep { words: self.words, plan: *plan }
+                };
+                ntt.openings().rows(kept, positions)
+            }
             None => gather_rows(self.words, self.row_words, positions),
         }
     }
@@ -282,9 +288,12 @@ impl LigeroWitness {
     fn opened_words(&self, positions: &[usize]) -> Vec<F64> {
         let row_words = 3 * self.num_interleaved;
         match &self.deferred {
-            Some(Deferred::Deep(ntt, deep)) => ntt.finish_rows(words(&self.mat), deep, positions),
+            Some(Deferred::Deep(ntt, plan)) => {
+                ntt.openings().rows(Kept::BeforeDeep { words: words(&self.mat), plan: *plan }, positions)
+            }
             Some(Deferred::Cosets(ntt, log_inv_rate)) => {
-                ntt.coset_rows(words(&self.mat), row_words, *log_inv_rate, positions)
+                let kept = Kept::Cosets { msg: words(&self.mat), row_words, log_inv_rate: *log_inv_rate };
+                ntt.openings().rows(kept, positions)
             }
             None => gather_rows(words(&self.mat), row_words, positions),
         }
@@ -1310,15 +1319,6 @@ fn send_ood(sc: &mut SumcheckProver, ps: &mut ProverState, n_vars: usize, count:
         ps.add_scalar(y);
         send_msg(ps, intro, y);
     }
-}
-
-/// The rows at the sorted `positions` of `words`, `row_words` each, back to back.
-fn gather_rows(words: &[F64], row_words: usize, positions: &[usize]) -> Vec<F64> {
-    let mut out = Vec::with_capacity(positions.len() * row_words);
-    for &q in positions {
-        out.extend_from_slice(&words[q * row_words..][..row_words]);
-    }
-    out
 }
 
 /// The row at position `q` out of `rows`, `row_words` each, back to back, which hold the sorted `group` positions.
