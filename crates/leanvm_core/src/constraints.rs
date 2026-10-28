@@ -381,6 +381,45 @@ fn over_passes(range: std::ops::Range<usize>, n: usize, passes: usize) -> impl I
     (0..passes).flat_map(move |p| range.clone().map(move |b| b + p * n))
 }
 
+/// What the columns hand each task of a pass: its `range` of their first `n` blocks and, with
+/// `passes == 2`, of their next `n`. Task-major, so a task's columns are consecutive, and the width.
+fn task_parts<'a>(
+    cols: impl Iterator<Item = &'a mut [F192x8]>,
+    n: usize,
+    passes: usize,
+) -> (Vec<&'a mut [F192x8]>, Vec<&'a mut [F192x8]>, usize) {
+    let (mut firsts, mut seconds) = (Vec::new(), Vec::new());
+    for col in cols {
+        let (first, second) = if passes == 2 { col.split_at_mut(n) } else { (col, &mut [][..]) };
+        firsts.push(first.chunks_mut(TASK_BLOCKS));
+        seconds.push(second.chunks_mut(TASK_BLOCKS));
+    }
+    let (width, tasks) = (firsts.len(), n.div_ceil(TASK_BLOCKS));
+    let (mut first, mut second) = (Vec::with_capacity(tasks * width), Vec::new());
+    for _ in 0..tasks {
+        first.extend(firsts.iter_mut().filter_map(Iterator::next));
+        if passes == 2 {
+            second.extend(seconds.iter_mut().filter_map(Iterator::next));
+        }
+    }
+    (first, second, width)
+}
+
+/// Block `j` of column `c`, as a task with blocks from `start` holds it: `n` blocks per pass, `first` and `second`.
+fn block_mut<'p>(
+    first: &'p mut [&mut [F192x8]],
+    second: &'p mut [&mut [F192x8]],
+    (n, start): (usize, usize),
+    c: usize,
+    j: usize,
+) -> &'p mut F192x8 {
+    if j < n {
+        &mut first[c][j - start]
+    } else {
+        &mut second[c][j - n - start]
+    }
+}
+
 fn xor2(a: [Prod8; 2], b: [Prod8; 2]) -> [Prod8; 2] {
     [a[0] ^ b[0], a[1] ^ b[1]]
 }
@@ -511,17 +550,7 @@ fn join(
         return (state, None);
     }
     let (blocks, width) = (half / 8, form.width());
-    // SAFETY: the pass below writes every block of every entry.
-    let mut state: Vec<Col> = (0..width)
-        .map(|c| {
-            if c == 0 && !with_lin {
-                Vec::new()
-            } else {
-                unsafe { primitives::uninit_vec(blocks) }
-            }
-        })
-        .collect();
-    let out: Vec<_> = state.iter_mut().map(|c| parallel::SendPtr(c.as_mut_ptr())).collect();
+    let skip = usize::from(!with_lin);
     let pair = |terms: &Lin| -> Vec<_> {
         terms
             .iter()
@@ -534,41 +563,47 @@ fn join(
     );
     let r8 = F192x8::splat(r);
     let (n, passes) = if next.is_some() { (blocks / 2, 2) } else { (blocks, 1) };
-    let acc = parallel::map_reduce_with_state(
-        n.div_ceil(TASK_BLOCKS),
-        || rows_scratch(cols.len()),
-        || [Prod8::ZERO; 2],
-        |rows, acc, t| {
-            let range = task_blocks(t, n);
-            for j in over_passes(range.clone(), n, passes) {
-                load_rows(cols, form.read(with_lin), 8 * j, half, false, rows);
-                let (lo, sum) = &*rows;
-                let dot = |terms: &[(usize, F192x8, F192x8)]| {
-                    terms
-                        .iter()
-                        .fold(Prod8::ZERO, |acc, &(c, w, wr)| {
-                            acc ^ w.mul_base_unreduced(lo[c]) ^ wr.mul_base_unreduced(sum[c])
-                        })
-                        .reduce_lanes()
-                };
-                // SAFETY: block `j` of an entry is written by the task that owns it, and by no other.
-                let put = |c: usize, v: F192x8| unsafe { *out[c].add(j) = v };
-                if with_lin {
-                    put(0, dot(&lin));
+    let mut acc = [Prod8::ZERO; 2];
+    // The pass writes every block of every entry.
+    let state: Vec<Col> = primitives::filled_cols((0..width).map(|c| if c < skip { 0 } else { blocks }), |outs| {
+        let (mut first, mut second, parts) = task_parts(outs[skip..].iter_mut().map(|c| &mut **c), n, passes);
+        let parts = parts.max(1);
+        acc = parallel::map_reduce_chunks_mut(
+            [&mut first[..], &mut second[..]],
+            [parts; 2],
+            || rows_scratch(cols.len()),
+            || [Prod8::ZERO; 2],
+            |rows, acc, t, [first, second]| {
+                let range = task_blocks(t, n);
+                let (start, at) = (range.start, (n, range.start));
+                for j in over_passes(range.clone(), n, passes) {
+                    load_rows(cols, form.read(with_lin), 8 * j, half, false, rows);
+                    let (lo, sum) = &*rows;
+                    let dot = |terms: &[(usize, F192x8, F192x8)]| {
+                        terms
+                            .iter()
+                            .fold(Prod8::ZERO, |acc, &(c, w, wr)| {
+                                acc ^ w.mul_base_unreduced(lo[c]) ^ wr.mul_base_unreduced(sum[c])
+                            })
+                            .reduce_lanes()
+                    };
+                    let mut put = |c: usize, v: F192x8| *block_mut(first, second, at, c - skip, j) = v;
+                    if with_lin {
+                        put(0, dot(&lin));
+                    }
+                    for (g, ((left, _), right)) in form.groups.iter().zip(&rights).enumerate() {
+                        put(1 + 2 * g, F192x8::from(lo[*left]) + r8.mul_base_unreduced(sum[*left]).reduce_lanes());
+                        put(2 + 2 * g, dot(right));
+                    }
                 }
-                for (g, ((left, _), right)) in form.groups.iter().zip(&rights).enumerate() {
-                    put(1 + 2 * g, F192x8::from(lo[*left]) + r8.mul_base_unreduced(sum[*left]).reduce_lanes());
-                    put(2 + 2 * g, dot(right));
+                if let Some((eqr, at_one)) = next {
+                    let col = |c: usize, b: usize| [first[c - skip][b - start], second[c - skip][b - start]];
+                    *acc = xor2(*acc, message_blocks(form, with_lin, at_one, eqr, range, col));
                 }
-            }
-            if let Some((eqr, at_one)) = next {
-                // SAFETY: both blocks of each pair were written above, by this task.
-                let col = |c: usize, b: usize| unsafe { [*out[c].add(b), *out[c].add(b + n)] };
-                *acc = xor2(*acc, message_blocks(form, with_lin, at_one, eqr, range, col));
-            }
-        },
-        xor2,
-    );
+            },
+            xor2,
+        );
+    });
     (state, next.map(|_| finish(acc, form.constant)))
 }
 
@@ -583,26 +618,31 @@ fn fold_state(form: &Form, state: &mut [Col], r: F192, half: usize, next: Next) 
         return None;
     }
     let (blocks, r8, with_lin) = (half / 8, F192x8::splat(r), !state[0].is_empty());
-    let ptrs: Vec<_> = state.iter_mut().map(|c| parallel::SendPtr(c.as_mut_ptr())).collect();
+    let skip = usize::from(!with_lin);
+    let (mut lows, mut highs) = (Vec::with_capacity(state.len()), Vec::with_capacity(state.len()));
+    for col in &mut state[skip..] {
+        let (low, high) = col.split_at_mut(blocks);
+        lows.push(low);
+        highs.push(&*high);
+    }
     let (n, passes) = if next.is_some() { (blocks / 2, 2) } else { (blocks, 1) };
-    let acc = parallel::fold_reduce(
-        n.div_ceil(TASK_BLOCKS),
+    let (mut first, mut second, parts) = task_parts(lows.iter_mut().map(|c| &mut **c), n, passes);
+    let acc = parallel::map_reduce_chunks_mut(
+        [&mut first[..], &mut second[..]],
+        [parts.max(1); 2],
+        || (),
         || [Prod8::ZERO; 2],
-        |acc, t| {
+        |(), acc, t, [first, second]| {
             let range = task_blocks(t, n);
-            for col in ptrs.iter().skip(usize::from(!with_lin)) {
+            let (start, at) = (range.start, (n, range.start));
+            for (c, high) in highs.iter().enumerate() {
                 for j in over_passes(range.clone(), n, passes) {
-                    // SAFETY: the task folds the blocks `j` of its range, no other task touches them,
-                    // and the upper half is only read.
-                    unsafe {
-                        let (lo, hi) = (*col.add(j), *col.add(j + blocks));
-                        *col.add(j) = lo + (lo + hi) * r8;
-                    }
+                    let lo = block_mut(first, second, at, c, j);
+                    *lo = *lo + (*lo + high[j]) * r8;
                 }
             }
             if let Some((eqr, at_one)) = next {
-                // SAFETY: the blocks were folded above, by this task.
-                let col = |c: usize, b: usize| unsafe { [*ptrs[c].add(b), *ptrs[c].add(b + n)] };
+                let col = |c: usize, b: usize| [first[c - skip][b - start], second[c - skip][b - start]];
                 *acc = xor2(*acc, message_blocks(form, with_lin, at_one, eqr, range, col));
             }
         },
