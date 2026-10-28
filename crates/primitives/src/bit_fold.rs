@@ -303,6 +303,7 @@ pub mod gfni {
     #[cfg(not(target_feature = "vpclmulqdq"))]
     use super::x8_from_values;
     use super::{BLOCK, F192, F192x8, lane_value};
+    use crate::simd::{self, from_words, xor};
 
     /// Bytes of an F192.
     pub const OUT_BYTES: usize = 24;
@@ -332,22 +333,14 @@ pub mod gfni {
             }
         }
 
-        #[inline(always)]
+        #[inline]
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
         fn apply<const N: usize>(&self, zbit: usize, regs: &mut [__m512i; N]) {
-            // SAFETY: both index arrays are 64 bytes.
-            let (lo, hi) = unsafe {
-                (
-                    _mm512_loadu_si512(self.lo.as_ptr().cast()),
-                    _mm512_loadu_si512(self.hi.as_ptr().cast()),
-                )
-            };
+            let (lo, hi) = (simd::load(&self.lo, 0), simd::load(&self.hi, 0));
             for z in (0..N).filter(|z| z & zbit == 0) {
                 let (u, w) = (regs[z], regs[z | zbit]);
-                // SAFETY: the module is compiled only with these target features enabled.
-                unsafe {
-                    regs[z] = _mm512_permutex2var_epi8(u, lo, w);
-                    regs[z | zbit] = _mm512_permutex2var_epi8(u, hi, w);
-                }
+                regs[z] = _mm512_permutex2var_epi8(u, lo, w);
+                regs[z | zbit] = _mm512_permutex2var_epi8(u, hi, w);
             }
         }
     }
@@ -375,7 +368,8 @@ pub mod gfni {
     fn coefficients<const G: usize>(acc: &[__m512i; OUT_BYTES]) -> [[__m512i; 8]; 3] {
         let mut c: [[__m512i; 8]; 3] = std::array::from_fn(|i| std::array::from_fn(|o| acc[8 * i + o]));
         for (s, stage) in OUTPUT_STAGES[G].iter().enumerate() {
-            c.iter_mut().for_each(|c| stage.apply(1 << s, c));
+            // SAFETY: the module is compiled only with these target features enabled.
+            c.iter_mut().for_each(|c| unsafe { stage.apply(1 << s, c) });
         }
         c
     }
@@ -386,7 +380,7 @@ pub mod gfni {
     ///
     /// The CPU must have the target features this function enables.
     #[inline]
-    #[target_feature(enable = "avx512f", enable = "avx512vbmi")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
     pub fn store_f192(acc: &[__m512i; OUT_BYTES], out: &mut [F192; BLOCK]) {
         let [c0, c1, c2] = coefficients::<0>(acc);
 
@@ -408,13 +402,11 @@ pub mod gfni {
             _mm512_setr_epi64(0, 5, 0, 0, 6, 0, 0, 7),
         ];
         let mask2: [__mmask8; 3] = [0b0010_0100, 0b0100_1001, 0b1001_0010];
-        let dst = out.as_mut_ptr().cast::<u8>();
-        for k in 0..8 {
+        for (k, group) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
             for i in 0..3 {
                 let v = _mm512_permutex2var_epi64(c0[k], idx01[i], c1[k]);
                 let v = _mm512_mask_permutexvar_epi64(v, mask2[i], idx2[i], c2[k]);
-                // SAFETY: the three stores of value group k cover out[8k..8k+8], 192 bytes.
-                unsafe { _mm512_storeu_si512(dst.add(192 * k + 64 * i).cast(), v) };
+                simd::store(group, i, v);
             }
         }
     }
@@ -460,29 +452,22 @@ pub mod gfni {
     ///
     /// The CPU must have the target features this function enables.
     #[inline]
-    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "gfni")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
     pub fn weight_matrices(w: &[F192; 8]) -> [u64; OUT_BYTES] {
-        let src = w.as_ptr().cast::<u8>();
-        // SAFETY: eight weights are 192 bytes, exactly three registers.
-        let v: [__m512i; 3] = std::array::from_fn(|i| unsafe { _mm512_loadu_si512(src.add(64 * i).cast()) });
+        let v: [__m512i; 3] = std::array::from_fn(|i| simd::load(w, i));
         // Byte t of each qword is the unit vector 1 << (7 - t).
         let reversed_identity = _mm512_set1_epi64(0x0102_0408_1020_4080);
         let mut out = [0u64; OUT_BYTES];
-        let dst = out.as_mut_ptr().cast::<u8>();
         for (g, (lo, hi, mask)) in GATHER.iter().enumerate() {
-            // SAFETY: the index arrays are 64 bytes, and store g fills out[8g..8g+8].
-            unsafe {
-                let q = _mm512_permutex2var_epi8(v[0], _mm512_loadu_si512(lo.as_ptr().cast()), v[1]);
-                let q = _mm512_mask_permutexvar_epi8(q, *mask, _mm512_loadu_si512(hi.as_ptr().cast()), v[2]);
-                let a = _mm512_gf2p8affine_epi64_epi8::<0>(reversed_identity, q);
-                _mm512_storeu_si512(dst.add(64 * g).cast(), a);
-            }
+            let q = _mm512_permutex2var_epi8(v[0], simd::load(lo, 0), v[1]);
+            let q = _mm512_mask_permutexvar_epi8(q, *mask, simd::load(hi, 0), v[2]);
+            simd::store(&mut out, g, _mm512_gf2p8affine_epi64_epi8::<0>(reversed_identity, q));
         }
         out
     }
 
     /// The stages `first..first + log2(TILE)` of the input transpose of `CHUNKS`-byte rows, one tile of `TILE` registers
-    /// at a time: register `r` is read through `load` and written to `dst`.
+    /// at a time: register `r` is read through `load` and written back to `regs`.
     ///
     /// A stage swaps offset bit `s` with register bit `s + skew`, so a group of stages exchanges within the tiles
     /// of registers that differ only in that group's register bits.
@@ -500,11 +485,12 @@ pub mod gfni {
             let base = ((t >> low) << (low + bits)) | (t & ((1 << low) - 1));
             let mut tile: [__m512i; TILE] = std::array::from_fn(|k| load(base | k << low));
             for i in 0..bits {
-                input[first + i].apply(1 << i, &mut tile);
+                // SAFETY: the module is compiled only with these target features enabled.
+                unsafe { input[first + i].apply(1 << i, &mut tile) };
             }
             for (k, r) in tile.into_iter().enumerate() {
                 // SAFETY: every register index is below CHUNKS, and `dst` holds CHUNKS registers.
-                unsafe { _mm512_store_si512(dst.add(base | k << low).cast(), r) };
+                unsafe { dst.add(base | k << low).write(r) };
             }
         }
     }
@@ -513,26 +499,24 @@ pub mod gfni {
     ///
     /// With `PREFETCH`, `next` is the block that follows, and its cache lines load two per input register pair.
     /// The pass is affine-bound, so the next block's fetch hides behind it, where a burst before the pass stalled.
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
     fn accumulate_into<const N: usize, const PREFETCH: bool>(
         acc: &mut [__m512i; OUT_BYTES],
         regs: &[__m512i; N],
         matrices: &[[u64; OUT_BYTES]; N],
         next: *const u8,
     ) {
-        // SAFETY: the module is compiled only with these target features enabled.
-        unsafe {
-            for (i, (pair, m)) in regs.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0).enumerate() {
-                if PREFETCH {
-                    // A prefetch past the end of the data is harmless.
-                    _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i).cast());
-                    _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i + 64).cast());
-                }
-                for o in 0..OUT_BYTES {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[0], _mm512_set1_epi64(m[0][o] as i64));
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[1], _mm512_set1_epi64(m[1][o] as i64));
-                    acc[o] = _mm512_ternarylogic_epi64::<0x96>(acc[o], g0, g1);
-                }
+        for (i, (pair, m)) in regs.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0).enumerate() {
+            if PREFETCH {
+                // A prefetch past the end of the data is harmless.
+                _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i).cast());
+                _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i + 64).cast());
+            }
+            for o in 0..OUT_BYTES {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[0], _mm512_set1_epi64(m[0][o] as i64));
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(pair[1], _mm512_set1_epi64(m[1][o] as i64));
+                acc[o] = _mm512_ternarylogic_epi64::<0x96>(acc[o], g0, g1);
             }
         }
     }
@@ -573,12 +557,7 @@ pub mod gfni {
     /// The matrices of every byte of a row's weights, as [`weight_matrices`] gives them.
     pub fn byte_matrices(weights: &[F192]) -> Vec<[u64; OUT_BYTES]> {
         // SAFETY: the module is compiled only with these target features enabled.
-        weights
-            .as_chunks()
-            .0
-            .iter()
-            .map(|w| unsafe { weight_matrices(w) })
-            .collect()
+        weights.as_chunks().0.iter().map(|w| unsafe { weight_matrices(w) }).collect()
     }
 
     /// 64 lines of 64 bytes, transposed: register `j` holds byte `j` of every line, one line per byte of the register.
@@ -590,13 +569,11 @@ pub mod gfni {
     impl Default for LineRegs {
         /// Registers to be [`load`](LineRegs::load)ed.
         fn default() -> Self {
-            // SAFETY: the module is compiled only with these target features enabled.
-            Self(unsafe { [_mm512_setzero_si512(); 64] })
+            Self([from_words([0; 8]); 64])
         }
     }
 
     impl LineRegs {
-
         #[cfg(test)]
         pub(super) fn registers(&self) -> &[__m512i; 64] {
             &self.0
@@ -609,13 +586,12 @@ pub mod gfni {
         /// the second leaves it, so the transpose needs no scratch to stay in the L1.
         #[inline(always)]
         pub fn load(&mut self, lines: [&[u8; 64]; 64]) {
-            let dst = self.0.as_mut_ptr();
-            // SAFETY: a line is 64 bytes, and `dst` holds 64 registers.
-            unsafe {
+            #[inline]
+            #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+            fn transpose(regs: &mut [__m512i; 64], lines: [&[u8; 64]; 64]) {
                 // Register bit `s` against the offset bits inside a 128-bit lane, 16 registers at a time.
                 for t in 0..4 {
-                    let mut x: [__m512i; 16] =
-                        std::array::from_fn(|k| _mm512_loadu_si512(lines[16 * t + k].as_ptr().cast()));
+                    let mut x: [__m512i; 16] = std::array::from_fn(|k| simd::load(lines[16 * t + k], 0));
                     unpack_stage::<1, 16>(&mut x, |u, w| (_mm512_unpacklo_epi8(u, w), _mm512_unpackhi_epi8(u, w)));
                     unpack_stage::<2, 16>(&mut x, |u, w| {
                         (_mm512_unpacklo_epi16(u, w), _mm512_unpackhi_epi16(u, w))
@@ -627,22 +603,24 @@ pub mod gfni {
                         (_mm512_unpacklo_epi64(u, w), _mm512_unpackhi_epi64(u, w))
                     });
                     for (k, r) in x.into_iter().enumerate() {
-                        _mm512_store_si512(dst.add(BYTE_OF_REG[16 * t + k] as usize).cast(), r);
+                        regs[BYTE_OF_REG[16 * t + k] as usize] = r;
                     }
                 }
                 // Register bits 4 and 5 against the lane index, four registers at a time.
                 for k in 0..16 {
-                    let at = [0, 16, 32, 48].map(|o| dst.add(BYTE_OF_REG[o + k] as usize));
-                    let [a, b, c, d] = at.map(|p| _mm512_load_si512(p.cast()));
+                    let at = [0, 16, 32, 48].map(|o| BYTE_OF_REG[o + k] as usize);
+                    let [a, b, c, d] = at.map(|p| regs[p]);
                     let (a, b) = (_mm512_shuffle_i64x2::<0x44>(a, b), _mm512_shuffle_i64x2::<0xEE>(a, b));
                     let (c, d) = (_mm512_shuffle_i64x2::<0x44>(c, d), _mm512_shuffle_i64x2::<0xEE>(c, d));
                     let (a, c) = (_mm512_shuffle_i64x2::<0x88>(a, c), _mm512_shuffle_i64x2::<0xDD>(a, c));
                     let (b, d) = (_mm512_shuffle_i64x2::<0x88>(b, d), _mm512_shuffle_i64x2::<0xDD>(b, d));
                     for (p, r) in at.into_iter().zip([a, b, c, d]) {
-                        _mm512_store_si512(p.cast(), r);
+                        regs[p] = r;
                     }
                 }
             }
+            // SAFETY: the module is compiled only with these target features enabled.
+            unsafe { transpose(&mut self.0, lines) }
         }
     }
 
@@ -659,7 +637,8 @@ pub mod gfni {
     };
 
     /// One stage of the lane unpacks: registers `z` and `z | BIT` become the low and the high halves of their interleave.
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
     fn unpack_stage<const BIT: usize, const N: usize>(
         x: &mut [__m512i; N],
         interleave: impl Fn(__m512i, __m512i) -> (__m512i, __m512i),
@@ -676,8 +655,7 @@ pub mod gfni {
 
     impl ByteAcc {
         pub fn zero() -> Self {
-            // SAFETY: the module is compiled only with these target features enabled.
-            Self(unsafe { [_mm512_setzero_si512(); OUT_BYTES] })
+            Self([from_words([0; 8]); OUT_BYTES])
         }
 
         /// Add, per lane, the sum of the weights of the set bits of registers `first..first + N`.
@@ -685,22 +663,26 @@ pub mod gfni {
         /// `matrices[j]` weighs the bits of register `first + j`, as [`byte_matrices`] builds them.
         #[inline(always)]
         pub fn add_fold<const N: usize>(&mut self, regs: &LineRegs, first: usize, matrices: &[[u64; OUT_BYTES]; N]) {
-            accumulate_into::<N, false>(
-                &mut self.0,
-                regs.0[first..first + N].try_into().expect("N registers"),
-                matrices,
-                std::ptr::null(),
-            );
+            // SAFETY: the module is compiled only with these target features enabled.
+            unsafe {
+                accumulate_into::<N, false>(
+                    &mut self.0,
+                    regs.0[first..first + N].try_into().expect("N registers"),
+                    matrices,
+                    std::ptr::null(),
+                );
+            }
         }
 
         /// The 64 sums as eight vectors of eight, lane `l` of vector `v` being sum [`x8_lane`](Self::x8_lane)`(v, l)`.
         #[cfg(target_feature = "vpclmulqdq")]
         #[inline(always)]
         pub fn to_x8(&self) -> [F192x8; 8] {
-            let c: [[__m512i; 8]; 3] = std::array::from_fn(|i| {
-                let mut x: [__m512i; 8] = std::array::from_fn(|o| self.0[8 * i + o]);
-                // SAFETY: the module is compiled only with these target features enabled.
-                unsafe {
+            #[inline]
+            #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+            fn unpack(acc: &[__m512i; OUT_BYTES]) -> [[__m512i; 8]; 3] {
+                std::array::from_fn(|i| {
+                    let mut x: [__m512i; 8] = std::array::from_fn(|o| acc[8 * i + o]);
                     unpack_stage::<1, 8>(&mut x, |u, w| (_mm512_unpacklo_epi8(u, w), _mm512_unpackhi_epi8(u, w)));
                     unpack_stage::<2, 8>(&mut x, |u, w| {
                         (_mm512_unpacklo_epi16(u, w), _mm512_unpackhi_epi16(u, w))
@@ -708,9 +690,11 @@ pub mod gfni {
                     unpack_stage::<4, 8>(&mut x, |u, w| {
                         (_mm512_unpacklo_epi32(u, w), _mm512_unpackhi_epi32(u, w))
                     });
-                }
-                x
-            });
+                    x
+                })
+            }
+            // SAFETY: the module is compiled only with these target features enabled.
+            let c = unsafe { unpack(&self.0) };
             std::array::from_fn(|r| F192x8::from_coeffs(c[0][r], c[1][r], c[2][r]))
         }
 
@@ -767,11 +751,8 @@ pub mod gfni {
             out: &mut [F192; BLOCK],
         ) {
             let (mut acc, tail_acc) = (self.accumulate_rows(head_rows), tail.accumulate_rows(tail_rows));
-            for (a, t) in acc.iter_mut().zip(&tail_acc) {
-                // SAFETY: the module is compiled only with these target features enabled.
-                *a = unsafe { _mm512_xor_si512(*a, *t) };
-            }
-            // SAFETY: as above.
+            acc.iter_mut().zip(&tail_acc).for_each(|(a, t)| *a = xor(*a, *t));
+            // SAFETY: the module is compiled only with these target features enabled.
             unsafe { store_f192(&acc, out) };
         }
 
@@ -819,7 +800,7 @@ pub mod gfni {
             let mut from = rows.as_ptr().cast::<__m512i>();
             for first in (0..c.min(6)).step_by(3) {
                 // SAFETY: `from` holds CHUNKS registers, the rows or what the previous group wrote.
-                let load = |r: usize| unsafe { _mm512_loadu_si512(from.add(r).cast()) };
+                let load = |r: usize| unsafe { from.add(r).read_unaligned() };
                 match c.min(6) - first {
                     1 => stages::<CHUNKS, 2>(&self.input, first, load, dst),
                     2 => stages::<CHUNKS, 4>(&self.input, first, load, dst),
@@ -838,15 +819,13 @@ pub mod gfni {
         }
 
         #[inline]
-        #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "gfni")]
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
         fn fold_columns_full<const CHUNKS: usize>(&self, cols: &[[u8; BLOCK]; CHUNKS]) -> [__m512i; OUT_BYTES] {
             // The register order the input stages leave: register `r` holds input byte `j(r)`.
             let c = CHUNKS.trailing_zeros() as usize;
             let skew = c.saturating_sub(6);
             let byte_of_reg = |r: usize| (r >> skew) | ((r & ((1 << skew) - 1)) << (c - skew));
-            // SAFETY: each column is one 64-byte register.
-            let regs: [__m512i; CHUNKS] =
-                std::array::from_fn(|r| unsafe { _mm512_loadu_si512(cols[byte_of_reg(r)].as_ptr().cast()) });
+            let regs: [__m512i; CHUNKS] = std::array::from_fn(|r| simd::load(&cols[byte_of_reg(r)], 0));
             self.accumulate::<CHUNKS, false>(&regs, std::ptr::null())
         }
 
@@ -859,10 +838,12 @@ pub mod gfni {
             regs: &[__m512i; CHUNKS],
             next: *const u8,
         ) -> [__m512i; OUT_BYTES] {
-            // SAFETY: the module is compiled only with these target features enabled.
-            let mut acc = unsafe { [_mm512_setzero_si512(); OUT_BYTES] };
+            let mut acc = [from_words([0; 8]); OUT_BYTES];
             let matrices = self.matrices.as_chunks::<OUT_BYTES>().0;
-            accumulate_into::<CHUNKS, PREFETCH>(&mut acc, regs, matrices.try_into().expect("a matrix per register"), next);
+            // SAFETY: the module is compiled only with these target features enabled.
+            unsafe {
+                accumulate_into::<CHUNKS, PREFETCH>(&mut acc, regs, matrices.try_into().expect("a matrix per register"), next);
+            }
             acc
         }
     }
@@ -888,8 +869,7 @@ mod tests {
         regs.load(std::array::from_fn(|p| &lines[p]));
         for j in 0..64 {
             let mut got = [0u8; 64];
-            // SAFETY: the cfg above enables the target features, and a register is 64 bytes.
-            unsafe { core::arch::x86_64::_mm512_storeu_si512(got.as_mut_ptr().cast(), regs.registers()[j]) };
+            crate::simd::store(&mut got, 0, regs.registers()[j]);
             assert_eq!(got, std::array::from_fn(|p| lines[p][j]), "register {j}");
         }
     }
