@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub use fiat_shamir::merkle::{Hash, PrunedMerklePaths, hash_leaf, hash_pair};
 use parallel::SendPtr;
 use primitives::field::F64;
+use primitives::{cast_slice, cast_slice_mut};
 use primitives::hash::{LANES, OUT_LEN, RATE, STATE_LANES, hash_many, hash_many_from_state, zero_prefix_state};
 
 /// Nodes one climb takes at most: 32 KiB of digests, which stay in L1.
@@ -75,7 +76,7 @@ impl MerkleBuilder {
     /// Panics unless the block is aligned, sized like every other, and new.
     #[timed]
     pub fn absorb(&self, first_leaf: usize, rows: &[F64]) {
-        self.absorb_bytes(first_leaf, words_as_bytes(rows));
+        self.absorb_bytes(first_leaf, cast_slice(rows));
     }
 
     fn absorb_bytes(&self, first_leaf: usize, rows: &[u8]) {
@@ -353,7 +354,7 @@ impl CutTree {
         let mut nodes = Nodes::new(n, 0);
         // SAFETY: the nodes are ours alone, the climb writes every level it reads, and the levels kept are written.
         let local = unsafe {
-            LeafHasher::new(8 * row_words, 8 * leaf_words).hash(words_as_bytes(group_rows), nodes.level_mut(0, 0, n));
+            LeafHasher::new(8 * row_words, 8 * leaf_words).hash(cast_slice(group_rows), nodes.level_mut(0, 0, n));
             nodes.climb(0, 0, n, self.cut);
             nodes.tree.truncate(Self::start(n, self.cut));
             nodes.assume_init()
@@ -453,19 +454,13 @@ impl Tile {
     ///
     /// The bytes before each row are never written, so they stay zero.
     fn extend(&mut self, rows: &[u8], row_bytes: usize, image: usize) -> &[u8] {
-        // SAFETY: any byte pattern is a u64.
-        let tile: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.0.as_mut_ptr().cast(), STAGE_TILE_BYTES) };
+        let tile: &mut [u8] = cast_slice_mut(&mut self.0);
         let n = rows.len() / row_bytes;
         for (slot, row) in tile.chunks_exact_mut(image).zip(rows.chunks_exact(row_bytes)) {
             slot[image - row_bytes..].copy_from_slice(row);
         }
         &tile[..n * image]
     }
-}
-
-fn words_as_bytes(words: &[F64]) -> &[u8] {
-    // SAFETY: F64 is repr(transparent) over u64, so on this LE target the slice is its words' byte image.
-    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), std::mem::size_of_val(words)) }
 }
 
 fn digests_as_bytes(out: &mut [MaybeUninit<Hash>]) -> &mut [u8] {
@@ -489,7 +484,7 @@ mod tests {
     fn merkle_tree_padded_rows(data: &[F64], num_leaves: usize, row_words: usize, leaf_words: usize) -> Vec<Hash> {
         assert_eq!(data.len(), row_words * num_leaves);
         let builder = MerkleBuilder::with_bytes(num_leaves, 8 * row_words, 8 * leaf_words, 0);
-        builder.absorb_all(words_as_bytes(data));
+        builder.absorb_all(cast_slice(data));
         builder.finish().nodes
     }
 
@@ -567,7 +562,7 @@ mod tests {
             let want = merkle_tree_sequential(
                 data.chunks(row_words).map(|row| {
                     let mut image = vec![0u8; 8 * (leaf_words - row_words)];
-                    image.extend_from_slice(words_as_bytes(row));
+                    image.extend_from_slice(cast_slice(row));
                     hash_leaf(&image)
                 }),
                 num_leaves,
@@ -590,7 +585,7 @@ mod tests {
             let full = merkle_tree_padded_rows(&data, num_leaves, row_words, leaf_words);
             let row = |q: usize| &data[q * row_words..][..row_words];
             let builder = MerkleBuilder::with_bytes(num_leaves, 8 * row_words, 8 * leaf_words, CUT);
-            builder.absorb_all(words_as_bytes(&data));
+            builder.absorb_all(cast_slice(&data));
             let cut = builder.finish();
             assert_eq!(cut.root(), *full.last().unwrap());
             for positions in [

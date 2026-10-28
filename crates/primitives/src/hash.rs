@@ -83,20 +83,13 @@ pub const PI: [usize; STATE_LANES] = {
 /// lanes. The permutation is written once over this trait, so each backend
 /// supplies only XOR, the χ step and the rotations.
 ///
-/// # Safety
-///
-/// `load` and `store` take raw pointers to `WIDTH` contiguous `u64`, and
-/// implementors may use unaligned vector accesses, so callers must keep those
-/// `WIDTH` elements in bounds.
+/// `load` and `store` move the `WIDTH` words from `src[i]` on, unaligned, through the
+/// bounds-checked [`load_at`] and [`store_at`].
 trait Lanes64: Copy {
     const WIDTH: usize;
 
-    /// # Safety
-    /// `p` must be valid for reads of `WIDTH` `u64`.
-    unsafe fn load(p: *const u64) -> Self;
-    /// # Safety
-    /// `p` must be valid for writes of `WIDTH` `u64`.
-    unsafe fn store(self, p: *mut u64);
+    fn load(src: &[u64], i: usize) -> Self;
+    fn store(self, dst: &mut [u64], i: usize);
 
     fn splat(x: u64) -> Self;
     fn xor(self, o: Self) -> Self;
@@ -161,12 +154,12 @@ impl Lanes64 for u64 {
     const WIDTH: usize = 1;
 
     #[inline(always)]
-    unsafe fn load(p: *const u64) -> Self {
-        unsafe { p.read_unaligned() }
+    fn load(src: &[u64], i: usize) -> Self {
+        src[i]
     }
     #[inline(always)]
-    unsafe fn store(self, p: *mut u64) {
-        unsafe { p.write_unaligned(self) }
+    fn store(self, dst: &mut [u64], i: usize) {
+        dst[i] = self;
     }
     #[inline(always)]
     fn splat(x: u64) -> Self {
@@ -366,6 +359,7 @@ fn hash_from_state(data: &[u8], state: &[u64; STATE_LANES]) -> [u8; OUT_LEN] {
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 mod x86 {
     use super::Lanes64;
+    use crate::{load_at, store_at};
     use core::arch::x86_64::*;
 
     /// AVX2: four lanes. No 64-bit rotate before AVX-512, so a rotation is a
@@ -381,12 +375,12 @@ mod x86 {
         const WIDTH: usize = 4;
 
         #[inline(always)]
-        unsafe fn load(p: *const u64) -> Self {
-            Self(unsafe { _mm256_loadu_si256(p.cast()) })
+        fn load(src: &[u64], i: usize) -> Self {
+            Self(load_at(src, i))
         }
         #[inline(always)]
-        unsafe fn store(self, p: *mut u64) {
-            unsafe { _mm256_storeu_si256(p.cast(), self.0) }
+        fn store(self, dst: &mut [u64], i: usize) {
+            store_at(dst, i, self.0)
         }
         #[inline(always)]
         fn splat(x: u64) -> Self {
@@ -424,12 +418,12 @@ mod x86 {
         const WIDTH: usize = 8;
 
         #[inline(always)]
-        unsafe fn load(p: *const u64) -> Self {
-            Self(unsafe { _mm512_loadu_si512(p.cast()) })
+        fn load(src: &[u64], i: usize) -> Self {
+            Self(load_at(src, i))
         }
         #[inline(always)]
-        unsafe fn store(self, p: *mut u64) {
-            unsafe { _mm512_storeu_si512(p.cast(), self.0) }
+        fn store(self, dst: &mut [u64], i: usize) {
+            store_at(dst, i, self.0)
         }
         #[inline(always)]
         fn splat(x: u64) -> Self {
@@ -472,12 +466,14 @@ mod arm {
         const WIDTH: usize = 2;
 
         #[inline(always)]
-        unsafe fn load(p: *const u64) -> Self {
-            Self(unsafe { vld1q_u64(p) })
+        fn load(src: &[u64], i: usize) -> Self {
+            let words = &src[i..i + 2];
+            Self(unsafe { vld1q_u64(words.as_ptr()) })
         }
         #[inline(always)]
-        unsafe fn store(self, p: *mut u64) {
-            unsafe { vst1q_u64(p, self.0) }
+        fn store(self, dst: &mut [u64], i: usize) {
+            let words = &mut dst[i..i + 2];
+            unsafe { vst1q_u64(words.as_mut_ptr(), self.0) }
         }
         #[inline(always)]
         fn splat(x: u64) -> Self {
@@ -540,32 +536,26 @@ pub const LANES: usize = Backend::WIDTH;
 /// Widest batch any backend takes.
 const MAX_WIDTH: usize = 8;
 
-/// Hash `S::WIDTH` inputs of `len` bytes starting at `inputs[l]`, from the shared
+/// Hash `S::WIDTH` inputs of `len` bytes, input `l` at `data[l * len..]`, from the shared
 /// sponge state `init`, writing the digests consecutively to `out`.
-///
-/// # Safety
-/// Every `inputs[l]` must be valid for `len` readable bytes, and `out` for
-/// `S::WIDTH * OUT_LEN` writable bytes.
 #[inline(always)]
-unsafe fn hash_group<S: Lanes64>(inputs: &[*const u8], len: usize, init: &[u64; STATE_LANES], out: *mut u8) {
-    debug_assert_eq!(inputs.len(), S::WIDTH);
+fn hash_group<S: Lanes64>(data: &[u8], len: usize, init: &[u64; STATE_LANES], out: &mut [u8]) {
+    debug_assert_eq!((data.len(), out.len()), (S::WIDTH * len, S::WIDTH * OUT_LEN));
     let mut st: [S; STATE_LANES] = std::array::from_fn(|i| S::splat(init[i]));
     // `buf[w * WIDTH + l]` is input `l`'s lane `w` of the current block.
     let mut buf = [0u64; RATE_LANES * MAX_WIDTH];
     // XOR the first `n` lanes of `buf` into the rate.
     let xor_buf = |st: &mut [S; STATE_LANES], buf: &[u64], n: usize| {
         for (w, lane) in st[..n].iter_mut().enumerate() {
-            // SAFETY: `buf` holds RATE_LANES * MAX_WIDTH >= (w + 1) * WIDTH words.
-            *lane = lane.xor(unsafe { S::load(buf.as_ptr().add(w * S::WIDTH)) });
+            *lane = lane.xor(S::load(buf, w * S::WIDTH));
         }
     };
     let (blocks, tail) = (len / RATE, len % RATE);
     for blk in 0..blocks {
-        for (l, &input) in inputs.iter().enumerate() {
-            for w in 0..RATE_LANES {
-                // SAFETY: the block lies inside the input's `len` bytes.
-                let word = unsafe { input.add(blk * RATE + 8 * w).cast::<u64>().read_unaligned() };
-                buf[w * S::WIDTH + l] = u64::from_le(word);
+        for l in 0..S::WIDTH {
+            let block = &data[l * len + blk * RATE..][..RATE];
+            for (w, word) in block.as_chunks::<8>().0.iter().enumerate() {
+                buf[w * S::WIDTH + l] = u64::from_le_bytes(*word);
             }
         }
         xor_buf(&mut st, &buf, RATE_LANES);
@@ -573,18 +563,14 @@ unsafe fn hash_group<S: Lanes64>(inputs: &[*const u8], len: usize, init: &[u64; 
     }
     // The final block, read in place: its words, then the padding, which every input has in the same lanes.
     let (words, part) = (tail / 8, tail % 8);
-    for (l, &input) in inputs.iter().enumerate() {
-        // SAFETY: the final block is the input's last `tail` bytes.
-        let input = unsafe { input.add(blocks * RATE) };
-        for w in 0..words {
-            // SAFETY: as above.
-            let word = unsafe { input.add(8 * w).cast::<u64>().read_unaligned() };
-            buf[w * S::WIDTH + l] = u64::from_le(word);
+    for l in 0..S::WIDTH {
+        let last = &data[l * len + blocks * RATE..][..tail];
+        let (whole, rest) = last.as_chunks::<8>();
+        for (w, word) in whole.iter().enumerate() {
+            buf[w * S::WIDTH + l] = u64::from_le_bytes(*word);
         }
         if part > 0 {
-            // SAFETY: as above.
-            let byte = |j: usize| u64::from(unsafe { *input.add(8 * words + j) }) << (8 * j);
-            buf[words * S::WIDTH + l] = (0..part).fold(0, |acc, j| acc | byte(j));
+            buf[words * S::WIDTH + l] = rest.iter().enumerate().fold(0, |acc, (j, &b)| acc | u64::from(b) << (8 * j));
         }
     }
     xor_buf(&mut st, &buf, words + usize::from(part > 0));
@@ -593,35 +579,23 @@ unsafe fn hash_group<S: Lanes64>(inputs: &[*const u8], len: usize, init: &[u64; 
     permute(&mut st);
     let mut lanes = [0u64; OUT_LANES * MAX_WIDTH];
     for (w, lane) in st[..OUT_LANES].iter().enumerate() {
-        // SAFETY: `lanes` holds OUT_LANES * MAX_WIDTH >= (w + 1) * WIDTH words.
-        unsafe { lane.store(lanes.as_mut_ptr().add(w * S::WIDTH)) };
+        lane.store(&mut lanes, w * S::WIDTH);
     }
-    for l in 0..S::WIDTH {
-        for w in 0..OUT_LANES {
-            let bytes = lanes[w * S::WIDTH + l].to_le_bytes();
-            // SAFETY: `l * 32 + 8 * w + 8 <= WIDTH * 32`.
-            unsafe { out.add(l * OUT_LEN + 8 * w).copy_from_nonoverlapping(bytes.as_ptr(), 8) };
+    for (l, digest) in out.chunks_exact_mut(OUT_LEN).enumerate() {
+        for (w, bytes) in digest.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            *bytes = lanes[w * S::WIDTH + l].to_le_bytes();
         }
     }
 }
 
-/// The batched hash over one backend.
-///
-/// # Safety
-/// `data.len() == n * len` and `out.len() == n * OUT_LEN` for some `n`.
+/// The batched hash over one backend: `out.len() / OUT_LEN` inputs of `len` bytes.
 #[inline(always)]
-unsafe fn hash_many_with<S: Lanes64>(data: &[u8], len: usize, state: &[u64; STATE_LANES], out: &mut [u8]) {
+fn hash_many_with<S: Lanes64>(data: &[u8], len: usize, state: &[u64; STATE_LANES], out: &mut [u8]) {
     let n = out.len() / OUT_LEN;
+    assert_eq!((data.len(), out.len()), (n * len, n * OUT_LEN));
     let groups = n / S::WIDTH;
-    let mut ptrs = [core::ptr::null::<u8>(); MAX_WIDTH];
-    for g in 0..groups {
-        let base = g * S::WIDTH;
-        for (l, slot) in ptrs[..S::WIDTH].iter_mut().enumerate() {
-            *slot = data[(base + l) * len..].as_ptr();
-        }
-        // SAFETY: each pointer has `len` readable bytes, and the output window
-        // `[base, base + WIDTH)` is inside `out`.
-        unsafe { hash_group::<S>(&ptrs[..S::WIDTH], len, state, out.as_mut_ptr().add(base * OUT_LEN)) };
+    for (g, digests) in out.chunks_exact_mut(S::WIDTH * OUT_LEN).enumerate() {
+        hash_group::<S>(&data[g * S::WIDTH * len..][..S::WIDTH * len], len, state, digests);
     }
     for i in groups * S::WIDTH..n {
         let d = hash_from_state(&data[i * len..(i + 1) * len], state);
@@ -639,11 +613,7 @@ pub fn hash_many(data: &[u8], len: usize, out: &mut [u8]) {
 /// [`hash_many`] continued from one sponge state shared by every input, which has absorbed
 /// whole blocks (see [`zero_prefix_state`]). Byte-identical to hashing each full image.
 pub fn hash_many_from_state(data: &[u8], len: usize, state: &[u64; STATE_LANES], out: &mut [u8]) {
-    let n = out.len() / OUT_LEN;
-    assert_eq!(out.len(), n * OUT_LEN);
-    assert_eq!(data.len(), n * len);
-    // SAFETY: the asserts pin the buffer sizes, and the backend is gated on the features its intrinsics need.
-    unsafe { hash_many_with::<Backend>(data, len, state, out) }
+    hash_many_with::<Backend>(data, len, state, out)
 }
 
 /// Keccak-f\[1600\] of every state in place, [`LANES`] at a time.
@@ -668,12 +638,10 @@ fn permute_group<S: Lanes64>(states: &mut [[u64; STATE_LANES]]) {
             buf[i * S::WIDTH + l] = lane;
         }
     }
-    // SAFETY: `buf` holds STATE_LANES * MAX_WIDTH >= (i + 1) * WIDTH words.
-    let mut st: [S; STATE_LANES] = std::array::from_fn(|i| unsafe { S::load(buf.as_ptr().add(i * S::WIDTH)) });
+    let mut st: [S; STATE_LANES] = std::array::from_fn(|i| S::load(&buf, i * S::WIDTH));
     permute(&mut st);
     for (i, lane) in st.iter().enumerate() {
-        // SAFETY: as above.
-        unsafe { lane.store(buf.as_mut_ptr().add(i * S::WIDTH)) };
+        lane.store(&mut buf, i * S::WIDTH);
     }
     for (l, state) in states.iter_mut().enumerate() {
         for (i, lane) in state.iter_mut().enumerate() {
@@ -768,8 +736,7 @@ mod tests {
                 for len in [0usize, 8, 64, 135, 136, 137, 272, 1024] {
                     let data: Vec<u8> = (0..n * len).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
                     let mut got = vec![0u8; n * OUT_LEN];
-                    // SAFETY: `data` holds `n * len` bytes and `got` `n * 32`.
-                    unsafe { hash_many_with::<S>(&data, len, &[0; STATE_LANES], &mut got) };
+                    hash_many_with::<S>(&data, len, &[0; STATE_LANES], &mut got);
                     for i in 0..n {
                         assert_eq!(
                             &got[i * OUT_LEN..(i + 1) * OUT_LEN],
