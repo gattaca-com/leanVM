@@ -6,6 +6,8 @@ pub mod bits;
 pub mod field;
 pub mod hash;
 pub mod multilinear;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub mod simd;
 pub mod stream;
 
 use std::mem::{MaybeUninit, needs_drop};
