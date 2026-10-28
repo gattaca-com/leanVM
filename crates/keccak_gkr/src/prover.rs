@@ -69,33 +69,8 @@ impl Part {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi"))]
     #[inline(always)]
     fn pack(products: &[u64; PART]) -> Self {
-        use core::arch::x86_64::*;
-        /// Byte `j` of output register `k` is byte `j % 6` of product `(64 * k + j) / 6`, which lies
-        /// in register `k` or `k + 1` of the products, eight to a register.
-        const BYTES: [[u8; 64]; 3] = {
-            let mut idx = [[0u8; 64]; 3];
-            let mut k = 0;
-            while k < 3 {
-                let mut j = 0;
-                while j < 64 {
-                    let (q, b) = ((64 * k + j) / 6, (64 * k + j) % 6);
-                    idx[k][j] = ((q - 8 * k) * 8 + b) as u8;
-                    j += 1;
-                }
-                k += 1;
-            }
-            idx
-        };
-        // SAFETY: the products are four registers, the parts three, and AVX-512 VBMI is enabled at compile time.
-        unsafe {
-            let p: [__m512i; 4] = std::array::from_fn(|i| _mm512_loadu_si512(products.as_ptr().add(8 * i).cast()));
-            let mut out = Self([0; PART_WORDS]);
-            for k in 0..3 {
-                let idx = _mm512_loadu_si512(BYTES[k].as_ptr().cast());
-                _mm512_store_si512(out.0.as_mut_ptr().add(8 * k).cast(), _mm512_permutex2var_epi8(p[k], idx, p[k + 1]));
-            }
-            out
-        }
+        // SAFETY: AVX-512 VBMI is enabled at compile time.
+        unsafe { pack_vbmi(products) }
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi")))]
@@ -111,30 +86,15 @@ impl Part {
     #[inline(always)]
     fn add(&mut self, other: &Self) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        // SAFETY: both parts are three registers, aligned to 64, and AVX-512 is enabled at compile time.
-        unsafe {
-            use core::arch::x86_64::*;
-            let (dst, src) = (
-                self.0.as_mut_ptr().cast::<__m512i>(),
-                other.0.as_ptr().cast::<__m512i>(),
-            );
-            for i in 0..PART_WORDS / 8 {
-                let x = _mm512_xor_si512(
-                    _mm512_load_si512(dst.add(i).cast()),
-                    _mm512_load_si512(src.add(i).cast()),
-                );
-                _mm512_store_si512(dst.add(i).cast(), x);
-            }
+        for i in 0..PART_WORDS / 8 {
+            use primitives::simd::{load, store, xor};
+            let x = xor(load(&self.0, i), load(&other.0, i));
+            store(&mut self.0, i, x);
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
-        // SAFETY: both parts are three registers, and AVX2 is enabled at compile time.
+        // SAFETY: AVX2 is enabled at compile time.
         unsafe {
-            use core::arch::x86_64::*;
-            let (dst, src) = (self.0.as_mut_ptr(), other.0.as_ptr());
-            for i in (0..PART_WORDS).step_by(4) {
-                let (d, s) = (dst.add(i).cast::<__m256i>(), src.add(i).cast::<__m256i>());
-                _mm256_storeu_si256(d, _mm256_xor_si256(_mm256_loadu_si256(d), _mm256_loadu_si256(s)));
-            }
+            add_avx2(&mut self.0, &other.0)
         }
         // Left to itself, the compiler XORs the words in general registers.
         #[cfg(target_arch = "aarch64")]
@@ -150,6 +110,51 @@ impl Part {
         for (x, y) in self.0.iter_mut().zip(&other.0) {
             *x ^= y;
         }
+    }
+}
+
+/// [`Part::pack`] with AVX-512 VBMI.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+#[inline]
+fn pack_vbmi(products: &[u64; PART]) -> Part {
+    use core::arch::x86_64::*;
+    use primitives::simd::{load, store};
+    /// Byte `j` of output register `k` is byte `j % 6` of product `(64 * k + j) / 6`, which lies
+    /// in register `k` or `k + 1` of the products, eight to a register.
+    const BYTES: [[u8; 64]; 3] = {
+        let mut idx = [[0u8; 64]; 3];
+        let mut k = 0;
+        while k < 3 {
+            let mut j = 0;
+            while j < 64 {
+                let (q, b) = ((64 * k + j) / 6, (64 * k + j) % 6);
+                idx[k][j] = ((q - 8 * k) * 8 + b) as u8;
+                j += 1;
+            }
+            k += 1;
+        }
+        idx
+    };
+    // The products are four registers and the parts three.
+    let p: [__m512i; 4] = std::array::from_fn(|i| load(&products[..], i));
+    let mut out = Part([0; PART_WORDS]);
+    for k in 0..3 {
+        store(&mut out.0, k, _mm512_permutex2var_epi8(p[k], load(&BYTES[k][..], 0), p[k + 1]));
+    }
+    out
+}
+
+/// [`Part::add`] with AVX2.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn add_avx2(dst: &mut [u64; PART_WORDS], src: &[u64; PART_WORDS]) {
+    use core::arch::x86_64::*;
+    use primitives::{load_at, store_at};
+    for i in (0..PART_WORDS).step_by(4) {
+        let (d, s): (__m256i, __m256i) = (load_at(&dst[..], i), load_at(&src[..], i));
+        store_at(&mut dst[..], i, _mm256_xor_si256(d, s));
     }
 }
 
@@ -208,8 +213,7 @@ impl Groups {
                     let v = NIBBLE * h + l;
                     let mut acc = Part::ZERO;
                     for &p in &order[starts[v] as usize..starts[v + 1] as usize] {
-                        // SAFETY: `order` holds positions.
-                        acc.add(unsafe { payloads.get_unchecked(p as usize) });
+                        acc.add(&payloads[p as usize]);
                     }
                     low.add(&acc);
                     sum.add(&acc);
@@ -691,8 +695,7 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(shape: Shape) -> Self {
         let rows = 1usize << (shape.y_vars() - SKIP);
-        // SAFETY: every pass writes the rows it reads.
-        let table = unsafe { primitives::uninit_vec(rows * ROW + rows * ROW / 2) };
+        let table = vec![0u64; rows * ROW + rows * ROW / 2];
         let pads = vec![0u64; ROW << shape.seg_log()];
         Self { table, pads }
     }
