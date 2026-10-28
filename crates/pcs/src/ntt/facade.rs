@@ -2,6 +2,7 @@
 
 use primitives::field::F64;
 
+use super::cosets::CosetEncoder;
 use super::encode::{Encoded, Encoder, Keep, RowSink};
 use super::layers::Layers;
 use super::plan::Plan;
@@ -100,5 +101,29 @@ impl AdditiveNttF64 {
         on_rows: &RowSink<'_>,
     ) -> Option<Plan> {
         Encoder::new(&self.tw).rows(data, msg, num_ntts, log_inv_rate, defer_deep, on_rows)
+    }
+
+    /// RS-encode a message coset by coset, handing `on_rows` every finished block of rows and writing no codeword.
+    ///
+    /// - The codeword is `2^r` cosets, each an independent transform of one copy of the message, from layer `r` on.
+    /// - A task builds each of its cosets in scratch and hashes it there, so no codeword is ever written.
+    /// - [`Self::coset_rows`] recomputes any row from the message.
+    ///
+    /// Use it when [`Self::encodes_by_coset`] holds: the scratch is then cache-resident.
+    #[inline]
+    pub fn encode_cosets(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, on_rows: &RowSink<'_>) {
+        CosetEncoder::new(&self.tw, msg.len(), num_ntts, log_inv_rate).encode(msg, on_rows)
+    }
+
+    /// Codeword rows `positions` (sorted) of the encode [`Self::encode_cosets`] ran, back to back.
+    #[inline]
+    pub fn coset_rows(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, positions: &[usize]) -> Vec<F64> {
+        CosetEncoder::new(&self.tw, msg.len(), num_ntts, log_inv_rate).rows(msg, positions)
+    }
+
+    /// Whether a message of `msg_words` words encodes coset by coset: one coset fits the cache budget.
+    #[inline]
+    pub fn encodes_by_coset(msg_words: usize) -> bool {
+        CosetEncoder::fits(msg_words)
     }
 }

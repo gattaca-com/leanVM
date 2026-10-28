@@ -1,97 +1,24 @@
-//! Coset-major encoding, and the tests of the encoder.
-
-use primitives::field::F64;
-use primitives::log2_strict_usize;
-
-use super::encode::RowSink;
-use super::facade::AdditiveNttF64;
-use super::layers::no_hook;
-use super::plan::L2_WORDS;
-use super::rows::built_rows;
-use super::scratch::with_scratch;
-
-impl AdditiveNttF64 {
-    /// RS-encode a message coset by coset, handing `on_rows` every finished block of rows and writing no codeword.
-    ///
-    /// - The codeword is `2^r` cosets, each an independent transform of one copy of the message, from layer `r` on.
-    /// - A task builds each of its cosets in scratch and hashes it there, so no codeword is ever written.
-    /// - Several cosets that are small share a scratch, so the blocks are all one size and reach the hasher in batches.
-    /// - [`Self::coset_rows`] recomputes any row from the message.
-    ///
-    /// Use it when [`Self::encodes_by_coset`] holds: the scratch is then cache-resident.
-    pub fn encode_cosets(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, on_rows: &RowSink<'_>) {
-        let log_d = self.coset_log_d(msg.len(), num_ntts, log_inv_rate);
-        let rows = msg.len() / num_ntts;
-        let group = 1usize << (L2_WORDS / msg.len()).max(1).ilog2().min(log_inv_rate as u32);
-        parallel::for_each_chunk((1 << log_inv_rate) / group, |lo, hi| {
-            with_scratch(group * msg.len(), |scratch| {
-                for g in lo..hi {
-                    for (i, coset) in scratch.chunks_exact_mut(msg.len()).enumerate() {
-                        self.build_coset(coset, msg, num_ntts, log_d, log_inv_rate, g * group + i);
-                    }
-                    on_rows(g * group * rows, scratch);
-                }
-            });
-        });
-    }
-
-    /// Codeword rows `positions` (sorted) of the encode [`Self::encode_cosets`] ran, back to back, one transform per
-    /// coset they touch.
-    pub fn coset_rows(&self, msg: &[F64], num_ntts: usize, log_inv_rate: usize, positions: &[usize]) -> Vec<F64> {
-        let log_d = self.coset_log_d(msg.len(), num_ntts, log_inv_rate);
-        built_rows(num_ntts, log_d - log_inv_rate, positions, |_, coset, buf| {
-            self.build_coset(buf, msg, num_ntts, log_d, log_inv_rate, coset)
-        })
-    }
-
-    /// Whether a message of `msg_words` words encodes coset by coset: one coset fits the cache budget [`COSET_WORDS`].
-    pub fn encodes_by_coset(msg_words: usize) -> bool {
-        msg_words <= COSET_WORDS
-    }
-
-    /// The log of the codeword's rows, for a message of `msg_words` words.
-    fn coset_log_d(&self, msg_words: usize, num_ntts: usize, log_inv_rate: usize) -> usize {
-        assert!(num_ntts > 0 && msg_words.is_multiple_of(num_ntts));
-        let log_d = log2_strict_usize(msg_words / num_ntts) + log_inv_rate;
-        assert!(log_d <= self.tw.log_domain_size());
-        log_d
-    }
-
-    /// Coset `coset` of the codeword, built into `buf` (one message long) from the message.
-    fn build_coset(&self, buf: &mut [F64], msg: &[F64], num_ntts: usize, log_d: usize, log_inv_rate: usize, coset: usize) {
-        let (first, end) = (log_inv_rate, log_d);
-        self.layers().run(buf, Some(msg), log_d, num_ntts, first, end, log_inv_rate, coset, None, no_hook);
-    }
-}
-
-/// Words of one coset a coset-major encode may span.
-///
-/// # Why this value
-///
-/// - 2^19 words is 4 MiB: the largest coset it admits is 2^13 rows of 48 words, 3 MiB.
-/// - A coset runs in a scratch that lives in L2 and L3, and never reaches DRAM.
-/// - Four nodes of two threads each share one 32 MiB L3, so a worker's share is 4 MiB.
-/// - A larger coset spills to DRAM, and then the codeword's write pass is the cheaper plan.
-const COSET_WORDS: usize = 1 << 19;
-
-/// Test oracle: fill every replica with a copy of a message held elsewhere.
-#[cfg(test)]
-fn replicate_rows(data: &mut [F64], msg: &[F64]) {
-    for replica in data.chunks_mut(msg.len()) {
-        replica.copy_from_slice(msg);
-    }
-}
+//! Tests of the additive NTT encoders.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::ntt::encode::{Encoded, Encoder, Keep};
+    use crate::ntt::facade::AdditiveNttF64;
     use crate::ntt::source::Source;
     use crate::ntt::stage::transpose_lane_major;
     use crate::ntt::window::Window;
     use crate::stack_open::EQUAL_BLOCK_LOG;
+    use primitives::field::F64;
+    use primitives::log2_strict_usize;
     use primitives::test_rng::Rng;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Test oracle: fill every replica with a copy of a message held elsewhere.
+    fn replicate_rows(data: &mut [F64], msg: &[F64]) {
+        for replica in data.chunks_mut(msg.len()) {
+            replica.copy_from_slice(msg);
+        }
+    }
 
     /// A row sink that copies each handed-over block into `dst` at its row, without locking.
     /// Every row is handed over exactly once, so the blocks written from pool tasks are disjoint.

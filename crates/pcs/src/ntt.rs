@@ -2,6 +2,7 @@
 //! The additive NTT (Lin-Chung-Han novel polynomial basis) WHIR commits with.
 
 mod additive_ntt_f64;
+mod cosets;
 mod deep;
 mod drain;
 mod encode;
