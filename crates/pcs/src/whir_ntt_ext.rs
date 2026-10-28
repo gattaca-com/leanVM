@@ -85,16 +85,12 @@ fn k_words<'a>(mat: &'a mut [F192], msg: &'a [F192], num_ntts: usize) -> (&'a mu
 
 /// A slice of E elements as its K words, shared.
 pub(crate) fn words(v: &[F192]) -> &[F64] {
-    // SAFETY: as in `words_mut`, for the shared view.
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<F64>(), 3 * v.len()) }
+    primitives::cast_slice(v)
 }
 
 /// A slice of E elements as its K words.
 pub(crate) fn words_mut(v: &mut [F192]) -> &mut [F64] {
-    // SAFETY:
-    // - An E element is laid out as three K words, and a K element as one word.
-    // - So the view covers exactly the same memory as the slice it came from.
-    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<F64>(), 3 * v.len()) }
+    primitives::cast_slice_mut(v)
 }
 
 #[cfg(test)]

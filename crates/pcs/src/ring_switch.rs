@@ -444,9 +444,8 @@ impl RingWeight {
             for (j, &e_lo) in lo_r.iter().enumerate() {
                 put(4 * lo4.len() + j, e_lo * e_hi);
             }
-            // SAFETY: `[u64; N]` and `[u8; 8 * N]` have the same size, and every bit pattern is a valid byte row.
-            let (head_rows, tail_rows): (&[[u8; 16]; BLOCK], &[[u8; 8]; BLOCK]) =
-                unsafe { (&*head.as_ptr().cast(), &*tail.as_ptr().cast()) };
+            let head_rows = primitives::cast_slice::<[u64; 2], [u8; 16]>(&head);
+            let tail_rows = primitives::cast_slice::<u64, [u8; 8]>(&tail);
             self.fold.0.fold_block_pair(&self.fold.1, &head_rows[..n], &tail_rows[..n], &mut folded);
             let (out8, out_r) = out.as_chunks_mut::<8>();
             for (o, f) in out8.iter_mut().zip(folded.as_chunks::<8>().0) {

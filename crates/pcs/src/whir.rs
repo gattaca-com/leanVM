@@ -1630,10 +1630,7 @@ mod tests {
                 "parallel mismatch at n={n}"
             );
             let g = rng.ext();
-            let mut seeded = Box::new_uninit_slice(1 << n).into_vec();
-            primitives::multilinear::fill_eq_table_uninit(&point, g, &mut seeded);
-            // SAFETY: fill_eq_table_uninit initializes every entry.
-            let seeded = unsafe { seeded.into_boxed_slice().assume_init() }.into_vec();
+            let seeded = primitives::filled_vec(1 << n, |seeded| primitives::multilinear::fill_eq_table(&point, g, seeded));
             let scaled: Vec<F192> = serial.iter().map(|&e| g * e).collect();
             assert_eq!(&*seeded, &scaled, "seeded mismatch at n={n}");
         }

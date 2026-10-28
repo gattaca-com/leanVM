@@ -231,8 +231,7 @@ impl Terms {
                     fold.get_or_insert_with(|| {
                         if !transposed {
                             for (col, group) in cols.iter_mut().zip(block(h).as_chunks::<8>().0) {
-                                // SAFETY: `F64` is a `u64`, so eight of them are 64 bytes.
-                                bit_transpose_64bytes(unsafe { &*group.as_ptr().cast() }, col);
+                                bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
                             }
                             transposed = true;
                         }

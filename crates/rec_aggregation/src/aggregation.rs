@@ -54,7 +54,7 @@ use leanvm_core::leaf::{Block, Coord};
 use leanvm_core::tables::N_TABLES;
 use leanvm_core::transcript::{FiatShamirState, RATE_SCALARS};
 use primitives::field::{F64, F192, F192Unreduced, G, Weights8, dot_base, g_pow};
-use primitives::multilinear::{eq_table, fill_eq_table_uninit, mle_eval_par};
+use primitives::multilinear::{eq_table, fill_eq_table, mle_eval_par};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use signatures::{lean_sphincs, lean_xmss};
 
@@ -769,13 +769,14 @@ fn bytecode_mle(point: &[F192]) -> F192 {
         .fold(F192::ZERO, |acc, value| acc + value)
 }
 
-/// Appends the `eq(r, ·)` table to `out`.
-fn extend_eq(out: &mut Vec<F192>, r: &[F192]) {
-    let len = 1 << r.len();
-    out.reserve(len);
-    fill_eq_table_uninit(r, F192::ONE, &mut out.spare_capacity_mut()[..len]);
-    // SAFETY: the fill writes all `len` entries.
-    unsafe { out.set_len(out.len() + len) };
+/// The `eq(r, ·)` tables of `vars` of each point, end to end.
+fn eq_tables(points: std::slice::ChunksExact<'_, F192>, vars: std::ops::Range<usize>) -> Vec<F192> {
+    let len = 1 << vars.len();
+    primitives::filled_vec(points.len() * len, |out| {
+        for (table, point) in out.chunks_exact_mut(len).zip(points) {
+            fill_eq_table(&point[vars.clone()], F192::ONE, table);
+        }
+    })
 }
 
 /// What the bytecode batch reads of the stacked table for each claim point, and the weights it reads it with.
@@ -799,8 +800,7 @@ fn bytecode_sums(points: &[F192]) -> BytecodeSums {
         .chunks(1 << kbc)
         .collect();
     let points = points.chunks_exact(bytecode_vars());
-    let mut eq_hi = Vec::new();
-    points.clone().for_each(|point| extend_eq(&mut eq_hi, &point[BLOCK_VARS..kbc]));
+    let eq_hi = eq_tables(points.clone(), BLOCK_VARS..kbc);
     // Rows `(high, low)` with `low` the first `BLOCK_VARS` variables, which the first rounds bind. Per claim,
     // the weight splits into a factor on each of slot, high and low rows, so those rounds run on the
     // slot and high rows summed out.
@@ -1037,8 +1037,7 @@ fn aggregate_deferred_claims(
         .chunks(1 << kbc)
         .collect();
     let BytecodeSums { eq_hi, mut sums } = bytecode;
-    let mut eq_lo = Vec::with_capacity(sums.len());
-    points.chunks_exact(kbcv).for_each(|point| extend_eq(&mut eq_lo, &point[..BLOCK_VARS]));
+    let mut eq_lo = eq_tables(points.chunks_exact(kbcv), 0..BLOCK_VARS);
     for round in 0..BLOCK_VARS {
         let len = BLOCK >> round;
         let pairs: Vec<(&[F192], &[F192], F192)> = sums
