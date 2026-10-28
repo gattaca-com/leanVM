@@ -119,6 +119,8 @@ pub unsafe trait Plain: Copy {}
 // SAFETY: integers, and `repr(transparent)` and `repr(C)` structs of them.
 unsafe impl Plain for u8 {}
 unsafe impl Plain for u64 {}
+unsafe impl Plain for u32 {}
+unsafe impl Plain for u128 {}
 // SAFETY: an array of plain elements has no padding.
 unsafe impl<T: Plain, const N: usize> Plain for [T; N] {}
 // SAFETY: `repr(transparent)` over `u64`.

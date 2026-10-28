@@ -2,9 +2,13 @@
 //! 128-bit lanes, one with PCLMULQDQ alone, two with VPCLMULQDQ and four with AVX-512 as well.
 //! Every operation is lane by lane, so a kernel written once serves every width.
 //!
-//! The intrinsics are safe to call: the module is compiled only where its features are.
+//! A trait method cannot carry `#[target_feature]`, so each intrinsic call is unsafe. The module is
+//! compiled only where its features are, which is the safety of every call below.
+//! Memory moves go through [`load_at`] and [`store_at`], which check their bounds.
 
 use core::arch::x86_64::*;
+
+use primitives::Plain;
 
 cfg_select! {
     all(target_feature = "avx512f", target_feature = "vpclmulqdq") => {
@@ -18,20 +22,32 @@ cfg_select! {
     }
 }
 
+/// The `A` whose bytes start at element `i` of `src`, read unaligned.
+#[inline(always)]
+pub fn load_at<T: Plain, A: Plain>(src: &[T], i: usize) -> A {
+    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(src));
+    // SAFETY: the assert keeps the bytes inside `src`, and any bytes of a `Plain` type are
+    // readable and a valid `A`.
+    unsafe { src.as_ptr().wrapping_add(i).cast::<A>().read_unaligned() }
+}
+
+/// Write `v` over the bytes from element `i` of `dst` on, unaligned.
+#[inline(always)]
+pub fn store_at<T: Plain, A: Plain>(dst: &mut [T], i: usize, v: A) {
+    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(dst));
+    // SAFETY: the assert keeps the bytes inside `dst`, and any bytes are a valid `Plain` value.
+    unsafe { dst.as_mut_ptr().add(i).cast::<A>().write_unaligned(v) }
+}
+
 pub trait Vector: Copy {
     /// 128-bit lanes.
     const N: usize;
-    /// # Safety
-    /// `p` is valid for reading `2 * N` words.
-    unsafe fn load(p: *const u64) -> Self;
-    /// # Safety
-    /// `p` is valid for writing `2 * N` words.
-    unsafe fn store(p: *mut u64, v: Self);
-    /// `2 * N` packs, a word each.
-    ///
-    /// # Safety
-    /// `p` is valid for reading `2 * N` packs.
-    unsafe fn load_packs(p: *const u32) -> Self;
+    /// The `2 * N` words from `src[i]` on.
+    fn load<T: Plain>(src: &[T], i: usize) -> Self;
+    /// Write the `2 * N` words from `dst[i]` on.
+    fn store<T: Plain>(dst: &mut [T], i: usize, v: Self);
+    /// `2 * N` packs, a word each, from `src[i]` on.
+    fn load_packs(src: &[u32], i: usize) -> Self;
     fn zero() -> Self;
     fn splat(x: u64) -> Self;
     fn xor(self, other: Self) -> Self;
@@ -48,16 +64,16 @@ pub trait Vector: Copy {
 impl Vector for __m128i {
     const N: usize = 1;
     #[inline(always)]
-    unsafe fn load(p: *const u64) -> Self {
-        unsafe { _mm_loadu_si128(p.cast()) }
+    fn load<T: Plain>(src: &[T], i: usize) -> Self {
+        load_at(src, i)
     }
     #[inline(always)]
-    unsafe fn store(p: *mut u64, v: Self) {
-        unsafe { _mm_storeu_si128(p.cast(), v) }
+    fn store<T: Plain>(dst: &mut [T], i: usize, v: Self) {
+        store_at(dst, i, v)
     }
     #[inline(always)]
-    unsafe fn load_packs(p: *const u32) -> Self {
-        unsafe { _mm_cvtepu32_epi64(_mm_loadl_epi64(p.cast())) }
+    fn load_packs(src: &[u32], i: usize) -> Self {
+        unsafe { _mm_cvtepu32_epi64(_mm_cvtsi64_si128(load_at::<u32, u64>(src, i) as i64)) }
     }
     #[inline(always)]
     fn zero() -> Self {
@@ -85,8 +101,7 @@ impl Vector for __m128i {
     }
     #[inline(always)]
     fn sum(self) -> u128 {
-        // SAFETY: both are 128 bits with no invalid patterns.
-        unsafe { core::mem::transmute::<Self, u128>(self) }
+        unsafe { _mm_cvtsi128_si64(self) as u64 as u128 | (_mm_extract_epi64::<1>(self) as u64 as u128) << 64 }
     }
 }
 
@@ -94,16 +109,16 @@ impl Vector for __m128i {
 impl Vector for __m256i {
     const N: usize = 2;
     #[inline(always)]
-    unsafe fn load(p: *const u64) -> Self {
-        unsafe { _mm256_loadu_si256(p.cast()) }
+    fn load<T: Plain>(src: &[T], i: usize) -> Self {
+        load_at(src, i)
     }
     #[inline(always)]
-    unsafe fn store(p: *mut u64, v: Self) {
-        unsafe { _mm256_storeu_si256(p.cast(), v) }
+    fn store<T: Plain>(dst: &mut [T], i: usize, v: Self) {
+        store_at(dst, i, v)
     }
     #[inline(always)]
-    unsafe fn load_packs(p: *const u32) -> Self {
-        unsafe { _mm256_cvtepu32_epi64(_mm_loadu_si128(p.cast())) }
+    fn load_packs(src: &[u32], i: usize) -> Self {
+        unsafe { _mm256_cvtepu32_epi64(load_at::<u32, __m128i>(src, i)) }
     }
     #[inline(always)]
     fn zero() -> Self {
@@ -139,16 +154,16 @@ impl Vector for __m256i {
 impl Vector for __m512i {
     const N: usize = 4;
     #[inline(always)]
-    unsafe fn load(p: *const u64) -> Self {
-        unsafe { _mm512_loadu_si512(p.cast()) }
+    fn load<T: Plain>(src: &[T], i: usize) -> Self {
+        load_at(src, i)
     }
     #[inline(always)]
-    unsafe fn store(p: *mut u64, v: Self) {
-        unsafe { _mm512_storeu_si512(p.cast(), v) }
+    fn store<T: Plain>(dst: &mut [T], i: usize, v: Self) {
+        store_at(dst, i, v)
     }
     #[inline(always)]
-    unsafe fn load_packs(p: *const u32) -> Self {
-        unsafe { _mm512_cvtepu32_epi64(_mm256_loadu_si256(p.cast())) }
+    fn load_packs(src: &[u32], i: usize) -> Self {
+        unsafe { _mm512_cvtepu32_epi64(load_at::<u32, __m256i>(src, i)) }
     }
     #[inline(always)]
     fn zero() -> Self {

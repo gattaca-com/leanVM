@@ -307,18 +307,11 @@ pub fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [
     let ones = V::splat(RMFE.ones as u64);
     let mut out = [0u64; PACKS];
     for q in (0..PACKS).step_by(2 * V::N) {
-        // SAFETY: `2 * N` packs at `q`, and as many words.
-        unsafe {
-            let (za, zb, zc) = (
-                V::load_packs(a.as_ptr().add(q)),
-                V::load_packs(b.as_ptr().add(q)),
-                V::load_packs(c.as_ptr().add(q)),
-            );
-            let linear = za.xor(zc);
-            let even = zb.clmul::<0x00>(zc).xor(linear.clmul::<0x00>(ones));
-            let odd = zb.clmul::<0x11>(zc).xor(linear.clmul::<0x11>(ones));
-            V::store(out.as_mut_ptr().add(q), even.unpacklo(odd));
-        }
+        let (za, zb, zc) = (V::load_packs(a, q), V::load_packs(b, q), V::load_packs(c, q));
+        let linear = za.xor(zc);
+        let even = zb.clmul::<0x00>(zc).xor(linear.clmul::<0x00>(ones));
+        let odd = zb.clmul::<0x11>(zc).xor(linear.clmul::<0x11>(ones));
+        V::store(&mut out, q, even.unpacklo(odd));
     }
     out
 }
@@ -750,8 +743,7 @@ mod avx2 {
     pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
         let w: [[V; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
         for p in (0..2 * MIXED).step_by(2 * V::N) {
-            // SAFETY: `p + 2 * N` is at most `SLOTS`.
-            let z: [V; 5] = std::array::from_fn(|x| unsafe { V::load_packs(e[x].as_ptr().add(p)) });
+            let z: [V; 5] = std::array::from_fn(|x| V::load_packs(&e[x], p));
             let mut sums = [[V::zero(); 2]; 3];
             for x in 0..5 {
                 let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
@@ -766,9 +758,8 @@ mod avx2 {
             for (acc, sums) in acc.0.iter_mut().zip(sums) {
                 for (h, sum) in sums.into_iter().enumerate() {
                     let (v, l) = lane(p + h);
-                    let slot = acc[v].0[l..].as_mut_ptr().cast::<u64>();
-                    // SAFETY: `N` lanes from `l`, a multiple of `N`.
-                    unsafe { V::store(slot, V::load(slot).xor(sum)) };
+                    let slot = &mut acc[v].0[l..];
+                    V::store(slot, 0, V::load(slot, 0).xor(sum));
                 }
             }
         }
@@ -779,13 +770,10 @@ mod avx2 {
         std::array::from_fn(|half| {
             let mut acc = [V::zero(); 3];
             for q in (0..GROUP).step_by(2 * V::N) {
-                // SAFETY: `2 * N` packs and weights at `q`.
-                unsafe {
-                    let ze = V::load_packs(e.as_ptr().add(GROUP * half + q));
-                    for (acc, weights) in acc.iter_mut().zip(weights) {
-                        let zw = V::load(weights.as_ptr().add(q));
-                        *acc = acc.xor(ze.clmul::<0x00>(zw)).xor(ze.clmul::<0x11>(zw));
-                    }
+                let ze = V::load_packs(e, GROUP * half + q);
+                for (acc, weights) in acc.iter_mut().zip(weights) {
+                    let zw = V::load(weights, q);
+                    *acc = acc.xor(ze.clmul::<0x00>(zw)).xor(ze.clmul::<0x11>(zw));
                 }
             }
             acc.map(V::sum)
