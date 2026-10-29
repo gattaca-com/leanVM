@@ -385,7 +385,11 @@ mod x86 {
     use primitives::simd;
 
     use super::*;
-    pub use super::{embed_extend_portable as embed_extend, products_clmul as products, skip_row_portable as skip_row};
+    // The prover folds groups with GF2P8AFFINE where AVX-512 VBMI is, as every such machine has it.
+    pub use super::{
+        embed_extend_portable as embed_extend, fold_groups_portable as fold_groups, products_clmul as products,
+        skip_row_portable as skip_row,
+    };
     use crate::keccak::BITS;
     use primitives::load_at;
 
@@ -446,13 +450,6 @@ mod x86 {
         simd::store(&mut out, 0, _mm512_permutex2var_epi64(first, order(0), second));
         simd::store(&mut out, 1, _mm512_permutex2var_epi64(first, order(4), second));
         out
-    }
-
-    /// Eight packs, a word each.
-    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
-    #[inline]
-    fn load_packs(packs: &[u32; PACKS], i: usize) -> __m512i {
-        _mm512_cvtepu32_epi64(load_at::<u32, __m256i>(packs, i))
     }
 
     /// Byte `k` of the embedding of each pack of `v`, in the low byte of the pack's 16 bits.
@@ -653,50 +650,6 @@ mod x86 {
                 (halves[1] >> 64) as u64,
             ]
         }
-    }
-
-    entry! {
-        /// The twelve sums are summed across their lanes four registers at a time: their lanes
-        /// interleave into one, which takes six shuffles where each register alone would leave the
-        /// vector unit.
-        #[inline(always)]
-        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] => fold_vectors;
-    }
-
-    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
-    #[inline]
-    fn fold_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] {
-        const _: () = assert!(GROUP == 8);
-        // `acc[3 * g + k]`, four lanes to sum: a group is a register of packs.
-        let mut acc = [_mm512_setzero_si512(); 3 * GROUPS];
-        for g in 0..GROUPS {
-            let ze = load_packs(e, 8 * g);
-            for k in 0..3 {
-                let zw = simd::load(&weights[k], 0);
-                let sum = _mm512_xor_si512(_mm512_clmulepi64_epi128(ze, zw, 0x00), _mm512_clmulepi64_epi128(ze, zw, 0x11));
-                acc[3 * g + k] = sum;
-            }
-        }
-        // Lanes `a0 + a2, a1 + a3, b0 + b2, b1 + b3`.
-        let pair = |a: __m512i, b: __m512i| {
-            _mm512_xor_si512(
-                _mm512_shuffle_i64x2::<0b01_00_01_00>(a, b),
-                _mm512_shuffle_i64x2::<0b11_10_11_10>(a, b),
-            )
-        };
-        // Of four registers, the four sums.
-        let four = |a: &[__m512i]| {
-            let (t, u) = (pair(a[0], a[1]), pair(a[2], a[3]));
-            let v = _mm512_xor_si512(
-                _mm512_shuffle_i64x2::<0b10_00_10_00>(t, u),
-                _mm512_shuffle_i64x2::<0b11_01_11_01>(t, u),
-            );
-            let mut lanes = [0u128; 4];
-            simd::store(&mut lanes, 0, v);
-            lanes
-        };
-        let sums: [[u128; 4]; 3] = std::array::from_fn(|i| four(&acc[4 * i..]));
-        std::array::from_fn(|g| std::array::from_fn(|k| sums[(3 * g + k) / 4][(3 * g + k) % 4]))
     }
 }
 
