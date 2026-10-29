@@ -489,23 +489,22 @@ mod x86 {
         }
     }
 
-    /// [`extend_group`] on registers, each of eight positions' values.
+    /// One high-variable pair of [`extend_group`], leaving the low pair binary.
     #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
     #[inline]
-    fn extend8(v: &[__m512i], out: &mut [__m512i; MIXED]) {
+    fn extend8_high(v: &[__m512i], high: usize) -> [__m512i; 4] {
         let x = |a: [__m512i; 4], b: [__m512i; 4]| -> [__m512i; 4] {
             std::array::from_fn(|l| _mm512_xor_si512(a[l], b[l]))
         };
         let q = |k: usize| -> [__m512i; 4] { std::array::from_fn(|l| v[4 * k + l]) };
-        let (w4, w5) = (x(q(0), q(1)), x(q(2), q(3)));
-        let w = [q(0), q(1), q(2), q(3), w4, w5, x(q(0), q(2)), x(q(1), q(3)), x(w4, w5)];
-        for (k, w) in w[4..].iter().enumerate() {
-            out[4 * k..][..4].copy_from_slice(w);
-        }
-        for (k, w) in w.iter().enumerate() {
-            let low = x([w[0], w[2], w[0], w[1]], [w[1], w[3], w[2], w[3]]);
-            out[20 + 4 * k..][..4].copy_from_slice(&low);
-            out[56 + k] = _mm512_xor_si512(low[0], low[1]);
+        match high {
+            0..=3 => q(high),
+            4 => x(q(0), q(1)),
+            5 => x(q(2), q(3)),
+            6 => x(q(0), q(2)),
+            7 => x(q(1), q(3)),
+            8 => x(x(q(0), q(1)), x(q(2), q(3))),
+            _ => unreachable!(),
         }
     }
 
@@ -532,7 +531,7 @@ mod x86 {
         /// Per slot, the even and odd positions' sums of each partial product.
         acc: Vec<[__m512i; 6]>,
         packs: [[__m512i; PACKS]; 5],
-        extended: [[__m512i; MIXED]; 5],
+        tile: [[__m512i; 4]; 5],
     }
 
     impl SkipBlock {
@@ -541,7 +540,7 @@ mod x86 {
             Box::new(Self {
                 acc: vec![[zero; 6]; 2 * MIXED],
                 packs: [[zero; PACKS]; 5],
-                extended: [[zero; MIXED]; 5],
+                tile: [[zero; 4]; 5],
             })
         }
 
@@ -566,25 +565,42 @@ mod x86 {
                     let w: [[__m512i; 3]; 5] =
                         std::array::from_fn(|x| std::array::from_fn(|k| load_at(&weights.0, k * BITS + js[x])));
                     for half in 0..2 {
-                        for (extended, packs) in self.extended.iter_mut().zip(&self.packs) {
-                            extend8(&packs[GROUP * half..][..GROUP], extended);
-                        }
-                        for i in 0..MIXED {
-                            let e: [__m512i; 5] = std::array::from_fn(|x| self.extended[x][i]);
-                            let mut sums = [_mm512_setzero_si512(); 6];
-                            for x in 0..5 {
-                                let (b, c) = (e[(x + 1) % 5], e[(x + 2) % 5]);
-                                let even = _mm512_clmulepi64_epi128(b, c, 0x00);
-                                let odd = _mm512_clmulepi64_epi128(b, c, 0x11);
-                                for k in 0..3 {
-                                    let (s, w) = (&mut sums[2 * k..], w[x][k]);
-                                    s[0] = _mm512_xor_si512(s[0], _mm512_clmulepi64_epi128(even, w, 0x00));
-                                    s[1] = _mm512_xor_si512(s[1], _mm512_clmulepi64_epi128(odd, w, 0x10));
-                                }
+                        for high in 0..HIGH.len() {
+                            for (tile, packs) in self.tile.iter_mut().zip(&self.packs) {
+                                *tile = extend8_high(&packs[GROUP * half..][..GROUP], high);
                             }
-                            let acc = &mut self.acc[slot(half, i)];
-                            for (acc, sum) in acc.iter_mut().zip(sums) {
-                                *acc = _mm512_xor_si512(*acc, sum);
+                            for i in 0..if high < 4 { 5 } else { 9 } {
+                                let e: [__m512i; 5] = std::array::from_fn(|x| {
+                                    let v = &self.tile[x];
+                                    match i {
+                                        0 => _mm512_xor_si512(v[0], v[1]),
+                                        1 => _mm512_xor_si512(v[2], v[3]),
+                                        2 => _mm512_xor_si512(v[0], v[2]),
+                                        3 => _mm512_xor_si512(v[1], v[3]),
+                                        4 => _mm512_xor_si512(_mm512_xor_si512(v[0], v[1]), _mm512_xor_si512(v[2], v[3])),
+                                        _ => v[i - 5],
+                                    }
+                                });
+                                let mut sums = [_mm512_setzero_si512(); 6];
+                                for x in 0..5 {
+                                    let (b, c) = (e[(x + 1) % 5], e[(x + 2) % 5]);
+                                    let even = _mm512_clmulepi64_epi128(b, c, 0x00);
+                                    let odd = _mm512_clmulepi64_epi128(b, c, 0x11);
+                                    for k in 0..3 {
+                                        let (s, w) = (&mut sums[2 * k..], w[x][k]);
+                                        s[0] = _mm512_xor_si512(s[0], _mm512_clmulepi64_epi128(even, w, 0x00));
+                                        s[1] = _mm512_xor_si512(s[1], _mm512_clmulepi64_epi128(odd, w, 0x10));
+                                    }
+                                }
+                                let point = match i {
+                                    0..=3 => 20 + 4 * high + i,
+                                    4 => 56 + high,
+                                    _ => 4 * (high - 4) + i - 5,
+                                };
+                                let acc = &mut self.acc[slot(half, point)];
+                                for (acc, sum) in acc.iter_mut().zip(sums) {
+                                    *acc = _mm512_xor_si512(*acc, sum);
+                                }
                             }
                         }
                     }
