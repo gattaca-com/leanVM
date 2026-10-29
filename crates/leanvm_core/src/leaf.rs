@@ -7,11 +7,11 @@
 //! g-powers, separators); the fingerprint challenges `α, β` are `E`-valued, so a
 //! leaf accumulates via the mixed `mul_base` product (2 PMULL per coordinate).
 
-use flux_profiler::timed;
 use crate::PAR_THRESHOLD;
 use crate::constraints::{self, TableBlocks};
 use crate::gkr;
 use crate::transcript::ProverState;
+use flux_profiler::timed;
 use primitives::field::{
     Acc8, F64, F64x8, F192, F192Unreduced, F192x8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
     mul_slices,
@@ -267,7 +267,7 @@ impl Lanes for F64x8 {
     }
 }
 
-/// Build and publish one task of consecutive GKR blocks, the first being block `first` of the leaf
+/// Build and publish one task of consecutive GKR `blocks` of the leaf
 /// vector: `compute(l)` returns the eight leaves from leaf `l`, and each block's first radix-four
 /// layer goes to `quads`, sixteen per block. The next two layers go to `tiers`: four nodes of level
 /// 4 per block, and one node of level 6 for each group of eight blocks that starts at a multiple of
@@ -284,15 +284,17 @@ impl Lanes for F64x8 {
 ///
 /// The first `columns` blocks of the task are computed but not stored: GKR recomputes them.
 ///
-/// `quads` and `tiers` are the task's blocks of those tables, sixteen, four and one per block.
+/// `quads` and `tiers` are the task's blocks of those tables, sixteen, four and one per block, and
+/// `task`, if present, holds their leaves.
 fn publish_task<G: Lanes>(
-    task: &mut [[G; 8]],
+    mut task: Option<&mut [[G; 8]]>,
     quads: &mut [G::Elem],
     [tier4, tier6]: [&mut [G::Elem]; 2],
-    first: usize,
+    blocks: Range<usize>,
     columns: usize,
     compute: impl Fn(usize) -> G,
 ) {
+    let (first, count) = (blocks.start, blocks.len());
     let stream = Stream::new();
     let mut stage = [[G::ZERO; 8]; 2];
     let zero = G::ZERO.to_array()[0];
@@ -304,18 +306,19 @@ fn publish_task<G: Lanes>(
     let mut nodes = [zero; 32];
     let mut node_lanes = [G::ZERO; 4];
     let mut even_block = None;
-    for k in 0..=task.len() {
+    for k in 0..=count {
         let (cur, prev) = (k % 2, (k + 1) % 2);
         let base = gkr::BLOCK_VALUES * (first + k);
         let mut groups = [G::ZERO; 8];
         let (mut evens, mut eights) = (G::ZERO, G::ZERO);
         for (j, group) in groups.iter_mut().enumerate() {
-            if k < task.len() {
+            if k < count {
                 *group = compute(base + 8 * j);
             }
             if k > 0 {
                 let v = &stage[prev];
                 if k > columns {
+                    let task = task.as_deref_mut().expect("stored leaves have a destination");
                     stream.copy(std::slice::from_mut(&mut task[k - 1][j]), &v[j..=j]);
                 }
                 // Lane `j` of the two quads of each group, a product per step.
@@ -339,7 +342,7 @@ fn publish_task<G: Lanes>(
         if k > 0 {
             let block = first + k - 1;
             stream.copy(&mut quads[16 * (k - 1)..][..16], &stage_quads[prev]);
-            let (slot, last) = (block % 8, k == task.len());
+            let (slot, last) = (block % 8, k == count);
             if block.is_multiple_of(2) && !last {
                 even_block = Some(eights);
             } else {
@@ -373,7 +376,7 @@ fn publish_task<G: Lanes>(
                 }
             }
         }
-        if k < task.len() {
+        if k < count {
             // Group `j` of eight leaves becomes lane `j` of the block's eight vectors.
             stage[cur] = G::transpose(groups);
         }
@@ -437,7 +440,11 @@ impl Side<'_> {
     fn bulk(&self, b: usize) -> usize {
         let blk = &self.blocks[b];
         let aligned = self.lay.offsets[b].is_multiple_of(gkr::BLOCK_VALUES);
-        if blk.rows >= PAR_THRESHOLD && aligned { blk.rows / gkr::BLOCK_VALUES } else { 0 }
+        if blk.rows >= PAR_THRESHOLD && aligned {
+            blk.rows / gkr::BLOCK_VALUES
+        } else {
+            0
+        }
     }
 
     /// The leading GKR blocks of block `b`'s bulk that are not stored: an even number, so that an odd
@@ -522,7 +529,7 @@ pub fn build_leaves<'a>(
     beta: F192,
     gpow: &'a [F64],
     columns: bool,
-) -> (Vec<gkr::Leaves>, Option<ColumnLeaves<'a>>) {
+) -> (Vec<gkr::Leaves<'static>>, Option<ColumnLeaves<'a>>) {
     let mut sides: Vec<Side> = sides
         .iter()
         .map(|&(blocks, lay)| {
@@ -641,7 +648,9 @@ pub fn build_leaves<'a>(
                         [ptrs[s].2[0].slice(4 * first, 4 * len), ptrs[s].2[1].slice(first, len)],
                     )
                 };
-                publish_task(task, quads, tiers, first, columns, |l| leaf_rows8(&side.terms[b], l - off));
+                publish_task(Some(task), quads, tiers, first..first + len, columns, |l| {
+                    leaf_rows8(&side.terms[b], l - off)
+                });
             }
         });
     }
@@ -710,7 +719,7 @@ pub fn build_leaves<'a>(
                 parallel::fill(&mut quads, |k| gkr::quad_at(&leaves, k));
             }
             gkr::Leaves {
-                leaves,
+                leaves: gkr::LeafData::Blocks(leaves),
                 len: explicit,
                 quads,
                 ones,
@@ -775,7 +784,10 @@ fn finish_quads(leaves: &[gkr::Block], quads: &mut [F192], blocks: &[Block], lay
         if blk.kappa < 2 {
             continue;
         }
-        let (start, end) = (quads_done[b] / 4, ((lay.offsets[b] + (1usize << blk.kappa)) / 4).min(small_from));
+        let (start, end) = (
+            quads_done[b] / 4,
+            ((lay.offsets[b] + (1usize << blk.kappa)) / 4).min(small_from),
+        );
         if start >= end {
             continue;
         }
@@ -1137,12 +1149,10 @@ pub fn stacked_bytecode_table(blocks: &[Block]) -> Vec<F64> {
     table
 }
 
-/// The count side's leaves, which stay in the base field. A count block is one plain column at weight
-/// `1` and `β = 0`, so its leaf is the column's own value and the leaves are a transposed copy of the
-/// columns, with the identity for padding rows. The first radix-four layer is built from the staged
-/// blocks, as in [`build_leaves`].
+/// The count side reads its base-field leaves directly from the columns. Only product levels
+/// are stored, with whole blocks of identity padding left implicit.
 #[timed]
-fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::Leaves<F64> {
+fn build_count_leaves<'a>(blocks: &[Block], lay: &Layout, cols: &[&'a [F64]]) -> gkr::Leaves<'a, F64> {
     // `(offset, end, column)` of each block, the column cut to its rows, by offset.
     let mut segments: Vec<(usize, usize, &[F64])> = blocks
         .iter()
@@ -1151,57 +1161,80 @@ fn build_count_leaves(blocks: &[Block], lay: &Layout, cols: &[&[F64]]) -> gkr::L
             let [Coord::Col(i)] = blk.coords.as_slice() else {
                 panic!("a count block is one column");
             };
-            (lay.offsets[b], lay.offsets[b] + (1usize << blk.kappa), &cols[*i][..blk.rows])
+            (
+                lay.offsets[b],
+                lay.offsets[b] + (1usize << blk.kappa),
+                &cols[*i][..blk.rows],
+            )
         })
         .collect();
     segments.sort_unstable_by_key(|segment| segment.0);
     let explicit = segments.iter().map(|segment| segment.1).max().unwrap_or(1);
     let block_count = explicit.div_ceil(gkr::BLOCK_VALUES);
-    // The segment starting at or before leaf `l`, which holds it unless it is a hole.
-    let segment_of = |l: usize| {
-        segments
-            .partition_point(|segment| segment.0 <= l)
-            .checked_sub(1)
-            .map(|i| segments[i])
+    let columns = gkr::Columns {
+        segments: segments.into_iter().map(|(off, _, data)| (off, data)).collect(),
+        len: explicit,
     };
-    // Eight leaves from leaf `l`: a run of one column, a run of padding, or the edge of either.
-    let eight = |l: usize| match segment_of(l) {
-        Some((off, _, data)) if data.len() >= l - off + 8 => {
-            F64x8::from_array(data[l - off..][..8].try_into().unwrap())
+    let mut ones = Vec::new();
+    let mut end = 0;
+    for &(off, data) in &columns.segments {
+        if end < off {
+            ones.push(end..off);
         }
-        Some((off, end, data)) if l >= off + data.len() && l + 8 <= end => F64x8::ONE,
-        _ => F64x8::from_array(&std::array::from_fn(|t| {
-            segment_of(l + t).and_then(|(off, _, data)| data.get(l + t - off).copied()).unwrap_or(F64::ONE)
-        })),
-    };
-    // The groups below write every block and every quad slot.
-    let mut leaves_out = Vec::new();
+        end = off + data.len();
+    }
+    if end < explicit {
+        ones.push(end..explicit);
+    }
+    let mut staged = Vec::new();
+    let mut first = 0;
+    for skip in gkr::identity_blocks(&ones, 0, explicit)
+        .into_iter()
+        .chain(std::iter::once(block_count..block_count))
+    {
+        staged.extend(
+            (first..skip.start)
+                .step_by(BLOCKS)
+                .map(|start| start..(start + BLOCKS).min(skip.start)),
+        );
+        first = skip.end;
+    }
+    // The staged runs write their quads and tiers, and the boundary fill below the identity quads GKR
+    // reads. Whole identity blocks stay unread, as in `build_leaves`.
     let [mut quads, mut tier4, mut tier6] = primitives::filled_vecs([16 * block_count, 4 * block_count, block_count], |bufs| {
-        let [quads, tier4, tier6] = bufs;
-        leaves_out = primitives::filled_vec::<gkr::KBlock>(block_count, |leaves| {
-            parallel::for_each_chunks_mut2(
-                [leaves],
-                [BLOCKS],
-                [&mut quads[..], &mut tier4[..], &mut tier6[..]],
-                [16 * BLOCKS, 4 * BLOCKS, BLOCKS],
-                |c, [task], [quads, tier4, tier6]| publish_task(task, quads, [tier4, tier6], c * BLOCKS, 0, eight),
-            );
+        let ptrs = bufs.map(|buf| parallel::SendPtr(buf.as_mut_ptr()));
+        parallel::for_each(staged.len(), |c| {
+            let run = staged[c].clone();
+            let (first, len) = (run.start, run.len());
+            // SAFETY: the staged runs are disjoint, and so are their blocks of the product levels.
+            let (quads, tiers) = unsafe {
+                (
+                    ptrs[0].slice(16 * first, 16 * len),
+                    [ptrs[1].slice(4 * first, 4 * len), ptrs[2].slice(first, len)],
+                )
+            };
+            publish_task(None, quads, tiers, run, len, |l| F64x8::from_array(&columns.read::<8>(l)));
         });
     });
-    let leaves = leaves_out;
     quads.truncate(explicit.div_ceil(4));
+    for run in &ones {
+        let range = run.start.div_ceil(4)..run.end / 4;
+        if !range.is_empty() {
+            for q in outside(range, unread(run.clone(), 2, quads.len())) {
+                quads[q] = F64::ONE;
+            }
+        }
+    }
     tier4.truncate(quads.len().div_ceil(4));
     tier6.truncate(quads.len().div_ceil(4).div_ceil(4));
     let tiers = [tier4, tier6];
     gkr::Leaves {
-        leaves,
+        leaves: gkr::LeafData::Columns(columns),
         len: explicit,
         quads,
-        ones: Vec::new(),
+        ones,
         tiers,
-        staged: (0..block_count.div_ceil(BLOCKS))
-            .map(|c| c * BLOCKS..((c + 1) * BLOCKS).min(block_count))
-            .collect(),
+        staged,
     }
 }
 
@@ -1330,7 +1363,11 @@ pub fn prove_balance(
         let tasks: Vec<(&[F64], &[F192])> = jobs
             .iter()
             .map(|&(col, kappa)| (cols[col], &bus_gkr.point[..kappa]))
-            .chain(publics.iter().map(|&(vals, kappa)| (&vals[..], &bus_gkr.point[..kappa])))
+            .chain(
+                publics
+                    .iter()
+                    .map(|&(vals, kappa)| (&vals[..], &bus_gkr.point[..kappa])),
+            )
             .collect();
         let values = mle_eval_many(&tasks);
         let (fresh, public_values) = values.split_at(jobs.len());
@@ -1354,8 +1391,13 @@ pub fn prove_balance(
             );
         }
     });
-    let (table_evals, prod_sums, blocks) =
-        crate::stage!("Bus table evals", || tables_and_prods_at(cols, tables, rows, &forms, &bus_gkr.point));
+    let (table_evals, prod_sums, blocks) = crate::stage!("Bus table evals", || tables_and_prods_at(
+        cols,
+        tables,
+        rows,
+        &forms,
+        &bus_gkr.point
+    ));
     let sigmas: [Vec<F192>; 3] = std::array::from_fn(|s| {
         let sigmas: Vec<F192> = forms[s]
             .iter()
@@ -1539,7 +1581,66 @@ fn tables_and_prods_at(
 
 #[cfg(test)]
 mod tests {
-    use super::soundness_bits;
+    use super::*;
+
+    #[test]
+    fn borrowed_count_columns_match_dense_proofs() {
+        let mut cases = vec![
+            vec![],
+            vec![(0, 0)],
+            vec![(0, 1)],
+            vec![(1, 1), (0, 1)],
+            vec![(11, 65), (10, 513), (4, 7), (0, 1), (9, 0), (3, 2)],
+        ];
+        for rows in [
+            0, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 8191, 8192, 8193, 16384,
+        ] {
+            cases.push(vec![(14, rows)]);
+        }
+        for case in cases {
+            let values: Vec<Vec<F64>> = case
+                .iter()
+                .enumerate()
+                .map(|(b, &(_, rows))| (0..rows).map(|i| F64((13 * i + 97 * b + 2) as u64)).collect())
+                .collect();
+            let cols: Vec<&[F64]> = values.iter().map(Vec::as_slice).collect();
+            let blocks: Vec<Block> = case
+                .iter()
+                .enumerate()
+                .map(|(i, &(kappa, rows))| Block {
+                    kappa,
+                    rows,
+                    coords: vec![Coord::Col(i)],
+                    padding: vec![F64::ONE],
+                })
+                .collect();
+            let lay = layout(&blocks);
+            let sparse = build_count_leaves(&blocks, &lay, &cols);
+            let len = sparse.len;
+            let mut dense = vec![F64::ONE; len];
+            for (b, data) in values.iter().enumerate() {
+                dense[lay.offsets[b]..lay.offsets[b] + data.len()].copy_from_slice(data);
+            }
+            let prove = |count| {
+                let mut ps = ProverState::from_label(b"borrowed-count-columns");
+                let result = gkr::prove_product_triple_from(
+                    gkr::Leaves::new(vec![F192::Y; len]),
+                    gkr::Leaves::new(vec![F192::Y + F192::ONE; len]),
+                    count,
+                    None,
+                    &mut ps,
+                    gkr::RootShape::Distinct,
+                );
+                (result, ps.into_proof().stream)
+            };
+            let (actual, actual_proof) = prove(sparse);
+            let (expected, expected_proof) = prove(gkr::Leaves::new(dense));
+            assert_eq!(actual.roots, expected.roots, "{case:?}");
+            assert_eq!(actual.values, expected.values, "{case:?}");
+            assert_eq!(actual.point, expected.point, "{case:?}");
+            assert_eq!(actual_proof, expected_proof, "{case:?}");
+        }
+    }
 
     /// The bound is `(N_TUPLE_BITS + 1)·2^mu` plus the GKR terms: only the bus
     /// DEPTH costs bits now, the multilinear fingerprint having fixed each factor's

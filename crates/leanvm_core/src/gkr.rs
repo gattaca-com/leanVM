@@ -7,9 +7,9 @@
 //! upstream, [`crate::leaf`]), except that a tree whose leaves are `K`-valued stays in `K`
 //! until its first fold with an `E` challenge ([`TreeField`]).
 
-use flux_profiler::timed;
 use crate::PAR_THRESHOLD;
 use crate::transcript::ProverState;
+use flux_profiler::timed;
 use primitives::field::{F64, F64x8, F192, F192Unreduced, F192x8, Prod8, mul_unreduced4, mul2, mul4};
 use primitives::multilinear::{eq_table, interp};
 use primitives::stream::Stream;
@@ -25,7 +25,7 @@ fn window_rows(total: usize) -> usize {
 /// A product tree's leaves with its first radix-four layer, `quads[k] = leaves[4k] · … ·
 /// leaves[4k + 3]` (absent leaves are the identity), built by whoever wrote the leaves.
 ///
-/// The leaves are blocks, covering `len` of them with the identity after.
+/// The leaves cover `len` values, stored as blocks or borrowed from columns, with the identity after.
 ///
 /// `ones` are sorted, disjoint runs of leaves that are the identity. The GKR never reads a whole
 /// block of 64 inside a run, at the leaves or at any level above them (see [`identity_blocks`]),
@@ -36,8 +36,8 @@ fn window_rows(total: usize) -> usize {
 /// sorted, disjoint runs of blocks. A run holds the level-4 entries of its blocks, and the level-6
 /// entry of each group of eight blocks that starts at a multiple of eight and lies inside the run.
 /// [`build_layers`] computes the entries no run holds.
-pub struct Leaves<F: TreeField = F192> {
-    pub leaves: Vec<F::Block>,
+pub struct Leaves<'a, F: TreeField = F192> {
+    pub leaves: LeafData<'a, F>,
     pub len: usize,
     pub quads: Vec<F>,
     pub ones: Vec<Range<usize>>,
@@ -45,18 +45,67 @@ pub struct Leaves<F: TreeField = F192> {
     pub staged: Vec<Range<usize>>,
 }
 
-impl<F: TreeField> Leaves<F> {
+impl<F: TreeField> Leaves<'_, F> {
     pub fn new(values: Vec<F>) -> Self {
         let leaves = blocks_from_values(&values);
         let quads = (0..values.len().div_ceil(4)).map(|k| quad_at(&leaves, k)).collect();
         Self {
-            leaves,
+            leaves: LeafData::Blocks(leaves),
             len: values.len(),
             quads,
             ones: Vec::new(),
             tiers: [Vec::new(), Vec::new()],
             staged: Vec::new(),
         }
+    }
+}
+
+/// Stored blocks, or columns read directly until the first fold.
+pub enum LeafData<'a, F: TreeField> {
+    Blocks(Vec<F::Block>),
+    Columns(Columns<'a, F>),
+}
+
+impl<F: TreeField> Default for LeafData<'_, F> {
+    fn default() -> Self {
+        Self::Blocks(Vec::new())
+    }
+}
+
+impl<'a, F: TreeField> LeafData<'a, F> {
+    fn leaf(&self, l: usize) -> F {
+        match self {
+            Self::Blocks(blocks) => F::leaf(blocks, l),
+            Self::Columns(columns) => columns.read::<1>(l)[0],
+        }
+    }
+
+    fn state(self, len: usize, width: usize) -> QuaternaryLayerState<'a> {
+        match self {
+            Self::Blocks(blocks) => F::state_from_blocks(blocks, len, width),
+            Self::Columns(columns) if len <= BLOCK_VALUES => {
+                QuaternaryLayerState::from_rows((0..len).map(|l| columns.read::<1>(l)[0].embed()).collect(), width)
+            }
+            Self::Columns(columns) => QuaternaryLayerState::from_table(Box::new(columns), width),
+        }
+    }
+}
+
+/// Sorted, disjoint columns at their leaf offsets, with identity values between them.
+pub struct Columns<'a, F> {
+    pub segments: Vec<(usize, &'a [F])>,
+    pub len: usize,
+}
+
+impl<F: TreeField> Columns<'_, F> {
+    pub fn read<const N: usize>(&self, start: usize) -> [F; N] {
+        let mut out = [F::ONE; N];
+        let first = self.segments.partition_point(|&(off, data)| off + data.len() <= start);
+        for &(off, data) in self.segments[first..].iter().take_while(|&&(off, _)| off < start + N) {
+            let (lo, hi) = (start.max(off), (start + N).min(off + data.len()));
+            out[lo - start..hi - start].copy_from_slice(&data[lo - off..hi - off]);
+        }
+        out
     }
 }
 
@@ -147,7 +196,7 @@ pub trait TreeField: primitives::Plain + Send + Sync + std::ops::Mul<Output = Se
     fn leaf(blocks: &[Self::Block], l: usize) -> Self;
 
     /// The layer state over a table of `len` values held as blocks, whose tail is the identity.
-    fn state_from_blocks(blocks: Vec<Self::Block>, len: usize, width: usize) -> QuaternaryLayerState;
+    fn state_from_blocks(blocks: Vec<Self::Block>, len: usize, width: usize) -> QuaternaryLayerState<'static>;
 }
 
 impl TreeField for F192 {
@@ -166,8 +215,7 @@ impl TreeField for F192 {
 
     #[inline(always)]
     fn eight_products(children: &[Self]) -> [Self; 8] {
-        let [a, b, c, d] =
-            std::array::from_fn(|i| F192x8::from_array(children[8 * i..8 * i + 8].try_into().unwrap()));
+        let [a, b, c, d] = std::array::from_fn(|i| F192x8::from_array(children[8 * i..8 * i + 8].try_into().unwrap()));
         let pairs = |x, y| {
             let (even, odd) = F192x8::even_odd(x, y);
             even * odd
@@ -198,7 +246,7 @@ impl TreeField for F192 {
         blocks[l / BLOCK_VALUES][l % 8].lane(l / 8 % 8)
     }
 
-    fn state_from_blocks(blocks: Vec<Block>, len: usize, width: usize) -> QuaternaryLayerState {
+    fn state_from_blocks(blocks: Vec<Block>, len: usize, width: usize) -> QuaternaryLayerState<'static> {
         QuaternaryLayerState::from_blocks(blocks, len, width)
     }
 }
@@ -247,7 +295,7 @@ impl TreeField for F64 {
         blocks[l / BLOCK_VALUES][l % 8].lane(l / 8 % 8)
     }
 
-    fn state_from_blocks(blocks: Vec<KBlock>, len: usize, width: usize) -> QuaternaryLayerState {
+    fn state_from_blocks(blocks: Vec<KBlock>, len: usize, width: usize) -> QuaternaryLayerState<'static> {
         QuaternaryLayerState::from_k_blocks(blocks, len, width)
     }
 }
@@ -264,16 +312,16 @@ pub(crate) fn quad_at<F: TreeField>(leaves: &[F::Block], k: usize) -> F {
 
 /// A product tree's levels: `layers[level]` holds the products of `2^level` leaves, built only for
 /// the levels radix four consumes (`0, 2, 4, …`, plus the binary root when the depth is odd), and
-/// the leaves themselves stay blocks.
-struct Levels<F: TreeField> {
+/// the leaves stay in their original representation until the first fold.
+struct Levels<'a, F: TreeField> {
     layers: Vec<Vec<F>>,
-    bottom: Vec<F::Block>,
+    bottom: LeafData<'a, F>,
     len: usize,
     ones: Vec<Range<usize>>,
 }
 
 /// A tree as the proof reads it, whatever field its values are in.
-trait Tree {
+trait Tree<'a> {
     /// The product of the tree's leaves.
     fn root(&self) -> F192;
 
@@ -281,10 +329,10 @@ trait Tree {
     fn nodes(&self, level: usize) -> Vec<F192>;
 
     /// The layer state over the children of a layer, the table two levels below it.
-    fn state(&mut self, layer: usize, width: usize) -> QuaternaryLayerState;
+    fn state(&mut self, layer: usize, width: usize) -> QuaternaryLayerState<'a>;
 }
 
-impl<F: TreeField> Tree for Levels<F> {
+impl<'a, F: TreeField> Tree<'a> for Levels<'a, F> {
     fn root(&self) -> F192 {
         self.layers.last().expect("a tree has a root level")[0].embed()
     }
@@ -293,10 +341,10 @@ impl<F: TreeField> Tree for Levels<F> {
         self.layers[level].iter().map(|node| node.embed()).collect()
     }
 
-    fn state(&mut self, layer: usize, width: usize) -> QuaternaryLayerState {
+    fn state(&mut self, layer: usize, width: usize) -> QuaternaryLayerState<'a> {
         let level = layer - 2;
         let mut state = if layer == 2 {
-            F::state_from_blocks(std::mem::take(&mut self.bottom), self.len, width)
+            std::mem::take(&mut self.bottom).state(self.len, width)
         } else {
             QuaternaryLayerState::new(std::mem::take(&mut self.layers[level]), width)
         };
@@ -306,7 +354,7 @@ impl<F: TreeField> Tree for Levels<F> {
 }
 
 #[timed]
-fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
+fn build_layers<F: TreeField>(leaves: Leaves<'_, F>, mu: usize) -> Levels<'_, F> {
     let Leaves {
         leaves,
         len,
@@ -325,7 +373,7 @@ fn build_layers<F: TreeField>(leaves: Leaves<F>, mu: usize) -> Levels<F> {
     let mut layers: Vec<Vec<F>> = (0..=mu).map(|_| Vec::new()).collect();
     let mut level = 0;
     if mu < 2 {
-        layers[0] = (0..len).map(|l| F::leaf(&leaves, l)).collect();
+        layers[0] = (0..len).map(|l| leaves.leaf(l)).collect();
     }
     if mu >= 2 {
         layers[2] = quads;
@@ -519,7 +567,11 @@ fn line_product(a0: F192x8, d0: F192x8, a1: F192x8, d1: F192x8) -> [F192x8; 3] {
     let low = a0.mul_unreduced(a1);
     let high = d0.mul_unreduced(d1);
     let at_one = (a0 + d0).mul_unreduced(a1 + d1);
-    [low.reduce_lanes(), (at_one ^ low ^ high).reduce_lanes(), high.reduce_lanes()]
+    [
+        low.reduce_lanes(),
+        (at_one ^ low ^ high).reduce_lanes(),
+        high.reduce_lanes(),
+    ]
 }
 
 impl TableBlock for Block {
@@ -636,6 +688,28 @@ impl<B: TableBlock, V: Deref<Target = [B]> + Sync> Source for V {
 /// A table of rows, the products of the level below. The first message and the first fold of a layer
 /// read them in place, so no table of blocks is written and read back.
 struct Rows<F>(Vec<F>);
+
+impl<F: TreeField> Source for Columns<'_, F> {
+    type Block = F::Block;
+
+    fn count(&self) -> usize {
+        self.len.div_ceil(BLOCK_VALUES)
+    }
+
+    fn block(&self, b: usize) -> Self::Block {
+        F::block(&self.read::<BLOCK_VALUES>(b * BLOCK_VALUES))
+    }
+
+    fn prefetch(&self, b: usize) {
+        let start = b * BLOCK_VALUES;
+        let next = self.segments.partition_point(|&(off, data)| off + data.len() <= start);
+        if let Some(&(off, data)) = self.segments.get(next) {
+            let at = start.saturating_sub(off);
+            let values = &data[at..(at + BLOCK_VALUES).min(data.len())];
+            prefetch_lines(values.as_ptr().cast(), size_of_val(values));
+        }
+    }
+}
 
 impl<F: TreeField> Source for Rows<F> {
     type Block = F::Block;
@@ -857,7 +931,7 @@ fn fold_block_pairs<S: Source + ?Sized>(
 }
 
 /// Two binary product levels contracted into one degree-four layer.
-pub struct QuaternaryLayerState {
+pub struct QuaternaryLayerState<'a> {
     /// Four child tables interleaved in their original order. This lets the
     /// prover consume a product-tree level without first transposing it.
     /// Empty once the table is held as `blocks`.
@@ -868,7 +942,7 @@ pub struct QuaternaryLayerState {
     next_blocks: Vec<Block>,
     /// A table of at least two blocks that is not yet `E` blocks (base-field blocks, or rows), until
     /// the first fold: it then replaces `blocks`.
-    first: Option<Box<dyn Table>>,
+    first: Option<Box<dyn Table + 'a>>,
     /// Logical row count after identity padding. `values` stores an arbitrary
     /// prefix; every omitted row is the constant four-tuple one.
     logical_rows: usize,
@@ -879,7 +953,7 @@ pub struct QuaternaryLayerState {
     columns: Vec<Range<usize>>,
 }
 
-impl QuaternaryLayerState {
+impl<'a> QuaternaryLayerState<'a> {
     fn new<F: TreeField>(values: Vec<F>, width: usize) -> Self {
         if values.len() <= BLOCK_VALUES {
             return Self::from_rows(values.into_iter().map(F::embed).collect(), width);
@@ -914,7 +988,7 @@ impl QuaternaryLayerState {
     }
 
     /// The state over a table of at least two blocks that the first fold turns into `E` blocks.
-    fn from_table(table: Box<dyn Table>, width: usize) -> Self {
+    fn from_table(table: Box<dyn Table + 'a>, width: usize) -> Self {
         Self {
             values: Vec::new(),
             next: Vec::new(),
@@ -1189,7 +1263,9 @@ impl QuaternaryLayerState {
         if !self.blocked() {
             return self.values.clone();
         }
-        (0..BLOCK_VALUES * self.blocks.len()).map(|l| F192::leaf(&self.blocks, l)).collect()
+        (0..BLOCK_VALUES * self.blocks.len())
+            .map(|l| F192::leaf(&self.blocks, l))
+            .collect()
     }
 }
 
@@ -1231,7 +1307,12 @@ fn fold_columns(
     equality: Option<&Equality>,
 ) -> [[F192; 4]; 2] {
     let [push, pull, _] = trees;
-    columns_fold(columns, [&mut push.next_blocks, &mut pull.next_blocks], challenge, equality)
+    columns_fold(
+        columns,
+        [&mut push.next_blocks, &mut pull.next_blocks],
+        challenge,
+        equality,
+    )
 }
 
 /// Prove three identity-padded grand products as one RLC-batched radix-four GKR.
@@ -1258,7 +1339,7 @@ pub fn prove_product_triple_from<C: TreeField>(
         [pull.len, count.len].iter().all(|&len| len > 0 && len <= 1 << mu),
         "batched trees must be nonempty prefixes of the first tree's logical tree"
     );
-    let mut levels: [Box<dyn Tree>; 3] = [
+    let mut levels: [Box<dyn Tree<'_> + '_>; 3] = [
         Box::new(build_layers(push, mu)),
         Box::new(build_layers(pull, mu)),
         Box::new(build_layers(count, mu)),
@@ -1437,7 +1518,9 @@ mod tests {
     #[test]
     fn fused_fold_matches_separate_fold_and_message() {
         for width in [4usize, 16, 64, 256, 1 << 14] {
-            let lengths = [1, 4, 5, 7, 8, 9, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 320, 1000, 4097];
+            let lengths = [
+                1, 4, 5, 7, 8, 9, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 320, 1000, 4097,
+            ];
             for len in lengths.into_iter().chain([4 * width - 5, 4 * width - 1, 4 * width]) {
                 if len > 4 * width {
                     continue;
@@ -1500,7 +1583,11 @@ mod tests {
                     .collect();
                 let mut equality = Equality::new(&point);
                 let mut dropped = 1;
-                assert_eq!(fused.round_message(&equality), reference.round_message(&equality), "{context}");
+                assert_eq!(
+                    fused.round_message(&equality),
+                    reference.round_message(&equality),
+                    "{context}"
+                );
                 while reference.logical_rows > 2 {
                     let challenge = F192::new(reference.logical_rows as u64, 13, 19);
                     reference.fold(challenge);
@@ -1525,7 +1612,12 @@ mod tests {
     #[test]
     fn base_field_count_tree_gives_the_same_proof() {
         for mu in 0..=13usize {
-            let lengths = [1usize << mu, (1usize << mu) - 3, (1usize << mu.saturating_sub(1)) + 1, 1];
+            let lengths = [
+                1usize << mu,
+                (1usize << mu) - 3,
+                (1usize << mu.saturating_sub(1)) + 1,
+                1,
+            ];
             for count_len in lengths {
                 if count_len == 0 || count_len > 1 << mu {
                     continue;
@@ -1552,7 +1644,11 @@ mod tests {
                     RootShape::Distinct,
                 );
                 dense.resize(1 << mu, F192::ONE);
-                assert_eq!(base.values[2], mle_eval_e(&dense, &base.point), "mu={mu}, len={count_len}");
+                assert_eq!(
+                    base.values[2],
+                    mle_eval_e(&dense, &base.point),
+                    "mu={mu}, len={count_len}"
+                );
                 assert_eq!(base.roots, extension.roots, "mu={mu}, len={count_len}");
                 assert_eq!(base.point, extension.point, "mu={mu}, len={count_len}");
                 assert_eq!(base.values, extension.values, "mu={mu}, len={count_len}");
@@ -1647,8 +1743,11 @@ mod tests {
             let garbage = F192::new(0xDEAD, 0xBEEF, 0xF00D);
             let sparse = |lane: usize| {
                 let mut leaves = Leaves::new(tree(lane));
+                let LeafData::Blocks(blocks) = &mut leaves.leaves else {
+                    unreachable!();
+                };
                 for b in identity_blocks(&runs, 0, leaves.len).into_iter().flatten() {
-                    leaves.leaves[b] = [F192x8::splat(garbage); 8];
+                    blocks[b] = [F192x8::splat(garbage); 8];
                 }
                 for b in identity_blocks(&runs, 2, leaves.quads.len()).into_iter().flatten() {
                     leaves.quads[BLOCK_VALUES * b..BLOCK_VALUES * (b + 1)].fill(garbage);
