@@ -623,9 +623,28 @@ fn quadratic_product(a: [F192x8; 3], b: [F192x8; 3]) -> [Prod8; 5] {
     [p0, p01 ^ p0 ^ p1, p02 ^ p0 ^ p2 ^ p1, p12 ^ p1 ^ p2, p2]
 }
 
-/// Adds coefficients of X^i Y^j; X folds the low row bit, and Y folds the next.
+/// The six Karatsuba products in `Y` of [`bivariate_summand`], each a quadratic in `X`, summed over
+/// pairs: `a_0 b_0`, `a_1 b_1`, `a_2 b_2`, then the cross terms of `0, 1`, `0, 2` and `1, 2`.
+type BivariateSum = [[Prod8; 5]; 6];
+
+/// The coefficients of X^i Y^j of a [`BivariateSum`]: row `i` takes the products whose `Y` degrees
+/// reach it, as the Karatsuba recombination does.
+fn bivariate_coefficients(sum: &BivariateSum) -> [[F192; 5]; 5] {
+    let [p0, p1, p2, p01, p02, p12] = sum;
+    let row =
+        |parts: &[&[Prod8; 5]]| std::array::from_fn(|j| parts.iter().fold(Prod8::ZERO, |acc, p| acc ^ p[j]).reduce());
+    [
+        row(&[p0]),
+        row(&[p0, p1, p01]),
+        row(&[p0, p1, p2, p02]),
+        row(&[p1, p2, p12]),
+        row(&[p2]),
+    ]
+}
+
+/// Adds the products of a pair to `sum`; X folds the low row bit, and Y folds the next.
 #[inline(never)]
-fn bivariate_summand(first: &Block, second: &Block, weight: F192x8, sum: &mut [[Prod8; 5]; 5]) {
+fn bivariate_summand(first: &Block, second: &Block, weight: F192x8, sum: &mut BivariateSum) {
     let factors: [[[F192x8; 2]; 2]; 4] = std::array::from_fn(|c| {
         let (v0, v2) = F192x8::even_odd(first[c], second[c]);
         let (v1, v3) = F192x8::even_odd(first[c + 4], second[c + 4]);
@@ -634,30 +653,25 @@ fn bivariate_summand(first: &Block, second: &Block, weight: F192x8, sum: &mut [[
     let weighted = factors[0].map(|row| row.map(|v| weight * v));
     let a = bilinear_product(weighted, factors[1]);
     let b = bilinear_product(factors[2], factors[3]);
-    macro_rules! add {
-        ($x:expr, $y:expr, $($i:literal),+) => {{
-            let product = quadratic_product($x, $y);
-            $(for j in 0..5 { sum[$i][j] ^= product[j]; })+
-        }};
+    add_product(&mut sum[0], a[0], b[0]);
+    add_product(&mut sum[1], a[1], b[1]);
+    add_product(&mut sum[2], a[2], b[2]);
+    for (k, (i, l)) in [(0, 1), (0, 2), (1, 2)].into_iter().enumerate() {
+        add_product(
+            &mut sum[3 + k],
+            std::array::from_fn(|j| a[i][j] + a[l][j]),
+            std::array::from_fn(|j| b[i][j] + b[l][j]),
+        );
     }
-    add!(a[0], b[0], 0, 1, 2);
-    add!(a[1], b[1], 1, 2, 3);
-    add!(a[2], b[2], 2, 3, 4);
-    add!(
-        std::array::from_fn(|j| a[0][j] + a[1][j]),
-        std::array::from_fn(|j| b[0][j] + b[1][j]),
-        1
-    );
-    add!(
-        std::array::from_fn(|j| a[0][j] + a[2][j]),
-        std::array::from_fn(|j| b[0][j] + b[2][j]),
-        2
-    );
-    add!(
-        std::array::from_fn(|j| a[1][j] + a[2][j]),
-        std::array::from_fn(|j| b[1][j] + b[2][j]),
-        3
-    );
+}
+
+/// Adds `x · y` to `sum`. Kept out of line: the caller's twelve factors and this product's
+/// temporaries do not fit the registers together.
+#[inline(never)]
+fn add_product(sum: &mut [Prod8; 5], x: [F192x8; 3], y: [F192x8; 3]) {
+    for (slot, product) in sum.iter_mut().zip(quadratic_product(x, y)) {
+        *slot ^= product;
+    }
 }
 
 fn bivariate_messages(coefficients: [[F192; 5]; 5], eta: F192, r1: F192) -> [[F192; 4]; 2] {
@@ -896,7 +910,7 @@ fn columns_message(columns: &dyn LeafColumns, equality: &Equality) -> [[F192; 4]
 #[timed]
 fn columns_polynomial(columns: &dyn LeafColumns, equality: &Equality) -> [[[F192; 5]; 5]; 2] {
     let task = |t| {
-        let mut sums = [[[Prod8::ZERO; 5]; 5]; 2];
+        let mut sums = [[[Prod8::ZERO; 5]; 6]; 2];
         let mut even = [[F192x8::ZERO; 8]; 2];
         columns.task(t, &mut |side, b, block| {
             if b % 2 == 0 {
@@ -905,7 +919,7 @@ fn columns_polynomial(columns: &dyn LeafColumns, equality: &Equality) -> [[[F192
                 bivariate_summand(&even[side], block, equality.block(b / 2), &mut sums[side]);
             }
         });
-        sums.map(|sum| sum.map(|row| row.map(Prod8::reduce)))
+        sums.map(|sum| bivariate_coefficients(&sum))
     };
     parallel::map_reduce(
         columns.tasks(),
@@ -1972,11 +1986,11 @@ mod two_round_tests {
         r1: F192,
         r2: F192,
     ) -> [[F192; 4]; 2] {
-        let mut sum = [[Prod8::ZERO; 5]; 5];
+        let mut sum = [[Prod8::ZERO; 5]; 6];
         for (pair, weight) in input.chunks_exact(2).zip(weights) {
             bivariate_summand(&pair[0], &pair[1], *weight, &mut sum);
         }
-        let result = bivariate_messages(sum.map(|row| row.map(Prod8::reduce)), eta, r1);
+        let result = bivariate_messages(bivariate_coefficients(&sum), eta, r1);
         let (r1, r2) = (F192x8::splat(r1), F192x8::splat(r2));
         for (pair, out) in input.chunks_exact(2).zip(quarter) {
             *out = interleave(pair[0].fold(r1), pair[1].fold(r1)).fold(r2);
@@ -2032,11 +2046,11 @@ mod two_round_tests {
                 for (a, b) in q0.iter().flatten().zip(q1.iter().flatten()) {
                     assert_eq!(a.to_array(), b.to_array());
                 }
-                let mut coefficients = [[Prod8::ZERO; 5]; 5];
+                let mut coefficients = [[Prod8::ZERO; 5]; 6];
                 for (pair, weight) in input.chunks_exact(2).zip(&weights) {
                     bivariate_summand(&pair[0], &pair[1], *weight, &mut coefficients);
                 }
-                let coefficients = coefficients.map(|row| row.map(Prod8::reduce));
+                let coefficients = bivariate_coefficients(&coefficients);
                 for (x, y) in [(F192::ZERO, F192::ONE), (r1, r2)] {
                     let actual = coefficients.iter().rev().fold(F192::ZERO, |sum, row| {
                         sum * x + row.iter().rev().fold(F192::ZERO, |v, c| v * y + *c)
