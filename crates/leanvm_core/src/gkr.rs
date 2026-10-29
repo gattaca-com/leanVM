@@ -866,7 +866,8 @@ pub trait LeafColumns: Sync {
     fn tasks(&self) -> usize;
 
     /// Computes task `t`'s blocks, calling `f(side, block index, block)` for each, in groups of four:
-    /// `4k` through `4k + 3` in that order, and the groups of a run in increasing order.
+    /// `4k` through `4k + 3` in that order, and the groups of a run in increasing order. The two
+    /// sides' calls may interleave block by block.
     fn task(&self, t: usize, f: &mut dyn FnMut(usize, usize, &Block));
 }
 
@@ -896,12 +897,12 @@ fn columns_message(columns: &dyn LeafColumns, equality: &Equality) -> [[F192; 4]
 fn columns_polynomial(columns: &dyn LeafColumns, equality: &Equality) -> [[[F192; 5]; 5]; 2] {
     let task = |t| {
         let mut sums = [[[Prod8::ZERO; 5]; 5]; 2];
-        let mut even = [F192x8::ZERO; 8];
+        let mut even = [[F192x8::ZERO; 8]; 2];
         columns.task(t, &mut |side, b, block| {
             if b % 2 == 0 {
-                even = *block;
+                even[side] = *block;
             } else {
-                bivariate_summand(&even, block, equality.block(b / 2), &mut sums[side]);
+                bivariate_summand(&even[side], block, equality.block(b / 2), &mut sums[side]);
             }
         });
         sums.map(|sum| sum.map(|row| row.map(Prod8::reduce)))
@@ -931,23 +932,23 @@ fn columns_fold(
         // The next round reads the destination; this round reads only the stage.
         let stream = Stream::new();
         let mut sums = [[Prod8::ZERO; 4]; 2];
-        let mut even = [F192x8::ZERO; 4];
-        let mut quarter = [F192x8::ZERO; 4];
+        let mut even = [[F192x8::ZERO; 4]; 2];
+        let mut quarter = [[F192x8::ZERO; 4]; 2];
         columns.task(t, &mut |s, b, block| {
             let folded = block.fold(challenge);
             if b % 2 == 0 {
-                even = folded;
+                even[s] = folded;
                 return;
             }
-            let mut block = interleave(even, folded);
+            let mut block = interleave(even[s], folded);
             let mut index = b / 2;
             if let Some(second) = second {
                 let folded = block.fold(second);
                 if b % 4 == 1 {
-                    quarter = folded;
+                    quarter[s] = folded;
                     return;
                 }
-                block = interleave(quarter, folded);
+                block = interleave(quarter[s], folded);
                 index = b / 4;
             }
             // SAFETY: each task owns complete pairs, or complete groups of four for two folds.
@@ -2068,11 +2069,9 @@ mod two_round_tests {
                 self.blocks[0].len() / 4
             }
             fn task(&self, t: usize, f: &mut dyn FnMut(usize, usize, &Block)) {
-                for side in 0..2 {
-                    if !in_runs(&self.runs[side], 4 * t) {
-                        continue;
-                    }
-                    for b in 4 * t..4 * t + 4 {
+                // The sides interleave block by block, as a twin's leaves do.
+                for b in 4 * t..4 * t + 4 {
+                    for side in (0..2).filter(|&side| in_runs(&self.runs[side], 4 * t)) {
                         f(side, b, &self.blocks[side][b]);
                     }
                 }

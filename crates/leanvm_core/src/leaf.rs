@@ -294,7 +294,7 @@ fn publish_task<G: Lanes>(
     [tier4, tier6]: [&mut [G::Elem]; 2],
     blocks: Range<usize>,
     columns: usize,
-    compute: impl Fn(usize) -> G,
+    mut compute: impl FnMut(usize) -> G,
 ) {
     let (first, count) = (blocks.start, blocks.len());
     let stream = Stream::new();
@@ -425,8 +425,76 @@ fn leaf_rows8((constant, terms): &(F192, Terms), z: usize) -> F192x8 {
     acc.reduce_lanes() + F192x8::splat(*constant)
 }
 
+/// Whether two coordinates are the same function of the row.
+fn same_coord(a: &Coord, b: &Coord) -> bool {
+    match (a, b) {
+        (Coord::Const(x), Coord::Const(y)) => x == y,
+        (Coord::Col(i), Coord::Col(j)) => i == j,
+        (Coord::GCol(i, k), Coord::GCol(j, l)) => (i, k) == (j, l),
+        (Coord::Prod(i, j, k), Coord::Prod(a, b, l)) => (i, j, k) == (a, b, l),
+        (Coord::Index, Coord::Index) => true,
+        (Coord::Public(x), Coord::Public(y)) => Arc::ptr_eq(x, y),
+        (Coord::Sum(x), Coord::Sum(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same_coord(a, b)),
+        _ => false,
+    }
+}
+
+/// The leaf terms that turn push block `push`'s leaves into those of its pull twin `pull`, when
+/// the tuples differ in one coordinate `i` only (a count's `GCol(c, 1)` against `Col(c)`, or a seed's
+/// `Const(1)` against a count column): `pull(z) = push(z) + w_i (pull_i(z) + push_i(z))`, one mixed
+/// product instead of the whole tuple. `None` when the blocks are not twins.
+fn twin_terms<'a>(
+    [push, pull]: [&'a Block; 2],
+    [push_tail, pull_tail]: [&Terms; 2],
+    w: &[F192],
+    cols: &[&'a [F64]],
+    gpow: &'a [F64],
+) -> Option<(F192, Terms<'a>)> {
+    if (push.kappa, push.rows, push.coords.len()) != (pull.kappa, pull.rows, pull.coords.len()) {
+        return None;
+    }
+    let mut differ = (0..push.coords.len()).filter(|&i| !same_coord(&push.coords[i], &pull.coords[i]));
+    let i = differ.next()?;
+    if differ.next().is_some() {
+        return None;
+    }
+    let (mut constant, mut terms) = (F192::ZERO, Terms::default());
+    for c in [&push.coords[i], &pull.coords[i]] {
+        push_terms(c, w[i], cols, gpow, &mut terms, &mut constant);
+    }
+    // `g·c` against `c` is one product by `w_i (g + 1)`.
+    let mut lins: Vec<(&[F64], F192)> = Vec::with_capacity(terms.lins.len());
+    for (k, c) in terms.lins {
+        match lins.iter_mut().find(|(l, _)| std::ptr::eq(*l, k)) {
+            Some((_, sum)) => *sum += c,
+            None => lins.push((k, c)),
+        }
+    }
+    terms.lins = lins;
+    // Past a memory block's real prefix both leaves are constant but for the same index term.
+    terms.memory_tail = match (push_tail.memory_tail, pull_tail.memory_tail) {
+        (None, None) => None,
+        (Some((start, _, weight, push)), Some((at, _, same, pull))) if (start, weight) == (at, same) => {
+            Some((start, gpow, F192::ZERO, push + pull))
+        }
+        _ => return None,
+    };
+    Some((constant, terms))
+}
+
+/// Eight leaves of a pull twin from row `z`, given its push twin's `push` there.
+fn twin_rows8(push: F192x8, delta: &(F192, Terms), z: usize) -> F192x8 {
+    match delta.1.memory_tail {
+        Some((start, .., value)) if z >= start => push + F192x8::splat(value),
+        _ => push + leaf_rows8(delta, z),
+    }
+}
+
 /// GKR blocks per task of the passes over the columns.
 const BLOCKS: usize = 128;
+
+/// GKR blocks of a push twin staged in L1 for its pull twin, a multiple of eight.
+const TWIN_BLOCKS: usize = 16;
 
 /// One side's leaf vector while it is built, with the leaf terms of each block.
 struct Side<'a> {
@@ -473,6 +541,8 @@ impl Side<'_> {
 /// from the columns, in the same groups and tasks as the build.
 pub struct ColumnLeaves<'a> {
     terms: [Vec<(F192, Terms<'a>)>; 2],
+    /// Per pull block, the terms that derive it from its push twin ([`twin_terms`]).
+    twins: Vec<Option<(F192, Terms<'a>)>>,
     offsets: [&'a [usize]; 2],
     /// `(rows, side, block)` of the blocks with unstored leaves, sorted by `rows`.
     jobs: Vec<(usize, usize, usize)>,
@@ -510,14 +580,22 @@ impl gkr::LeafColumns for ColumnLeaves<'_> {
                 continue;
             }
             for &(rows, s, b) in group {
+                // A pull twin follows its push twin block by block.
+                let twin = self.twins.get(b).and_then(Option::as_ref);
+                if s == 1 && twin.is_some() {
+                    continue;
+                }
                 let off = self.offsets[s][b];
                 debug_assert!(off.is_multiple_of(4 * gkr::BLOCK_VALUES));
                 debug_assert!(BLOCKS.is_multiple_of(4));
                 for k in t * BLOCKS..((t + 1) * BLOCKS).min(Self::blocks(rows)) {
-                    let block = F192x8::transpose(std::array::from_fn(|j| {
-                        leaf_rows8(&self.terms[s][b], gkr::BLOCK_VALUES * k + 8 * j)
-                    }));
-                    f(s, off / gkr::BLOCK_VALUES + k, &block);
+                    let z = gkr::BLOCK_VALUES * k;
+                    let groups: [F192x8; 8] = std::array::from_fn(|j| leaf_rows8(&self.terms[s][b], z + 8 * j));
+                    f(s, off / gkr::BLOCK_VALUES + k, &F192x8::transpose(groups));
+                    if let Some(delta) = twin {
+                        let groups = std::array::from_fn(|j| twin_rows8(groups[j], delta, z + 8 * j));
+                        f(1, off / gkr::BLOCK_VALUES + k, &F192x8::transpose(groups));
+                    }
                 }
             }
             return;
@@ -638,6 +716,23 @@ pub fn build_leaves<'a>(
             }
         })
         .collect();
+    // Push and pull pair up block by block; a pull twin's leaves come from its push twin's.
+    let [push, pull] = [&sides[0], &sides[1]];
+    let twins: Vec<_> = if push.lay.offsets == pull.lay.offsets && push.columns == pull.columns {
+        (0..pull.blocks.len().min(push.blocks.len()))
+            .map(|b| {
+                twin_terms(
+                    [&push.blocks[b], &pull.blocks[b]],
+                    [&push.terms[b].1, &pull.terms[b].1],
+                    w,
+                    cols,
+                    gpow,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     for side in &mut sides {
         if (0..side.blocks.len()).any(|b| side.bulk(b) > 0) {
             let level4 = side.quads.len().div_ceil(4);
@@ -677,24 +772,58 @@ pub fn build_leaves<'a>(
             })
             .collect();
         parallel::for_each(bulk.div_ceil(BLOCKS), |c| {
+            // Side `s`'s leaves, quads and tiers of `blocks`, as `publish_task` takes them.
+            let parts = |s: usize, blocks: Range<usize>| {
+                let (first, len) = (blocks.start, blocks.len());
+                // SAFETY: task `c` owns these blocks of the leaves, their quads and their tiers, which no
+                // other task or block of the group touches.
+                unsafe {
+                    (
+                        Some(ptrs[s].0.slice(first, len)),
+                        ptrs[s].1.slice(16 * first, 16 * len),
+                        [ptrs[s].2[0].slice(4 * first, 4 * len), ptrs[s].2[1].slice(first, len)],
+                        blocks,
+                    )
+                }
+            };
             for &(_, s, b) in group {
+                let twin = twins.get(b).and_then(Option::as_ref);
+                if s == 1 && twin.is_some() {
+                    continue;
+                }
                 let side = &sides[s];
                 let off = side.lay.offsets[b];
                 let first = off / gkr::BLOCK_VALUES + c * BLOCKS;
-                let len = BLOCKS.min(bulk - c * BLOCKS);
+                let end = first + BLOCKS.min(bulk - c * BLOCKS);
                 let columns = side.unstored(b).saturating_sub(c * BLOCKS).min(BLOCKS);
-                // SAFETY: task `c` owns these blocks of the leaves, their quads and their tiers, which no
-                // other task or block of the group touches.
-                let (task, quads, tiers) = unsafe {
-                    (
-                        ptrs[s].0.slice(first, len),
-                        ptrs[s].1.slice(16 * first, 16 * len),
-                        [ptrs[s].2[0].slice(4 * first, 4 * len), ptrs[s].2[1].slice(first, len)],
-                    )
+                let Some(delta) = twin else {
+                    let (task, quads, tiers, blocks) = parts(s, first..end);
+                    publish_task(task, quads, tiers, blocks, columns, |l| {
+                        leaf_rows8(&side.terms[b], l - off)
+                    });
+                    continue;
                 };
-                publish_task(Some(task), quads, tiers, first..first + len, columns, |l| {
-                    leaf_rows8(&side.terms[b], l - off)
-                });
+                // The pull twin publishes each run of `TWIN_BLOCKS` right after the push twin, from its
+                // leaves staged in L1. The runs split at multiples of eight, as the level-6 groups do.
+                let mut stage = [[F192x8::ZERO; 8]; TWIN_BLOCKS];
+                let slot = |l: usize| (l / gkr::BLOCK_VALUES % TWIN_BLOCKS, l % gkr::BLOCK_VALUES / 8);
+                let mut start = first;
+                while start < end {
+                    let stop = ((start / TWIN_BLOCKS + 1) * TWIN_BLOCKS).min(end);
+                    let columns = columns.saturating_sub(start - first).min(stop - start);
+                    let (task, quads, tiers, blocks) = parts(0, start..stop);
+                    publish_task(task, quads, tiers, blocks, columns, |l| {
+                        let (i, j) = slot(l);
+                        stage[i][j] = leaf_rows8(&side.terms[b], l - off);
+                        stage[i][j]
+                    });
+                    let (task, quads, tiers, blocks) = parts(1, start..stop);
+                    publish_task(task, quads, tiers, blocks, columns, |l| {
+                        let (i, j) = slot(l);
+                        twin_rows8(stage[i][j], delta, l - off)
+                    });
+                    start = stop;
+                }
             }
         });
     }
@@ -778,6 +907,7 @@ pub fn build_leaves<'a>(
         .sum();
     let columns = (!column_jobs.is_empty()).then_some(ColumnLeaves {
         terms: column_terms,
+        twins,
         offsets,
         jobs: column_jobs,
         runs,
