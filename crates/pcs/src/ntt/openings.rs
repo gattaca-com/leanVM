@@ -43,27 +43,27 @@ pub(super) fn built_rows(
     build: impl Fn(usize, usize, &mut [F64]) + Sync,
 ) -> Vec<F64> {
     debug_assert!(positions.is_sorted());
-    let mut out = vec![F64::ZERO; positions.len() * n];
-    let mut rest = &mut out[..];
-    let mut parts = positions
-        .chunk_by(|a, b| a >> log_block == b >> log_block)
-        .map(|run| {
-            let (head, tail) = std::mem::take(&mut rest).split_at_mut(run.len() * n);
-            rest = tail;
-            (head, run)
-        })
-        .collect::<Vec<_>>();
-    parallel::chunks_mut(&mut parts, 1, |i, part| {
-        let (dst, run) = &mut part[0];
-        let block = run[0] >> log_block;
-        with_scratch(n << log_block, |scratch| {
-            build(i, block, scratch);
-            for (dst, &q) in dst.chunks_exact_mut(n).zip(run.iter()) {
-                dst.copy_from_slice(&scratch[(q & ((1 << log_block) - 1)) * n..][..n]);
-            }
+    primitives::filled_vec(positions.len() * n, |out| {
+        let mut rest = out;
+        let mut parts = positions
+            .chunk_by(|a, b| a >> log_block == b >> log_block)
+            .map(|run| {
+                let (head, tail) = std::mem::take(&mut rest).split_at_mut(run.len() * n);
+                rest = tail;
+                (head, run)
+            })
+            .collect::<Vec<_>>();
+        parallel::chunks_mut(&mut parts, 1, |i, part| {
+            let (dst, run) = &mut part[0];
+            let block = run[0] >> log_block;
+            with_scratch(n << log_block, |scratch| {
+                build(i, block, scratch);
+                for (dst, &q) in dst.chunks_exact_mut(n).zip(run.iter()) {
+                    dst.copy_from_slice(&scratch[(q & ((1 << log_block) - 1)) * n..][..n]);
+                }
+            });
         });
-    });
-    out
+    })
 }
 
 /// Codeword rows of an encode that left rows out of its codeword.

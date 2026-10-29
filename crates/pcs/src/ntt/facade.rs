@@ -35,10 +35,6 @@ impl AdditiveNttF64 {
         Self { tw: Twiddles::standard(dim) }
     }
 
-    pub fn log_domain_size(&self) -> usize {
-        self.tw.log_domain_size()
-    }
-
     /// Twiddle of one block at one layer.
     ///
     /// - It is `s_i(sum_j bit_j(block) * b_(i+1+j))`, with `i = L - layer - 1` on a `2^L`-point domain.

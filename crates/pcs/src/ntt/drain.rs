@@ -116,11 +116,6 @@ impl<'s> LateDrain<'s> {
         Self { scratch, idle, drain: Drain::default(), stream: stream.then(Stream::new), per_hook, late }
     }
 
-    /// Whether finished groups drain during the next transform, or copy out at once.
-    pub(super) fn is_late(&self) -> bool {
-        self.late
-    }
-
     /// The scratch the next group is built in.
     #[inline(always)]
     pub(super) fn scratch(&mut self) -> &mut [F64] {

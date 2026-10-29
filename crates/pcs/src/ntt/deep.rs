@@ -5,7 +5,7 @@ use primitives::field::F64;
 use super::encode::RowSink;
 use super::scratch::with_scratch;
 use super::drain::{Drain, LateDrain};
-use super::layers::{Layers, no_hook};
+use super::layers::Layers;
 use super::plan::Plan;
 use super::source::Source;
 use super::window::Window;
@@ -94,25 +94,10 @@ impl<'s> DeepPass<'s> {
                         let copy = |part: &mut [F64]| part.copy_from_slice(&msg[..part.len()]);
                         ld.scratch().chunks_mut(block_len).for_each(copy);
                     }
-                    if ld.is_late() {
-                        // The previous sub-block drains while this one transforms.
-                        ld.transform(|scratch, mut hook| {
-                            layers.run(
-                                scratch,
-                                from,
-                                log_d,
-                                num_ntts,
-                                deep_start,
-                                log_d,
-                                outer,
-                                sub_idx,
-                                None,
-                                move || hook.step(),
-                            )
-                        });
-                    } else {
+                    // The previous sub-block drains while this one transforms, if it drains late.
+                    ld.transform(|scratch, mut hook| {
                         layers.run(
-                            ld.scratch(),
+                            scratch,
                             from,
                             log_d,
                             num_ntts,
@@ -121,9 +106,9 @@ impl<'s> DeepPass<'s> {
                             outer,
                             sub_idx,
                             None,
-                            no_hook,
-                        );
-                    }
+                            move || hook.step(),
+                        )
+                    });
                     if let Some(f) = sink {
                         f(sub_idx << log_sub, ld.scratch());
                     }
