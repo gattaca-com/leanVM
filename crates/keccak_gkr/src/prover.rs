@@ -400,29 +400,41 @@ fn weigh_gfni(
     }
 }
 
-/// The tables' rows of a block: per group and position, the value at `s` of the group's packs,
-/// folded. Each group's sums of products, four words, reduced.
+/// The tables' rows of a block: per row and position, the value at `s` of the row's `B / 2`
+/// packs, folded. Each row's sums of products, four words, reduced. A row of 16 packs sums two
+/// groups' folds, each at its half of the weights.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
-struct Fold([[u64; GROUP]; 3]);
+struct Fold<const B: usize>(Vec<[[u64; GROUP]; 3]>);
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
-impl Fold {
-    fn new(_: &PowerField, fold: &[Element; GROUP]) -> Self {
-        Self(std::array::from_fn(|k| std::array::from_fn(|q| fold[q][k])))
+impl<const B: usize> Fold<B> {
+    fn new(_: &PowerField, fold: &[Element]) -> Self {
+        assert!(fold.len() == B / 2 && (B / 2).is_multiple_of(GROUP));
+        Self(
+            fold.chunks_exact(GROUP)
+                .map(|fold| std::array::from_fn(|k| std::array::from_fn(|q| fold[q][k])))
+                .collect(),
+        )
     }
 
     fn scratch() -> Vec<u64> {
         vec![0u64; 4 * GROUPS * BITS]
     }
 
-    /// The rows of the first `rows.len() / ROW` groups.
+    /// The first `rows.len() / ROW` rows.
     fn rows(&self, field: &PowerField, block: &[u64], rows: &mut [u64], wide: &mut [u64]) {
-        let groups = rows.len() / ROW;
-        // The groups' unreduced sums, four words each and laid out by word.
+        let n = rows.len() / ROW;
+        let parts = self.0.len();
+        // The rows' unreduced sums, four words each and laid out by word.
         for j in 0..BITS {
-            let sums = fold_groups(&embed(words(block, j)), &self.0);
-            for (wide, sum) in wide.as_chunks_mut::<{ 4 * BITS }>().0[..groups].iter_mut().zip(&sums) {
-                let sum: [u64; 4] = carry(sum);
+            let e = embed(words(block, j));
+            let folds: [[[u128; 3]; GROUPS]; 2] = std::array::from_fn(|t| {
+                if t < parts { fold_groups(&e, &self.0[t]) } else { [[0; 3]; GROUPS] }
+            });
+            for (r, wide) in wide.as_chunks_mut::<{ 4 * BITS }>().0[..n].iter_mut().enumerate() {
+                let sum: [u128; 3] =
+                    std::array::from_fn(|k| (0..parts).fold(0, |acc, t| acc ^ folds[t][parts * r + t][k]));
+                let sum: [u64; 4] = carry(&sum);
                 for (k, &word) in sum.iter().enumerate() {
                     wide[k * BITS + j] = word;
                 }
@@ -434,15 +446,16 @@ impl Fold {
     }
 }
 
-/// [`Fold`] as a GF(2)-linear map of a group's 16 bytes to its value's 24: GF2P8AFFINE matrix
+/// [`Fold`] as a GF(2)-linear map of a row's `B` bytes to its value's 24: GF2P8AFFINE matrix
 /// `[i][z]` lane `l` sends input byte `i` to output byte `8z + l`, eight positions at a time.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
-struct Fold([[[u64; 8]; 3]; 2 * GROUP]);
+struct Fold<const B: usize>([[[u64; 8]; 3]; B]);
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
-impl Fold {
-    fn new(field: &PowerField, fold: &[Element; GROUP]) -> Self {
-        let mut maps = [[[0u64; 8]; 3]; 2 * GROUP];
+impl<const B: usize> Fold<B> {
+    fn new(field: &PowerField, fold: &[Element]) -> Self {
+        assert!(fold.len() == B / 2);
+        let mut maps = [[[0u64; 8]; 3]; B];
         for (i, map) in maps.iter_mut().enumerate() {
             for k in 0..8 {
                 // Bit `k` of input byte `i` is bit `8 (i % 2) + k` of pack `i / 2`.
@@ -463,7 +476,7 @@ impl Fold {
     }
 
     fn rows(&self, _: &PowerField, block: &[u64], rows: &mut [u64], _: &mut [u64]) {
-        assert!(block.len() >= BITS * 8 && rows.len().is_multiple_of(ROW) && rows.len() <= GROUPS * ROW);
+        assert!(block.len() >= BITS * 8 && rows.len().is_multiple_of(ROW) && rows.len() <= 64 / B * ROW);
         // SAFETY: the features are enabled at compile time.
         unsafe { fold_gfni(&self.0, block, rows) }
     }
@@ -471,7 +484,7 @@ impl Fold {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-fn fold_gfni(maps: &[[[u64; 8]; 3]; 2 * GROUP], block: &[u64], rows: &mut [u64]) {
+fn fold_gfni<const B: usize>(maps: &[[[u64; 8]; 3]; B], block: &[u64], rows: &mut [u64]) {
     use core::arch::x86_64::*;
     use primitives::simd::{load, store};
     // Byte `8b + m` of the output is byte `8m + b` of the input: an 8 x 8 byte transpose per word.
@@ -486,7 +499,7 @@ fn fold_gfni(maps: &[[[u64; 8]; 3]; 2 * GROUP], block: &[u64], rows: &mut [u64])
             let mut acc = [_mm512_setzero_si512(); 3];
             for (pair, maps) in maps.as_chunks::<2>().0.iter().enumerate() {
                 let x: [__m512i; 2] = std::array::from_fn(|h| {
-                    let i = 16 * g + 2 * pair + h;
+                    let i = B * g + 2 * pair + h;
                     _mm512_permutexvar_epi64(_mm512_set1_epi64((i % 8) as i64), bytes[i / 8])
                 });
                 for (z, acc) in acc.iter_mut().enumerate() {
@@ -645,16 +658,47 @@ impl Layer<'_> {
         sums
     }
 
-    /// The table the remaining rounds fold, a row per group: `T[j]`, the value at `s` of position
-    /// `j`'s embeddings, folded over the group's packs at `challenges`. A half block's two groups
-    /// are the first of those rounds' pairs, so its round values are summed while the rows are at
-    /// hand, each half weighted by `halves`, and each block by `blocks`.
-    /// The padding block's groups are one row, its segment's entry of `pads`.
+    /// The values of the round over a half's two groups: per group and position, `T[j]`, the
+    /// value at `s` of position `j`'s embeddings folded over the group's packs at `challenges`.
+    /// A block's groups stay in `scratch`, each half weighted by `halves` and each block by
+    /// `blocks`. The padding block's groups are one row.
+    fn group_values(&self, round: &Round, challenges: &[F192], halves: &[F192], blocks: &[F192]) -> (F192, F192) {
+        let field = round.field;
+        let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
+        let fold = Fold::<{ 2 * GROUP }>::new(field, &fold);
+        let weights = self.task_weights(blocks);
+        let halves = eq_table(halves);
+        let written = self.witness.written();
+        let sums = parallel::map_reduce_with_state(
+            self.n_tasks(),
+            || (vec![0u64; 4 * FACTOR_ROW], vec![0u64; GROUPS * ROW], Fold::<{ 2 * GROUP }>::scratch(), Recompute::new()),
+            RoundSums::default,
+            |(scratch, rows, wide, recompute), sums, task| {
+                let (_, g, block) = self.block(recompute, task);
+                if g < written {
+                    fold.rows(field, block, rows, wide);
+                    for (pair, &half) in rows.chunks_exact(2 * ROW).zip(&halves) {
+                        round.add_pair(sums, scratch, &pair[..ROW], &pair[ROW..], weights[task] * half);
+                    }
+                } else {
+                    let row = &mut rows[..ROW];
+                    fold.rows(field, block, row, wide);
+                    round.add_pair(sums, scratch, row, row, weights[task]);
+                }
+            },
+            RoundSums::merge,
+        );
+        round.finish(&sums)
+    }
+
+    /// The table the remaining rounds fold, a row per half block: `T[j]` folded over the half's
+    /// packs at `challenges`. A block's two halves are the first of those rounds' pairs, so its
+    /// round values are summed while the rows are at hand, weighted by `blocks`. The padding
+    /// block's halves are one row, its segment's entry of `pads`.
     fn table(
         &self,
         round: &Round,
         challenges: &[F192],
-        halves: &[F192],
         blocks: &[F192],
         layout: Rows,
         table: &mut [u64],
@@ -662,9 +706,8 @@ impl Layer<'_> {
     ) -> (F192, F192) {
         let field = round.field;
         let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
-        let fold = Fold::new(field, fold.as_slice().try_into().unwrap());
+        let fold = Fold::<{ 4 * GROUP }>::new(field, &fold);
         let weights = self.task_weights(blocks);
-        let halves = eq_table(halves);
         // Rows of segments that do not exist are zero, and so is their product.
         table[self.rounds.len() * layout.live * ROW..layout.len() * ROW].fill(0);
         pads[self.rounds.len() * ROW..].fill(0);
@@ -677,7 +720,7 @@ impl Layer<'_> {
             let (segment, tail) = rest.split_at_mut(layout.live * ROW);
             let (pad, pad_tail) = pad_rows.split_at_mut(ROW);
             (rest, pad_rows) = (tail, pad_tail);
-            parts.extend(segment.chunks_mut(GROUPS * ROW));
+            parts.extend(segment.chunks_mut(2 * ROW));
             if held > written {
                 parts.push(pad);
             }
@@ -685,20 +728,13 @@ impl Layer<'_> {
         let sums = parallel::map_reduce_chunks_mut(
             [&mut parts[..]],
             [1],
-            || (vec![0u64; 4 * FACTOR_ROW], Fold::scratch(), Recompute::new()),
+            || (vec![0u64; 4 * FACTOR_ROW], Fold::<{ 4 * GROUP }>::scratch(), Recompute::new()),
             RoundSums::default,
             |(scratch, wide, recompute), sums, task, [part]| {
                 let (_, _, block) = self.block(recompute, task);
                 let rows = &mut *part[0];
-                let groups = rows.len() / ROW;
                 fold.rows(field, block, rows, wide);
-                // A written block's pairs are its halves; the padding block's one row stands for all.
-                if groups == 1 {
-                    round.add_pair(sums, scratch, rows, rows, weights[task]);
-                }
-                for (pair, &half) in rows.chunks_exact(2 * ROW).zip(&halves) {
-                    round.add_pair(sums, scratch, &pair[..ROW], &pair[ROW..], weights[task] * half);
-                }
+                round.add_pair(sums, scratch, &rows[..ROW], &rows[rows.len() - ROW..], weights[task]);
             },
             RoundSums::merge,
         );
@@ -926,7 +962,7 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new(shape: Shape) -> Self {
-        let rows = 1usize << (shape.y_vars() - SKIP);
+        let rows = 1usize << (shape.y_vars() - PACK_VARS + 1);
         let table = vec![0u64; rows * ROW + rows * ROW / 2];
         let pads = vec![0u64; ROW << shape.seg_log()];
         Self { table, pads }
@@ -987,22 +1023,26 @@ pub fn prove_layer(
             .collect();
     }
 
-    // The groups, blocks and segments, on a table in the power basis. Each pass over it writes
-    // the rows of one round and sums that round's values over them.
     let round = Round::new(&field, claim, s, kappa);
+    let blocks = eq_table(&claim.point[PACK_VARS..]);
+    // The round over a half's groups, from rows that are not kept.
+    let (zero, infinity) = tracing::info_span!("Groups")
+        .in_scope(|| layer.group_values(&round, &point, &claim.point[SKIP + 1..PACK_VARS], &blocks));
+    let coeffs = round_coefficients(scale, zero, infinity, value, claim.point[SKIP]);
+    bind(ps, &coeffs, claim.point[SKIP], &mut value, &mut scale, &mut point);
+
+    // The blocks and segments, on a table in the power basis. Each pass over it writes the rows
+    // of one round and sums that round's values over them.
     let mut layout = Rows {
-        m: GROUPS * shape.n_blocks(),
-        live: GROUPS * witness.written(),
+        m: 2 * shape.n_blocks(),
+        live: 2 * witness.written(),
         segments: 1 << shape.seg_log(),
     };
     let (mut src, mut dst) = scratch.table.split_at_mut(layout.m * layout.segments * ROW);
     let pads = &mut scratch.pads;
-    let mut values = tracing::info_span!("Tables").in_scope(|| {
-        let blocks = eq_table(&claim.point[PACK_VARS..]);
-        layer.table(&round, &point, &claim.point[SKIP + 1..PACK_VARS], &blocks, layout, src, pads)
-    });
+    let mut values = tracing::info_span!("Tables").in_scope(|| layer.table(&round, &point, &blocks, layout, src, pads));
     let tail = tracing::info_span!("Tail").entered();
-    for i in SKIP..claim.point.len() {
+    for i in PACK_VARS - 1..claim.point.len() {
         let coeffs = round_coefficients(scale, values.0, values.1, value, claim.point[i]);
         let challenge = bind(ps, &coeffs, claim.point[i], &mut value, &mut scale, &mut point);
         let later = eq_table(claim.point.get(i + 2..).unwrap_or(&[]));
