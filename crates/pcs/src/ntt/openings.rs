@@ -34,32 +34,35 @@ pub fn gather_rows(words: &[F64], row_words: usize, positions: &[usize]) -> Vec<
 /// The rows at the sorted `positions`, `n` words each, back to back.
 ///
 /// - The rows group by the block of `2^log_block` rows that holds them, one pool task per block.
-/// - `build(i, block, scratch)` writes block number `block`, the `i`-th one touched, into the thread's scratch.
-/// - Only the queried rows are copied out of it.
+/// - `build(i, block, live, scratch)` writes block number `block`, the `i`-th one touched, into the thread's scratch.
+/// - Only the rows `live` (sorted, within the block) must come out right, and only they are copied out of it.
 pub(super) fn built_rows(
     n: usize,
     log_block: usize,
     positions: &[usize],
-    build: impl Fn(usize, usize, &mut [F64]) + Sync,
+    build: impl Fn(usize, usize, &[usize], &mut [F64]) + Sync,
 ) -> Vec<F64> {
     debug_assert!(positions.is_sorted());
+    let places: Vec<usize> = positions.iter().map(|q| q & ((1 << log_block) - 1)).collect();
     primitives::filled_vec(positions.len() * n, |out| {
         let mut rest = out;
+        let mut at = 0;
         let mut parts = positions
             .chunk_by(|a, b| a >> log_block == b >> log_block)
             .map(|run| {
                 let (head, tail) = std::mem::take(&mut rest).split_at_mut(run.len() * n);
                 rest = tail;
-                (head, run)
+                at += run.len();
+                (head, run, &places[at - run.len()..at])
             })
             .collect::<Vec<_>>();
         parallel::chunks_mut(&mut parts, 1, |i, part| {
-            let (dst, run) = &mut part[0];
+            let (dst, run, live) = &mut part[0];
             let block = run[0] >> log_block;
             with_scratch(n << log_block, |scratch| {
-                build(i, block, scratch);
-                for (dst, &q) in dst.chunks_exact_mut(n).zip(run.iter()) {
-                    dst.copy_from_slice(&scratch[(q & ((1 << log_block) - 1)) * n..][..n]);
+                build(i, block, live, scratch);
+                for (dst, &p) in dst.chunks_exact_mut(n).zip(live.iter()) {
+                    dst.copy_from_slice(&scratch[p * n..][..n]);
                 }
             });
         });
@@ -112,9 +115,9 @@ impl<'t> Openings<'t> {
     ) -> Vec<F64> {
         let Plan { log_d, num_ntts, deep_start, .. } = *plan;
         let layers = self.layers;
-        built_rows(num_ntts, log_d - deep_start, positions, |i, sub_idx, sub| {
+        built_rows(num_ntts, log_d - deep_start, positions, |i, sub_idx, live, sub| {
             let src = Some(src(i, sub_idx));
-            layers.run(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, None, no_hook);
+            layers.run(sub, src, log_d, num_ntts, deep_start, log_d, deep_start, sub_idx, Some(live), no_hook);
         })
     }
 }

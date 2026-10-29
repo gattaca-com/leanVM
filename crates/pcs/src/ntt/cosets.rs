@@ -47,7 +47,7 @@ impl<'t> CosetEncoder<'t> {
             with_scratch(group * msg.len(), |scratch| {
                 for g in lo..hi {
                     for (i, coset) in scratch.chunks_exact_mut(msg.len()).enumerate() {
-                        self.build(coset, msg, g * group + i);
+                        self.build(coset, msg, g * group + i, None);
                     }
                     sink(g * group * rows, scratch);
                 }
@@ -59,15 +59,17 @@ impl<'t> CosetEncoder<'t> {
     ///
     /// It runs one transform per coset the positions touch.
     pub(super) fn rows(&self, msg: &[F64], positions: &[usize]) -> Vec<F64> {
-        built_rows(self.num_ntts, self.log_d - self.log_inv_rate, positions, |_, coset, buf| {
-            self.build(buf, msg, coset)
+        built_rows(self.num_ntts, self.log_d - self.log_inv_rate, positions, |_, coset, live, buf| {
+            self.build(buf, msg, coset, Some(live))
         })
     }
 
     /// Coset `coset` of the codeword, built into `buf` (one message long) from the message.
-    fn build(&self, buf: &mut [F64], msg: &[F64], coset: usize) {
+    ///
+    /// With `live`, only those rows of the coset come out right.
+    fn build(&self, buf: &mut [F64], msg: &[F64], coset: usize, live: Option<&[usize]>) {
         let (log_d, first, end) = (self.log_d, self.log_inv_rate, self.log_d);
-        self.layers.run(buf, Some(msg), log_d, self.num_ntts, first, end, self.log_inv_rate, coset, None, no_hook);
+        self.layers.run(buf, Some(msg), log_d, self.num_ntts, first, end, self.log_inv_rate, coset, live, no_hook);
     }
 }
 
