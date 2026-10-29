@@ -22,7 +22,7 @@ use crate::open::fold;
 use crate::power::{Element, FACTOR_ROW, PowerField, get, set};
 use crate::protocol::{Claim, chi_weights, mu_at, sum};
 use crate::rmfe::PROD_BITS;
-use crate::witness::{Shape, Witness, transpose64, words};
+use crate::witness::{Recompute, Shape, Witness, transpose64, words};
 
 /// The pattern index of a binary assignment.
 fn ternary(b: usize) -> usize {
@@ -248,14 +248,13 @@ impl Layer<'_> {
     /// The blocks a segment's tasks walk: those written, then the padding block once, standing
     /// for every block after them.
     fn held(&self) -> usize {
-        let written = self.witness.written();
-        written + usize::from(written < self.witness.shape.n_blocks())
+        self.witness.held()
     }
 
-    /// Task `held * segment + g`, as `(segment, g, block)`.
-    fn block(&self, task: usize) -> (usize, usize, &[u64]) {
+    /// Task `held * segment + g`, as `(segment, g, block)`, recomputed into `scratch` if not stored.
+    fn block<'b>(&'b self, scratch: &'b mut Recompute, task: usize) -> (usize, usize, &'b [u64]) {
         let (segment, g) = (task / self.held(), task % self.held());
-        (segment, g, self.witness.layer(self.rounds[segment], g))
+        (segment, g, self.witness.state(scratch, self.rounds[segment], g))
     }
 
     fn n_tasks(&self) -> usize {
@@ -297,11 +296,12 @@ impl Layer<'_> {
                 (
                     vec![[Part::ZERO; BITS]; PACKS / PART],
                     vec![[Part::ZERO; 192]; PACKS / PART],
+                    Recompute::new(),
                 )
             },
             || vec![F192Unreduced::ZERO; PAYLOAD_BITS],
-            |(payloads, rows), sums, task| {
-                let (_, _, block) = self.block(task);
+            |(payloads, rows, recompute), sums, task| {
+                let (_, _, block) = self.block(recompute, task);
                 for r in 0..5 {
                     for z in 0..64 {
                         let js = row_positions(r, z);
@@ -361,11 +361,11 @@ impl Layer<'_> {
         let (nb, written) = (self.witness.shape.n_blocks(), self.witness.written());
         let mixed = parallel::map_reduce_with_state(
             self.rounds.len() * written,
-            SkipBlock::new,
+            || (SkipBlock::new(), Recompute::new()),
             || vec![[0u64; 7]; MIXED],
-            |skip, total, task| {
+            |(skip, recompute), total, task| {
                 let (segment, g) = (task / written, task % written);
-                let (row, block) = (g + nb * segment, self.witness.layer(self.rounds[segment], g));
+                let (row, block) = (g + nb * segment, self.witness.state(recompute, self.rounds[segment], g));
                 skip.run(block, &weights);
                 for half in 0..2 {
                     for (i, total) in total.iter_mut().enumerate() {
@@ -430,10 +430,10 @@ impl Layer<'_> {
         let sums = parallel::map_reduce_chunks_mut(
             [&mut parts[..]],
             [1],
-            || (vec![0u64; 4 * FACTOR_ROW], vec![0u64; 8 * BITS]),
+            || (vec![0u64; 4 * FACTOR_ROW], vec![0u64; 8 * BITS], Recompute::new()),
             RoundSums::default,
-            |(scratch, wide), sums, task, [part]| {
-                let (_, _, block) = self.block(task);
+            |(scratch, wide, recompute), sums, task, [part]| {
+                let (_, _, block) = self.block(recompute, task);
                 let rows = &mut *part[0];
                 let halves = rows.len() / ROW;
                 // Both groups' unreduced sums, four words each and laid out by word.

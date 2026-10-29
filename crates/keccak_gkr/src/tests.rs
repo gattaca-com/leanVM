@@ -213,7 +213,7 @@ fn proof_verifies_against_the_commitment() {
 
 /// The witness of every block run, the padding ones included.
 fn dense(shape: Shape, inputs: &[[u64; LANES]]) -> Witness {
-    let extent = Extent::new(0, shape.n_blocks());
+    let extent = Extent::new(0, shape.n_blocks(), shape.depth());
     for g in 0..shape.n_blocks() {
         let inputs = &inputs[(g * BLOCK).min(inputs.len())..((g + 1) * BLOCK).min(inputs.len())];
         block(shape.depth(), inputs, extent.slot(g), |_, _, _| {});

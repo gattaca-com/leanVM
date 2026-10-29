@@ -2,7 +2,8 @@
 //!
 //! A word holds one position of 64 instances, and a block is 512 instances: eight such words
 //! per position, laid out position after position. Only every `depth`-th state is committed,
-//! as lanes.
+//! as lanes, and only every [`every`]-th state is stored: a layer's passes recompute the others
+//! from the one below them, a block at a time ([`Recompute`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,18 @@ pub const BLOCK_LEN: usize = BITS * BLOCK_WORDS;
 #[inline(always)]
 pub(crate) fn words(block: &[u64], j: usize) -> &[u64; BLOCK_WORDS] {
     block[j * BLOCK_WORDS..][..BLOCK_WORDS].try_into().expect("eight words")
+}
+
+/// Rounds between two stored states of a batch of depth `depth`: the largest divisor of the
+/// checkpoint interval that divides `depth`, so that every committed state is stored. Each
+/// layer's passes recompute a round that is not stored, once per block, which more threads
+/// absorb: they store fewer states.
+pub fn every(depth: usize) -> usize {
+    let mut k = if parallel::num_threads() >= 8 { 4 } else { 2 };
+    while !depth.is_multiple_of(k) {
+        k /= 2;
+    }
+    k
 }
 
 /// Built only by [`Shape::new`], whose bounds keep the committed column's sizes from wrapping.
@@ -106,11 +119,12 @@ struct Buf {
     written: Box<[AtomicBool]>,
 }
 
-/// A run of blocks, round after round: block `first + i` of round `r` (the input state being
-/// round 0) is at word `(r * blocks + i) * BLOCK_LEN`.
+/// A run of blocks, every `every`-th round after another: block `first + i` of round `r` (the
+/// input state being round 0) is at word `(r / every * blocks + i) * BLOCK_LEN`.
 pub struct Extent {
     first: usize,
     blocks: usize,
+    every: usize,
     buf: Arc<Buf>,
 }
 
@@ -120,13 +134,17 @@ pub struct Slot {
     buf: Arc<Buf>,
     block: usize,
     blocks: usize,
+    every: usize,
 }
 
 impl Slot {
-    /// Write the state of round `round` of this slot's block.
+    /// Write the state of round `round` of this slot's block, if the extent stores that round.
     fn store(&self, stream: &Stream, round: usize, words: &[u64]) {
         assert!(round <= ROUNDS && words.len() == BLOCK_LEN);
-        let at = (round * self.blocks + self.block) * BLOCK_LEN;
+        if !round.is_multiple_of(self.every) {
+            return;
+        }
+        let at = (round / self.every * self.blocks + self.block) * BLOCK_LEN;
         // SAFETY: the asserts and `Extent::slot` keep the block's `BLOCK_LEN` words inside the
         // buffer, which the `Arc` keeps alive. This is the only writer of them, and nothing
         // reads them before `finish` flags them, so they do not overlap `words`.
@@ -140,10 +158,12 @@ impl Slot {
 }
 
 impl Extent {
-    /// An extent for blocks `first .. first + blocks`, none of them run yet.
-    pub fn new(first: usize, blocks: usize) -> Self {
+    /// An extent for blocks `first .. first + blocks` of a batch of depth `depth`, none of them
+    /// run yet.
+    pub fn new(first: usize, blocks: usize, depth: usize) -> Self {
+        let every = every(depth);
         // SAFETY: a block is read only once its `written` flag is set, which follows its last write.
-        let mut words = unsafe { primitives::uninit_vec::<u64>((ROUNDS + 1) * blocks * BLOCK_LEN) };
+        let mut words = unsafe { primitives::uninit_vec::<u64>((ROUNDS / every + 1) * blocks * BLOCK_LEN) };
         let flags = || (0..blocks).map(|_| AtomicBool::new(false)).collect();
         let buf = Buf {
             base: SendPtr(words.as_mut_ptr()),
@@ -154,6 +174,7 @@ impl Extent {
         Self {
             first,
             blocks,
+            every,
             buf: Arc::new(buf),
         }
     }
@@ -171,6 +192,7 @@ impl Extent {
             buf: Arc::clone(&self.buf),
             block,
             blocks: self.blocks,
+            every: self.every,
         }
     }
 
@@ -180,7 +202,8 @@ impl Extent {
 
     fn round(&self, round: usize, g: usize) -> &[u64] {
         assert!(round <= ROUNDS && self.is_written(g), "block {g} was not run");
-        let at = (round * self.blocks + g - self.first) * BLOCK_LEN;
+        assert!(round.is_multiple_of(self.every), "round {round} is not stored");
+        let at = (round / self.every * self.blocks + g - self.first) * BLOCK_LEN;
         // SAFETY: the block's words are written, and nothing writes them again. The buffer
         // lives as long as `self`, and the block lies in it.
         unsafe { std::slice::from_raw_parts(self.buf.base.add(at), BLOCK_LEN) }
@@ -193,6 +216,8 @@ pub struct Witness {
     extents: Vec<Extent>,
     written: usize,
     padding: Option<Extent>,
+    /// Rounds between two stored states, as the extents store them.
+    every: usize,
 }
 
 /// Transpose a 64 by 64 bit matrix: bit `c` of row `r` becomes bit `r` of row `c`.
@@ -292,7 +317,7 @@ fn chi_iota(u: &[Word], round: usize, state: &mut [Word]) {
 }
 
 /// Run one block of instances, padded with all-zero inputs, and write its input state and the
-/// state each round applies `chi` to, all sliced, into `slot`. `commit(slot, w, lanes)` receives lane `slot % 25`
+/// state each round applies `chi` to, all sliced, into `slot`, those of the rounds it stores. `commit(slot, w, lanes)` receives lane `slot % 25`
 /// of the state after `depth * (slot / 25)` rounds, for instances `64 * w ..` of the block: every
 /// state a segment starts from, the output not being committed.
 ///
@@ -359,7 +384,7 @@ pub fn block_lanes_into(depth: usize, inputs: &[[u64; LANES]], slot: Slot, out: 
 /// them: its one-block extent and its lanes.
 fn padding(shape: Shape, written: usize) -> Option<(Extent, Vec<u64>)> {
     (written < shape.n_blocks()).then(|| {
-        let extent = Extent::new(written, 1);
+        let extent = Extent::new(written, 1, shape.depth);
         // `block_lanes_into` writes every word.
         let lanes = primitives::filled_vec(lanes_len(shape.depth), |lanes| {
             block_lanes_into(shape.depth, &[], extent.slot(written), lanes)
@@ -402,7 +427,7 @@ impl Witness {
     pub fn generate(shape: Shape, inputs: &[[u64; LANES]], committed: &mut [F64]) -> Self {
         assert!(inputs.len() <= shape.n());
         let written = inputs.len().div_ceil(BLOCK);
-        let extent = Extent::new(0, written);
+        let extent = Extent::new(0, written, shape.depth);
         let stride = lanes_len(shape.depth);
         // `block_lanes_into` writes every word of its chunk.
         let lanes = primitives::filled_vec(written * stride, |lanes| {
@@ -441,11 +466,15 @@ impl Witness {
         written: usize,
         padding: Option<Extent>,
     ) -> Self {
+        let every = extents.iter().chain(&padding).next().map_or(1, |e| e.every);
+        assert!(shape.depth.is_multiple_of(every), "every committed state is stored");
         let mut end = 0;
         for extent in &extents {
             assert_eq!(extent.first, end, "extents are consecutive");
+            assert_eq!(extent.every, every, "extents store the same rounds");
             end = extent.end();
         }
+        assert!(padding.as_ref().is_none_or(|p| p.every == every));
         assert!(written <= end && written <= shape.n_blocks());
         assert!(written == shape.n_blocks() || padding.as_ref().is_some_and(|p| p.blocks == 1));
         let run = |e: &Extent, upto: usize| (e.first..e.end().min(upto)).all(|g| e.is_written(g));
@@ -458,6 +487,7 @@ impl Witness {
             extents,
             written,
             padding,
+            every,
         }
     }
 
@@ -467,8 +497,38 @@ impl Witness {
         self.written
     }
 
+    /// The blocks a layer reads: those written, then the padding block once, standing for every
+    /// block after them.
+    pub(crate) fn held(&self) -> usize {
+        self.written + usize::from(self.written < self.shape.n_blocks())
+    }
+
     /// Block `g` of the state round `round` applies `chi` to, rounds counted from 1, or of the
-    /// input state for `round` 0, sliced.
+    /// input state for `round` 0, sliced: a stored round, or one recomputed into `scratch` from
+    /// the stored round below it.
+    pub(crate) fn state<'a>(&'a self, scratch: &'a mut Recompute, round: usize, g: usize) -> &'a [u64] {
+        let from = round - round % self.every;
+        let stored = self.layer(from, g);
+        if from == round {
+            return stored;
+        }
+        let stored = stored.as_chunks::<BLOCK_WORDS>().0;
+        let Recompute { state, u } = scratch;
+        if from > 0 {
+            chi_iota(stored, from, state);
+        }
+        for r in from + 1..=round {
+            let input: &[Word] = if r == 1 { stored } else { state };
+            linear(input, u);
+            if r < round {
+                chi_iota(u, r, state);
+            }
+        }
+        u.as_flattened()
+    }
+
+    /// Block `g` of the state round `round` applies `chi` to, rounds counted from 1, or of the
+    /// input state for `round` 0, sliced. The round must be stored.
     pub fn layer(&self, round: usize, g: usize) -> &[u64] {
         if g >= self.written {
             let padding = self.padding.as_ref().expect("a block of the batch");
@@ -476,6 +536,24 @@ impl Witness {
         }
         let extent = self.extents.iter().find(|e| g < e.end()).expect("a written block");
         extent.round(round, g)
+    }
+}
+
+/// A worker's scratch for [`Witness::state`]: a block of a state and of the next round's input.
+pub(crate) struct Recompute {
+    state: Vec<Word>,
+    u: Vec<Word>,
+}
+
+impl Recompute {
+    pub(crate) fn new() -> Self {
+        // SAFETY: `Witness::state` writes every word before it reads it.
+        unsafe {
+            Self {
+                state: primitives::uninit_vec(BITS),
+                u: primitives::uninit_vec(BITS),
+            }
+        }
     }
 }
 

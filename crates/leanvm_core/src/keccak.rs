@@ -177,7 +177,7 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LA
         let mut steps = 0;
         let mut dispatch = |pending: &mut Vec<[u64; STATE_LANES]>, last: bool| {
             if extents.last().is_none_or(|e| e.end() == blocks) {
-                extents.push(Extent::new(blocks, blocks.max(8)));
+                extents.push(Extent::new(blocks, blocks.max(8), DEPTH));
             }
             let slot = extents.last().expect("an extent").slot(blocks);
             if workers == 0 || last {
