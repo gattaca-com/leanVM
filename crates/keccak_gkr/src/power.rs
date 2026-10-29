@@ -124,7 +124,8 @@ impl PowerField {
     }
 
     /// The dot products of `B[j] = weights[j] * (kappa + T[j + 1]) + constant[j]` and `T[j + 2]`,
-    /// at zero and infinity over two rows. Weights and constants are by lane, then by word.
+    /// at zero and infinity over two rows, unreduced or not. Weights and constants are by lane,
+    /// then by word.
     pub fn chi_dot_pair(
         &self,
         t: [&[u64]; 2],
@@ -410,6 +411,8 @@ mod x86 {
             (finish(&acc[0]), finish(&acc[1]))
         }
 
+        /// `B` stays unreduced, six words: its two halves each meet `T[j + 2]` in a Karatsuba
+        /// product, which costs fewer products than reducing `B` first. The sums are reduced once.
         pub fn chi_dot_pair(
             field: &PowerField,
             t: [&[u64]; 2],
@@ -419,41 +422,53 @@ mod x86 {
             scratch: &mut [u64],
         ) -> ([u64; 6], [u64; 6]) {
             let kappa: [V; 3] = std::array::from_fn(|k| V::splat(kappa[k]));
-            let mut acc = [[V::zero(); 5]; 2];
+            // Sums by word offset: the low half's products at 0, the high half's at 3.
+            let mut acc = [[V::zero(); 8]; 2];
             for lane in 0..BITS / 64 {
                 let (weights, constant) = (&weights[FACTOR_ROW * lane..], &constant[FACTOR_ROW * lane..]);
                 let at = along(64 * lane, 1);
                 for (half, t) in t.into_iter().enumerate() {
-                    let b = &mut scratch[half * FACTOR_ROW..][..FACTOR_ROW];
+                    let b = &mut scratch[2 * half * FACTOR_ROW..][..2 * FACTOR_ROW];
                     for z in (0..64).step_by(STEP) {
                         let (w, c, shifted) = (
                             load3(weights, 64, z),
                             load3(constant, 64, z),
                             xor3(&load3(t, BITS, at + z), &kappa),
                         );
-                        let product = reduce_pair(field, &partial(&w, &shifted));
-                        store3(b, 64, z, xor3(&c, &product));
+                        let sums = partial(&w, &shifted);
+                        let [even, odd] = [0, 1].map(|h| -> [V; 6] { std::array::from_fn(|k| word(&sums[h], k)) });
+                        let low: [V; 3] = std::array::from_fn(|k| even[k].unpacklo(odd[k]));
+                        let high: [V; 3] = std::array::from_fn(|k| even[3 + k].unpacklo(odd[3 + k]));
+                        store3(b, 64, z, xor3(&c, &low));
+                        store3(&mut b[FACTOR_ROW..], 64, z, high);
                     }
                 }
                 let at = along(64 * lane, 2);
                 for z in (0..64).step_by(STEP) {
-                    let (a0, a1, b0, b1) = (
-                        load3(scratch, 64, z),
-                        load3(&scratch[FACTOR_ROW..], 64, z),
-                        load3(t[0], BITS, at + z),
-                        load3(t[1], BITS, at + z),
-                    );
-                    for (acc, p) in acc
-                        .iter_mut()
-                        .zip([partial(&a0, &b0), partial(&xor3(&a0, &a1), &xor3(&b0, &b1))])
-                    {
+                    let b: [[V; 3]; 4] = std::array::from_fn(|i| load3(&scratch[i * FACTOR_ROW..], 64, z));
+                    let (t0, t1) = (load3(t[0], BITS, at + z), load3(t[1], BITS, at + z));
+                    let (dt, db) = (xor3(&t0, &t1), [xor3(&b[0], &b[2]), xor3(&b[1], &b[3])]);
+                    for (acc, (a, t)) in acc.iter_mut().zip([([b[0], b[1]], t0), (db, dt)]) {
+                        let (low, high) = (partial(&a[0], &t), partial(&a[1], &t));
                         for s in 0..5 {
-                            acc[s] = acc[s].xor(p[0][s].xor(p[1][s]));
+                            acc[s] = acc[s].xor(low[0][s].xor(low[1][s]));
+                            acc[s + 3] = acc[s + 3].xor(high[0][s].xor(high[1][s]));
                         }
                     }
                 }
             }
-            finish_dot(&acc)
+            let finish = |acc: &[V; 8]| -> [u64; 6] {
+                let mut wide = [0u64; 9];
+                for (s, sum) in acc.iter().enumerate() {
+                    let sum = sum.sum();
+                    wide[s] ^= sum as u64;
+                    wide[s + 1] ^= (sum >> 64) as u64;
+                }
+                let high = field.reduce(&wide[3..].try_into().unwrap());
+                let r = field.reduce(&[wide[0], wide[1], wide[2], high[0], high[1], high[2]]);
+                [r[0], r[1], r[2], 0, 0, 0]
+            };
+            (finish(&acc[0]), finish(&acc[1]))
         }
 
         pub fn reduce_row(field: &PowerField, dst: &mut [u64], wide: &[u64], width: usize) {
@@ -663,7 +678,9 @@ mod tests {
             let t = [rows[0].as_slice(), high.as_slice()];
             let expected = field.chi_dot_pair_by_lane(t, &rows[2], &rows[3], &kappa, &mut scratch);
             let actual = field.chi_dot_pair(t, &rows[2], &rows[3], &kappa, &mut scratch);
-            assert_eq!(actual, expected);
+            // The kernels may leave the sums reduced to different degrees.
+            assert_eq!(field.reduce(&actual.0), field.reduce(&expected.0));
+            assert_eq!(field.reduce(&actual.1), field.reduce(&expected.1));
         }
     }
 
