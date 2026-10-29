@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parallel::SendPtr;
 use primitives::field::F64;
-use primitives::hash::{RC, ROUNDS};
+use primitives::hash::{PI, RC, RHO, ROUNDS};
 use primitives::stream::Stream;
 
-use crate::keccak::{BITS, LANES, along, linear};
+use crate::keccak::{BITS, LANES, along};
 
 /// Instances a block holds, and the words one position of a block takes.
 pub const BLOCK: usize = 512;
@@ -236,8 +236,59 @@ pub fn transpose64_portable(a: &mut [u64; 64]) {
 
 type Word = [u64; BLOCK_WORDS];
 
-fn xor(a: Word, b: Word) -> Word {
-    std::array::from_fn(|i| a[i] ^ b[i])
+// The round works on runs of consecutive positions, flattened to words: a loop over positions of
+// `Word`s is vectorized across positions, with a gather per word.
+
+/// `out = a ^ b`, word by word.
+#[inline(always)]
+fn xor_run(out: &mut [Word], a: &[Word], b: &[Word]) {
+    for ((o, x), y) in out.as_flattened_mut().iter_mut().zip(a.as_flattened()).zip(b.as_flattened()) {
+        *o = x ^ y;
+    }
+}
+
+/// [`crate::keccak::linear`] on a sliced block.
+fn linear(a: &[Word], out: &mut [Word]) {
+    let mut c = [[0u64; BLOCK_WORDS]; 5 * 64];
+    for (x, c) in c.as_chunks_mut::<64>().0.iter_mut().enumerate() {
+        xor_run(c, &a[64 * x..][..64], &a[64 * (x + 5)..][..64]);
+        for y in 2..5 {
+            for (c, a) in c.as_flattened_mut().iter_mut().zip(a[64 * (x + 5 * y)..][..64].as_flattened()) {
+                *c ^= a;
+            }
+        }
+    }
+    let mut d = [[0u64; BLOCK_WORDS]; 5 * 64];
+    for x in 0..5 {
+        let (c4, c1) = (&c[64 * ((x + 4) % 5)..][..64], &c[64 * ((x + 1) % 5)..][..64]);
+        let d = &mut d[64 * x..][..64];
+        xor_run(&mut d[1..], &c4[1..], &c1[..63]);
+        xor_run(&mut d[..1], &c4[..1], &c1[63..]);
+    }
+    for lane in 0..LANES {
+        let rot = RHO[lane] as usize;
+        let (a, d, out) = (&a[64 * lane..][..64], &d[64 * (lane % 5)..][..64], &mut out[64 * PI[lane]..][..64]);
+        xor_run(&mut out[rot..], &a[..64 - rot], &d[..64 - rot]);
+        xor_run(&mut out[..rot], &a[64 - rot..], &d[64 - rot..]);
+    }
+}
+
+/// The state after round `round`, from the state `u` that round applies `chi` to.
+fn chi_iota(u: &[Word], round: usize, state: &mut [Word]) {
+    for lane in 0..LANES {
+        let (a, b, c) = (64 * lane, along(64 * lane, 1), along(64 * lane, 2));
+        let (x, y, w) = (
+            u[a..][..64].as_flattened(),
+            u[b..][..64].as_flattened(),
+            u[c..][..64].as_flattened(),
+        );
+        for (i, s) in state[a..][..64].as_flattened_mut().iter_mut().enumerate() {
+            *s = x[i] ^ (!y[i] & w[i]);
+        }
+    }
+    for z in (0..64).filter(|z| RC[round - 1] >> z & 1 == 1) {
+        state[z] = state[z].map(|w| !w);
+    }
 }
 
 /// Run one block of instances, padded with all-zero inputs, and write its input state and the
@@ -279,17 +330,9 @@ pub fn block(depth: usize, inputs: &[[u64; LANES]], slot: Slot, mut commit: impl
     store(0, &state);
     lanes(0, &state);
     for round in 1..=ROUNDS {
-        linear(&state, &mut u, xor);
+        linear(&state, &mut u);
         store(round, &u);
-        for lane in 0..LANES {
-            let (a, b, c) = (64 * lane, along(64 * lane, 1), along(64 * lane, 2));
-            for z in 0..64 {
-                state[a + z] = std::array::from_fn(|i| u[a + z][i] ^ (!u[b + z][i] & u[c + z][i]));
-            }
-        }
-        for z in (0..64).filter(|z| RC[round - 1] >> z & 1 == 1) {
-            state[z] = state[z].map(|w| !w);
-        }
+        chi_iota(&u, round, &mut state);
         if round.is_multiple_of(depth) && round < ROUNDS {
             lanes(round / depth, &state);
         }
@@ -609,7 +652,7 @@ mod neon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keccak::{along, iota_bit};
+    use crate::keccak::{along, iota_bit, linear};
     use primitives::test_rng::Rng;
 
     #[test]
