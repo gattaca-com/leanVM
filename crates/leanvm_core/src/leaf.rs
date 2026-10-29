@@ -434,7 +434,7 @@ struct Side<'a> {
     lay: &'a Layout,
     explicit: usize,
     tiled: bool,
-    /// Whether the pairs of GKR blocks inside a block's bulk are left unstored for GKR to recompute.
+    /// Whether aligned groups of four GKR blocks are left unstored for GKR to recompute.
     columns: bool,
     leaves: Vec<gkr::Block>,
     quads: Vec<F192>,
@@ -459,10 +459,13 @@ impl Side<'_> {
         }
     }
 
-    /// The leading GKR blocks of block `b`'s bulk that are not stored: an even number, so that an odd
-    /// last block stays stored, where it pairs with the block after it.
+    /// Whole groups of four GKR blocks, so two folds write complete destination blocks.
     fn unstored(&self, b: usize) -> usize {
-        if self.columns { self.bulk(b) & !1 } else { 0 }
+        if self.columns && self.lay.offsets[b].is_multiple_of(4 * gkr::BLOCK_VALUES) {
+            self.bulk(b) & !3
+        } else {
+            0
+        }
     }
 }
 
@@ -480,7 +483,7 @@ pub struct ColumnLeaves<'a> {
 impl ColumnLeaves<'_> {
     /// The unstored GKR blocks of a block of `rows` rows, as [`Side::unstored`] counts them.
     fn blocks(rows: usize) -> usize {
-        (rows / gkr::BLOCK_VALUES) & !1
+        (rows / gkr::BLOCK_VALUES) & !3
     }
 
     /// The tasks of the group of `rows`: one per `BLOCKS` unstored blocks.
@@ -508,6 +511,8 @@ impl gkr::LeafColumns for ColumnLeaves<'_> {
             }
             for &(rows, s, b) in group {
                 let off = self.offsets[s][b];
+                debug_assert!(off.is_multiple_of(4 * gkr::BLOCK_VALUES));
+                debug_assert!(BLOCKS.is_multiple_of(4));
                 for k in t * BLOCKS..((t + 1) * BLOCKS).min(Self::blocks(rows)) {
                     let block = F192x8::transpose(std::array::from_fn(|j| {
                         leaf_rows8(&self.terms[s][b], gkr::BLOCK_VALUES * k + 8 * j)
@@ -530,9 +535,9 @@ impl gkr::LeafColumns for ColumnLeaves<'_> {
 /// them together over each chunk of rows: the table's columns come from DRAM once for all of them,
 /// and every block publishes exactly what its own pass would.
 ///
-/// With `columns`, the leaves of the bulk of a block are not stored, but for an odd last GKR block:
-/// the returned [`ColumnLeaves`] computes them again from the columns, which costs less DRAM
-/// traffic than reading them back. A side that does not tile its layout keeps all its leaves.
+/// With `columns`, aligned groups of four bulk GKR blocks are left unstored; incomplete boundary groups remain stored.
+/// The returned [`ColumnLeaves`] recomputes them from the columns, reducing traffic compared with reading stored leaves.
+/// A side that does not tile its layout keeps all its leaves.
 #[timed]
 /// `memory_len` bounds the real prefix of columns `MEM_LO..=MFCNT`; their suffixes must each be constant.
 pub fn build_leaves<'a>(
