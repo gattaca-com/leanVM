@@ -51,6 +51,18 @@ pub const MIN_MU: usize = 15;
 /// Largest committed size accepted by all verifiers and compiled into the recursion guest.
 pub const MAX_MU: usize = 28;
 
+/// Prepare the configurations for every supported witness size and PCS rate.
+pub(crate) fn setup() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        for rate in MIN_LOG_INV_RATE..=MAX_LOG_INV_RATE {
+            for mu in MIN_MU..=MAX_MU {
+                whir_config(mu, rate);
+            }
+        }
+    });
+}
+
 /// The shared WHIR config for a `2^μ`-word witness, memoized per `(μ, log_inv_rate)`.
 fn whir_config(mu: usize, log_inv_rate: usize) -> std::sync::Arc<ProverConfig> {
     use std::collections::HashMap;

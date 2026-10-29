@@ -7,10 +7,11 @@
 pub use rec_aggregation::{
     AggregateVerifyError, AggregationError, ClaimSelection, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
     LeanSphincsClaim, LeanXmssClaim, MAX_DA_ROOTS, MAX_KEYS, MAX_RECURSIONS, SignatureClaims, VerifierError, aggregate,
+    aggregate_with_stats, setup as setup_prover_with_capacity,
 };
 
 pub use leanvm_core::{
-    cpu::{ExecError, Fault, ProveError},
+    cpu::{ExecError, Fault, GPow, ProveError, Stats},
     pcs::{MAX_LOG_INV_RATE, MIN_LOG_INV_RATE},
 };
 
@@ -44,11 +45,12 @@ pub use rand;
 /// Call once before verifying an [`EthereumProof`]. Idempotent, and
 /// [`setup_prover`] does it for you.
 pub fn setup_verifier() {
-    leanvm_core::init_prover();
     rec_aggregation::warm_up();
 }
 
 /// Call once before [`aggregate`].
+/// Use [`setup_prover_with_capacity`] to also prepare reusable execution tables and memory,
+/// then pass its returned state to [`aggregate_with_stats`].
 ///
 /// A proof's buffers are ordinary heap allocations, freed before it returns, so
 /// proving speed depends on the process's global allocator. One that keeps freed
@@ -56,5 +58,6 @@ pub fn setup_verifier() {
 /// dirty pages that never decay, which the `leanvm` CLI installs. glibc's default
 /// is the slow case, since it unmaps a large block on free.
 pub fn setup_prover() {
+    leanvm_core::init_prover();
     setup_verifier();
 }

@@ -3,12 +3,11 @@
 
 use flux_profiler::timed;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
-use super::hints::{GPow, MAX_CELLS};
+use super::hints::{GPow, MAX_CELLS, bounded_dlog};
 use super::*;
 use primitives::{
-    field::{F64, F192, mul_by_g},
+    field::{F64, F192},
     pretty_f64, pretty_integer,
 };
 
@@ -73,6 +72,28 @@ pub(crate) struct Cell {
 pub(crate) struct Cells(&'static mut [Cell; LIMIT]);
 
 impl Cells {
+    pub(super) fn prepare(capacity: usize) -> Option<Self> {
+        let mut cells = Self::reserve()?;
+        cells.clear(capacity);
+        Some(cells)
+    }
+
+    fn clear(&mut self, used: usize) {
+        const ZERO_CELLS: usize = (1 << 16) / std::mem::size_of::<Cell>();
+        static ZERO: [Cell; ZERO_CELLS] = [Cell {
+            word: F192::ZERO,
+            count: 0,
+            state: State::Unwritten,
+        }; ZERO_CELLS];
+        let touched = &mut self.0[..used.min(LIMIT)];
+        parallel::chunks_mut(touched, (1 << 20) / std::mem::size_of::<Cell>(), |_, chunk| {
+            let stream = primitives::stream::Stream::new();
+            for c in chunk.chunks_mut(ZERO.len()) {
+                stream.copy(c, &ZERO[..c.len()]);
+            }
+        });
+    }
+
     fn reserve() -> Option<Self> {
         let bytes = LIMIT * std::mem::size_of::<Cell>();
         // SAFETY: an anonymous private mapping; failure is checked.
@@ -105,16 +126,8 @@ impl Drop for Cells {
 impl Memory {
     /// The cell mapping, zeroed again so a later run can start from it. Its pages stay
     /// faulted, so that run takes no page faults and the kernel zeroes nothing.
-    pub(crate) fn into_cells(self) -> Cells {
-        static ZERO: [Cell; (1 << 16) / std::mem::size_of::<Cell>()] =
-            [Cell { word: F192::ZERO, count: 0, state: State::Unwritten }; (1 << 16) / std::mem::size_of::<Cell>()];
-        let touched = &mut self.cells.0[..self.used.min(LIMIT)];
-        parallel::chunks_mut(touched, (1 << 20) / std::mem::size_of::<Cell>(), |_, chunk| {
-            let stream = primitives::stream::Stream::new();
-            for c in chunk.chunks_mut(ZERO.len()) {
-                stream.copy(c, &ZERO[..c.len()]);
-            }
-        });
+    pub(crate) fn into_cells(mut self) -> Cells {
+        self.cells.clear(self.used);
         self.cells
     }
 }
@@ -538,34 +551,6 @@ impl Program {
                 Ok(count)
             }
         }
-        // Bounded discrete log for `hint_decompose_bits_exponent`: find n < 2^nbits
-        // with g^n = x, by baby-step giant-step (baby table g^j for j < 2^17,
-        // built once per process; giant step ×g^(-2^17)). Prover-side only: the
-        // guest re-verifies the hinted bits in-circuit.
-        fn bounded_dlog(x: F64, nbits: u32) -> Option<u128> {
-            const LOG_BABY: u32 = 17;
-            static TABLE: OnceLock<(GPow, F64)> = OnceLock::new();
-            let (baby, giant) = TABLE.get_or_init(|| {
-                let baby = GPow::dense((1usize << LOG_BABY) - 1);
-                // g^(2^17), one past the table; its inverse is the giant step.
-                let giant = mul_by_g(baby.pow((1usize << LOG_BABY) - 1)).inv();
-                (baby, giant)
-            });
-            let mut y = x;
-            let max_giant = if nbits > LOG_BABY {
-                1u64 << (nbits - LOG_BABY)
-            } else {
-                1
-            };
-            for a in 0..max_giant {
-                if let Some(j) = baby.lookup(y) {
-                    return Some((a as u128) << LOG_BABY | j as u128);
-                }
-                y *= *giant;
-            }
-            None
-        }
-
         // A runtime count (a loop's frame span, a `HeapBuf` size) as the exponent of
         // a g-power: the address table when it covers it, else a bounded discrete log.
         fn count(g: &mut GPow, x: F64) -> Option<u32> {

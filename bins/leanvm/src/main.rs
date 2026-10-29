@@ -39,7 +39,16 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 2)]
     cooldown: u64,
 
-    /// Skip the warmup pass, to time a fresh process's first pass.
+    /// VM cells to prepare before timing, as a base-2 logarithm.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 23,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=28)
+    )]
+    setup_log_memory: usize,
+
+    /// Skip the warmup pass, to time the first proof after setup.
     #[arg(long, global = true)]
     cold: bool,
 
@@ -124,7 +133,7 @@ fn main() {
     }
     match cli.command {
         Command::Aggregate { xmss, sphincs, blobs } => {
-            benchmark::run_aggregation(xmss, sphincs, blobs, cli.log_inv_rate, plan);
+            benchmark::run_aggregation(xmss, sphincs, blobs, cli.log_inv_rate, 1 << cli.setup_log_memory, plan);
         }
         Command::Recursion {
             n,
@@ -141,6 +150,7 @@ fn main() {
                 cli.log_inv_rate,
                 cli.tracing,
                 proof_out.as_deref(),
+                1 << cli.setup_log_memory,
                 plan,
             );
         }
@@ -148,7 +158,7 @@ fn main() {
             keccak_gkr::batch_bench::run(1 << log_n, leanvm_core::keccak::DEPTH, cli.log_inv_rate, plan).print();
         }
         Command::Fibonacci { n } => {
-            fibonacci::run_fibonacci(n, cli.log_inv_rate, plan);
+            fibonacci::run_fibonacci(n, cli.log_inv_rate, 1 << cli.setup_log_memory, plan);
         }
     }
 }

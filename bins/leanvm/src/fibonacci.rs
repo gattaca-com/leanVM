@@ -3,7 +3,7 @@
 
 use bench::Plan;
 use lean_compiler::{compile, parse};
-use leanvm_core::cpu::{prove, verify};
+use leanvm_core::cpu::{GPow, Witness, prove_with, verify};
 use primitives::{
     field::{F64, F192, g_pow},
     pretty_f64, pretty_integer,
@@ -13,16 +13,24 @@ use primitives::{
 /// `mul_range` recurrence), binding `g^{F(n)}` as the public input. Prints the
 /// benchmark report. Proving runs one discarded warmup pass followed by
 /// `plan.repeat` measured passes (see [`bench`]).
-pub fn run_fibonacci(n: usize, log_inv_rate: usize, plan: Plan) {
+pub fn run_fibonacci(n: usize, log_inv_rate: usize, setup_capacity: usize, plan: Plan) {
     let trace_span = tracing::info_span!("Fibonacci", n, log_inv_rate).entered();
 
     let (src, pi) = fibonacci_program(n);
     let program = compile(&parse(&src).unwrap());
+    let witness = Witness::default();
+    let mut gpow = tracing::info_span!("Setup", capacity = setup_capacity).in_scope(|| GPow::setup(setup_capacity));
 
     // Only the final measured pass of each stage is traced (see `run_recursion`).
     let ((proof, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
-        prove(&program, pi, log_inv_rate).expect("the Fibonacci program proves")
+        let result = prove_with(&program, &witness, pi, log_inv_rate, &mut gpow).expect("the Fibonacci program proves");
+        assert_eq!(
+            gpow.capacity(),
+            setup_capacity,
+            "increase --setup-log-memory to cover this execution"
+        );
+        result
     });
     let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
@@ -107,6 +115,11 @@ fn fibonacci_program(fib_n: usize) -> (String, [F192; 2]) {
 mod tests {
     #[test]
     fn fibonacci() {
-        super::run_fibonacci(200_000, leanvm_core::pcs::TEST_LOG_INV_RATE, bench::Plan::default());
+        super::run_fibonacci(
+            200_000,
+            leanvm_core::pcs::TEST_LOG_INV_RATE,
+            1 << 20,
+            bench::Plan::default(),
+        );
     }
 }

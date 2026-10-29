@@ -4,6 +4,7 @@
 
 use primitives::field::{F64, mul_by_g};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Frame-relative offset operand (matches the compiler's `ir::Off`).
 pub type Off = u32;
@@ -70,6 +71,26 @@ impl GPow {
             coarsed: 0,
             cells: None,
         }
+    }
+
+    /// Prepare powers and zeroed VM memory for `capacity` cells before proving.
+    /// Larger executions can grow the tables and touch more pages on demand.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero, exceeds the VM address space, or its memory mapping fails.
+    pub fn setup(capacity: usize) -> Self {
+        assert!((1..=MAX_CELLS as usize).contains(&capacity), "invalid setup capacity");
+        crate::init_prover();
+        let mut g = Self::new();
+        g.grow_to(capacity - 1);
+        g.cells = Some(super::execute::Cells::prepare(capacity).expect("reserve VM memory for setup"));
+        g
+    }
+
+    /// The number of exponents covered by the precomputed powers.
+    pub fn capacity(&self) -> usize {
+        self.pow.len()
     }
 
     /// Covering index `upto`, every exponent up to there announced, so that
@@ -216,6 +237,39 @@ impl GPow {
         }
         self.index = index;
     }
+}
+
+const LOG_BABY: u32 = 17;
+
+fn dlog_table() -> &'static (GPow, F64) {
+    static TABLE: OnceLock<(GPow, F64)> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let baby = GPow::dense((1usize << LOG_BABY) - 1);
+        let giant = mul_by_g(baby.pow((1usize << LOG_BABY) - 1)).inv();
+        (baby, giant)
+    })
+}
+
+pub(crate) fn setup() {
+    dlog_table();
+}
+
+/// Bounded discrete log for exponent hints; the guest checks the hinted bits.
+pub(super) fn bounded_dlog(x: F64, nbits: u32) -> Option<u128> {
+    let (baby, giant) = dlog_table();
+    let mut y = x;
+    let max_giant = if nbits > LOG_BABY {
+        1u64 << (nbits - LOG_BABY)
+    } else {
+        1
+    };
+    for a in 0..max_giant {
+        if let Some(j) = baby.lookup(y) {
+            return Some((a as u128) << LOG_BABY | j as u128);
+        }
+        y *= *giant;
+    }
+    None
 }
 
 /// The inverse of [`mul_by_g`]: bit 0 of its output says whether it folded.

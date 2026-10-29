@@ -15,6 +15,18 @@ use std::mem::{MaybeUninit, needs_drop};
 #[cfg(feature = "test-util")]
 pub mod test_rng;
 
+/// Initialize the field lookup and SIMD shuffle tables before proving.
+pub fn setup() {
+    field::g_pow32_by_lookup(0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    bit_fold::gfni::setup();
+}
+
 /// Format an integer with comma-separated groups of three decimal digits.
 ///
 /// This accepts every standard signed and unsigned integer type through its

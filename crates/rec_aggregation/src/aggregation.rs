@@ -2701,6 +2701,18 @@ pub fn warm_up() {
     unified_guest();
     stacked_bytecode();
     scalar_bytecode();
+    bytecode_window();
+}
+
+/// Prepare reusable prover state for up to `capacity` VM cells, independently of proof inputs.
+///
+/// Initializes the worker pool, static prover and guest tables, address powers, and zeroed VM memory.
+/// Pass the returned state to [`aggregate_with_stats`] for each proof. Larger executions can grow it.
+#[tracing::instrument(name = "Setup")]
+pub fn setup(capacity: usize) -> GPow {
+    leanvm_core::init_prover();
+    warm_up();
+    GPow::setup(capacity)
 }
 
 /// The aggregation bytecode, compiled to a fixed point on its own size.

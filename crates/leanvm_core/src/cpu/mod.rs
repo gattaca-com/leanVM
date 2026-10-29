@@ -542,6 +542,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
 /// The g-power table the run needs is owned by the caller. A run starts from
 /// `gpow` and leaves it grown, so a caller that proves again, even another program, passes
 /// the same table back and skips growing it. On an error `gpow` is left as a fresh table.
+/// [`GPow::setup`] prepares the tables and VM memory before the first proof.
 #[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
 #[timed]
 pub fn prove_with(
@@ -908,6 +909,25 @@ mod tests {
 
         let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &pi, &proof).expect("a hand-assembled program verifies");
+    }
+
+    #[test]
+    fn prepared_prover_matches_fresh_across_runs() {
+        let capacity = 1 << 17;
+        let mut gpow = GPow::setup(capacity);
+        for seed in [7, 19] {
+            let program = keccak_program(w(seed), w(seed + 1), [w(seed + 2); 4], w(seed + 3));
+            let pi = [w(seed + 4), w(seed + 5)];
+            let (prepared, _) = prove_with(&program, &program.witness, pi, crate::pcs::TEST_LOG_INV_RATE, &mut gpow)
+                .expect("prepared state proves a new execution");
+            assert_eq!(gpow.capacity(), capacity);
+            let (fresh, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+            assert!(
+                prepared == fresh,
+                "setup and reused memory must preserve the complete proof"
+            );
+            verify(&program, &pi, &prepared).unwrap();
+        }
     }
 
     /// A state cell carries `(lo, hi, 0)`. This is not an extra AIR constraint: the

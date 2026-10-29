@@ -4,7 +4,6 @@
 
 use flux_profiler::timed;
 use bench::{Plan, Timing};
-use leanvm_core::cpu::GPow;
 use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rec_aggregation::{EthereumProof, aggregate, aggregate_with_stats, signers_cache};
@@ -82,25 +81,29 @@ fn describe(n_lean_xmss: usize, n_lean_sphincs: usize) -> String {
 /// Proving runs one discarded warmup pass followed by `plan.repeat` measured
 /// passes; see [`bench`] for why the first pass is not
 /// representative and why the cooldown matters.
-pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize, log_inv_rate: usize, plan: Plan) {
+pub fn run_aggregation(
+    n_lean_xmss: usize,
+    n_lean_sphincs: usize,
+    n_blobs: usize,
+    log_inv_rate: usize,
+    setup_capacity: usize,
+    plan: Plan,
+) {
     assert!(
         n_lean_xmss > 0 || n_lean_sphincs > 0 || n_blobs > 0,
         "a leaf needs signatures or blobs"
     );
     assert!(n_blobs <= lean_da::DA_MAX_ROWS, "too many blobs in one commitment");
+    let mut gpow = rec_aggregation::setup(setup_capacity);
     let trace_span = tracing::info_span!("aggregation", n_lean_xmss, n_lean_sphincs, n_blobs, log_inv_rate).entered();
-    // Spawn the worker pool before any timed work, so no kernel pays the spawn cost.
-    leanvm_core::init_prover();
-    rec_aggregation::warm_up();
     let raw_lean_xmss = signers(0, n_lean_xmss);
     let raw_lean_sphincs = lean_sphincs_signers(0, n_lean_sphincs);
     let blobs = blobs(n_blobs, 0);
     // Only the final measured pass of each stage is traced: the tree describes the
     // proof the reported timings are about, instead of repeating itself per pass.
-    let mut gpow = GPow::new();
     let ((sig, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
-        aggregate_with_stats(
+        let result = aggregate_with_stats(
             &[],
             raw_lean_xmss.clone(),
             raw_lean_sphincs.clone(),
@@ -109,7 +112,13 @@ pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize
             log_inv_rate,
             &mut gpow,
         )
-        .expect("leaf aggregates")
+        .expect("leaf aggregates");
+        assert_eq!(
+            gpow.capacity(),
+            setup_capacity,
+            "increase --setup-log-memory to cover this execution"
+        );
+        result
     });
     let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
@@ -207,6 +216,7 @@ pub fn run_recursion(
     log_inv_rate: usize,
     enable_tracing: bool,
     proof_out: Option<&std::path::Path>,
+    setup_capacity: usize,
     plan: Plan,
 ) {
     assert!(
@@ -252,10 +262,17 @@ pub fn run_recursion(
     if enable_tracing {
         bench::init_tracing();
     }
-    let mut gpow = GPow::new();
+    let mut gpow = rec_aggregation::setup(setup_capacity);
     let ((sig, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
-        aggregate_with_stats(&children, vec![], vec![], &[], None, log_inv_rate, &mut gpow).expect("node aggregates")
+        let result = aggregate_with_stats(&children, vec![], vec![], &[], None, log_inv_rate, &mut gpow)
+            .expect("node aggregates");
+        assert_eq!(
+            gpow.capacity(),
+            setup_capacity,
+            "increase --setup-log-memory to cover this execution"
+        );
+        result
     });
     if let Some(out) = proof_out {
         std::fs::write(out, sig.to_bytes()).expect("write proof");

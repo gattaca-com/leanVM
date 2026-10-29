@@ -361,6 +361,10 @@ pub mod gfni {
         })
     });
 
+    pub(crate) fn setup() {
+        LazyLock::force(&OUTPUT_STAGES);
+    }
+
     /// The coefficient registers of 24 registers of output bytes, register `o` holding byte `o` of 64 values.
     ///
     /// Per coefficient, register `r` and qword `l` hold the coefficient of value `lane_value(G, r, l)`.

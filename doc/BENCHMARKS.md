@@ -26,7 +26,8 @@ All proving times are warm: the bench runs one unmeasured pass first.
 | 8 concurrent 8:1 nodes, 2 threads each | start 8 copies of the 2-thread 8:1 command at once (`--repeat 3`), each on its own 2 cores; report each node's proving time |
 
 `--tracing` prints the stage tree (Commit, Prove bus, Prove constraints, Keccak reduction, PCS open, ...).
-`--cold` times a fresh process's first proof instead.
+
+VM benchmarks call setup before timing: it prepares the static tables, address powers, and zeroed memory for `2^setup_log_memory` cells (`--setup-log-memory 23` by default). Increase that capacity for larger executions; the benchmark rejects a run that grows its power table during proving. `--cold` skips the proving warmup and times the first proof after setup. Allocator reuse can still make later proofs faster.
 
 ## Correctness
 
