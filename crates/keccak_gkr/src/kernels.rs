@@ -273,9 +273,18 @@ cfg_select! {
         target_feature = "vpclmulqdq",
         target_feature = "gfni"
     ) => {
-        pub use x86::SkipBlock;
+        pub use x86::{SkipBlock, SkipWeights};
     }
     _ => {
+        pub struct SkipWeights(Vec<[u64; 3]>);
+
+        impl SkipWeights {
+            pub fn new(weights: Vec<[u64; 3]>) -> Self {
+                assert_eq!(weights.len(), crate::keccak::BITS);
+                Self(weights)
+            }
+        }
+
         /// [`skip_row`] over every row and slice of a block, a position at a time.
         pub struct SkipBlock {
             acc: Box<SkipAcc>,
@@ -291,7 +300,7 @@ cfg_select! {
             }
 
             /// Sum a block, the position weights as elements.
-            pub fn run(&mut self, block: &[u64], weights: &[[u64; 3]]) {
+            pub fn run(&mut self, block: &[u64], weights: &SkipWeights) {
                 self.acc.clear();
                 for r in 0..5 {
                     for z in 0..64 {
@@ -299,7 +308,7 @@ cfg_select! {
                         for x in 0..5 {
                             embed_extend(crate::witness::words(block, js[x]), &mut self.extended[x]);
                         }
-                        skip_row(&mut self.acc, &self.extended, std::array::from_fn(|x| &weights[js[x]]));
+                        skip_row(&mut self.acc, &self.extended, std::array::from_fn(|x| &weights.0[js[x]]));
                     }
                 }
             }
@@ -500,6 +509,22 @@ mod x86 {
         }
     }
 
+    /// The layer's position weights, by word for vector loads.
+    pub struct SkipWeights(Vec<u64>);
+
+    impl SkipWeights {
+        pub fn new(weights: Vec<[u64; 3]>) -> Self {
+            assert_eq!(weights.len(), BITS);
+            let mut words = vec![0; 3 * BITS];
+            for (j, w) in weights.iter().enumerate() {
+                for (k, &w) in w.iter().enumerate() {
+                    words[k * BITS + j] = w;
+                }
+            }
+            Self(words)
+        }
+    }
+
     /// [`skip_row`] over every row and slice of a block, eight slices at a time: each register
     /// holds one value of eight positions, so the extension is a sum of registers and each slot's
     /// products are a register's lanes, weighted by eight positions' weights at once.
@@ -508,8 +533,6 @@ mod x86 {
         acc: Vec<[__m512i; 6]>,
         packs: [[__m512i; PACKS]; 5],
         extended: [[__m512i; MIXED]; 5],
-        /// The weights by word: word `k` of position `j` at `k * BITS + j`.
-        weights: Vec<u64>,
     }
 
     impl SkipBlock {
@@ -519,26 +542,20 @@ mod x86 {
                 acc: vec![[zero; 6]; 2 * MIXED],
                 packs: [[zero; PACKS]; 5],
                 extended: [[zero; MIXED]; 5],
-                weights: vec![0; 3 * BITS],
             })
         }
 
         /// Sum a block, the position weights as elements.
-        pub fn run(&mut self, block: &[u64], weights: &[[u64; 3]]) {
-            assert!(block.len() >= BITS * BLOCK_WORDS && weights.len() >= BITS);
-            for (j, w) in weights[..BITS].iter().enumerate() {
-                for (k, &w) in w.iter().enumerate() {
-                    self.weights[k * BITS + j] = w;
-                }
-            }
+        pub fn run(&mut self, block: &[u64], weights: &SkipWeights) {
+            assert!(block.len() >= BITS * BLOCK_WORDS);
             // SAFETY: the features are enabled at compile time.
-            unsafe { self.sum(block) }
+            unsafe { self.sum(block, weights) }
         }
 
-        /// The sums over a block, whose positions and weights [`run`](Self::run) has checked.
+        /// The sums over a block, whose positions [`run`](Self::run) has checked.
         #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
         #[inline]
-        fn sum(&mut self, block: &[u64]) {
+        fn sum(&mut self, block: &[u64], weights: &SkipWeights) {
             self.acc.fill([_mm512_setzero_si512(); 6]);
             for r in 0..5 {
                 for z in (0..64).step_by(8) {
@@ -547,7 +564,7 @@ mod x86 {
                         embed8(&block[BLOCK_WORDS * j..][..8 * BLOCK_WORDS], packs);
                     }
                     let w: [[__m512i; 3]; 5] =
-                        std::array::from_fn(|x| std::array::from_fn(|k| load_at(&self.weights, k * BITS + js[x])));
+                        std::array::from_fn(|x| std::array::from_fn(|k| load_at(&weights.0, k * BITS + js[x])));
                     for half in 0..2 {
                         for (extended, packs) in self.extended.iter_mut().zip(&self.packs) {
                             extend8(&packs[GROUP * half..][..GROUP], extended);
@@ -1094,13 +1111,16 @@ mod tests {
             let fold: [[u64; GROUP]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64()));
             assert_eq!(fold_groups(&e, &fold), fold_groups_portable(&e, &fold));
         }
-        let block: Vec<u64> = (0..crate::witness::BLOCK_LEN).map(|_| rng.next_u64()).collect();
         let weights: Vec<[u64; 3]> = (0..BITS).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
+        let prepared = SkipWeights::new(weights.clone());
         let mut skip = SkipBlock::new();
-        skip.run(&block, &weights);
-        let expected = skip_block_portable(&block, &weights);
-        for (i, expected) in expected.iter().enumerate() {
-            assert_eq!(&skip.get(i), expected, "slot {i}");
+        for _ in 0..2 {
+            let block: Vec<u64> = (0..crate::witness::BLOCK_LEN).map(|_| rng.next_u64()).collect();
+            skip.run(&block, &prepared);
+            let expected = skip_block_portable(&block, &weights);
+            for (i, expected) in expected.iter().enumerate() {
+                assert_eq!(&skip.get(i), expected, "slot {i}");
+            }
         }
     }
 }
