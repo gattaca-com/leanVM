@@ -612,79 +612,106 @@ impl TableBlock for Block {
     }
 }
 
-#[inline(always)]
-fn bilinear_product(a: [[F192x8; 2]; 2], b: [[F192x8; 2]; 2]) -> [[F192x8; 3]; 3] {
-    let low = line_product(a[0][0], a[0][1], b[0][0], b[0][1]);
-    let high = line_product(a[1][0], a[1][1], b[1][0], b[1][1]);
-    let sum = line_product(
-        a[0][0] + a[1][0],
-        a[0][1] + a[1][1],
-        b[0][0] + b[1][0],
-        b[0][1] + b[1][1],
-    );
-    [low, std::array::from_fn(|j| sum[j] + low[j] + high[j]), high]
+/// The lanes the bivariate summand computes in: `E`, or `K` for the count leaves.
+trait Lanes: Copy + std::ops::Add<Output = Self> + std::ops::Mul<Output = Self> {
+    /// Every lane times `x`, the generator of `K`: a shift per base-field word.
+    fn mul_x(self) -> Self;
 }
 
-#[inline(always)]
-fn quadratic_product(a: [F192x8; 3], b: [F192x8; 3]) -> [Prod8; 5] {
-    let p0 = a[0].mul_unreduced(b[0]).merge_parities();
-    let p1 = a[1].mul_unreduced(b[1]).merge_parities();
-    let p2 = a[2].mul_unreduced(b[2]).merge_parities();
-    let p01 = (a[0] + a[1]).mul_unreduced(b[0] + b[1]).merge_parities();
-    let p02 = (a[0] + a[2]).mul_unreduced(b[0] + b[2]).merge_parities();
-    let p12 = (a[1] + a[2]).mul_unreduced(b[1] + b[2]).merge_parities();
-    [p0, p01 ^ p0 ^ p1, p02 ^ p0 ^ p2 ^ p1, p12 ^ p1 ^ p2, p2]
+impl Lanes for F192x8 {
+    #[inline(always)]
+    fn mul_x(self) -> Self {
+        F192x8::mul_x(self)
+    }
 }
 
-/// The six Karatsuba products in `Y` of [`bivariate_summand`], each a quadratic in `X`, summed over
-/// pairs: `a_0 b_0`, `a_1 b_1`, `a_2 b_2`, then the cross terms of `0, 1`, `0, 2` and `1, 2`.
-type BivariateSum = [[Prod8; 5]; 6];
+impl Lanes for F64x8 {
+    #[inline(always)]
+    fn mul_x(self) -> Self {
+        F64x8::mul_x(self)
+    }
+}
 
-/// The coefficients of X^i Y^j of a [`BivariateSum`]: row `i` takes the products whose `Y` degrees
-/// reach it, as the Karatsuba recombination does.
-fn bivariate_coefficients(sum: &BivariateSum) -> [[F192; 5]; 5] {
-    let [p0, p1, p2, p01, p02, p12] = sum;
-    let row =
-        |parts: &[&[Prod8; 5]]| std::array::from_fn(|j| parts.iter().fold(Prod8::ZERO, |acc, p| acc ^ p[j]).reduce());
+/// A quadratic's values at `0, 1, ∞`, extended to the five points `0, 1, ∞, x, x + 1` that
+/// [`bivariate_summand`] evaluates both variables at. `∞` stands for the leading coefficient.
+#[inline(always)]
+fn extend<T: Lanes>([v0, v1, top]: [T; 3]) -> [T; 5] {
+    // q = v0 + (v0 + v1 + top) X + top X^2, and q(x + 1) = q(x) + q(1) + q(0).
+    let at_x = v0 + (v0 + v1 + top + top.mul_x()).mul_x();
+    [v0, v1, top, at_x, at_x + v0 + v1]
+}
+
+/// The product of two multilinear factors at the points `0, 1, ∞` of X and the five points of Y,
+/// `[X][Y]`. Each factor is given by its corners `[[f(0, 0), f(1, 0)], [f(0, 1), f(1, 1)]]`.
+#[inline(always)]
+fn bilinear_columns<T: Lanes>(
+    [[f00, f10], [f01, f11]]: [[T; 2]; 2],
+    [[g00, g10], [g01, g11]]: [[T; 2]; 2],
+) -> [[T; 5]; 3] {
+    // The column at X = ∞ is the slope in X, and Y = ∞ is the slope in Y.
+    let column = |f0: T, f1: T, g0: T, g1: T| extend([f0 * g0, f1 * g1, (f0 + f1) * (g0 + g1)]);
     [
-        row(&[p0]),
-        row(&[p0, p1, p01]),
-        row(&[p0, p1, p2, p02]),
-        row(&[p1, p2, p12]),
-        row(&[p2]),
+        column(f00, f01, g00, g01),
+        column(f10, f11, g10, g11),
+        column(f00 + f10, f01 + f11, g00 + g10, g01 + g11),
     ]
 }
 
-/// Adds the products of a pair to `sum`; X folds the low row bit, and Y folds the next.
-#[inline(never)]
-fn bivariate_summand(first: &Block, second: &Block, weight: F192x8, sum: &mut BivariateSum) {
-    let factors: [[[F192x8; 2]; 2]; 4] = std::array::from_fn(|c| {
-        let (v0, v2) = F192x8::even_odd(first[c], second[c]);
-        let (v1, v3) = F192x8::even_odd(first[c + 4], second[c + 4]);
-        [[v0, v0 + v2], [v0 + v1, v0 + v1 + v2 + v3]]
-    });
-    let weighted = factors[0].map(|row| row.map(|v| weight * v));
-    let a = bilinear_product(weighted, factors[1]);
-    let b = bilinear_product(factors[2], factors[3]);
-    add_product(&mut sum[0], a[0], b[0]);
-    add_product(&mut sum[1], a[1], b[1]);
-    add_product(&mut sum[2], a[2], b[2]);
-    for (k, (i, l)) in [(0, 1), (0, 2), (1, 2)].into_iter().enumerate() {
-        add_product(
-            &mut sum[3 + k],
-            std::array::from_fn(|j| a[i][j] + a[l][j]),
-            std::array::from_fn(|j| b[i][j] + b[l][j]),
-        );
+/// Adds `product(a(x, y), b(x, y))` at the 5 × 5 points to `sum`, one row of Y at a time.
+#[inline(always)]
+fn add_products<T: Lanes>(sum: &mut BivariateSum, a: [[T; 5]; 3], b: [[T; 5]; 3], product: impl Fn(T, T) -> Prod8) {
+    for (y, row) in sum.iter_mut().enumerate() {
+        let a = extend([a[0][y], a[1][y], a[2][y]]);
+        let b = extend([b[0][y], b[1][y], b[2][y]]);
+        for x in 0..5 {
+            row[x] ^= product(a[x], b[x]);
+        }
     }
 }
 
-/// Adds `x · y` to `sum`. Kept out of line: the caller's twelve factors and this product's
-/// temporaries do not fit the registers together.
+/// The pair's four factors by their corners, `[Y][X]`: X folds the low row bit, and Y the next.
+#[inline(always)]
+fn pair_corners<T: Copy>(first: &[T; 8], second: &[T; 8], even_odd: impl Fn(T, T) -> (T, T)) -> [[[T; 2]; 2]; 4] {
+    std::array::from_fn(|c| {
+        let (v0, v2) = even_odd(first[c], second[c]);
+        let (v1, v3) = even_odd(first[c + 4], second[c + 4]);
+        [[v0, v2], [v1, v3]]
+    })
+}
+
+/// The summand of [`bivariate_summand`] at the 5 × 5 points, `[Y][X]`, summed over pairs.
+type BivariateSum = [[Prod8; 5]; 5];
+
+/// The coefficients of `X^j Y^i` of a [`BivariateSum`], at `[i][j]`.
+fn bivariate_coefficients(sum: &BivariateSum) -> [[F192; 5]; 5] {
+    let [over_x, over_x_squared, over_x_one] = [2, 6, 3].map(|k| F64(k).inv());
+    // A quartic's coefficients from its values at the five points.
+    let interpolate = |[v0, v1, top, at_x, at_x_one]: [F192; 5]| {
+        // c3 (x^2 + x) = q(0) + q(1) + q(x) + q(x + 1).
+        let c3 = (v0 + v1 + at_x + at_x_one).mul_base(over_x_squared);
+        let ones = v0 + v1 + top + c3;
+        // (q(x) + q(0) + top x^4 + c3 x^3) / x = c1 + c2 x, and c1 + c2 = ones.
+        let line = (at_x + v0 + top.mul_base(F64(16)) + c3.mul_base(F64(8))).mul_base(over_x);
+        let c2 = (line + ones).mul_base(over_x_one);
+        [v0, ones + c2, c2, c3, top]
+    };
+    let rows = sum.map(|row| interpolate(row.map(Prod8::reduce)));
+    let columns: [[F192; 5]; 5] = std::array::from_fn(|j| interpolate(rows.map(|row| row[j])));
+    std::array::from_fn(|i| std::array::from_fn(|j| columns[j][i]))
+}
+
+/// Adds the pair's summand, the weighted product of its four factors, to `sum` at the 5 × 5 points.
+/// Building the two factor pairs takes 4 + 18 products and their product 25, where Karatsuba in both
+/// variables takes 36. The extension to the points costs shifts.
 #[inline(never)]
-fn add_product(sum: &mut [Prod8; 5], x: [F192x8; 3], y: [F192x8; 3]) {
-    for (slot, product) in sum.iter_mut().zip(quadratic_product(x, y)) {
-        *slot ^= product;
-    }
+fn bivariate_summand(first: &Block, second: &Block, weight: F192x8, sum: &mut BivariateSum) {
+    let factors = pair_corners(first, second, F192x8::even_odd);
+    let weighted = factors[0].map(|row| row.map(|v| weight * v));
+    let (a, b) = (
+        bilinear_columns(weighted, factors[1]),
+        bilinear_columns(factors[2], factors[3]),
+    );
+    add_products(sum, a, b, |a, b| a.mul_unreduced(b).merge_parities());
 }
 
 fn bivariate_messages(coefficients: [[F192; 5]; 5], eta: F192, r1: F192) -> [[F192; 4]; 2] {
@@ -724,51 +751,16 @@ impl TableBlock for KBlock {
     }
 
     const ONE: Self = [F64x8::ONE; 8];
-
     /// [`bivariate_summand`] with every product in `K`: only the weight is in `E`, and it multiplies
-    /// each product's five coefficients as mixed products.
+    /// the 25 values as mixed products.
     #[inline(never)]
     fn bivariate(&self, second: &Self, weight: F192x8, sum: &mut BivariateSum) {
-        let line = |a0: F64x8, d0: F64x8, a1: F64x8, d1: F64x8| {
-            let (low, high) = (a0 * a1, d0 * d1);
-            [low, (a0 + d0) * (a1 + d1) + low + high, high]
-        };
-        let bilinear = |a: [[F64x8; 2]; 2], b: [[F64x8; 2]; 2]| {
-            let low = line(a[0][0], a[0][1], b[0][0], b[0][1]);
-            let high = line(a[1][0], a[1][1], b[1][0], b[1][1]);
-            let cross = line(
-                a[0][0] + a[1][0],
-                a[0][1] + a[1][1],
-                b[0][0] + b[1][0],
-                b[0][1] + b[1][1],
-            );
-            [low, std::array::from_fn(|j| cross[j] + low[j] + high[j]), high]
-        };
-        let factors: [[[F64x8; 2]; 2]; 4] = std::array::from_fn(|c| {
-            let (v0, v2) = F64x8::even_odd(self[c], second[c]);
-            let (v1, v3) = F64x8::even_odd(self[c + 4], second[c + 4]);
-            [[v0, v0 + v2], [v0 + v1, v0 + v1 + v2 + v3]]
-        });
-        let (a, b) = (bilinear(factors[0], factors[1]), bilinear(factors[2], factors[3]));
-        let both = |x: [[F64x8; 3]; 3], i: usize, l: usize| std::array::from_fn(|j| x[i][j] + x[l][j]);
-        let pairs = [
-            (a[0], b[0]),
-            (a[1], b[1]),
-            (a[2], b[2]),
-            (both(a, 0, 1), both(b, 0, 1)),
-            (both(a, 0, 2), both(b, 0, 2)),
-            (both(a, 1, 2), both(b, 1, 2)),
-        ];
-        for (slot, (x, y)) in sum.iter_mut().zip(pairs) {
-            let (p0, p1, p2) = (x[0] * y[0], x[1] * y[1], x[2] * y[2]);
-            let p01 = (x[0] + x[1]) * (y[0] + y[1]);
-            let p02 = (x[0] + x[2]) * (y[0] + y[2]);
-            let p12 = (x[1] + x[2]) * (y[1] + y[2]);
-            let coefficients = [p0, p01 + p0 + p1, p02 + p0 + p2 + p1, p12 + p1 + p2, p2];
-            for (slot, c) in slot.iter_mut().zip(coefficients) {
-                *slot ^= weight.mul_base_unreduced(c).merge_parities();
-            }
-        }
+        let factors = pair_corners(self, second, F64x8::even_odd);
+        let (a, b) = (
+            bilinear_columns(factors[0], factors[1]),
+            bilinear_columns(factors[2], factors[3]),
+        );
+        add_products(sum, a, b, |a, b| weight.mul_base_unreduced(a * b).merge_parities());
     }
 }
 
@@ -979,7 +971,7 @@ fn columns_message(columns: &dyn LeafColumns, equality: &Equality) -> [[F192; 4]
 #[timed]
 fn columns_polynomial(columns: &dyn LeafColumns, equality: &Equality) -> [[[F192; 5]; 5]; 2] {
     let task = |t| {
-        let mut sums = [[[Prod8::ZERO; 5]; 6]; 2];
+        let mut sums = [[[Prod8::ZERO; 5]; 5]; 2];
         let mut even = [[F192x8::ZERO; 8]; 2];
         columns.task(t, &mut |side, b, block| {
             if b % 2 == 0 {
@@ -1088,7 +1080,7 @@ fn blocks_polynomial<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], equa
     };
     let rows = window_blocks(pairs);
     let window = |index: usize| {
-        let mut sum = [[Prod8::ZERO; 5]; 6];
+        let mut sum = [[Prod8::ZERO; 5]; 5];
         for k in live(&pair_ones, index * rows..((index + 1) * rows).min(pairs)) {
             source.prefetch(2 * (k + PREFETCH));
             source.prefetch(2 * (k + PREFETCH) + 1);
@@ -1099,9 +1091,9 @@ fn blocks_polynomial<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], equa
     let xor = |left: BivariateSum, right: BivariateSum| std::array::from_fn(|k| xor_coefficients(left[k], right[k]));
     let windows = pairs.div_ceil(rows);
     let sum = if BLOCK_PAIRS * count >= PAR_THRESHOLD {
-        parallel::map_reduce(windows, || [[Prod8::ZERO; 5]; 6], window, xor)
+        parallel::map_reduce(windows, || [[Prod8::ZERO; 5]; 5], window, xor)
     } else {
-        (0..windows).map(window).fold([[Prod8::ZERO; 5]; 6], xor)
+        (0..windows).map(window).fold([[Prod8::ZERO; 5]; 5], xor)
     };
     bivariate_coefficients(&sum)
 }
@@ -2138,7 +2130,7 @@ mod two_round_tests {
         r1: F192,
         r2: F192,
     ) -> [[F192; 4]; 2] {
-        let mut sum = [[Prod8::ZERO; 5]; 6];
+        let mut sum = [[Prod8::ZERO; 5]; 5];
         for (pair, weight) in input.chunks_exact(2).zip(weights) {
             bivariate_summand(&pair[0], &pair[1], *weight, &mut sum);
         }
@@ -2198,7 +2190,7 @@ mod two_round_tests {
                 for (a, b) in q0.iter().flatten().zip(q1.iter().flatten()) {
                     assert_eq!(a.to_array(), b.to_array());
                 }
-                let mut coefficients = [[Prod8::ZERO; 5]; 6];
+                let mut coefficients = [[Prod8::ZERO; 5]; 5];
                 for (pair, weight) in input.chunks_exact(2).zip(&weights) {
                     bivariate_summand(&pair[0], &pair[1], *weight, &mut coefficients);
                 }
@@ -2287,3 +2279,4 @@ mod two_round_tests {
         }
     }
 }
+

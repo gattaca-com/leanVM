@@ -29,6 +29,12 @@ impl F64 {
         self.0 == 0
     }
 
+    /// The product with `x`: a shift, and the bit carried out folds back as `x^64 = 0x1B`.
+    #[inline]
+    pub const fn mul_x(self) -> Self {
+        Self((self.0 << 1) ^ ((self.0 >> 63) * R64))
+    }
+
     /// Squaring, as a bit spread followed by one reduction.
     ///
     /// Cross terms vanish in characteristic 2, so the square moves bit `i` to bit `2i`.

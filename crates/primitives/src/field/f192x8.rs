@@ -64,6 +64,13 @@ impl F192x8 {
         self.0[i] = e;
     }
 
+    /// Every element times `x`, the base field's generator: each coefficient on its own.
+    #[inline]
+    pub fn mul_x(self) -> Self {
+        let x = |c: u64| F64(c).mul_x().0;
+        Self(self.0.map(|e| F192::new(x(e.c0), x(e.c1), x(e.c2))))
+    }
+
     #[inline]
     pub fn mul_unreduced(self, rhs: Self) -> Prod8 {
         let [a, b] = [0, 4].map(|h| {
@@ -149,6 +156,12 @@ impl F64x8 {
     #[inline]
     pub fn to_array(self) -> [F64; 8] {
         self.0
+    }
+
+    /// Every element times `x`.
+    #[inline]
+    pub fn mul_x(self) -> Self {
+        Self(self.0.map(F64::mul_x))
     }
 
     #[inline]
@@ -502,6 +515,13 @@ mod avx512 {
             to_words(self.0).map(F64)
         }
 
+        /// Every element times `x`.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            // SAFETY: the module is compiled only with avx512f enabled.
+            Self(unsafe { words_mul_x(self.0) })
+        }
+
         #[inline]
         pub fn lane(&self, i: usize) -> F64 {
             self.to_array()[i]
@@ -658,6 +678,15 @@ mod avx512 {
         F192Unreduced::from_coeffs(coeffs).reduce()
     }
 
+    /// Every qword times `x`: a shift, and the carried-out bit folds back as `x^64 = 0x1B`.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn words_mul_x(w: __m512i) -> __m512i {
+        let carry = _mm512_srai_epi64::<63>(w);
+        // 0x78 is `a ^ (b & c)`.
+        _mm512_ternarylogic_epi64::<0x78>(_mm512_slli_epi64::<1>(w), carry, _mm512_set1_epi64(0x1B))
+    }
+
     /// Eight consecutive elements, 24 qwords, into their planes: three loads, six permutes.
     #[inline]
     #[target_feature(enable = "avx512f")]
@@ -719,6 +748,19 @@ mod avx512 {
         pub fn from_array(e: &[F192; 8]) -> Self {
             // SAFETY: the module is compiled only with the features enabled.
             unsafe { load_planes(e) }
+        }
+
+        /// Every element times `x`, the base field's generator: each coefficient on its own.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe {
+                Self {
+                    lo: words_mul_x(self.lo),
+                    hi: words_mul_x(self.hi),
+                    c2: words_mul_x(self.c2),
+                }
+            }
         }
 
         /// Eight elements from their coefficient registers: qword `i` of `c0`, `c1` and `c2` is that coefficient of element `i`.
@@ -1028,6 +1070,8 @@ mod tests {
             assert_eq!(fold_lones8_ext(&x0, r), core::array::from_fn(|j| x0[j] + r * x0[j]));
 
             assert_eq!(mul_f64x8(&k0, &k1), core::array::from_fn(|j| k0[j] * k1[j]));
+            assert_eq!(F64x8::from_array(&k0).mul_x().to_array(), k0.map(|k| k * F64::G));
+            assert_eq!(F192x8::from_array(&x0).mul_x().to_array(), x0.map(|e| e.mul_base(F64::G)));
             let dot = |x: &[F192; 8], y: &[F192; 8]| (0..8).fold(F192::ZERO, |acc, j| acc + x[j] * y[j]);
             let (u0, u2) = msg_terms8_ext(&x0, &x1, &y0, &y1);
             assert_eq!(u0.reduce(), dot(&x0, &y0));
