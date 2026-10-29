@@ -57,15 +57,21 @@ cfg_select! {
 }
 
 /// Packs in a block position.
-pub const PACKS: usize = 32;
-/// Packs the bit-level rounds fold together: half a block.
-pub const GROUP: usize = 16;
-/// Variables indexing the packs of a group.
-pub const SKIP: usize = 4;
-/// Points of `{0, 1, infinity}^SKIP`, and those of them with a coordinate at infinity.
+pub const PACKS: usize = 1 << PACK_VARS;
+pub const PACK_VARS: usize = 5;
+/// Variables indexing the packs the bit-level rounds fold together, a group.
+pub const SKIP: usize = 3;
+pub const GROUP: usize = 1 << SKIP;
+/// Groups in a block position.
+pub const GROUPS: usize = PACKS / GROUP;
+/// Points of `{0, 1, infinity}^SKIP`.
 pub const TERNARY: usize = 3usize.pow(SKIP as u32);
-pub const MIXED: usize = TERNARY - GROUP;
-/// The mixed points of a block position's two groups, rounded up to whole vectors.
+/// Packs the kernels extend together: half a block, two groups.
+pub const HALF: usize = 16;
+/// Points of `{0, 1, infinity}^4` over a half with a coordinate at infinity. The rounds use those
+/// whose last coordinate, a half's group, is binary ([`used`]).
+pub const MIXED: usize = 81 - HALF;
+/// The mixed points of a block position's two halves, rounded up to whole vectors.
 pub const SLOTS: usize = (2 * MIXED).next_multiple_of(8);
 
 /// Sums of `value * weight word`, a 128-bit product each, laid out as the vector kernel leaves
@@ -106,14 +112,14 @@ const HIGH: [(usize, usize); 9] = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1
 /// The mixed points of the low two variables, in the order their values fill a vector.
 const LOW_MIXED: [(usize, usize); 4] = [(2, 0), (2, 1), (0, 2), (1, 2)];
 
-/// The slot of output `i` of group `half` of a block position: each group's first 64 outputs
+/// The slot of output `i` of half `half` of a block position: each half's first 64 outputs
 /// are whole vectors, and their last outputs share a pair of slots.
 #[inline(always)]
 pub const fn slot(half: usize, i: usize) -> usize {
     if i < 64 { 64 * half + i } else { 128 + half }
 }
 
-/// Extend one group's values on the binary cube to the mixed points of `{0, 1, infinity}^SKIP`:
+/// Extend one half's values on the binary cube to the mixed points of `{0, 1, infinity}^4`:
 /// along each variable, the value at infinity is the sum of the two others.
 ///
 /// The values are four vectors of four, the high two variables across the vectors and the low
@@ -121,7 +127,7 @@ pub const fn slot(half: usize, i: usize) -> usize {
 /// the low variables have five mixed points: four filling a vector, and the sum of all four
 /// lanes. The outputs are the new vectors' binary points, every vector's four low mixed points,
 /// then every vector's lane sum; [`mixed_points`] names each by its ternary digits.
-pub fn extend_group(v: &[u32; GROUP]) -> [u32; MIXED] {
+pub fn extend_group(v: &[u32; HALF]) -> [u32; MIXED] {
     let q = |k: usize| -> [u32; 4] { v[4 * k..][..4].try_into().unwrap() };
     let x = |a: [u32; 4], b: [u32; 4]| -> [u32; 4] { std::array::from_fn(|l| a[l] ^ b[l]) };
     let (w4, w5) = (x(q(0), q(1)), x(q(2), q(3)));
@@ -140,18 +146,39 @@ pub fn extend_group(v: &[u32; GROUP]) -> [u32; MIXED] {
 /// The ternary index of each output of [`extend_group`]: variable `k`'s point is its `k`-th
 /// digit, with infinity as 2.
 pub fn mixed_points() -> [usize; MIXED] {
-    let index = |(c0, c1): (usize, usize), (c2, c3): (usize, usize)| c0 + 3 * c1 + 9 * c2 + 27 * c3;
-    std::array::from_fn(|i| match i {
+    std::array::from_fn(mixed_point)
+}
+
+/// Entry `i` of [`mixed_points`].
+pub const fn mixed_point(i: usize) -> usize {
+    const fn index((c0, c1): (usize, usize), (c2, c3): (usize, usize)) -> usize {
+        c0 + 3 * c1 + 9 * c2 + 27 * c3
+    }
+    match i {
         0..20 => index(((i % 4) & 1, (i % 4) >> 1), HIGH[4 + i / 4]),
         20..56 => index(LOW_MIXED[(i - 20) % 4], HIGH[(i - 20) / 4]),
         _ => index((2, 2), HIGH[i - 56]),
-    })
+    }
 }
 
-/// Both groups of a block position, at their [`slot`]s.
+/// Whether the rounds use the point of [`mixed_points`] index `p`: its group is binary.
+pub const fn used(p: usize) -> bool {
+    p / 27 < 2
+}
+
+/// Whether the rounds read [`slot`] `p`: the kernels may skip the others.
+pub const fn slot_used(p: usize) -> bool {
+    match p {
+        0..128 => used(mixed_point(p % 64)),
+        128..130 => used(mixed_point(64)),
+        _ => false,
+    }
+}
+
+/// Both halves of a block position, at their [`slot`]s.
 pub fn extend(packs: &[u32; PACKS], out: &mut [u32; SLOTS]) {
     for half in 0..2 {
-        let e = extend_group(packs[GROUP * half..][..GROUP].try_into().unwrap());
+        let e = extend_group(packs[HALF * half..][..HALF].try_into().unwrap());
         for (i, &e) in e.iter().enumerate() {
             out[slot(half, i)] = e;
         }
@@ -199,7 +226,7 @@ pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5
 pub fn skip_row_portable(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
     for x in 0..5 {
         let (b, c) = (&e[(x + 1) % 5], &e[(x + 2) % 5]);
-        for p in 0..SLOTS {
+        for p in (0..SLOTS).filter(|&p| slot_used(p)) {
             let product = mul_wide(b[p] as u64, c[p] as u64) as u64;
             let (v, l) = lane(p);
             for k in 0..3 {
@@ -209,16 +236,16 @@ pub fn skip_row_portable(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u
     }
 }
 
-/// For both groups of a block position, `sum over the group's packs of weights[.][q] * e[q]`,
+/// For every group of a block position, `sum over the group's packs of weights[.][q] * e[q]`,
 /// as three partial products.
 #[inline(always)]
-pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
+pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] {
     simd::fold_groups(e, weights)
 }
 
-pub fn fold_groups_portable(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-    std::array::from_fn(|half| {
-        std::array::from_fn(|k| (0..GROUP).fold(0, |acc, q| acc ^ mul_wide(e[GROUP * half + q] as u64, weights[k][q])))
+pub fn fold_groups_portable(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] {
+    std::array::from_fn(|g| {
+        std::array::from_fn(|k| (0..GROUP).fold(0, |acc, q| acc ^ mul_wide(e[GROUP * g + q] as u64, weights[k][q])))
     })
 }
 
@@ -445,7 +472,7 @@ mod x86 {
     /// register holds one word of each, and a pack is then a field of every word alike.
     #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
     #[inline]
-    fn embed8(positions: &[u64], half: usize, out: &mut [__m512i; GROUP]) {
+    fn embed8(positions: &[u64], half: usize, out: &mut [__m512i; HALF]) {
         let a: [__m512i; 8] = std::array::from_fn(|i| simd::load(positions, i));
         let b: [__m512i; 8] = std::array::from_fn(|i| {
             if i % 2 == 0 {
@@ -526,7 +553,7 @@ mod x86 {
     pub struct SkipBlock {
         /// Per slot, the low and high polynomial halves, each split into even and odd positions.
         acc: Vec<[__m512i; 4]>,
-        packs: [[__m512i; GROUP]; 5],
+        packs: [[__m512i; HALF]; 5],
         tile: [[__m512i; 4]; 5],
     }
 
@@ -535,7 +562,7 @@ mod x86 {
             let zero = simd::from_words([0; 8]);
             Box::new(Self {
                 acc: vec![[zero; 4]; 2 * MIXED],
-                packs: [[zero; GROUP]; 5],
+                packs: [[zero; HALF]; 5],
                 tile: [[zero; 4]; 5],
             })
         }
@@ -561,7 +588,8 @@ mod x86 {
                         }
                         let w: [[__m512i; 3]; 5] =
                             std::array::from_fn(|x| std::array::from_fn(|k| load_at(&weights.0, k * BITS + js[x])));
-                        for high in 0..HIGH.len() {
+                        // `HIGH[6..]` have the group at infinity, which the rounds do not use.
+                        for high in 0..6 {
                             for (tile, packs) in self.tile.iter_mut().zip(&self.packs) {
                                 *tile = extend8_high(packs, high);
                             }
@@ -628,24 +656,25 @@ mod x86 {
     }
 
     entry! {
-        /// The six sums are summed across their lanes together: two registers' lanes interleave into
-        /// one, which takes two shuffles where each register alone would leave the vector unit.
+        /// The twelve sums are summed across their lanes four registers at a time: their lanes
+        /// interleave into one, which takes six shuffles where each register alone would leave the
+        /// vector unit.
         #[inline(always)]
-        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] => fold_vectors;
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] => fold_vectors;
     }
 
     #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
     #[inline]
-    fn fold_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-        // `acc[3 * half + k]`, four lanes to sum.
-        let mut acc = [_mm512_setzero_si512(); 6];
-        for g in 0..PACKS / 8 {
+    fn fold_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] {
+        const _: () = assert!(GROUP == 8);
+        // `acc[3 * g + k]`, four lanes to sum: a group is a register of packs.
+        let mut acc = [_mm512_setzero_si512(); 3 * GROUPS];
+        for g in 0..GROUPS {
             let ze = load_packs(e, 8 * g);
             for k in 0..3 {
-                let zw = simd::load(&weights[k], g % 2);
-                let sum = &mut acc[3 * (g / 2) + k];
-                *sum = _mm512_xor_si512(*sum, _mm512_clmulepi64_epi128(ze, zw, 0x00));
-                *sum = _mm512_xor_si512(*sum, _mm512_clmulepi64_epi128(ze, zw, 0x11));
+                let zw = simd::load(&weights[k], 0);
+                let sum = _mm512_xor_si512(_mm512_clmulepi64_epi128(ze, zw, 0x00), _mm512_clmulepi64_epi128(ze, zw, 0x11));
+                acc[3 * g + k] = sum;
             }
         }
         // Lanes `a0 + a2, a1 + a3, b0 + b2, b1 + b3`.
@@ -655,19 +684,19 @@ mod x86 {
                 _mm512_shuffle_i64x2::<0b11_10_11_10>(a, b),
             )
         };
-        // Of two pairs, the four sums.
-        let (t, u) = (pair(acc[0], acc[1]), pair(acc[2], acc[3]));
-        let four = _mm512_xor_si512(
-            _mm512_shuffle_i64x2::<0b10_00_10_00>(t, u),
-            _mm512_shuffle_i64x2::<0b11_01_11_01>(t, u),
-        );
-        // Of the last pair, the two sums in lanes 0 and 2.
-        let v = pair(acc[4], acc[5]);
-        let two = _mm512_xor_si512(v, _mm512_shuffle_i64x2::<0b10_11_00_01>(v, v));
-        let (mut a, mut b) = ([0u128; 4], [0u128; 4]);
-        simd::store(&mut a, 0, four);
-        simd::store(&mut b, 0, two);
-        [[a[0], a[1], a[2]], [a[3], b[0], b[2]]]
+        // Of four registers, the four sums.
+        let four = |a: &[__m512i]| {
+            let (t, u) = (pair(a[0], a[1]), pair(a[2], a[3]));
+            let v = _mm512_xor_si512(
+                _mm512_shuffle_i64x2::<0b10_00_10_00>(t, u),
+                _mm512_shuffle_i64x2::<0b11_01_11_01>(t, u),
+            );
+            let mut lanes = [0u128; 4];
+            simd::store(&mut lanes, 0, v);
+            lanes
+        };
+        let sums: [[u128; 4]; 3] = std::array::from_fn(|i| four(&acc[4 * i..]));
+        std::array::from_fn(|g| std::array::from_fn(|k| sums[(3 * g + k) / 4][(3 * g + k) % 4]))
     }
 }
 
@@ -812,7 +841,7 @@ mod avx2 {
         /// the last whole register are skipped: nothing reads their sums.
         fn skip_row_vectors(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
             let w: [[V; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
-            for p in (0..2 * MIXED).step_by(2 * V::N) {
+            for p in (0..2 * MIXED).step_by(2 * V::N).filter(|&p| (p..p + 2 * V::N).any(slot_used)) {
                 let z: [V; 5] = std::array::from_fn(|x| V::load_packs(&e[x], p));
                 let mut sums = [[V::zero(); 2]; 3];
                 for x in 0..5 {
@@ -838,15 +867,15 @@ mod avx2 {
 
     entry! {
         #[inline(always)]
-        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] => fold_groups_vectors;
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] => fold_groups_vectors;
     }
 
     clmul_kernel! {
-        fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-            std::array::from_fn(|half| {
+        fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] {
+            std::array::from_fn(|g| {
                 let mut acc = [V::zero(); 3];
                 for q in (0..GROUP).step_by(2 * V::N) {
-                    let ze = V::load_packs(e, GROUP * half + q);
+                    let ze = V::load_packs(e, GROUP * g + q);
                     for (acc, weights) in acc.iter_mut().zip(weights) {
                         let zw = V::load(weights, q);
                         *acc = acc.xor(ze.clmul::<0x00>(zw)).xor(ze.clmul::<0x11>(zw));
@@ -1030,7 +1059,7 @@ mod neon {
     #[inline]
     fn skip_row_vectors(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
         let w: [[uint64x2_t; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| vdupq_n_u64(weights[x][k])));
-        for p in (0..2 * MIXED).step_by(2) {
+        for p in (0..2 * MIXED).step_by(2).filter(|&p| slot_used(p) || slot_used(p + 1)) {
             let z: [uint64x2_t; 5] = std::array::from_fn(|x| load(&e[x], p));
             let mut sums = [[vdupq_n_u64(0); 2]; 3];
             for x in 0..5 {
@@ -1053,17 +1082,17 @@ mod neon {
 
     entry! {
         #[inline(always)]
-        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] => fold_groups_vectors;
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] => fold_groups_vectors;
     }
 
     #[target_feature(enable = "neon,aes")]
     #[inline]
-    fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; 2] {
-        std::array::from_fn(|half| {
+    fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 3]) -> [[u128; 3]; GROUPS] {
+        std::array::from_fn(|g| {
             std::array::from_fn(|k| {
                 let mut acc = vdupq_n_u64(0);
                 for q in (0..GROUP).step_by(2) {
-                    let (ze, zw) = (load(e, GROUP * half + q), load_at::<u64, uint64x2_t>(&weights[k], q));
+                    let (ze, zw) = (load(e, GROUP * g + q), load_at::<u64, uint64x2_t>(&weights[k], q));
                     acc = veorq_u64(acc, veorq_u64(mul_lo(ze, zw), mul_hi(ze, zw)));
                 }
                 vgetq_lane_u64::<0>(acc) as u128 | (vgetq_lane_u64::<1>(acc) as u128) << 64
@@ -1081,17 +1110,17 @@ mod tests {
     #[test]
     fn extension_follows_the_ternary_digits() {
         let mut rng = Rng::new(31);
-        let v: [u32; GROUP] = std::array::from_fn(|_| rng.next_u64() as u32);
+        let v: [u32; HALF] = std::array::from_fn(|_| rng.next_u64() as u32);
         let out = extend_group(&v);
         let points = mixed_points();
-        let mut seen = [false; TERNARY];
+        let mut seen = [false; 81];
         for (i, &p) in points.iter().enumerate() {
             // A digit at infinity sums both points of its variable.
-            let digits: [usize; SKIP] = std::array::from_fn(|k| p / 3usize.pow(k as u32) % 3);
+            let digits: [usize; 4] = std::array::from_fn(|k| p / 3usize.pow(k as u32) % 3);
             assert!(digits.contains(&2) && !seen[p]);
             seen[p] = true;
-            let expected = (0..GROUP)
-                .filter(|q| (0..SKIP).all(|k| digits[k] == 2 || digits[k] == q >> k & 1))
+            let expected = (0..HALF)
+                .filter(|q| (0..4).all(|k| digits[k] == 2 || digits[k] == q >> k & 1))
                 .fold(0, |acc, q| acc ^ v[q]);
             assert_eq!(out[i], expected, "output {i}");
         }
@@ -1128,7 +1157,7 @@ mod tests {
                 skip_row(&mut fast, &row, row_weights);
                 skip_row_portable(&mut slow, &row, row_weights);
             }
-            for slot in 0..SLOTS {
+            for slot in (0..SLOTS).filter(|&p| slot_used(p)) {
                 assert_eq!(fast.get(slot), slow.get(slot));
             }
             let fold: [[u64; GROUP]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64()));
@@ -1141,8 +1170,10 @@ mod tests {
             let block: Vec<u64> = (0..crate::witness::BLOCK_LEN).map(|_| rng.next_u64()).collect();
             skip.run(&block, &prepared);
             let expected = skip_block_portable(&block, &weights);
-            for (i, expected) in expected.iter().enumerate() {
-                assert_eq!(&skip.get(i), expected, "slot {i}");
+            for i in (0..MIXED).filter(|&i| used(mixed_points()[i])) {
+                for half in 0..2 {
+                    assert_eq!(skip.get(slot(half, i)), expected[slot(half, i)], "output {i}");
+                }
             }
         }
     }

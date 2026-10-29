@@ -16,7 +16,8 @@ use primitives::multilinear::{eq_table, poly_eval};
 use crate::basis::{PolyEval, add_mul, carry};
 use crate::keccak::{BITS, LOCAL_VARS, along, linear_transpose, row_positions};
 use crate::kernels::{
-    GROUP, MIXED, PACKS, SKIP, SkipBlock, SkipWeights, TERNARY, embed, fold_groups, mixed_points, products, slot,
+    GROUP, GROUPS, PACK_VARS, PACKS, SKIP, SkipBlock, SkipWeights, TERNARY, embed, fold_groups, mixed_points, products,
+    slot, used,
 };
 use crate::open::fold;
 use crate::power::{Element, FACTOR_ROW, PowerField, get, set};
@@ -279,7 +280,7 @@ impl Layer<'_> {
     }
 
     /// Per pack `q` of a block, the coefficients of
-    /// `sum over blocks and positions of eq(point[5..], block) * weights[j] * product(q, j)`,
+    /// `sum over blocks and positions of eq(point[PACK_VARS..], block) * weights[j] * product(q, j)`,
     /// where the product is `ones * u[j] + (ones + u[j + 1]) * u[j + 2]` on embeddings, the
     /// unprojected `chi`.
     ///
@@ -288,7 +289,7 @@ impl Layer<'_> {
     /// over positions is grouped by their digits ([`Groups`]), a part of the packs at a time;
     /// only that sum meets the block's weight, as field elements.
     fn pack_products(&self, claim: &Claim) -> Vec<[F192; PROD_BITS]> {
-        let weights = self.task_weights(&eq_table(&claim.point[SKIP + 1..]));
+        let weights = self.task_weights(&eq_table(&claim.point[PACK_VARS..]));
         let groups = Groups::new(&claim.weights);
         let sums = parallel::map_reduce_with_state(
             self.n_tasks(),
@@ -358,18 +359,25 @@ impl Layer<'_> {
             .iter()
             .map(|&e| field.to_poly(e))
             .collect();
+        // The kernel outputs the rounds use, as `(output, group of the half, point of the group)`.
+        let points: Vec<(usize, usize, usize)> = mixed_points()
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, p)| used(p))
+            .map(|(i, p)| (i, p / TERNARY, p % TERNARY))
+            .collect();
         let (nb, written) = (self.witness.shape.n_blocks(), self.witness.written());
         let mixed = parallel::map_reduce_with_state(
             self.rounds.len() * written,
             || (SkipBlock::new(), Recompute::new()),
-            || vec![[0u64; 7]; MIXED],
+            || vec![[0u64; 7]; TERNARY],
             |(skip, recompute), total, task| {
                 let (segment, g) = (task / written, task % written);
                 let (row, block) = (g + nb * segment, self.witness.state(recompute, self.rounds[segment], g));
                 skip.run(block, &weights);
                 for half in 0..2 {
-                    for (i, total) in total.iter_mut().enumerate() {
-                        add_mul(total, &skip.get(slot(half, i)), &groups[2 * row + half]);
+                    for &(i, group, p) in &points {
+                        add_mul(&mut total[p], &skip.get(slot(half, i)), &groups[GROUPS * row + 2 * half + group]);
                     }
                 }
             },
@@ -384,8 +392,8 @@ impl Layer<'_> {
         );
         let eval = PolyEval::new(s, 56);
         let mut sums = vec![F192::ZERO; TERNARY];
-        for (slot, p) in mixed_points().into_iter().enumerate() {
-            sums[p] = eval.eval(&mixed[slot]);
+        for &(_, _, p) in &points {
+            sums[p] = eval.eval(&mixed[p]);
         }
         for (q, &value) in binary.iter().enumerate() {
             sums[ternary(q)] = value;
@@ -394,14 +402,16 @@ impl Layer<'_> {
     }
 
     /// The table the remaining rounds fold, a row per group: `T[j]`, the value at `s` of position
-    /// `j`'s embeddings, folded over the group's packs at `challenges`. A block's two groups are
-    /// the first of those rounds' pairs, so its round values are summed while the rows are at hand.
+    /// `j`'s embeddings, folded over the group's packs at `challenges`. A half block's two groups
+    /// are the first of those rounds' pairs, so its round values are summed while the rows are at
+    /// hand, each half weighted by `halves`, and each block by `blocks`.
     /// The padding block's groups are one row, its segment's entry of `pads`.
     fn table(
         &self,
         round: &Round,
         challenges: &[F192],
-        eq: &[F192],
+        halves: &[F192],
+        blocks: &[F192],
         layout: Rows,
         table: &mut [u64],
         pads: &mut [u64],
@@ -409,7 +419,8 @@ impl Layer<'_> {
         let field = round.field;
         let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
         let fold: [[u64; GROUP]; 3] = std::array::from_fn(|k| std::array::from_fn(|q| fold[q][k]));
-        let weights = self.task_weights(eq);
+        let weights = self.task_weights(blocks);
+        let halves = eq_table(halves);
         // Rows of segments that do not exist are zero, and so is their product.
         table[self.rounds.len() * layout.live * ROW..layout.len() * ROW].fill(0);
         pads[self.rounds.len() * ROW..].fill(0);
@@ -422,7 +433,7 @@ impl Layer<'_> {
             let (segment, tail) = rest.split_at_mut(layout.live * ROW);
             let (pad, pad_tail) = pad_rows.split_at_mut(ROW);
             (rest, pad_rows) = (tail, pad_tail);
-            parts.extend(segment.chunks_mut(2 * ROW));
+            parts.extend(segment.chunks_mut(GROUPS * ROW));
             if held > written {
                 parts.push(pad);
             }
@@ -430,16 +441,16 @@ impl Layer<'_> {
         let sums = parallel::map_reduce_chunks_mut(
             [&mut parts[..]],
             [1],
-            || (vec![0u64; 4 * FACTOR_ROW], vec![0u64; 8 * BITS], Recompute::new()),
+            || (vec![0u64; 4 * FACTOR_ROW], vec![0u64; 4 * GROUPS * BITS], Recompute::new()),
             RoundSums::default,
             |(scratch, wide, recompute), sums, task, [part]| {
                 let (_, _, block) = self.block(recompute, task);
                 let rows = &mut *part[0];
-                let halves = rows.len() / ROW;
-                // Both groups' unreduced sums, four words each and laid out by word.
+                let groups = rows.len() / ROW;
+                // The groups' unreduced sums, four words each and laid out by word.
                 for j in 0..BITS {
                     let sums = fold_groups(&embed(words(block, j)), &fold);
-                    for (wide, sum) in wide.as_chunks_mut::<{ 4 * BITS }>().0[..halves].iter_mut().zip(&sums) {
+                    for (wide, sum) in wide.as_chunks_mut::<{ 4 * BITS }>().0[..groups].iter_mut().zip(&sums) {
                         let sum: [u64; 4] = carry(sum);
                         for (k, &word) in sum.iter().enumerate() {
                             wide[k * BITS + j] = word;
@@ -454,7 +465,13 @@ impl Layer<'_> {
                 {
                     field.reduce_row(t, wide, BITS);
                 }
-                round.add_pair(sums, scratch, &rows[..ROW], &rows[rows.len() - ROW..], weights[task]);
+                // A written block's pairs are its halves; the padding block's one row stands for all.
+                if groups == 1 {
+                    round.add_pair(sums, scratch, rows, rows, weights[task]);
+                }
+                for (pair, &half) in rows.chunks_exact(2 * ROW).zip(&halves) {
+                    round.add_pair(sums, scratch, &pair[..ROW], &pair[ROW..], weights[task] * half);
+                }
             },
             RoundSums::merge,
         );
@@ -567,8 +584,9 @@ impl<'a> Round<'a> {
         // A task per pair of rows written, the second of a ragged one being the padding row.
         let (pairs, half) = (to.live.div_ceil(2), to.m / 2);
         // Task `pairs * segment + t` owns rows `2t` and `2t + 1` of its segment, the last one alone if it is ragged.
+        // With no block written, no row is live and there are no parts.
         let mut parts: Vec<&mut [u64]> = dst[..to.len() * ROW]
-            .chunks_mut(to.live * ROW)
+            .chunks_mut(to.live.max(1) * ROW)
             .flat_map(|segment| segment.chunks_mut(2 * ROW))
             .collect();
         let mut sums = parallel::map_reduce_chunks_mut(
@@ -706,7 +724,7 @@ pub fn prove_layer(
     };
 
     let per_pack = tracing::info_span!("Product").in_scope(|| layer.pack_products(claim));
-    let pack_weights = eq_table(&claim.point[..SKIP + 1]);
+    let pack_weights = eq_table(&claim.point[..PACK_VARS]);
     let product: [F192; PROD_BITS] =
         std::array::from_fn(|c| (0..PACKS).fold(F192::ZERO, |acc, q| acc + pack_weights[q] * per_pack[q][c]));
     ps.add_scalars(&product);
@@ -717,9 +735,9 @@ pub fn prove_layer(
 
     // The packs of a group, from sums of bit-level products. A pack's own sum is its product
     // polynomial at `s`, over both groups of the block.
+    let outer = eq_table(&claim.point[SKIP..PACK_VARS]);
     let binary: [F192; GROUP] = std::array::from_fn(|q| {
-        let half = claim.point[SKIP];
-        (F192::ONE + half) * poly_eval(&per_pack[q], s) + half * poly_eval(&per_pack[GROUP + q], s)
+        (0..GROUPS).fold(F192::ZERO, |acc, g| acc + outer[g] * poly_eval(&per_pack[GROUP * g + q], s))
     });
     let mut sums = tracing::info_span!("Skip").in_scope(|| layer.skip_sums(claim, &field, s, &binary));
     let mut scale = F192::ONE;
@@ -746,15 +764,15 @@ pub fn prove_layer(
     // the rows of one round and sums that round's values over them.
     let round = Round::new(&field, claim, s, kappa);
     let mut layout = Rows {
-        m: 2 * shape.n_blocks(),
-        live: 2 * witness.written(),
+        m: GROUPS * shape.n_blocks(),
+        live: GROUPS * witness.written(),
         segments: 1 << shape.seg_log(),
     };
     let (mut src, mut dst) = scratch.table.split_at_mut(layout.m * layout.segments * ROW);
     let pads = &mut scratch.pads;
     let mut values = tracing::info_span!("Tables").in_scope(|| {
-        let eq = eq_table(&claim.point[SKIP + 1..]);
-        layer.table(&round, &point, &eq, layout, src, pads)
+        let blocks = eq_table(&claim.point[PACK_VARS..]);
+        layer.table(&round, &point, &claim.point[SKIP + 1..PACK_VARS], &blocks, layout, src, pads)
     });
     let tail = tracing::info_span!("Tail").entered();
     for i in SKIP..claim.point.len() {
