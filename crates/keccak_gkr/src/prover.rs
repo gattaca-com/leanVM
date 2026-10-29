@@ -179,7 +179,7 @@ impl Groups {
         let mut order = vec![[0u16; BITS]; DIGITS];
         let mut starts = vec![[0u16; (1 << DIGIT_BITS) + 1]; DIGITS];
         for (d, (order, starts)) in order.iter_mut().zip(&mut starts).enumerate() {
-            let digits: Vec<usize> = weights[..BITS].iter().map(|&w| digit(w, d)).collect();
+            let digits: [usize; BITS] = std::array::from_fn(|j| digit(weights[j], d));
             for &v in &digits {
                 starts[v + 1] += 1;
             }
