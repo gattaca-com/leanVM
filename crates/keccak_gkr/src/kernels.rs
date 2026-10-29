@@ -440,12 +440,12 @@ mod x86 {
         )
     }
 
-    /// The packs of eight consecutive positions, embedded: `out[q]` holds pack `q` of position
-    /// `i` in word `i`. The positions' words are transposed first, so a register holds one word
-    /// of each, and a pack is then a field of every word alike.
+    /// One group's packs of eight consecutive positions, embedded: `out[q]` holds the group's
+    /// pack `q` of position `i` in word `i`. The positions' words are transposed first, so a
+    /// register holds one word of each, and a pack is then a field of every word alike.
     #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
     #[inline]
-    fn embed8(positions: &[u64], out: &mut [__m512i; PACKS]) {
+    fn embed8(positions: &[u64], half: usize, out: &mut [__m512i; GROUP]) {
         let a: [__m512i; 8] = std::array::from_fn(|i| simd::load(positions, i));
         let b: [__m512i; 8] = std::array::from_fn(|i| {
             if i % 2 == 0 {
@@ -464,16 +464,13 @@ mod x86 {
             let (x, y) = (b[4 * m + t % 2], b[4 * m + 2 + t % 2]);
             if t < 2 { low(x, y) } else { high(x, y) }
         });
-        let words = [
-            low(c[0], c[4]),
-            low(c[1], c[5]),
-            low(c[2], c[6]),
-            low(c[3], c[7]),
-            high(c[0], c[4]),
-            high(c[1], c[5]),
-            high(c[2], c[6]),
-            high(c[3], c[7]),
-        ];
+        let words: [__m512i; 4] = std::array::from_fn(|i| {
+            if half == 0 {
+                low(c[i], c[i + 4])
+            } else {
+                high(c[i], c[i + 4])
+            }
+        });
         let zero = _mm512_setzero_si512();
         for (w, &v) in words.iter().enumerate() {
             let low = _mm512_or_si512(embedding_byte(v, 0), _mm512_slli_epi16(embedding_byte(v, 1), 8));
@@ -529,7 +526,7 @@ mod x86 {
     pub struct SkipBlock {
         /// Per slot, the low and high polynomial halves, each split into even and odd positions.
         acc: Vec<[__m512i; 4]>,
-        packs: [[__m512i; PACKS]; 5],
+        packs: [[__m512i; GROUP]; 5],
         tile: [[__m512i; 4]; 5],
     }
 
@@ -538,7 +535,7 @@ mod x86 {
             let zero = simd::from_words([0; 8]);
             Box::new(Self {
                 acc: vec![[zero; 4]; 2 * MIXED],
-                packs: [[zero; PACKS]; 5],
+                packs: [[zero; GROUP]; 5],
                 tile: [[zero; 4]; 5],
             })
         }
@@ -555,18 +552,18 @@ mod x86 {
         #[inline]
         fn sum(&mut self, block: &[u64], weights: &SkipWeights) {
             self.acc.fill([_mm512_setzero_si512(); 4]);
-            for r in 0..5 {
-                for z in (0..64).step_by(8) {
-                    let js = row_positions(r, z);
-                    for (packs, &j) in self.packs.iter_mut().zip(&js) {
-                        embed8(&block[BLOCK_WORDS * j..][..8 * BLOCK_WORDS], packs);
-                    }
-                    let w: [[__m512i; 3]; 5] =
-                        std::array::from_fn(|x| std::array::from_fn(|k| load_at(&weights.0, k * BITS + js[x])));
-                    for half in 0..2 {
+            for half in 0..2 {
+                for r in 0..5 {
+                    for z in (0..64).step_by(8) {
+                        let js = row_positions(r, z);
+                        for (packs, &j) in self.packs.iter_mut().zip(&js) {
+                            embed8(&block[BLOCK_WORDS * j..][..8 * BLOCK_WORDS], half, packs);
+                        }
+                        let w: [[__m512i; 3]; 5] =
+                            std::array::from_fn(|x| std::array::from_fn(|k| load_at(&weights.0, k * BITS + js[x])));
                         for high in 0..HIGH.len() {
                             for (tile, packs) in self.tile.iter_mut().zip(&self.packs) {
-                                *tile = extend8_high(&packs[GROUP * half..][..GROUP], high);
+                                *tile = extend8_high(packs, high);
                             }
                             for i in 0..if high < 4 { 5 } else { 9 } {
                                 let e: [__m512i; 5] = std::array::from_fn(|x| {
