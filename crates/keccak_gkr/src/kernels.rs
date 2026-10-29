@@ -247,10 +247,9 @@ pub static NIBBLES: [[u8; 16]; 12] = {
     tables
 };
 
-/// [`skip_row`] over every row and slice of a block, the position weights as elements: per
-/// [`slot`], the three partial products.
+/// [`skip_row`] over every row and slice of a block, as four polynomial words per [`slot`].
 #[cfg(test)]
-fn skip_block_portable(block: &[u64], weights: &[[u64; 3]]) -> Vec<[u128; 3]> {
+fn skip_block_portable(block: &[u64], weights: &[[u64; 3]]) -> Vec<[u64; 4]> {
     let mut acc = SkipAcc::new();
     let mut extended = [[0u32; SLOTS]; 5];
     for r in 0..5 {
@@ -262,7 +261,7 @@ fn skip_block_portable(block: &[u64], weights: &[[u64; 3]]) -> Vec<[u128; 3]> {
             skip_row_portable(&mut acc, &extended, std::array::from_fn(|x| &weights[js[x]]));
         }
     }
-    (0..2 * MIXED).map(|i| acc.get(i)).collect()
+    (0..2 * MIXED).map(|i| crate::basis::carry(&acc.get(i))).collect()
 }
 
 cfg_select! {
@@ -313,9 +312,9 @@ cfg_select! {
                 }
             }
 
-            /// The three partial products of slot `i`.
-            pub fn get(&self, i: usize) -> [u128; 3] {
-                self.acc.get(i)
+            /// The sum for slot `i`, as four polynomial words.
+            pub fn get(&self, i: usize) -> [u64; 4] {
+                crate::basis::carry(&self.acc.get(i))
             }
         }
     }
@@ -528,8 +527,8 @@ mod x86 {
     /// holds one value of eight positions, so the extension is a sum of registers and each slot's
     /// products are a register's lanes, weighted by eight positions' weights at once.
     pub struct SkipBlock {
-        /// Per slot, the even and odd positions' sums of each partial product.
-        acc: Vec<[__m512i; 6]>,
+        /// Per slot, the low and high polynomial halves, each split into even and odd positions.
+        acc: Vec<[__m512i; 4]>,
         packs: [[__m512i; PACKS]; 5],
         tile: [[__m512i; 4]; 5],
     }
@@ -538,7 +537,7 @@ mod x86 {
         pub fn new() -> Box<Self> {
             let zero = simd::from_words([0; 8]);
             Box::new(Self {
-                acc: vec![[zero; 6]; 2 * MIXED],
+                acc: vec![[zero; 4]; 2 * MIXED],
                 packs: [[zero; PACKS]; 5],
                 tile: [[zero; 4]; 5],
             })
@@ -555,7 +554,7 @@ mod x86 {
         #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
         #[inline]
         fn sum(&mut self, block: &[u64], weights: &SkipWeights) {
-            self.acc.fill([_mm512_setzero_si512(); 6]);
+            self.acc.fill([_mm512_setzero_si512(); 4]);
             for r in 0..5 {
                 for z in (0..64).step_by(8) {
                     let js = row_positions(r, z);
@@ -597,6 +596,13 @@ mod x86 {
                                     4 => 56 + high,
                                     _ => 4 * (high - 4) + i - 5,
                                 };
+                                // The products start at bits 0, 64 and 128; combine their overlaps before storing.
+                                let sums = [
+                                    _mm512_xor_si512(sums[0], _mm512_bslli_epi128::<8>(sums[2])),
+                                    _mm512_xor_si512(sums[1], _mm512_bslli_epi128::<8>(sums[3])),
+                                    _mm512_xor_si512(sums[4], _mm512_bsrli_epi128::<8>(sums[2])),
+                                    _mm512_xor_si512(sums[5], _mm512_bsrli_epi128::<8>(sums[3])),
+                                ];
                                 let acc = &mut self.acc[slot(half, point)];
                                 for (acc, sum) in acc.iter_mut().zip(sums) {
                                     *acc = _mm512_xor_si512(*acc, sum);
@@ -608,15 +614,19 @@ mod x86 {
             }
         }
 
-        /// The three partial products of slot `i`.
-        pub fn get(&self, i: usize) -> [u128; 3] {
-            std::array::from_fn(|k| {
-                let mut lanes = [[0u128; 4]; 2];
-                for (lanes, &acc) in lanes.iter_mut().zip(&self.acc[i][2 * k..2 * k + 2]) {
-                    simd::store(lanes, 0, acc);
-                }
-                lanes.as_flattened().iter().fold(0, |a, &b| a ^ b)
-            })
+        /// The sum for slot `i`, as four polynomial words.
+        pub fn get(&self, i: usize) -> [u64; 4] {
+            let halves: [u128; 2] = std::array::from_fn(|k| {
+                let mut lanes = [0u128; 4];
+                simd::store(&mut lanes, 0, simd::xor(self.acc[i][2 * k], self.acc[i][2 * k + 1]));
+                lanes.iter().fold(0, |a, &b| a ^ b)
+            });
+            [
+                halves[0] as u64,
+                (halves[0] >> 64) as u64,
+                halves[1] as u64,
+                (halves[1] >> 64) as u64,
+            ]
         }
     }
 

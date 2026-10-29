@@ -369,7 +369,7 @@ impl Layer<'_> {
                 skip.run(block, &weights);
                 for half in 0..2 {
                     for (i, total) in total.iter_mut().enumerate() {
-                        add_mul(total, &carry::<3, 4>(&skip.get(slot(half, i))), &groups[2 * row + half]);
+                        add_mul(total, &skip.get(slot(half, i)), &groups[2 * row + half]);
                     }
                 }
             },
