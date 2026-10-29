@@ -90,14 +90,32 @@ pub const fn cell_lanes(odd: bool) -> [(Option<usize>, Option<usize>); STATE_CEL
 
 /// The 25 lanes thirteen state cells hold in a layout.
 pub fn state_of_cells(cells: &[F192; STATE_CELLS], odd: bool) -> [u64; STATE_LANES] {
+    read_state(odd, |c| cells[c])
+}
+
+/// Read a state without collecting its cells into an intermediate array.
+#[inline]
+pub(crate) fn read_state(odd: bool, cell: impl Fn(usize) -> F192) -> [u64; STATE_LANES] {
     let mut s = [0u64; STATE_LANES];
-    for (cell, (lo, hi)) in cells.iter().zip(cell_lanes(odd)) {
-        if let Some(lo) = lo {
-            s[lo] = cell.c0;
+    if odd {
+        s[0] = cell(0).c1;
+        for c in 1..RATE_CELLS {
+            let w = cell(c);
+            s[2 * c - 1] = w.c0;
+            s[2 * c] = w.c1;
         }
-        if let Some(hi) = hi {
-            s[hi] = cell.c1;
+    } else {
+        for c in 0..RATE_CELLS - 1 {
+            let w = cell(c);
+            s[2 * c] = w.c0;
+            s[2 * c + 1] = w.c1;
         }
+        s[16] = cell(RATE_CELLS - 1).c0;
+    }
+    for c in RATE_CELLS..STATE_CELLS {
+        let w = cell(c);
+        s[2 * c - 1] = w.c0;
+        s[2 * c] = w.c1;
     }
     s
 }
@@ -300,6 +318,26 @@ mod tests {
                 (openings, ps.into_proof())
             };
             assert!(stream(&witness) == stream(&reference), "{n} steps");
+        }
+    }
+
+    #[test]
+    fn state_reader_matches_cell_layouts() {
+        let cells: [F192; STATE_CELLS] = std::array::from_fn(|c| {
+            let x = (c as u64 + 1).wrapping_mul(0x0123_4567_89ab_cdef);
+            F192::new(x, x.rotate_left(17), !x)
+        });
+        for odd in [false, true] {
+            let mut expected = [0; STATE_LANES];
+            for (cell, (lo, hi)) in cells.iter().zip(cell_lanes(odd)) {
+                if let Some(lane) = lo {
+                    expected[lane] = cell.c0;
+                }
+                if let Some(lane) = hi {
+                    expected[lane] = cell.c1;
+                }
+            }
+            assert_eq!(read_state(odd, |c| cells[c]), expected);
         }
     }
 
