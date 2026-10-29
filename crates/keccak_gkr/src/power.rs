@@ -123,6 +123,25 @@ impl PowerField {
         row_kernel!(width, dot_pair(a, b, width), dot_pair_portable(a, b, width))
     }
 
+    /// `sum_j (weights[j] * a[j]) * b[j]`, with the inner product reduced and the sum unreduced.
+    pub fn weighted_dot(&self, a: &[u64], b: &[u64], weights: &[u64], width: usize) -> [u64; 6] {
+        assert!([a, b, weights].iter().all(|row| row.len() >= 3 * width));
+        row_kernel!(
+            width,
+            weighted_dot(self, a, b, weights, width),
+            self.weighted_dot_portable(a, b, weights, width)
+        )
+    }
+
+    fn weighted_dot_portable(&self, a: &[u64], b: &[u64], weights: &[u64], width: usize) -> [u64; 6] {
+        let mut sum = [0; 6];
+        for j in 0..width {
+            let product = self.mul(&get(a, width, j), &get(weights, width, j));
+            add_mul(&mut sum, &product, &get(b, width, j));
+        }
+        sum
+    }
+
     /// The dot products of `B[j] = weights[j] * (kappa + T[j + 1]) + constant[j]` and `T[j + 2]`,
     /// at zero and infinity over two rows, unreduced or not. Weights and constants are by lane,
     /// then by word.
@@ -414,6 +433,18 @@ mod x86 {
             (finish(&acc[0]), finish(&acc[1]))
         }
 
+        pub fn weighted_dot(field: &PowerField, a: &[u64], b: &[u64], weights: &[u64], width: usize) -> [u64; 6] {
+            let mut acc = [V::zero(); 5];
+            for j in (0..width).step_by(STEP) {
+                let weighted = reduce_pair(field, &partial(&load3(a, width, j), &load3(weights, width, j)));
+                let p = partial(&weighted, &load3(b, width, j));
+                for k in 0..5 {
+                    acc[k] = acc[k].xor(p[0][k].xor(p[1][k]));
+                }
+            }
+            finish_dot(&[acc, [V::zero(); 5]]).0
+        }
+
         /// `B` stays unreduced, six words: its two halves each meet `T[j + 2]` in a Karatsuba
         /// product, which costs fewer products than reducing `B` first. The sums are reduced once.
         pub fn chi_dot_pair(
@@ -597,6 +628,26 @@ mod neon {
 
     #[target_feature(enable = "neon,aes")]
     #[inline]
+    pub fn weighted_dot(field: &PowerField, a: &[u64], b: &[u64], weights: &[u64], width: usize) -> [u64; 6] {
+        let mut acc = [vdupq_n_u64(0); 5];
+        for j in (0..width).step_by(2) {
+            let p = partial(&load3(a, width, j), &load3(weights, width, j), ALL);
+            let weighted = reduce(field, &std::array::from_fn(|w| word(&p, w)));
+            let p = partial(&weighted, &load3(b, width, j), ALL);
+            for k in 0..5 {
+                acc[k] = veorq_u64(acc[k], veorq_u64(p[0][k], p[1][k]));
+            }
+        }
+        let mut out = [0; 6];
+        for (k, &sum) in acc.iter().enumerate() {
+            out[k] ^= vgetq_lane_u64::<0>(sum);
+            out[k + 1] ^= vgetq_lane_u64::<1>(sum);
+        }
+        out
+    }
+
+    #[target_feature(enable = "neon,aes")]
+    #[inline]
     pub fn dot_pair(a: [&[u64]; 2], b: [&[u64]; 2], width: usize) -> ([u64; 6], [u64; 6]) {
         let mut acc = [[vdupq_n_u64(0); 5]; 2];
         for j in (0..width).step_by(2) {
@@ -718,6 +769,11 @@ mod tests {
         assert_eq!(field.to_field(&field.reduce(&zero)), expected);
         let expected = (0..width).fold(F192::ZERO, |acc, j| acc + (a0[j] + a1[j]) * (b0[j] + b1[j]));
         assert_eq!(field.to_field(&field.reduce(&infinity)), expected);
+
+        let weighted = field.weighted_dot(&ra0, &rb0, &ra1, width);
+        assert_eq!(weighted, field.weighted_dot_portable(&ra0, &rb0, &ra1, width));
+        let expected = (0..width).fold(F192::ZERO, |acc, j| acc + a0[j] * b0[j] * a1[j]);
+        assert_eq!(field.to_field(&field.reduce(&weighted)), expected);
 
         let challenge = rng.ext();
         let (mut fast, mut slow) = (vec![0u64; 3 * width], vec![0u64; 3 * width]);
