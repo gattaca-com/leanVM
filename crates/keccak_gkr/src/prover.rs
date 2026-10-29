@@ -299,16 +299,12 @@ impl Weigh {
     /// Matrix `r` of chunk `c` takes bit `k` of an input byte from position `8c + k`, and makes
     /// output bit `t` from bit `8r + t` of each one's weight. Byte `7 - t` is that output's row.
     fn new(weights: &[F192]) -> Self {
-        let mut matrices = vec![[0u64; 24]; CHUNKS];
-        for (j, w) in weights.iter().enumerate() {
-            let (c, k) = (j / 8, j % 8);
-            for (r, m) in matrices[c].iter_mut().enumerate() {
-                let byte = [w.c0, w.c1, w.c2][r / 8] >> (8 * (r % 8)) & 0xff;
-                for t in (0..8).filter(|t| byte >> t & 1 == 1) {
-                    *m |= 1 << (8 * (7 - t) + k);
-                }
-            }
-        }
+        let matrices = weights
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|w| std::array::from_fn(|r| affine_matrix(std::array::from_fn(|k| byte(&w[k], r)))))
+            .collect();
         Self(matrices)
     }
 
@@ -325,11 +321,32 @@ impl Weigh {
     }
 }
 
+/// Byte `r` of an element's 24.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+pub(crate) fn byte(x: &F192, r: usize) -> u8 {
+    ([x.c0, x.c1, x.c2][r / 8] >> (8 * (r % 8))) as u8
+}
+
+/// The GF2P8AFFINE matrix whose output bit `t` sums the input bits `k` with bit `t` of
+/// `bytes[k]` set: that output's row is matrix byte `7 - t`, the 8 x 8 transpose reversed.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+pub(crate) fn affine_matrix(bytes: [u8; 8]) -> u64 {
+    // Bit `8 r + c` moves to bit `8 c + r` (Hacker's Delight, section 7-3).
+    let mut x = u64::from_le_bytes(bytes);
+    let t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+    x ^= t ^ (t << 7);
+    let t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+    x ^= t ^ (t << 14);
+    let t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+    x ^= t ^ (t << 28);
+    x.swap_bytes()
+}
+
 /// The 8 x 8 transpose of eight registers' words: word `k` of output `w` is word `w` of input `k`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[target_feature(enable = "avx512f")]
 #[inline]
-fn transpose8(a: [core::arch::x86_64::__m512i; 8]) -> [core::arch::x86_64::__m512i; 8] {
+pub(crate) fn transpose8(a: [core::arch::x86_64::__m512i; 8]) -> [core::arch::x86_64::__m512i; 8] {
     use core::arch::x86_64::*;
     let idx = |v: [i64; 8]| _mm512_setr_epi64(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
     let mut out = a;
@@ -455,20 +472,14 @@ struct Fold<const B: usize>([[[u64; 8]; 3]; B]);
 impl<const B: usize> Fold<B> {
     fn new(field: &PowerField, fold: &[Element]) -> Self {
         assert!(fold.len() == B / 2);
-        let mut maps = [[[0u64; 8]; 3]; B];
-        for (i, map) in maps.iter_mut().enumerate() {
-            for k in 0..8 {
-                // Bit `k` of input byte `i` is bit `8 (i % 2) + k` of pack `i / 2`.
-                let value = field.mul(&fold[i / 2], &[crate::rmfe::RMFE.emb[8 * (i % 2) + k] as u64, 0, 0]);
-                for o in 0..24 {
-                    let byte = value[o / 8] >> (8 * (o % 8)) & 0xff;
-                    for t in (0..8).filter(|t| byte >> t & 1 == 1) {
-                        map[o / 8][o % 8] |= 1 << (8 * (7 - t) + k);
-                    }
-                }
-            }
-        }
-        Self(maps)
+        Self(std::array::from_fn(|i| {
+            // Bit `k` of input byte `i` is bit `8 (i % 2) + k` of pack `i / 2`.
+            let values: [F192; 8] = std::array::from_fn(|k| {
+                let [c0, c1, c2] = field.mul(&fold[i / 2], &[crate::rmfe::RMFE.emb[8 * (i % 2) + k] as u64, 0, 0]);
+                F192::new(c0, c1, c2)
+            });
+            std::array::from_fn(|z| std::array::from_fn(|l| affine_matrix(values.map(|v| byte(&v, 8 * z + l)))))
+        }))
     }
 
     fn scratch() -> Vec<u64> {
