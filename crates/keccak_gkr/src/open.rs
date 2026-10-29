@@ -14,6 +14,7 @@ use primitives::field::{F64, F192};
 use primitives::field::F192Unreduced;
 use primitives::multilinear::{eq_table, mle_eval, poly_eval};
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 use crate::basis::byte_sums;
 use crate::keccak::{BITS, LANES, along, iota_bit};
 use crate::protocol::{Claim, dot, sum};
@@ -252,6 +253,7 @@ fn fold_gfni(witness: &Witness, round: usize, j: usize, matrices: &[[[u64; 24]; 
 }
 
 /// Byte `b` of word `x` at `8 * x + b`.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 fn le_bytes(words: &[u64; BLOCK_WORDS]) -> [u8; 64] {
     let mut bytes = [0u8; 64];
     for (bytes, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words) {
@@ -353,6 +355,7 @@ pub fn open_outputs(
 /// Slice `z` of slot `s` is `Σ_step eq(instance, step) · bit z of committed[s·n + step]`: a
 /// subset sum of the `eq` table over the steps whose bit is set, read eight steps at a time off
 /// their transposed bytes.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 fn spare_slices(shape: Shape, committed: &[F64], instance: &[F192]) -> Vec<[F192; 64]> {
     let (n, spare) = (shape.n(), (1 << shape.slot_log()) - shape.slots());
     let eq = eq_table(instance);
@@ -381,6 +384,74 @@ fn spare_slices(shape: Shape, committed: &[F64], instance: &[F192]) -> Vec<[F192
             a
         },
     )
+}
+
+/// [`spare_slices`] as a GF(2) matrix product: eight steps' words, transposed, are a byte per
+/// bit position, which a GF2P8AFFINE matrix of the steps' weights sends to one byte of the slice.
+/// A task per run of steps, whose matrices serve every spare slot.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+fn spare_slices(shape: Shape, committed: &[F64], instance: &[F192]) -> Vec<[F192; 64]> {
+    const RUN: usize = 128;
+    let (n, spare) = (shape.n(), (1 << shape.slot_log()) - shape.slots());
+    let eq = eq_table(instance);
+    let slots = &committed[shape.slots() * n..];
+    let chunks = eq.as_chunks::<8>().0;
+    parallel::fold_reduce(
+        chunks.len().div_ceil(RUN),
+        || vec![[F192::ZERO; 64]; spare],
+        |acc, task| {
+            let first = RUN * task;
+            let matrices: Vec<[u64; 24]> = chunks[first..(first + RUN).min(chunks.len())]
+                .iter()
+                .map(|e| std::array::from_fn(|o| affine_matrix(std::array::from_fn(|w| byte(&e[w], o)))))
+                .collect();
+            for (slot, acc) in acc.iter_mut().enumerate() {
+                let words = &slots[slot * n + 8 * first..][..8 * matrices.len()];
+                // SAFETY: the features are enabled at compile time.
+                let sums = unsafe { slices_gfni(words, &matrices) };
+                for (acc, sum) in acc.iter_mut().zip(sums) {
+                    *acc += sum;
+                }
+            }
+        },
+        |mut a, b| {
+            for (a, b) in a.iter_mut().flatten().zip(b.iter().flatten()) {
+                *a += *b;
+            }
+            a
+        },
+    )
+}
+
+/// Per bit position, the sum of the weights of the steps whose word has it set: matrix `[c][o]`
+/// makes byte `o` of the sum from steps `8c..8c + 8`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+fn slices_gfni(words: &[F64], matrices: &[[u64; 24]]) -> [F192; 64] {
+    use core::arch::x86_64::*;
+    use primitives::bits::bit_transpose_64bytes_m512;
+    use primitives::simd::{load, store};
+    assert!(words.len() == 8 * matrices.len() && matrices.len().is_multiple_of(2));
+    let mut acc = [_mm512_setzero_si512(); 24];
+    for (c, m) in matrices.as_chunks::<2>().0.iter().enumerate() {
+        // Byte `z` of `x[h]`: bit `w` is bit `z` of step `8 (2c + h) + w`.
+        let x = [0, 1].map(|h| bit_transpose_64bytes_m512(load(&words[8 * (2 * c + h)..][..8], 0)));
+        for (o, acc) in acc.iter_mut().enumerate() {
+            let a = _mm512_gf2p8affine_epi64_epi8(x[0], _mm512_set1_epi64(m[0][o] as i64), 0);
+            let b = _mm512_gf2p8affine_epi64_epi8(x[1], _mm512_set1_epi64(m[1][o] as i64), 0);
+            *acc = _mm512_ternarylogic_epi64(*acc, a, b, 0x96);
+        }
+    }
+    // Byte `z` of `acc[o]` is byte `o` of position `z`'s sum.
+    let gather: [u8; 64] = std::array::from_fn(|o| (8 * (o % 8) + o / 8) as u8);
+    let gather = load(&gather[..], 0);
+    let mut limbs = [[0u64; 64]; 3];
+    for (limb, acc) in limbs.iter_mut().zip(acc.as_chunks::<8>().0) {
+        for (m, x) in crate::prover::transpose8(*acc).into_iter().enumerate() {
+            store(&mut limb[..], m, _mm512_permutexvar_epi8(gather, x));
+        }
+    }
+    std::array::from_fn(|z| F192::new(limbs[0][z], limbs[1][z], limbs[2][z]))
 }
 
 /// Open the claim on the inputs: the instances of a pack first, then the slot.
