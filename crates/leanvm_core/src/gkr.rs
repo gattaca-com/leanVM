@@ -171,6 +171,13 @@ pub trait TableBlock: primitives::Plain + Send + Sync {
 
     /// The fold of the block by `challenge`: `V[c] + r (V[c] + V[c + 4])` for each child `c`.
     fn fold(&self, challenge: F192x8) -> [F192x8; 4];
+
+    /// The block of identity rows.
+    const ONE: Self;
+
+    /// Adds the first two round polynomials of the blocks `self` and `second`, one pair of blocks,
+    /// weighted by `weight`, to `sum` ([`bivariate_summand`]).
+    fn bivariate(&self, second: &Self, weight: F192x8, sum: &mut BivariateSum);
 }
 
 /// The field a product tree's values live in: `E`, or `K` for a tree that the first fold lifts to
@@ -597,6 +604,12 @@ impl TableBlock for Block {
     fn fold(&self, challenge: F192x8) -> [F192x8; 4] {
         std::array::from_fn(|c| self[c] + challenge * (self[c] + self[c + 4]))
     }
+
+    const ONE: Self = [F192x8::ONE; 8];
+
+    fn bivariate(&self, second: &Self, weight: F192x8, sum: &mut BivariateSum) {
+        bivariate_summand(self, second, weight, sum);
+    }
 }
 
 #[inline(always)]
@@ -709,6 +722,54 @@ impl TableBlock for KBlock {
             F192x8::from(self[c]) + challenge.mul_base_unreduced(self[c] + self[c + 4]).reduce_lanes()
         })
     }
+
+    const ONE: Self = [F64x8::ONE; 8];
+
+    /// [`bivariate_summand`] with every product in `K`: only the weight is in `E`, and it multiplies
+    /// each product's five coefficients as mixed products.
+    #[inline(never)]
+    fn bivariate(&self, second: &Self, weight: F192x8, sum: &mut BivariateSum) {
+        let line = |a0: F64x8, d0: F64x8, a1: F64x8, d1: F64x8| {
+            let (low, high) = (a0 * a1, d0 * d1);
+            [low, (a0 + d0) * (a1 + d1) + low + high, high]
+        };
+        let bilinear = |a: [[F64x8; 2]; 2], b: [[F64x8; 2]; 2]| {
+            let low = line(a[0][0], a[0][1], b[0][0], b[0][1]);
+            let high = line(a[1][0], a[1][1], b[1][0], b[1][1]);
+            let cross = line(
+                a[0][0] + a[1][0],
+                a[0][1] + a[1][1],
+                b[0][0] + b[1][0],
+                b[0][1] + b[1][1],
+            );
+            [low, std::array::from_fn(|j| cross[j] + low[j] + high[j]), high]
+        };
+        let factors: [[[F64x8; 2]; 2]; 4] = std::array::from_fn(|c| {
+            let (v0, v2) = F64x8::even_odd(self[c], second[c]);
+            let (v1, v3) = F64x8::even_odd(self[c + 4], second[c + 4]);
+            [[v0, v0 + v2], [v0 + v1, v0 + v1 + v2 + v3]]
+        });
+        let (a, b) = (bilinear(factors[0], factors[1]), bilinear(factors[2], factors[3]));
+        let both = |x: [[F64x8; 3]; 3], i: usize, l: usize| std::array::from_fn(|j| x[i][j] + x[l][j]);
+        let pairs = [
+            (a[0], b[0]),
+            (a[1], b[1]),
+            (a[2], b[2]),
+            (both(a, 0, 1), both(b, 0, 1)),
+            (both(a, 0, 2), both(b, 0, 2)),
+            (both(a, 1, 2), both(b, 1, 2)),
+        ];
+        for (slot, (x, y)) in sum.iter_mut().zip(pairs) {
+            let (p0, p1, p2) = (x[0] * y[0], x[1] * y[1], x[2] * y[2]);
+            let p01 = (x[0] + x[1]) * (y[0] + y[1]);
+            let p02 = (x[0] + x[2]) * (y[0] + y[2]);
+            let p12 = (x[1] + x[2]) * (y[1] + y[2]);
+            let coefficients = [p0, p01 + p0 + p1, p02 + p0 + p2 + p1, p12 + p1 + p2, p2];
+            for (slot, c) in slot.iter_mut().zip(coefficients) {
+                *slot ^= weight.mul_base_unreduced(c).merge_parities();
+            }
+        }
+    }
 }
 
 /// A table read block by block, stored as blocks or as rows that are packed as they are read.
@@ -819,11 +880,14 @@ trait Table: Send + Sync {
 
     fn message(&self, ones: &[Range<usize>], equality: &Equality) -> [F192; 4];
 
+    fn polynomial(&self, ones: &[Range<usize>], equality: &Equality) -> [[F192; 5]; 5];
+
     fn fold(
         &self,
         next_blocks: &mut [Block],
         ones: &[Range<usize>],
         challenge: F192,
+        second: Option<F192>,
         equality: Option<&Equality>,
     ) -> [F192; 4];
 }
@@ -837,14 +901,19 @@ impl<S: Source + Send> Table for S {
         blocks_message(self, ones, equality)
     }
 
+    fn polynomial(&self, ones: &[Range<usize>], equality: &Equality) -> [[F192; 5]; 5] {
+        blocks_polynomial(self, ones, equality)
+    }
+
     fn fold(
         &self,
         next_blocks: &mut [Block],
         ones: &[Range<usize>],
         challenge: F192,
+        second: Option<F192>,
         equality: Option<&Equality>,
     ) -> [F192; 4] {
-        fold_block_pairs(self, next_blocks, ones, challenge, equality)
+        fold_block_pairs(self, next_blocks, ones, challenge, second, equality)
     }
 }
 
@@ -976,7 +1045,7 @@ fn columns_fold(
     reduce_sides(columns, task)
 }
 
-fn xor_coefficients(mut left: [Prod8; 4], right: [Prod8; 4]) -> [Prod8; 4] {
+fn xor_coefficients<const N: usize>(mut left: [Prod8; N], right: [Prod8; N]) -> [Prod8; N] {
     for (a, b) in left.iter_mut().zip(right) {
         *a ^= b;
     }
@@ -1003,17 +1072,58 @@ fn blocks_message<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], equalit
     message.map(Prod8::reduce)
 }
 
-/// Fold every pair of blocks of `source` by `challenge` into `E` blocks, and with an `equality` weigh the
-/// folded table's round message as it is produced. Folded blocks that are wholly identity are not written.
+/// The first two round polynomials of a table of blocks, before either challenge is sampled: the
+/// pairs of blocks weighted by `equality`. A pair of identity blocks adds only to the constant
+/// coefficient, which no message reads.
+fn blocks_polynomial<S: Source + ?Sized>(source: &S, ones: &[Range<usize>], equality: &Equality) -> [[F192; 5]; 5] {
+    let count = source.count();
+    let pairs = count.div_ceil(2);
+    let pair_ones = halve(ones, pairs);
+    let block = |b: usize| {
+        if b < count && !in_runs(ones, b) {
+            source.block(b)
+        } else {
+            S::Block::ONE
+        }
+    };
+    let rows = window_blocks(pairs);
+    let window = |index: usize| {
+        let mut sum = [[Prod8::ZERO; 5]; 6];
+        for k in live(&pair_ones, index * rows..((index + 1) * rows).min(pairs)) {
+            source.prefetch(2 * (k + PREFETCH));
+            source.prefetch(2 * (k + PREFETCH) + 1);
+            block(2 * k).bivariate(&block(2 * k + 1), equality.block(k), &mut sum);
+        }
+        sum
+    };
+    let xor = |left: BivariateSum, right: BivariateSum| std::array::from_fn(|k| xor_coefficients(left[k], right[k]));
+    let windows = pairs.div_ceil(rows);
+    let sum = if BLOCK_PAIRS * count >= PAR_THRESHOLD {
+        parallel::map_reduce(windows, || [[Prod8::ZERO; 5]; 6], window, xor)
+    } else {
+        (0..windows).map(window).fold([[Prod8::ZERO; 5]; 6], xor)
+    };
+    bivariate_coefficients(&sum)
+}
+
+/// Fold every pair of blocks of `source` by `challenge`, and with a `second` challenge every pair of
+/// the folded blocks again, into `E` blocks, and with an `equality` weigh the folded table's round
+/// message as it is produced. Folded blocks that are wholly identity are not written.
 fn fold_block_pairs<S: Source + ?Sized>(
     source: &S,
     next_blocks: &mut [Block],
     ones: &[Range<usize>],
     challenge: F192,
+    second: Option<F192>,
     equality: Option<&Equality>,
 ) -> [F192; 4] {
     let count = next_blocks.len();
-    let next_ones = halve(ones, count);
+    let next_ones = match second {
+        Some(_) => halve(&halve(ones, source.count().div_ceil(2)), count),
+        None => halve(ones, count),
+    };
+    let span = if second.is_some() { 4 } else { 2 };
+    let second = second.map(F192x8::splat);
     let challenge = F192x8::splat(challenge);
     let window = window_blocks(count);
     let task = |index: usize, out: &mut [Block]| {
@@ -1022,9 +1132,16 @@ fn fold_block_pairs<S: Source + ?Sized>(
         let first = index * window;
         let mut message = [Prod8::ZERO; 4];
         for k in live(&next_ones, first..first + out.len()) {
-            source.prefetch(2 * (k + PREFETCH_FOLD));
-            source.prefetch(2 * (k + PREFETCH_FOLD) + 1);
-            let block = fold_block_pair(source, ones, k, challenge);
+            for b in 0..span {
+                source.prefetch(span * (k + PREFETCH_FOLD) + b);
+            }
+            let block = match second {
+                Some(second) => interleave(
+                    fold_block_pair(source, ones, 2 * k, challenge).fold(second),
+                    fold_block_pair(source, ones, 2 * k + 1, challenge).fold(second),
+                ),
+                None => fold_block_pair(source, ones, k, challenge),
+            };
             // The stores go before the summand, so they overlap its products.
             stream.copy_lines_into(&mut out[k - first], &block);
             if let Some(equality) = equality {
@@ -1203,17 +1320,36 @@ impl<'a> QuaternaryLayerState<'a> {
 
     /// Fold every pair of blocks by `challenge` into `next_blocks`, and with an `equality` weigh the
     /// folded table's round message as it is produced.
-    fn fold_blocks(&mut self, challenge: F192, equality: Option<&Equality>, keep_columns: bool) -> [F192; 4] {
+    /// With a `second` challenge, the folded table is folded again by it in the same pass.
+    fn fold_blocks(
+        &mut self,
+        challenge: F192,
+        second: Option<F192>,
+        equality: Option<&Equality>,
+        keep_columns: bool,
+    ) -> [F192; 4] {
         let blocks = self.first.as_ref().map_or(self.blocks.len(), |first| first.count());
-        let count = blocks.div_ceil(2);
+        let half = blocks.div_ceil(2);
+        let count = if second.is_some() { half.div_ceil(2) } else { half };
         self.next_blocks.truncate(count);
         let first = self.first.take();
         let unstored = self.unstored();
         let message = match &first {
-            Some(first) => first.fold(&mut self.next_blocks, &unstored, challenge, equality),
-            None => fold_block_pairs(&self.blocks, &mut self.next_blocks, &unstored, challenge, equality),
+            Some(first) => first.fold(&mut self.next_blocks, &unstored, challenge, second, equality),
+            None => fold_block_pairs(
+                &self.blocks,
+                &mut self.next_blocks,
+                &unstored,
+                challenge,
+                second,
+                equality,
+            ),
         };
-        self.ones = halve(&self.ones, count);
+        self.ones = halve(&self.ones, half);
+        if second.is_some() {
+            self.ones = halve(&self.ones, count);
+            self.logical_rows /= 2;
+        }
         if keep_columns {
             self.columns = halve(&self.columns, count);
         } else {
@@ -1233,7 +1369,7 @@ impl<'a> QuaternaryLayerState<'a> {
     #[timed]
     fn fold(&mut self, challenge: F192) {
         if self.blocked() {
-            self.fold_blocks(challenge, None, false);
+            self.fold_blocks(challenge, None, None, false);
             return;
         }
         let stored_rows = self.values.len() / 4;
@@ -1299,7 +1435,7 @@ impl<'a> QuaternaryLayerState<'a> {
     #[timed]
     fn fold_and_message(&mut self, challenge: F192, equality: &Equality) -> [F192; 4] {
         if self.blocked() {
-            return self.fold_blocks(challenge, Some(equality), false);
+            return self.fold_blocks(challenge, None, Some(equality), false);
         }
         let stored_rows = self.values.len() / 4;
         let rows = stored_rows.div_ceil(2);
@@ -1517,22 +1653,32 @@ pub fn prove_product_triple_from<C: TreeField>(
         }
         let mut equality = Equality::new(point.get(1..).unwrap_or_default());
         let mut round_point = Vec::with_capacity(round_count);
+        // With enough workers to hide the extra products behind the saved traffic, a layer's first two
+        // rounds come from one pass over its columns or its first table, and one double fold.
+        let two_rounds = round_count >= 2
+            && parallel::num_threads() >= 4
+            && cfg!(all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                target_feature = "avx512f"
+            ));
+        let pairs = two_rounds.then(|| Equality::new(&point[2..]));
+        // A first table's double fold carries the third round's message, so it needs three rounds.
+        let firsts: [Option<[[F192; 5]; 5]>; 3] = trees.each_ref().map(|tree| {
+            let first = tree.first.as_ref().filter(|_| round_count >= 3)?;
+            Some(first.polynomial(&tree.ones, pairs.as_ref()?))
+        });
         let mut messages = if round_count > 0 {
-            trees.each_ref().map(|tree| tree.round_message(&equality))
+            std::array::from_fn(|s| match firsts[s] {
+                Some(polynomial) => bivariate_messages(polynomial, point[1], F192::ZERO)[0],
+                None => trees[s].round_message(&equality),
+            })
         } else {
             [[F192::ZERO; 4]; 3]
         };
         let polynomial = columns
-            .filter(|_| {
-                round_count >= 2
-                    && parallel::num_threads() >= 4
-                    && cfg!(all(
-                        target_arch = "x86_64",
-                        target_feature = "vpclmulqdq",
-                        target_feature = "avx512f"
-                    ))
-            })
-            .map(|columns| columns_polynomial(columns, &Equality::new(&point[2..])));
+            .zip(pairs.as_ref())
+            .map(|(columns, pairs)| columns_polynomial(columns, pairs));
         if let Some(columns) = columns {
             let from_columns = polynomial.map_or_else(
                 || columns_message(columns, &equality),
@@ -1566,8 +1712,14 @@ pub fn prove_product_triple_from<C: TreeField>(
                     None
                 };
                 messages = std::array::from_fn(|s| {
-                    if round == 0 && polynomial.is_some() && s < 2 && trees[s].blocked() {
-                        trees[s].fold_blocks(challenge, Some(&equality), true)
+                    if let Some(polynomial) = firsts[s] {
+                        match round {
+                            0 => bivariate_messages(polynomial, F192::ZERO, challenge)[1],
+                            1 => trees[s].fold_blocks(round_point[0], Some(challenge), Some(&equality), false),
+                            _ => trees[s].fold_and_message(challenge, &equality),
+                        }
+                    } else if round == 0 && polynomial.is_some() && s < 2 && trees[s].blocked() {
+                        trees[s].fold_blocks(challenge, None, Some(&equality), true)
                     } else {
                         trees[s].fold_and_message(challenge, &equality)
                     }
