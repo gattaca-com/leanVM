@@ -11,8 +11,10 @@
 use primitives::field::F192;
 
 use crate::basis::{PolyEval, PowerBasis, add_mul};
+use crate::keccak::{BITS, along};
 
 pub type Element = [u64; 3];
+pub const FACTOR_ROW: usize = 3 * 64;
 
 /// A row kernel's vector form, where one is compiled and `width` is whole vectors of it, else
 /// `portable`. The caller bounds every row.
@@ -119,6 +121,78 @@ impl PowerField {
     pub fn dot_pair(&self, a: [&[u64]; 2], b: [&[u64]; 2], width: usize) -> ([u64; 6], [u64; 6]) {
         assert!(a.iter().chain(&b).all(|row| row.len() >= 3 * width));
         row_kernel!(width, dot_pair(a, b, width), dot_pair_portable(a, b, width))
+    }
+
+    /// The dot products of `B[j] = weights[j] * (kappa + T[j + 1]) + constant[j]` and `T[j + 2]`,
+    /// at zero and infinity over two rows. Weights and constants are by lane, then by word.
+    pub fn chi_dot_pair(
+        &self,
+        t: [&[u64]; 2],
+        weights: &[u64],
+        constant: &[u64],
+        kappa: &Element,
+        scratch: &mut [u64],
+    ) -> ([u64; 6], [u64; 6]) {
+        assert!(
+            t.into_iter()
+                .chain([weights, constant])
+                .all(|row| row.len() >= 3 * BITS)
+        );
+        assert!(scratch.len() >= 4 * FACTOR_ROW);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+        if 64usize.is_multiple_of(x86::STEP) {
+            // SAFETY: the rows are bounded above, and a lane contains whole vectors.
+            return unsafe { x86::chi_dot_pair(self, t, weights, constant, kappa, scratch) };
+        }
+        self.chi_dot_pair_by_lane(t, weights, constant, kappa, scratch)
+    }
+
+    fn chi_dot_pair_by_lane(
+        &self,
+        t: [&[u64]; 2],
+        weights: &[u64],
+        constant: &[u64],
+        kappa: &Element,
+        scratch: &mut [u64],
+    ) -> ([u64; 6], [u64; 6]) {
+        let (b, shifted) = scratch.split_at_mut(2 * FACTOR_ROW);
+        let (mut zero, mut infinity) = ([0u64; 6], [0u64; 6]);
+        for lane in 0..BITS / 64 {
+            for (half, t) in t.into_iter().enumerate() {
+                let (b, shifted) = (
+                    &mut b[half * FACTOR_ROW..][..FACTOR_ROW],
+                    &mut shifted[half * FACTOR_ROW..][..FACTOR_ROW],
+                );
+                let at = along(64 * lane, 1);
+                for k in 0..3 {
+                    for z in 0..64 {
+                        shifted[64 * k + z] = t[k * BITS + at + z] ^ kappa[k];
+                    }
+                }
+                let at = FACTOR_ROW * lane;
+                self.mul_row(
+                    b,
+                    &weights[at..][..FACTOR_ROW],
+                    shifted,
+                    &constant[at..][..FACTOR_ROW],
+                    64,
+                );
+                let at = along(64 * lane, 2);
+                for k in 0..3 {
+                    shifted[64 * k..][..64].copy_from_slice(&t[k * BITS + at..][..64]);
+                }
+            }
+            let (z, i) = self.dot_pair(
+                [&b[..FACTOR_ROW], &b[FACTOR_ROW..]],
+                [&shifted[..FACTOR_ROW], &shifted[FACTOR_ROW..]],
+                64,
+            );
+            for k in 0..6 {
+                zero[k] ^= z[k];
+                infinity[k] ^= i[k];
+            }
+        }
+        (zero, infinity)
     }
 
     /// `dst[j] = lo[j] + challenge * (lo[j] + hi[j])`.
@@ -320,6 +394,10 @@ mod x86 {
                     }
                 }
             }
+            finish_dot(&acc)
+        }
+
+        fn finish_dot(acc: &[[V; 5]; 2]) -> ([u64; 6], [u64; 6]) {
             let finish = |acc: &[V; 5]| {
                 let mut out = [0u64; 6];
                 for (s, sum) in acc.iter().enumerate() {
@@ -330,6 +408,52 @@ mod x86 {
                 out
             };
             (finish(&acc[0]), finish(&acc[1]))
+        }
+
+        pub fn chi_dot_pair(
+            field: &PowerField,
+            t: [&[u64]; 2],
+            weights: &[u64],
+            constant: &[u64],
+            kappa: &Element,
+            scratch: &mut [u64],
+        ) -> ([u64; 6], [u64; 6]) {
+            let kappa: [V; 3] = std::array::from_fn(|k| V::splat(kappa[k]));
+            let mut acc = [[V::zero(); 5]; 2];
+            for lane in 0..BITS / 64 {
+                let (weights, constant) = (&weights[FACTOR_ROW * lane..], &constant[FACTOR_ROW * lane..]);
+                let at = along(64 * lane, 1);
+                for (half, t) in t.into_iter().enumerate() {
+                    let b = &mut scratch[half * FACTOR_ROW..][..FACTOR_ROW];
+                    for z in (0..64).step_by(STEP) {
+                        let (w, c, shifted) = (
+                            load3(weights, 64, z),
+                            load3(constant, 64, z),
+                            xor3(&load3(t, BITS, at + z), &kappa),
+                        );
+                        let product = reduce_pair(field, &partial(&w, &shifted));
+                        store3(b, 64, z, xor3(&c, &product));
+                    }
+                }
+                let at = along(64 * lane, 2);
+                for z in (0..64).step_by(STEP) {
+                    let (a0, a1, b0, b1) = (
+                        load3(scratch, 64, z),
+                        load3(&scratch[FACTOR_ROW..], 64, z),
+                        load3(t[0], BITS, at + z),
+                        load3(t[1], BITS, at + z),
+                    );
+                    for (acc, p) in acc
+                        .iter_mut()
+                        .zip([partial(&a0, &b0), partial(&xor3(&a0, &a1), &xor3(&b0, &b1))])
+                    {
+                        for s in 0..5 {
+                            acc[s] = acc[s].xor(p[0][s].xor(p[1][s]));
+                        }
+                    }
+                }
+            }
+            finish_dot(&acc)
         }
 
         pub fn reduce_row(field: &PowerField, dst: &mut [u64], wide: &[u64], width: usize) {
@@ -527,6 +651,21 @@ mod neon {
 mod tests {
     use super::*;
     use primitives::test_rng::Rng;
+
+    #[test]
+    fn chi_factors_match_separate_row_operations() {
+        let mut rng = Rng::new(43);
+        let field = PowerField::new(rng.ext()).unwrap();
+        let rows: [Vec<u64>; 4] = std::array::from_fn(|_| (0..3 * BITS).map(|_| rng.next_u64()).collect());
+        let kappa = std::array::from_fn(|_| rng.next_u64());
+        let mut scratch = vec![0; 4 * FACTOR_ROW];
+        for high in [&rows[1], &rows[0]] {
+            let t = [rows[0].as_slice(), high.as_slice()];
+            let expected = field.chi_dot_pair_by_lane(t, &rows[2], &rows[3], &kappa, &mut scratch);
+            let actual = field.chi_dot_pair(t, &rows[2], &rows[3], &kappa, &mut scratch);
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn arithmetic_matches_the_standard_basis() {
