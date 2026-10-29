@@ -23,7 +23,9 @@ use crate::open::fold;
 use crate::power::{Element, FACTOR_ROW, PowerField, get, set};
 use crate::protocol::{Claim, chi_weights, mu_at, sum};
 use crate::rmfe::PROD_BITS;
-use crate::witness::{Recompute, Shape, Witness, transpose64, words};
+use crate::witness::{Recompute, Shape, Witness, words};
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
+use crate::witness::transpose64;
 
 /// The pattern index of a binary assignment.
 fn ternary(b: usize) -> usize {
@@ -31,9 +33,12 @@ fn ternary(b: usize) -> usize {
 }
 
 /// Digits a weight splits into, and the values of one.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 const DIGIT_BITS: usize = 8;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 const DIGITS: usize = 192 / DIGIT_BITS;
 /// Values of half a digit.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 const NIBBLE: usize = 1 << (DIGIT_BITS / 2);
 /// The bits of a block position's products, 48 to each pack.
 const PAYLOAD_BITS: usize = 48 * PACKS;
@@ -86,6 +91,7 @@ impl Part {
         Self(out)
     }
 
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
     #[inline(always)]
     fn add(&mut self, other: &Self) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
@@ -162,6 +168,7 @@ fn add_avx2(dst: &mut [u64; PART_WORDS], src: &[u64; PART_WORDS]) {
 }
 
 /// Digit `d` of a weight.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 #[inline(always)]
 fn digit(weight: F192, d: usize) -> usize {
     let w = [weight.c0, weight.c1, weight.c2];
@@ -170,11 +177,13 @@ fn digit(weight: F192, d: usize) -> usize {
 
 /// The positions grouped by each digit of their weight: those whose digit `d` is `v` are
 /// `order[d][starts[d][v]..starts[d][v + 1]]`.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 struct Groups {
     order: Vec<[u16; BITS]>,
     starts: Vec<[u16; (1 << DIGIT_BITS) + 1]>,
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 impl Groups {
     fn new(weights: &[F192]) -> Self {
         let mut order = vec![[0u16; BITS]; DIGITS];
@@ -236,6 +245,159 @@ impl Groups {
     }
 }
 
+/// A block's payloads summed over the positions, each weighted by its position's weight, then
+/// by the block's weight: [`Groups`] of the weights' digits, rows of bits, then field elements.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
+struct Weigh(Groups);
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
+impl Weigh {
+    fn new(weights: &[F192]) -> Self {
+        Self(Groups::new(weights))
+    }
+
+    fn scratch() -> Vec<[Part; 192]> {
+        vec![[Part::ZERO; 192]; PACKS / PART]
+    }
+
+    fn add(&self, payloads: &[[Part; BITS]], rows: &mut [[Part; 192]], weight: F192, sums: &mut [F192Unreduced]) {
+        for (payloads, rows) in payloads.iter().zip(rows.iter_mut()) {
+            self.0.add_rows(payloads, rows);
+        }
+        // Row `r` holds bit `r` of each payload bit's weighted sum: transposed, they are
+        // field elements, which the block's weight multiplies.
+        let mut columns = [[0u64; 64]; 3];
+        for m in 0..PAYLOAD_BITS / 64 {
+            let (q, w) = (m / PART_WORDS, m % PART_WORDS);
+            for (k, column) in columns.iter_mut().enumerate() {
+                for (b, word) in column.iter_mut().enumerate() {
+                    *word = rows[q][64 * k + b].0[w];
+                }
+                transpose64(column);
+            }
+            for (t, sum) in sums[64 * m..][..64].iter_mut().enumerate() {
+                *sum ^= weight.mul_unreduced(F192::new(columns[0][t], columns[1][t], columns[2][t]));
+            }
+        }
+    }
+}
+
+/// [`Weigh`] as a product of bit matrices over GF(2), eight positions at a time: the payload bits
+/// of eight positions are a byte, which a GF2P8AFFINE matrix of their weights' bits sends to one
+/// byte of the weighted sum. The payloads are read once, where digit groups read them per digit.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+struct Weigh(Vec<[u64; 24]>);
+
+/// Chunks of eight positions, and registers of a payload.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+const CHUNKS: usize = BITS / 8;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+impl Weigh {
+    /// Matrix `r` of chunk `c` takes bit `k` of an input byte from position `8c + k`, and makes
+    /// output bit `t` from bit `8r + t` of each one's weight. Byte `7 - t` is that output's row.
+    fn new(weights: &[F192]) -> Self {
+        let mut matrices = vec![[0u64; 24]; CHUNKS];
+        for (j, w) in weights.iter().enumerate() {
+            let (c, k) = (j / 8, j % 8);
+            for (r, m) in matrices[c].iter_mut().enumerate() {
+                let byte = [w.c0, w.c1, w.c2][r / 8] >> (8 * (r % 8)) & 0xff;
+                for t in (0..8).filter(|t| byte >> t & 1 == 1) {
+                    *m |= 1 << (8 * (7 - t) + k);
+                }
+            }
+        }
+        Self(matrices)
+    }
+
+    /// The payload bits by bit, `PAYLOAD_BITS / 64` registers per chunk: byte `i` of register
+    /// `CHUNKS * g + c` holds payload bit `64 g + i` of chunk `c`'s positions.
+    fn scratch() -> Vec<[u64; 8]> {
+        vec![[0; 8]; PAYLOAD_BITS / 64 * CHUNKS]
+    }
+
+    fn add(&self, payloads: &[[Part; BITS]], bits: &mut [[u64; 8]], weight: F192, sums: &mut [F192Unreduced]) {
+        assert!(bits.len() == PAYLOAD_BITS / 64 * CHUNKS && sums.len() == PAYLOAD_BITS);
+        // SAFETY: the features are enabled at compile time.
+        unsafe { weigh_gfni(&self.0, &payloads[0], bits, weight, sums) }
+    }
+}
+
+/// The 8 x 8 transpose of eight registers' words: word `k` of output `w` is word `w` of input `k`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[target_feature(enable = "avx512f")]
+#[inline]
+fn transpose8(a: [core::arch::x86_64::__m512i; 8]) -> [core::arch::x86_64::__m512i; 8] {
+    use core::arch::x86_64::*;
+    let idx = |v: [i64; 8]| _mm512_setr_epi64(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    let mut out = a;
+    // Swap 4 x 4, then 2 x 2, then 1 x 1 blocks.
+    for (step, lo, hi) in [
+        (4, [0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]),
+        (2, [0, 1, 8, 9, 4, 5, 12, 13], [2, 3, 10, 11, 6, 7, 14, 15]),
+        (1, [0, 8, 2, 10, 4, 12, 6, 14], [1, 9, 3, 11, 5, 13, 7, 15]),
+    ] {
+        let prev = out;
+        for i in (0..8).filter(|i| i & step == 0) {
+            out[i] = _mm512_permutex2var_epi64(prev[i], idx(lo), prev[i + step]);
+            out[i + step] = _mm512_permutex2var_epi64(prev[i], idx(hi), prev[i + step]);
+        }
+    }
+    out
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+fn weigh_gfni(
+    matrices: &[[u64; 24]],
+    payloads: &[Part; BITS],
+    bits: &mut [[u64; 8]],
+    weight: F192,
+    sums: &mut [F192Unreduced],
+) {
+    use core::arch::x86_64::*;
+    use primitives::simd::{load, store};
+    const G: usize = PAYLOAD_BITS / 64;
+    // Byte `8b + 7 - k` of the output is byte `b` of word `k`, then byte `8b + t` bit `k` is its bit `t`.
+    let spread: [u8; 64] = std::array::from_fn(|o| (8 * (7 - o % 8) + o / 8) as u8);
+    let spread = load(&spread[..], 0);
+    let unit = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+    for c in 0..CHUNKS {
+        for v in 0..PART_WORDS / 8 {
+            let words = transpose8(std::array::from_fn(|k| load(&payloads[8 * c + k].0, v)));
+            for (w, x) in words.into_iter().enumerate() {
+                let x = _mm512_gf2p8affine_epi64_epi8(unit, _mm512_permutexvar_epi8(spread, x), 0);
+                store(&mut bits[CHUNKS * (8 * v + w) + c], 0, x);
+            }
+        }
+    }
+    // Byte `8i + r` of the output is byte `8r + i` of the input: an 8 x 8 byte transpose per word.
+    let gather: [u8; 64] = std::array::from_fn(|o| (8 * (o % 8) + o / 8) as u8);
+    let gather = load(&gather[..], 0);
+    let mut limbs = [[0u64; 64]; 3];
+    for g in 0..G {
+        let mut acc = [_mm512_setzero_si512(); 24];
+        let bits = &bits[CHUNKS * g..][..CHUNKS];
+        for (pair, m) in bits.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0) {
+            let (x0, x1) = (load(&pair[0], 0), load(&pair[1], 0));
+            for (r, acc) in acc.iter_mut().enumerate() {
+                let a = _mm512_gf2p8affine_epi64_epi8(x0, _mm512_set1_epi64(m[0][r] as i64), 0);
+                let b = _mm512_gf2p8affine_epi64_epi8(x1, _mm512_set1_epi64(m[1][r] as i64), 0);
+                *acc = _mm512_ternarylogic_epi64(*acc, a, b, 0x96);
+            }
+        }
+        // Byte `i` of `acc[r]` is byte `r` of payload bit `64 g + i`'s sum.
+        for (limb, acc) in limbs.iter_mut().zip(acc.as_chunks::<8>().0) {
+            for (m, x) in transpose8(*acc).into_iter().enumerate() {
+                store(&mut limb[..], m, _mm512_permutexvar_epi8(gather, x));
+            }
+        }
+        for (t, sum) in sums[64 * g..][..64].iter_mut().enumerate() {
+            *sum ^= weight.mul_unreduced(F192::new(limbs[0][t], limbs[1][t], limbs[2][t]));
+        }
+    }
+}
+
 struct Layer<'a> {
     witness: &'a Witness,
     /// The round whose `chi` each segment's claim is on.
@@ -286,22 +448,16 @@ impl Layer<'_> {
     ///
     /// Nothing here knows where the polynomials will be evaluated, so each product meets its
     /// weight bit by bit. The position weights are the same in every block, so a block's sum
-    /// over positions is grouped by their digits ([`Groups`]), a part of the packs at a time;
-    /// only that sum meets the block's weight, as field elements.
+    /// over positions is a product of bit matrices ([`Weigh`]); only that sum meets the block's
+    /// weight, as field elements.
     fn pack_products(&self, claim: &Claim) -> Vec<[F192; PROD_BITS]> {
         let weights = self.task_weights(&eq_table(&claim.point[PACK_VARS..]));
-        let groups = Groups::new(&claim.weights);
+        let weigh = Weigh::new(&claim.weights);
         let sums = parallel::map_reduce_with_state(
             self.n_tasks(),
-            || {
-                (
-                    vec![[Part::ZERO; BITS]; PACKS / PART],
-                    vec![[Part::ZERO; 192]; PACKS / PART],
-                    Recompute::new(),
-                )
-            },
+            || (vec![[Part::ZERO; BITS]; PACKS / PART], Weigh::scratch(), Recompute::new()),
             || vec![F192Unreduced::ZERO; PAYLOAD_BITS],
-            |(payloads, rows, recompute), sums, task| {
+            |(payloads, scratch, recompute), sums, task| {
                 let (_, _, block) = self.block(recompute, task);
                 for r in 0..5 {
                     for z in 0..64 {
@@ -315,24 +471,7 @@ impl Layer<'_> {
                         }
                     }
                 }
-                for (payloads, rows) in payloads.iter().zip(rows.iter_mut()) {
-                    groups.add_rows(payloads, rows);
-                }
-                // Row `r` holds bit `r` of each payload bit's weighted sum: transposed, they are
-                // field elements, which the block's weight multiplies.
-                let mut columns = [[0u64; 64]; 3];
-                for m in 0..PAYLOAD_BITS / 64 {
-                    let (q, w) = (m / PART_WORDS, m % PART_WORDS);
-                    for (k, column) in columns.iter_mut().enumerate() {
-                        for (b, word) in column.iter_mut().enumerate() {
-                            *word = rows[q][64 * k + b].0[w];
-                        }
-                        transpose64(column);
-                    }
-                    for (t, sum) in sums[64 * m..][..64].iter_mut().enumerate() {
-                        *sum ^= weights[task].mul_unreduced(F192::new(columns[0][t], columns[1][t], columns[2][t]));
-                    }
-                }
+                weigh.add(payloads, scratch, weights[task], sums);
             },
             |mut a, b| {
                 for (x, y) in a.iter_mut().zip(b) {
