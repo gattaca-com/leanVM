@@ -195,6 +195,8 @@ pub fn layout(blocks: &[Block]) -> Layout {
 struct Terms<'a> {
     lins: Vec<(&'a [F64], F192)>,
     prods: Vec<(&'a [F64], &'a [F64], F192)>,
+    // First padded row, address powers, address coefficient, and the remaining fingerprint.
+    memory_tail: Option<(usize, &'a [F64], F192, F192)>,
 }
 
 /// Flatten one coordinate into leaf terms at coefficient `w`. A [`Coord::Sum`]
@@ -387,6 +389,11 @@ fn publish_task<G: Lanes>(
 /// product contributes its three raw limb products (3 PMULL, no reduction tail) and one combined
 /// reduction ends the row, bit-identical to summing reduced `mul_base` terms.
 fn leaf_row((constant, terms): &(F192, Terms), z: usize) -> F192 {
+    if let Some((start, index, weight, value)) = terms.memory_tail
+        && z >= start
+    {
+        return value + weight.mul_base(index[z]);
+    }
     let mut acc = F192Unreduced::ZERO;
     for (k, c) in &terms.lins {
         acc ^= c.mul_base_unreduced(k[z]);
@@ -400,6 +407,11 @@ fn leaf_row((constant, terms): &(F192, Terms), z: usize) -> F192 {
 /// Eight leaves of a block from row `z`: every mixed product of a term is one wide kernel call,
 /// and the reduction happens once per eight rows.
 fn leaf_rows8((constant, terms): &(F192, Terms), z: usize) -> F192x8 {
+    if let Some((start, index, weight, value)) = terms.memory_tail
+        && z >= start
+    {
+        return mul_base_splat8(weight, index[z..z + 8].try_into().unwrap()).reduce_lanes() + F192x8::splat(value);
+    }
     fn eight(k: &[F64], z: usize) -> &[F64; 8] {
         k[z..z + 8].try_into().expect("eight words")
     }
@@ -522,6 +534,7 @@ impl gkr::LeafColumns for ColumnLeaves<'_> {
 /// the returned [`ColumnLeaves`] computes them again from the columns, which costs less DRAM
 /// traffic than reading them back. A side that does not tile its layout keeps all its leaves.
 #[timed]
+/// `memory_len` bounds the real prefix of columns `MEM_LO..=MFCNT`; their suffixes must each be constant.
 pub fn build_leaves<'a>(
     sides: &[(&'a [Block], &'a Layout); 2],
     cols: &[&'a [F64]],
@@ -529,6 +542,7 @@ pub fn build_leaves<'a>(
     beta: F192,
     gpow: &'a [F64],
     columns: bool,
+    memory_len: usize,
 ) -> (Vec<gkr::Leaves<'static>>, Option<ColumnLeaves<'a>>) {
     let mut sides: Vec<Side> = sides
         .iter()
@@ -575,6 +589,31 @@ pub fn build_leaves<'a>(
                     let mut terms = Terms::default();
                     for (i, c) in blk.coords.iter().enumerate() {
                         push_terms(c, w[i], cols, gpow, &mut terms, &mut const_part);
+                    }
+                    let start = memory_len.div_ceil(8) * 8;
+                    if start < 1 << blk.kappa
+                        && blk.coords.iter().any(|c| matches!(c, Coord::Index))
+                        && blk.coords.iter().all(|c| match c {
+                            Coord::Const(_) | Coord::Index => true,
+                            Coord::Col(i) => *i <= crate::cpu::MFCNT,
+                            _ => false,
+                        })
+                        && blk
+                            .coords
+                            .iter()
+                            .any(|c| matches!(c, Coord::Col(i) if *i <= crate::cpu::MFCNT))
+                    {
+                        let mut value = beta;
+                        let mut index = F192::ZERO;
+                        for (c, &weight) in blk.coords.iter().zip(w) {
+                            match c {
+                                Coord::Const(v) => value += weight.mul_base(*v),
+                                Coord::Index => index += weight,
+                                Coord::Col(i) if *i <= crate::cpu::MFCNT => value += weight.mul_base(cols[*i][start]),
+                                _ => unreachable!("memory blocks contain only memory columns and the index"),
+                            }
+                        }
+                        terms.memory_tail = Some((start, gpow, index, value));
                     }
                     (const_part, terms)
                 })
@@ -1071,6 +1110,31 @@ fn fresh_coords<'a>(
     }
 }
 
+/// Evaluate columns with a constant suffix, splitting only their real prefix into aligned cubes.
+fn mle_eval_padded_many(jobs: &[(&[F64], &[F192], usize)]) -> Vec<F192> {
+    let mut tasks = Vec::new();
+    let mut weights = Vec::new();
+    let mut out = vec![F192::ZERO; jobs.len()];
+    for (j, &(values, point, real)) in jobs.iter().enumerate() {
+        assert!(real <= values.len());
+        if real < values.len() {
+            out[j] = padding_weight(point, real).mul_base(values[real]);
+        }
+        let mut at = 0;
+        while at < real {
+            let k = (real - at).ilog2() as usize;
+            let n = 1 << k;
+            tasks.push((&values[at..at + n], &point[..k]));
+            weights.push((j, eq_eval_bits(at >> k, &point[k..])));
+            at += n;
+        }
+    }
+    for ((j, weight), value) in weights.into_iter().zip(mle_eval_many(&tasks)) {
+        out[j] += weight * value;
+    }
+    out
+}
+
 /// Prover-side decomposition: writes each FRESH committed value onto the stream and records the
 /// matching claim (block/coord order); duplicates reuse the recorded value.
 ///
@@ -1277,6 +1341,7 @@ pub struct BusProof {
     pub blocks: Vec<TableBlocks>,
 }
 
+/// The four memory columns must be constant from `memory_len` to their logical end.
 #[timed]
 pub fn prove_balance(
     push: &[Block],
@@ -1286,6 +1351,7 @@ pub fn prove_balance(
     owners: &[Vec<Option<(usize, usize)>>; 3],
     tables: &[(usize, usize)],
     rows: &[usize],
+    memory_len: usize,
     ps: &mut ProverState,
 ) -> BusProof {
     let push_lay = layout(push);
@@ -1310,8 +1376,15 @@ pub fn prove_balance(
     // With several threads, GKR recomputes most of their leaves from the columns instead of storing them.
     let columns = parallel::num_threads() > 1;
     let (push_leaves, pull_leaves, count_leaves, column_leaves) = crate::stage!("Bus leaves", || {
-        let (leaves, column_leaves) =
-            build_leaves(&[(push, &push_lay), (pull, &pull_lay)], cols, &w, beta, &gpow, columns);
+        let (leaves, column_leaves) = build_leaves(
+            &[(push, &push_lay), (pull, &pull_lay)],
+            cols,
+            &w,
+            beta,
+            &gpow,
+            columns,
+            memory_len,
+        );
         let [push_leaves, pull_leaves]: [_; 2] = leaves.try_into().ok().expect("two sides");
         (
             push_leaves,
@@ -1360,16 +1433,26 @@ pub fn prove_balance(
         for (s, &(blocks, ..)) in sides.iter().enumerate() {
             fresh_coords(blocks, &owners[s], &claims, &bus_gkr.point, &mut jobs, &mut publics);
         }
-        let tasks: Vec<(&[F64], &[F192])> = jobs
+        let tasks: Vec<(&[F64], &[F192], usize)> = jobs
             .iter()
-            .map(|&(col, kappa)| (cols[col], &bus_gkr.point[..kappa]))
+            .map(|&(col, kappa)| {
+                (
+                    cols[col],
+                    &bus_gkr.point[..kappa],
+                    if col <= crate::cpu::MFCNT {
+                        memory_len.min(cols[col].len())
+                    } else {
+                        cols[col].len()
+                    },
+                )
+            })
             .chain(
                 publics
                     .iter()
-                    .map(|&(vals, kappa)| (&vals[..], &bus_gkr.point[..kappa])),
+                    .map(|&(vals, kappa)| (&vals[..], &bus_gkr.point[..kappa], vals.len())),
             )
             .collect();
-        let values = mle_eval_many(&tasks);
+        let values = mle_eval_padded_many(&tasks);
         let (fresh, public_values) = values.split_at(jobs.len());
         for (&(vals, kappa), &v) in publics.iter().zip(public_values) {
             public.insert((Arc::as_ptr(vals) as usize, kappa), v);
@@ -1582,6 +1665,83 @@ fn tables_and_prods_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_tail_leaves_match_dense_at_boundaries() {
+        let n = 1 << 14;
+        let index = primitives::field::g_powers(n);
+        let weights = std::array::from_fn::<_, 6, _>(|i| F192::new(i as u64 + 3, 17, 29));
+        let block = Block::full(
+            14,
+            vec![
+                Coord::Const(F64(7)),
+                Coord::Index,
+                Coord::Col(0),
+                Coord::Col(1),
+                Coord::Col(2),
+                Coord::Col(3),
+            ],
+        );
+        let blocks = std::slice::from_ref(&block);
+        let lay = layout(blocks);
+        for real in [0, 1, 7, 8, 9, 63, 64, 65, 1023, 1024, 1025, 8191, 8192, 8193, n] {
+            let values: Vec<_> = (0..4 * n)
+                .map(|i| {
+                    if i % n < real {
+                        F64((i as u64).wrapping_mul(0xabcdef))
+                    } else {
+                        F64(u64::from(i / n == 3))
+                    }
+                })
+                .collect();
+            let cols = std::array::from_fn::<_, 4, _>(|c| &values[c * n..(c + 1) * n]);
+            let (dense, _) = build_leaves(&[(blocks, &lay); 2], &cols, &weights, F192::Y, &index, false, n);
+            let (sparse, from_columns) =
+                build_leaves(&[(blocks, &lay); 2], &cols, &weights, F192::Y, &index, true, real);
+            let from_columns = from_columns.unwrap();
+            for side in 0..2 {
+                assert_eq!(dense[side].quads, sparse[side].quads, "real={real}");
+                let gkr::LeafData::Blocks(ref expected) = dense[side].leaves else {
+                    unreachable!()
+                };
+                for row in 0..n {
+                    assert_eq!(
+                        leaf_row(&from_columns.terms[side][0], row),
+                        <F192 as gkr::TreeField>::leaf(expected, row)
+                    );
+                }
+            }
+            for t in 0..gkr::LeafColumns::tasks(&from_columns) {
+                gkr::LeafColumns::task(&from_columns, t, &mut |side, b, got| {
+                    let gkr::LeafData::Blocks(ref expected) = dense[side].leaves else {
+                        unreachable!()
+                    };
+                    for (a, b) in got.iter().zip(expected[b]) {
+                        assert_eq!(a.to_array(), b.to_array(), "real={real}");
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn padded_mles_match_dense_at_boundaries() {
+        let point = std::array::from_fn::<_, 12, _>(|i| F192::new(i as u64 + 2, 3, 5));
+        for real in [0, 1, 7, 8, 9, 63, 64, 65, 1023, 1024, 1025, 4095, 4096] {
+            let values: Vec<_> = (0..3 * 4096)
+                .map(|i| {
+                    if i % 4096 < real {
+                        F64((i as u64).wrapping_mul(0xabcdef))
+                    } else {
+                        F64([0, 1, 0xfedcba][i / 4096])
+                    }
+                })
+                .collect();
+            let dense = std::array::from_fn::<_, 3, _>(|c| (&values[c * 4096..(c + 1) * 4096], &point[..]));
+            let padded = dense.map(|(v, p)| (v, p, real));
+            assert_eq!(mle_eval_padded_many(&padded), mle_eval_many(&dense), "real={real}");
+        }
+    }
 
     #[test]
     fn borrowed_count_columns_match_dense_proofs() {

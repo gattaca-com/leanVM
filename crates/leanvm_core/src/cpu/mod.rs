@@ -608,7 +608,17 @@ pub fn prove_with(
         let l = &w.layout;
         let cols = w.columns();
         let bus = crate::stage!("Prove bus", || {
-            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &l.rows, &mut ps)
+            leaf::prove_balance(
+                &l.push,
+                &l.pull,
+                &l.count,
+                &cols,
+                &owners,
+                &spans,
+                &l.rows,
+                exec.mem_used.next_multiple_of(1 << 10),
+                &mut ps,
+            )
         });
         let table_claims = crate::stage!("Prove constraints", || {
             // One sumcheck for all six tables (§constraints).
