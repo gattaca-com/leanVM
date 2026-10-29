@@ -350,20 +350,19 @@ pub(crate) fn affine_matrix(bytes: [u8; 8]) -> u64 {
 pub(crate) fn transpose8(a: [core::arch::x86_64::__m512i; 8]) -> [core::arch::x86_64::__m512i; 8] {
     use core::arch::x86_64::*;
     let idx = |v: [i64; 8]| _mm512_setr_epi64(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
-    let mut out = a;
+    // Register `i` of a stage pairs `i & !step` with `i | step`. Written as `from_fn`, the stages
+    // unroll whole: a filtered loop over the registers left them on the stack between stages.
+    let stage = |v: [__m512i; 8], step: usize, lo: [i64; 8], hi: [i64; 8]| -> [__m512i; 8] {
+        let (lo, hi) = (idx(lo), idx(hi));
+        std::array::from_fn(|i| {
+            let j = i & !step;
+            _mm512_permutex2var_epi64(v[j], if i & step == 0 { lo } else { hi }, v[j | step])
+        })
+    };
     // Swap 4 x 4, then 2 x 2, then 1 x 1 blocks.
-    for (step, lo, hi) in [
-        (4, [0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]),
-        (2, [0, 1, 8, 9, 4, 5, 12, 13], [2, 3, 10, 11, 6, 7, 14, 15]),
-        (1, [0, 8, 2, 10, 4, 12, 6, 14], [1, 9, 3, 11, 5, 13, 7, 15]),
-    ] {
-        let prev = out;
-        for i in (0..8).filter(|i| i & step == 0) {
-            out[i] = _mm512_permutex2var_epi64(prev[i], idx(lo), prev[i + step]);
-            out[i + step] = _mm512_permutex2var_epi64(prev[i], idx(hi), prev[i + step]);
-        }
-    }
-    out
+    let a = stage(a, 4, [0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]);
+    let a = stage(a, 2, [0, 1, 8, 9, 4, 5, 12, 13], [2, 3, 10, 11, 6, 7, 14, 15]);
+    stage(a, 1, [0, 8, 2, 10, 4, 12, 6, 14], [1, 9, 3, 11, 5, 13, 7, 15])
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
