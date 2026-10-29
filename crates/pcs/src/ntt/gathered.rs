@@ -40,7 +40,8 @@ use super::window::Window;
 /// # Tasks
 ///
 /// - A task is one residue over every block the buffer holds, from `first_block` on, block 0 last.
-/// - With a message, every block's rows come from the message, which may be the buffer's block 0.
+/// - With a message, it gathers the message's rows once, and every block transforms a copy of them.
+/// - The message may be the buffer's block 0, so block 0 goes last.
 /// - Tasks own disjoint residues, so no task reads rows another task writes.
 ///
 /// # With a lane-major message
@@ -98,7 +99,10 @@ impl<'a> GatheredPass<'a> {
         let subs = stage_subs(staged, log_step);
         let batch = if staged { BATCH * subs } else { 1 };
         let width = if staged { BATCH * 8 } else { num_ntts };
-        let (group_len, stage_len) = (rows * width, if staged { subs * rows * width } else { 0 });
+        // A message that is not lane-major gathers into a stage of one group; replicas gather per block.
+        let gathers = matches!(src, Source::Rows(_) | Source::InPlace);
+        let group_len = rows * width;
+        let stage_len = if staged { subs * group_len } else if gathers { group_len } else { 0 };
         let staging = match src {
             Source::Lanes(lanes) => Some(Stage::new(&lanes, log_step, rows, block_rows, num_ntts, subs)),
             _ => None,
@@ -154,10 +158,17 @@ impl<'a> GatheredPass<'a> {
                                 }
                             }
                         }
-                        _ => self.blocks.clone().rev().for_each(|block| {
-                            let dst = win.row(self.block_rows, block, t);
-                            self.group(layers, &mut late, win, base, block, t, None, dst)
-                        }),
+                        _ => {
+                            let msg = self.message_rows(base, win, t);
+                            if let Some(msg) = msg {
+                                self.gather(stage, msg);
+                            }
+                            for block in self.blocks.clone().rev() {
+                                let dst = win.row(self.block_rows, block, t);
+                                let from = msg.map(|_| &*stage);
+                                self.group(layers, &mut late, win, base, block, t, from, dst);
+                            }
+                        }
                     }
                 }
                 late.finish();
@@ -165,9 +176,32 @@ impl<'a> GatheredPass<'a> {
         });
     }
 
+    /// The first word of residue `r`'s rows in the message, or `None` if the blocks hold their own rows.
+    fn message_rows(&self, base: parallel::SendPtr<F64>, win: &Window, r: usize) -> Option<*const F64> {
+        let first = win.row(self.block_rows, self.first_block, r);
+        match self.src {
+            Source::Rows(msg) => Some(msg.as_ptr().wrapping_add(first)),
+            Source::InPlace => Some(base.0.cast_const().wrapping_add(first)),
+            Source::Replicas | Source::Lanes(_) => None,
+        }
+    }
+
+    /// Copy the group's rows, `step` rows apart from `src` on, into `dst`.
+    #[inline(always)]
+    fn gather(&self, dst: &mut [F64], src: *const F64) {
+        let (num_ntts, step) = (self.num_ntts, self.step);
+        for (i, dst) in dst.chunks_exact_mut(num_ntts).enumerate() {
+            // SAFETY:
+            // - The message and the buffer both cover every row addressed here.
+            // - Tasks own disjoint residues, so no other task writes these rows.
+            // - Block 0 is written last, after every read of the message in it.
+            dst.copy_from_slice(unsafe { std::slice::from_raw_parts(src.add(i * step * num_ntts), num_ntts) });
+        }
+    }
+
     /// Transform residue `r`'s group as layer-`layer` block `block`, and send it back to word `dst` on.
     ///
-    /// The rows are `from` the stage, or gathered from the message or the buffer.
+    /// The rows are `from` the stage, or gathered from the block's own rows of the buffer.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn group(
@@ -183,17 +217,8 @@ impl<'a> GatheredPass<'a> {
     ) {
         let (layer, g, num_ntts, step) = (self.layer, self.g, self.num_ntts, self.step);
         if from.is_none() {
-            // Every block copies the message's rows, which the buffer's block 0 may hold, or its own rows.
-            let own = win.row(self.block_rows, block, r);
-            let first = win.row(self.block_rows, self.first_block, r);
-            let src = self.src.group_src(base.0.cast_const(), own, first);
-            for (i, dst) in late.scratch().chunks_exact_mut(num_ntts).enumerate() {
-                // SAFETY:
-                // - The message and the buffer both cover every row addressed here.
-                // - Tasks own disjoint residues, so no other task writes these rows.
-                // - Block 0 is written last, after every read of the message in it.
-                dst.copy_from_slice(unsafe { std::slice::from_raw_parts(src.add(i * step * num_ntts), num_ntts) });
-            }
+            // Replicas: each block transforms its own rows of the buffer.
+            self.gather(late.scratch(), base.0.cast_const().wrapping_add(win.row(self.block_rows, block, r)));
         }
         late.transform(|scratch, mut hook| {
             layers.run(

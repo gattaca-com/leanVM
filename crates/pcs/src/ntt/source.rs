@@ -46,19 +46,6 @@ impl<'a> Source<'a> {
         }
     }
 
-    /// The first word of the rows a group reads, `own` for the group's block and `first` for the first block.
-    ///
-    /// - A message, in the buffer or apart, is read from the first block's rows.
-    /// - Once the buffer holds the replicas, each block reads its own rows.
-    #[inline(always)]
-    pub(super) fn group_src(&self, base: *const F64, own: usize, first: usize) -> *const F64 {
-        match self {
-            Source::Rows(m) => m.as_ptr().wrapping_add(first),
-            Source::Replicas => base.wrapping_add(own),
-            Source::InPlace | Source::Lanes(_) => base.wrapping_add(first),
-        }
-    }
-
     /// Transpose a lane-major message into block 0 of the buffer, which then holds it in place.
     pub(super) fn transpose_into(self, win: &mut Window, log_rows: usize) -> Self {
         let Source::Lanes(lanes) = self else { return self };
