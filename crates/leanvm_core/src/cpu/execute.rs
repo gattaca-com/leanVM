@@ -934,6 +934,15 @@ impl Program {
                     use crate::keccak::{ROW_CELLS, STATE_CELLS};
                     let k = crate::tables::KeccakOp::of(op);
                     let cells: [u32; ROW_CELLS] = std::array::from_fn(|c| k.cell(fp, c));
+                    // The output cells are usually untouched and cold: fetch them while the permutation runs.
+                    #[cfg(target_arch = "x86_64")]
+                    for &c in &cells[STATE_CELLS..] {
+                        // SAFETY: a prefetch of any address is harmless.
+                        unsafe {
+                            let line = m.cells.0.as_ptr().wrapping_add(c as usize).cast();
+                            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(line)
+                        };
+                    }
                     let input: [F192; STATE_CELLS] = std::array::from_fn(|c| m.read(cells[c]));
                     // The table reads every cell with a literal zero top limb, so anything
                     // else could not balance the bus.
