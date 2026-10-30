@@ -74,7 +74,7 @@ fn public_api_end_to_end() {
     //    commitment hashes each child's. `declare` selects the node's own raw signatures and
     //    the DA roots. Here every claim stays and one DA root goes.
     let narrowed = aggregate(
-        &[received.clone()],
+        std::slice::from_ref(&received),
         vec![],
         vec![],
         &[],

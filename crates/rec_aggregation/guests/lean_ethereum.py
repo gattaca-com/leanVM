@@ -381,8 +381,8 @@ STMT_CELLS = STMT_DEFER_OFF + 3 * STMT_PAIRS
 # carries that state through a heap run between loop frames, KECCAK_STATE cells a
 # step (`claim_list_digest`).
 KECCAK_STATE = KECCAK_STATE_PLACEHOLDER
-# Claims a declared claim list absorbs a loop frame: 68 cells, four block pairs.
-CLAIM_GROUP = CLAIM_GROUP_PLACEHOLDER
+# Cells a variable-length run absorbs a loop frame: one block pair (`stream_digest`).
+STREAM_FRAME = STREAM_FRAME_PLACEHOLDER
 
 # --------------------------------------------------------- WOTS+C (host-supplied)
 # Both schemes' one-time keys: chains of CHAIN_LENGTH positions, whose digits are
@@ -403,8 +403,11 @@ TW_MSG = TW_MSG_PLACEHOLDER
 HI_MUL = 2 ** 32
 STEP_MUL = 2 ** 61
 DIGEST_CELLS = 2
-# The first cell of a node's signer commitment preimage (`node_commitment`).
+# The first cell of a node's signer commitment preimage (`node_commitment`), of a raw
+# claim list's (`claim_list_digest`) and of one message group's.
 NODE_TAG = 1
+TAG_LIST = 2
+TAG_GROUP = 3
 
 # ----------------------------------------------------- leanXMSS (host-supplied)
 # Two layers of trees of height LX_HEIGHT over keys of LX_V chains. A layer's digest
@@ -3991,11 +3994,14 @@ def statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, defer):
     return st[0], st[1]
 
 
-# A declared claim list is hashed CLAIM_GROUP claims a loop frame: a claim is 64 bytes,
-# four cells, so a group is 68 cells, four block pairs, and the sponge state is carried
-# between frames through a heap chain of KECCAK_STATE cells a step, from the zero state.
-# Only the claims after the last whole group depend on the length: a `match` on their
-# count.
+# A declared claim list is hashed by message group. Every variable-length preimage
+# here is first laid out as a heap run of cells, then absorbed STREAM_FRAME cells a
+# loop frame (one block pair), the sponge state carried between frames through a heap
+# chain of KECCAK_STATE cells a step from the zero state, and the cells after the last
+# whole frame absorbed by a `match` on their count. A group's run is TAG_GROUP, its
+# message, then its keys, read off this node's table at consecutive slots whose
+# message must be the group's; the list's run is TAG_LIST then every group's digest.
+# Keccak's padding binds each run's length, so the two levels are injective on the list.
 
 
 @inline
@@ -4005,55 +4011,86 @@ def zero_state(chain):
     return
 
 
-def list_split(n_g):
-    # A list of n claims as (g^groups, g^rest), n = CLAIM_GROUP * groups + rest. The range
-    # checks and the product identity leave that split the only solution.
+def stream_split(len_g):
+    # A run of len cells as (g^frames, g^rest), len = STREAM_FRAME * frames + rest. The
+    # range checks and the product identity leave that split the only solution.
     split = StackBuf(2)
-    hint_witness(split, "signers_split")
-    groups = split[0]
+    hint_witness(split, "stream_split")
+    frames = split[0]
     rest = split[1]
-    assert log(rest) < CLAIM_GROUP
-    assert log(groups) < MAX_KEYS
+    assert log(rest) < STREAM_FRAME
+    assert log(frames) < MAX_KEYS
     # Both exponents are small and nonnegative, so this is an identity over the
-    # integers: CLAIM_GROUP * groups + rest == n.
-    assert groups ** CLAIM_GROUP * rest == n_g
-    return groups, rest
+    # integers: STREAM_FRAME * frames + rest == len.
+    assert frames ** STREAM_FRAME * rest == len_g
+    return frames, rest
 
 
-def claim_list_digest(entries_ptr, n_g):
-    # The hash of one scheme's declared claims: 64 bytes a claim, the claimed pubkey
-    # then the message it signed. An empty list hashes the empty string, and the
-    # padding binds the length.
+def stream_digest(run, len_g):
+    # The hash of the len cells at `run`, a whole frame a step, then the rest.
     digest = StackBuf(KECCAK_STATE)
-    if n_g == 1:
-        keccak([0, 0], [0, 0], digest, len=0)
-    else:
-        groups, rest = list_split(n_g)
-        chain = HeapBuf((groups * GEN) ** KECCAK_STATE)
-        zero_state(chain)
-        for xq in mul_range(1, groups):
-            st = chain * xq ** KECCAK_STATE
-            nxt = st * GEN ** KECCAK_STATE
-            blk = entries_ptr * xq ** (4 * CLAIM_GROUP)
-            for j in unroll(0, CLAIM_GROUP):
-                hint_witness(blk[4 * j:4 * j + 4], "claims")
-            keccak_cells(blk[0:4 * CLAIM_GROUP], nxt[0:KECCAK_STATE], state=st[0:KECCAK_STATE], final=0)
-        last = chain * groups ** KECCAK_STATE
-        d0, d1 = match(log(rest), range(0, CLAIM_GROUP), lambda k: claim_list_last(last, entries_ptr * groups ** (4 * CLAIM_GROUP), k))
-        digest[0] = d0
-        digest[1] = d1
+    frames, rest = stream_split(len_g)
+    chain = HeapBuf((frames * GEN) ** KECCAK_STATE)
+    zero_state(chain)
+    for xq in mul_range(1, frames):
+        st = chain * xq ** KECCAK_STATE
+        nxt = st * GEN ** KECCAK_STATE
+        blk = run * xq ** STREAM_FRAME
+        keccak_cells(blk[0:STREAM_FRAME], nxt[0:KECCAK_STATE], state=st[0:KECCAK_STATE], final=0)
+    last = chain * frames ** KECCAK_STATE
+    d0, d1 = match(log(rest), range(0, STREAM_FRAME), lambda k: stream_last(last, run * frames ** STREAM_FRAME, k))
+    digest[0] = d0
+    digest[1] = d1
     return digest[0], digest[1]
 
 
-def claim_list_last(state, blk, k: Const):
+def stream_last(state, blk, k: Const):
     digest = StackBuf(KECCAK_STATE)
     if const(k == 0):
         keccak_cells([0], digest, state=state[0:KECCAK_STATE], len=0)
     else:
-        for j in unroll(0, k):
-            hint_witness(blk[4 * j:4 * j + 4], "claims")
-        keccak_cells(blk[0:4 * k], digest, state=state[0:KECCAK_STATE])
+        keccak_cells(blk[0:k], digest, state=state[0:KECCAK_STATE])
     return digest[0], digest[1]
+
+
+def claim_list_digest(entries_ptr, n_g):
+    # The hash of one scheme's declared claims, by message group. The table's declared
+    # prefix is the groups' keys in order, each slot carrying its group's message, so
+    # the n slots a raw signature can verify against are exactly the hashed claims.
+    n_groups_g = hint_witness("n_groups")
+    assert log(n_groups_g) < MAX_KEYS
+    groups_len = GEN * n_groups_g ** 2
+    groups = HeapBuf(groups_len)
+    groups[1] = TAG_LIST
+    pos = HeapBuf(n_groups_g * GEN)  # loop-carried claim count, in the exponent
+    pos[1] = 1
+    for xg in mul_range(1, n_groups_g):
+        meta = StackBuf(3)
+        hint_witness(meta, "group_meta")  # the message's two cells, then g^keys
+        n_keys_g = meta[2]
+        assert log(n_keys_g) < MAX_KEYS
+        at = pos[xg]
+        run_len = GEN ** 3 * n_keys_g ** 2
+        run = HeapBuf(run_len)
+        run[1] = TAG_GROUP
+        run[GEN] = meta[0]
+        run[GEN ** 2] = meta[1]
+        for xk in mul_range(1, n_keys_g):
+            slot = entries_ptr * ((at * xk) ** 4)
+            hint_witness(slot[0:4], "claims")
+            assert slot[GEN ** 2] == run[GEN]
+            assert slot[GEN ** 3] == run[GEN ** 2]
+            key = run * (xk ** 2) * GEN ** 3
+            key[1] = slot[1]
+            key[GEN] = slot[GEN]
+        g_0, g_1 = stream_digest(run, run_len)
+        entry = groups * (xg ** 2) * GEN
+        entry[1] = g_0
+        entry[GEN] = g_1
+        pos[xg * GEN] = at * n_keys_g
+    assert pos[n_groups_g] == n_g
+    d0, d1 = stream_digest(groups, groups_len)
+    return d0, d1
 
 
 def node_commitment(kids, xd_0, xd_1, sd_0, sd_1, k: Const):
@@ -4319,8 +4356,8 @@ def main():
     # verifier, which holds it) followed by its own duplicate slots. The coverage
     # indices below run over one space: leanXMSS, then leanSPHINCS, then DA.
     #
-    # Each list's digest is a plain hash of its claims, 64 bytes a claim, its padding
-    # binding its length; both digests end the signer commitment hashed below.
+    # Each list's digest hashes its claims by message group (`claim_list_digest`);
+    # both digests end the signer commitment hashed below.
     lx_table = HeapBuf(lx_slots_g ** 4)
     lean_sphincs_table = HeapBuf(lean_sphincs_slots_g ** 4)
     xd_0, xd_1 = claim_list_digest(lx_table, n_lx_g)
