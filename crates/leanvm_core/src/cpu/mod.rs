@@ -583,14 +583,14 @@ pub fn prove_with(
         if reserve.capacity() != 0 {
             scope.spawn(|| {
                 let _span = prefault.enter();
-                parallel::chunks_mut(reserve.spare_capacity_mut(), 1 << 21, |_, chunk| {
-                    for page in chunk.iter_mut().step_by(4096) {
-                        page.write(0);
-                    }
-                    if let Some(last) = chunk.last_mut() {
-                        last.write(0);
-                    }
-                });
+                // A single helper leaves cores for execution and the Keccak workers.
+                let pages = reserve.spare_capacity_mut();
+                for page in pages.iter_mut().step_by(4096) {
+                    page.write(0);
+                }
+                if let Some(last) = pages.last_mut() {
+                    last.write(0);
+                }
             });
         }
         crate::stage!("Execute program", || {
