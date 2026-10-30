@@ -225,6 +225,86 @@ impl PowerField {
         )
     }
 
+    /// Fold rows indexed by `x + 2y`, with challenges `[r, s, r*s]`, sharing one reduction.
+    pub fn fold_quad(&self, dst: &mut [u64], rows: [&[u64]; 4], challenges: &[Element; 3], width: usize) {
+        assert!(dst.len() >= 3 * width && rows.iter().all(|row| row.len() >= 3 * width));
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+        if width.is_multiple_of(x86::STEP) {
+            // SAFETY: the features are enabled at compile time and the rows are bounded above.
+            unsafe { x86::fold_quad(self, dst, rows, challenges, width) };
+            return;
+        }
+        for j in 0..width {
+            let [a, b, c, d] = rows.map(|row| get(row, width, j));
+            let differences: [Element; 3] = [
+                std::array::from_fn(|k| a[k] ^ b[k]),
+                std::array::from_fn(|k| a[k] ^ c[k]),
+                std::array::from_fn(|k| a[k] ^ b[k] ^ c[k] ^ d[k]),
+            ];
+            let mut wide = [0; 6];
+            for (delta, r) in differences.iter().zip(challenges) {
+                add_mul(&mut wide, delta, r);
+            }
+            let folded = self.reduce(&wide);
+            set(dst, width, j, &std::array::from_fn(|k| a[k] ^ folded[k]));
+        }
+    }
+
+    /// Chi at (0,0), (inf,0), (0,1), (inf,1), (1,0), (1,inf), (0,inf), (inf,inf).
+    /// Infinity selects the leading coefficient in that variable.
+    pub fn chi_dot_quad(
+        &self,
+        rows: [&[u64]; 4],
+        weights: &[u64],
+        constant: &[u64],
+        kappa: &Element,
+        scratch: &mut [u64],
+    ) -> [[u64; 6]; 8] {
+        assert!(
+            rows.into_iter()
+                .chain([weights, constant])
+                .all(|row| row.len() >= 3 * BITS)
+        );
+        assert!(scratch.len() >= 12 * FACTOR_ROW);
+        let (a, b) = scratch.split_at_mut(6 * FACTOR_ROW);
+        let mut sums = [[0; 6]; 8];
+        for lane in 0..BITS / 64 {
+            for (i, row) in rows.iter().enumerate() {
+                let (a, b) = (
+                    &mut a[i * FACTOR_ROW..][..FACTOR_ROW],
+                    &mut b[i * FACTOR_ROW..][..FACTOR_ROW],
+                );
+                for k in 0..3 {
+                    for z in 0..64 {
+                        b[64 * k + z] = row[BITS * k + along(64 * lane, 1) + z] ^ kappa[k];
+                    }
+                }
+                let at = lane * FACTOR_ROW;
+                self.mul_row(a, &weights[at..], b, &constant[at..], 64);
+                for k in 0..3 {
+                    b[64 * k..][..64].copy_from_slice(&row[BITS * k + along(64 * lane, 2)..][..64]);
+                }
+            }
+            for row in [&mut *a, &mut *b] {
+                for k in 0..2 * FACTOR_ROW {
+                    row[4 * FACTOR_ROW + k] = row[k] ^ row[2 * FACTOR_ROW + k];
+                }
+            }
+            for (pair, [lo, hi]) in [[0, 1], [2, 3], [1, 3], [4, 5]].into_iter().enumerate() {
+                let (zero, infinity) = self.dot_pair(
+                    [lo, hi].map(|i| &a[i * FACTOR_ROW..][..FACTOR_ROW]),
+                    [lo, hi].map(|i| &b[i * FACTOR_ROW..][..FACTOR_ROW]),
+                    64,
+                );
+                for k in 0..6 {
+                    sums[2 * pair][k] ^= zero[k];
+                    sums[2 * pair + 1][k] ^= infinity[k];
+                }
+            }
+        }
+        sums
+    }
+
     /// `dst[j] = wide[j]` reduced, for a row of four-word polynomials laid out by word.
     #[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))))]
     pub fn reduce_row(&self, dst: &mut [u64], wide: &[u64], width: usize) {
@@ -542,6 +622,33 @@ mod x86 {
                 store3(dst, width, j, xor3(&l, &folded));
             }
         }
+
+        pub fn fold_quad(
+            field: &PowerField,
+            dst: &mut [u64],
+            rows: [&[u64]; 4],
+            challenges: &[Element; 3],
+            width: usize,
+        ) {
+            let challenges: [[V; 3]; 3] = challenges.map(|r| r.map(|x| V::splat(x)));
+            for j in (0..width).step_by(STEP) {
+                let [a, b, c, d] = rows.map(|row| load3(row, width, j));
+                let dx = xor3(&a, &b);
+                let dy = xor3(&a, &c);
+                let dxy = xor3(&dx, &xor3(&c, &d));
+                let mut wide = [[V::zero(); 5]; 2];
+                for (delta, r) in [dx, dy, dxy].iter().zip(&challenges) {
+                    let product = partial(delta, r);
+                    for half in 0..2 {
+                        for k in 0..5 {
+                            wide[half][k] = wide[half][k].xor(product[half][k]);
+                        }
+                    }
+                }
+                let folded = reduce_pair(field, &wide);
+                store3(dst, width, j, xor3(&a, &folded));
+            }
+        }
     }
 }
 
@@ -721,6 +828,27 @@ mod neon {
 mod tests {
     use super::*;
     use primitives::test_rng::Rng;
+
+    #[test]
+    fn two_round_fold_matches_successive_folds() {
+        let mut rng = Rng::new(45);
+        let field = PowerField::new(rng.ext()).unwrap();
+        for width in [7, 16, BITS] {
+            let rows: [Vec<u64>; 4] = std::array::from_fn(|_| (0..3 * width).map(|_| rng.next_u64()).collect());
+            let [x, y] = [rng.ext(), rng.ext()].map(|r| field.to_poly(r));
+            let mut actual = vec![0; 3 * width];
+            let mut expected = actual.clone();
+            let mut low = actual.clone();
+            let mut high = actual.clone();
+            for input in [rows.each_ref().map(Vec::as_slice), [&rows[0][..]; 4]] {
+                field.fold_row_portable(&mut low, input[0], input[1], &x, width);
+                field.fold_row_portable(&mut high, input[2], input[3], &x, width);
+                field.fold_row_portable(&mut expected, &low, &high, &y, width);
+                field.fold_quad(&mut actual, input, &[x, y, field.mul(&x, &y)], width);
+                assert_eq!(actual, expected, "width {width}");
+            }
+        }
+    }
 
     #[test]
     fn chi_factors_match_separate_row_operations() {

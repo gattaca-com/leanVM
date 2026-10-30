@@ -625,6 +625,11 @@ struct Layer<'a> {
 
 /// A row of a table in the power basis: three words per position, laid out by word.
 const ROW: usize = 3 * BITS;
+const PAIRED_TAIL: bool = cfg!(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+));
 
 impl Layer<'_> {
     /// The blocks a segment's tasks walk: those written, then the padding block once, standing
@@ -860,6 +865,71 @@ impl Layer<'_> {
         );
         round.finish(&sums)
     }
+
+    fn table_pair(
+        &self,
+        round: &Round,
+        challenges: &[F192],
+        eq: &[F192],
+        layout: Rows,
+        table: &mut [u64],
+        pads: &mut [u64],
+    ) -> RoundPair {
+        let field = round.field;
+        let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
+        let fold = Fold::<{ 4 * GROUP }>::new(field, &fold);
+        table[self.rounds.len() * layout.live * ROW..layout.len() * ROW].fill(0);
+        pads.fill(0);
+        let (held, written) = (self.held(), self.witness.written());
+        if held > written {
+            let (mut recompute, mut wide) = (Recompute::new(), Fold::<{ 4 * GROUP }>::scratch());
+            for segment in 0..self.rounds.len() {
+                let (_, _, block) = self.block(&mut recompute, held * segment + written);
+                fold.rows(field, block, &mut pads[segment * ROW..][..ROW], &mut wide);
+            }
+        }
+        let pairs = written.div_ceil(2);
+        let mut parts: Vec<&mut [u64]> = table[..self.rounds.len() * layout.live * ROW]
+            .chunks_mut(layout.live.max(1) * ROW)
+            .flat_map(|segment| segment.chunks_mut(4 * ROW))
+            .collect();
+        let mut sums = parallel::map_reduce_chunks_mut(
+            [&mut parts[..]],
+            [1],
+            || {
+                (
+                    vec![0u64; 12 * FACTOR_ROW],
+                    Fold::<{ 4 * GROUP }>::scratch(),
+                    Recompute::new(),
+                )
+            },
+            PairSums::default,
+            |(scratch, wide, recompute), sums, task, [part]| {
+                let (segment, pair) = (task / pairs, task % pairs);
+                let rows = &mut *part[0];
+                for (i, rows) in rows.chunks_mut(2 * ROW).enumerate() {
+                    let (_, _, block) = self.block(recompute, held * segment + 2 * pair + i);
+                    fold.rows(field, block, rows, wide);
+                }
+                let n = rows.len() / ROW;
+                round.add_quad(
+                    sums,
+                    scratch,
+                    std::array::from_fn(|i| {
+                        if i < n {
+                            &rows[i * ROW..][..ROW]
+                        } else {
+                            &pads[segment * ROW..][..ROW]
+                        }
+                    }),
+                    eq[layout.m / 4 * segment + pair],
+                );
+            },
+            PairSums::merge,
+        );
+        round.add_padding_quad(&mut sums, layout, pads, eq);
+        round.finish_pair(&sums)
+    }
 }
 
 /// The sums a round accumulates, unreduced: its values at `0` and at infinity.
@@ -873,6 +943,53 @@ impl RoundSums {
             self.1[i] ^= other.1[i];
         }
         self
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PairSums([[u64; 9]; 8]);
+
+impl PairSums {
+    fn merge(mut self, other: Self) -> Self {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            for (a, b) in a.iter_mut().zip(b) {
+                *a ^= b;
+            }
+        }
+        self
+    }
+}
+
+/// The eight bivariate values needed to send two ordinary round messages.
+struct RoundPair([F192; 8]);
+
+impl RoundPair {
+    fn first(&self, eta: F192) -> (F192, F192) {
+        let q = &self.0;
+        (q[0] + eta * (q[0] + q[2]), q[1] + eta * (q[1] + q[3]))
+    }
+
+    fn second(&self, r: F192) -> (F192, F192) {
+        let q = &self.0;
+        let r2 = r.square() + r;
+        (
+            q[0] + r * (q[0] + q[4]) + r2 * q[1],
+            q[6] + r * (q[6] + q[5]) + r2 * q[7],
+        )
+    }
+}
+
+enum TailMessage {
+    Single(F192, F192),
+    Pair(RoundPair),
+}
+
+impl TailMessage {
+    fn first(&self, eta: F192) -> (F192, F192) {
+        match self {
+            Self::Single(zero, infinity) => (*zero, *infinity),
+            Self::Pair(pair) => pair.first(eta),
+        }
     }
 }
 
@@ -924,6 +1041,114 @@ impl<'a> Round<'a> {
 
     fn finish(&self, sums: &RoundSums) -> (F192, F192) {
         (self.eval.eval(&sums.0), self.eval.eval(&sums.1))
+    }
+
+    fn add_quad(&self, sums: &mut PairSums, scratch: &mut [u64], rows: [&[u64]; 4], eq: F192) {
+        let values = self
+            .field
+            .chi_dot_quad(rows, &self.weights, &self.constant, &self.kappa, scratch);
+        let weight = self.field.to_poly(eq);
+        for (sum, value) in sums.0.iter_mut().zip(values) {
+            add_mul(sum, &value, &weight);
+        }
+    }
+
+    fn finish_pair(&self, sums: &PairSums) -> RoundPair {
+        RoundPair(sums.0.map(|sum| self.eval.eval(&sum)))
+    }
+
+    fn fold_pair(
+        &self,
+        src: &[u64],
+        from: Rows,
+        dst: &mut [u64],
+        pads: &[u64],
+        challenges: &[Element; 2],
+        eq: &[F192],
+    ) -> TailMessage {
+        let to = from.next().next();
+        let challenges = [
+            challenges[0],
+            challenges[1],
+            self.field.mul(&challenges[0], &challenges[1]),
+        ];
+        let fold = |out: &mut [u64], segment: usize, r: usize| {
+            self.field.fold_quad(
+                out,
+                std::array::from_fn(|i| from.row(src, pads, segment, 4 * r + i)),
+                &challenges,
+                BITS,
+            );
+        };
+        if to.m < 4 {
+            for (i, out) in dst[..to.len() * ROW].as_chunks_mut::<ROW>().0.iter_mut().enumerate() {
+                fold(out, i / to.live, i % to.live);
+            }
+            let mut sums = RoundSums::default();
+            let mut scratch = vec![0; 4 * FACTOR_ROW];
+            if to.m == 1 {
+                for (pair, &eq) in dst[..to.len() * ROW].as_chunks::<{ 2 * ROW }>().0.iter().zip(eq) {
+                    self.add_pair(&mut sums, &mut scratch, &pair[..ROW], &pair[ROW..], eq);
+                }
+            } else {
+                for (segment, &eq) in eq.iter().enumerate() {
+                    self.add_pair(
+                        &mut sums,
+                        &mut scratch,
+                        to.row(dst, pads, segment, 0),
+                        to.row(dst, pads, segment, 1),
+                        eq,
+                    );
+                }
+            }
+            let (zero, infinity) = self.finish(&sums);
+            return TailMessage::Single(zero, infinity);
+        }
+        let quads = to.live.div_ceil(4);
+        let mut parts: Vec<&mut [u64]> = dst[..to.len() * ROW]
+            .chunks_mut(to.live.max(1) * ROW)
+            .flat_map(|segment| segment.chunks_mut(4 * ROW))
+            .collect();
+        let mut sums = parallel::map_reduce_chunks_mut(
+            [&mut parts[..]],
+            [1],
+            || vec![0; 12 * FACTOR_ROW],
+            PairSums::default,
+            |scratch, sums, task, [part]| {
+                let (segment, q) = (task / quads, task % quads);
+                let rows = &mut *part[0];
+                for (i, out) in rows.as_chunks_mut::<ROW>().0.iter_mut().enumerate() {
+                    fold(out, segment, 4 * q + i);
+                }
+                let n = rows.len() / ROW;
+                self.add_quad(
+                    sums,
+                    scratch,
+                    std::array::from_fn(|i| {
+                        if i < n {
+                            &rows[i * ROW..][..ROW]
+                        } else {
+                            &pads[segment * ROW..][..ROW]
+                        }
+                    }),
+                    eq[to.m / 4 * segment + q],
+                );
+            },
+            PairSums::merge,
+        );
+        self.add_padding_quad(&mut sums, to, pads, eq);
+        TailMessage::Pair(self.finish_pair(&sums))
+    }
+
+    fn add_padding_quad(&self, sums: &mut PairSums, layout: Rows, pads: &[u64], eq: &[F192]) {
+        let (first, quads) = (layout.live.div_ceil(4), layout.m / 4);
+        if first == quads {
+            return;
+        }
+        let mut scratch = vec![0; 12 * FACTOR_ROW];
+        for (pad, eq) in pads.as_chunks::<ROW>().0.iter().zip(eq.chunks_exact(quads)) {
+            self.add_quad(sums, &mut scratch, [pad; 4], sum(&eq[first..]));
+        }
     }
 
     /// Fold the rows of `src`, laid out as `from`, in pairs into `dst`, and sum the next round's
@@ -1021,6 +1246,10 @@ struct Rows {
 }
 
 impl Rows {
+    fn paired(&self) -> bool {
+        PAIRED_TAIL && self.m >= 4
+    }
+
     fn len(&self) -> usize {
         self.segments * self.live
     }
@@ -1072,7 +1301,7 @@ fn local_round(w: &[F192], t: &[Vec<F192>; 3], kappa: F192) -> [F192; 4] {
     h
 }
 
-/// The table the rounds after the bit-level ones fold, and the half they fold it into: reused
+/// The table the rounds after the bit-level ones fold, and their output buffer: reused
 /// from layer to layer.
 pub struct Scratch {
     table: Vec<u64>,
@@ -1083,7 +1312,8 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(shape: Shape) -> Self {
         let rows = 1usize << (shape.y_vars() - PACK_VARS + 1);
-        let table = vec![0u64; rows * ROW + rows * ROW / 2];
+        let divisor = if PAIRED_TAIL && shape.n_blocks() >= 2 { 4 } else { 2 };
+        let table = vec![0u64; rows * ROW + rows * ROW / divisor];
         let pads = vec![0u64; ROW << shape.seg_log()];
         Self { table, pads }
     }
@@ -1167,14 +1397,48 @@ pub fn prove_layer(
     };
     let (mut src, mut dst) = scratch.table.split_at_mut(layout.m * layout.segments * ROW);
     let pads = &mut scratch.pads;
-    let mut values = tracing::info_span!("Tables").in_scope(|| layer.table(&round, &point, &blocks, layout, src, pads));
+    let mut message = tracing::info_span!("Tables").in_scope(|| {
+        if layout.paired() {
+            let eq = eq_table(&claim.point[PACK_VARS + 1..]);
+            TailMessage::Pair(layer.table_pair(&round, &point, &eq, layout, src, pads))
+        } else {
+            let (zero, infinity) = layer.table(&round, &point, &blocks, layout, src, pads);
+            TailMessage::Single(zero, infinity)
+        }
+    });
     let tail = tracing::info_span!("Tail").entered();
-    for i in PACK_VARS - 1..claim.point.len() {
+    let mut i = PACK_VARS - 1;
+    while i < claim.point.len() {
+        let values = message.first(claim.point.get(i + 1).copied().unwrap_or(F192::ZERO));
         let coeffs = round_coefficients(scale, values.0, values.1, value, claim.point[i]);
         let challenge = bind(ps, &coeffs, claim.point[i], &mut value, &mut scale, &mut point);
-        let later = eq_table(claim.point.get(i + 2..).unwrap_or(&[]));
-        values = round.fold(src, layout, dst, pads, &field.to_poly(challenge), &later);
-        layout = layout.next();
+        match message {
+            TailMessage::Pair(pair) => {
+                let values = pair.second(challenge);
+                let coeffs = round_coefficients(scale, values.0, values.1, value, claim.point[i + 1]);
+                let second = bind(ps, &coeffs, claim.point[i + 1], &mut value, &mut scale, &mut point);
+                let to = layout.next().next();
+                i += 2;
+                let skipped = if to.paired() { 2 } else { 1 };
+                let later = eq_table(claim.point.get(i + skipped..).unwrap_or(&[]));
+                message = round.fold_pair(
+                    src,
+                    layout,
+                    dst,
+                    pads,
+                    &[field.to_poly(challenge), field.to_poly(second)],
+                    &later,
+                );
+                layout = to;
+            }
+            TailMessage::Single(_, _) => {
+                let later = eq_table(claim.point.get(i + 2..).unwrap_or(&[]));
+                let (zero, infinity) = round.fold(src, layout, dst, pads, &field.to_poly(challenge), &later);
+                message = TailMessage::Single(zero, infinity);
+                layout = layout.next();
+                i += 1;
+            }
+        }
         (src, dst) = (dst, src);
     }
     let table = &src[..ROW];
@@ -1243,4 +1507,47 @@ fn round_coefficients(scale: F192, zero: F192, infinity: F192, value: F192, r: F
     // value = c0 + r (c1 + c2).
     let c1 = (value + c0) * r.inv() + c2;
     [c0, c1, c2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use primitives::test_rng::Rng;
+
+    #[test]
+    fn paired_messages_match_successive_rounds() {
+        let mut rng = Rng::new(47);
+        let s = rng.ext();
+        let field = PowerField::new(s).unwrap();
+        let claim = Claim {
+            value: F192::ZERO,
+            mu: [F192::ZERO; crate::rmfe::PACK],
+            point: Vec::new(),
+            weights: rng.ext_vec(BITS),
+        };
+        let round = Round::new(&field, &claim, s, rng.ext());
+        let rows: [Vec<u64>; 4] = std::array::from_fn(|_| (0..ROW).map(|_| rng.next_u64()).collect());
+        let mut scratch = vec![0; 12 * FACTOR_ROW];
+        for input in [
+            rows.each_ref().map(Vec::as_slice),
+            [&rows[0][..], &rows[1], &rows[2], &rows[2]],
+            [&rows[0][..]; 4],
+        ] {
+            let (eq, eta, r) = (rng.ext(), rng.ext(), rng.ext());
+            let mut sums = PairSums::default();
+            round.add_quad(&mut sums, &mut scratch, input, eq);
+            let pair = round.finish_pair(&sums);
+            let mut first = RoundSums::default();
+            round.add_pair(&mut first, &mut scratch, input[0], input[1], eq * (F192::ONE + eta));
+            round.add_pair(&mut first, &mut scratch, input[2], input[3], eq * eta);
+            assert_eq!(pair.first(eta), round.finish(&first));
+
+            let (mut low, mut high) = (vec![0; ROW], vec![0; ROW]);
+            field.fold_row_portable(&mut low, input[0], input[1], &field.to_poly(r), BITS);
+            field.fold_row_portable(&mut high, input[2], input[3], &field.to_poly(r), BITS);
+            let mut second = RoundSums::default();
+            round.add_pair(&mut second, &mut scratch, &low, &high, eq);
+            assert_eq!(pair.second(r), round.finish(&second));
+        }
+    }
 }
