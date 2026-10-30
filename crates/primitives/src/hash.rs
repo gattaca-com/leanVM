@@ -4,7 +4,7 @@
 //! Three surfaces, in increasing order of how much of the machine they touch:
 //!
 //! - [`keccak_f`], the Keccak-f\[1600\] permutation, which the VM's `KECCAK` opcode computes
-//!   and `keccak_gkr` proves, and [`keccak_f_many`], its batched form.
+//!   and `keccak_gkr` proves.
 //! - [`hash`] / [`Hasher`], Keccak-256 over bytes.
 //! - [`hash_many`], the batched form: [`LANES`] independent equal-length inputs
 //!   hashed together with the state transposed across lanes, which is how the
@@ -661,38 +661,21 @@ pub fn hash_many_from_state(data: &[u8], len: usize, state: &[u64; STATE_LANES],
     hash_many_with::<Backend>(data, len, state, out)
 }
 
-/// Keccak-f\[1600\] of every state in place, [`LANES`] at a time.
-pub fn keccak_f_many(states: &mut [[u64; STATE_LANES]]) {
-    let (groups, rest) = states.as_chunks_mut::<LANES>();
-    for group in groups {
-        permute_group::<Backend>(group);
-    }
-    for state in rest {
-        keccak_f(state);
-    }
+/// Keccak-f of [`LANES`] copies of `state` whose lane `lane` holds `first + i` in copy `i`: the
+/// smallest `i` whose output lane 0 has no bit of `mask` set.
+pub fn grind_lane(state: &[u64; STATE_LANES], lane: usize, first: u64, mask: u64) -> Option<usize> {
+    grind_lane_with::<Backend>(state, lane, first, mask)
 }
 
-/// Keccak-f of `S::WIDTH` states, transposed into one vector per lane and back.
 #[inline(always)]
-fn permute_group<S: Lanes64>(states: &mut [[u64; STATE_LANES]]) {
-    debug_assert_eq!(states.len(), S::WIDTH);
-    // `buf[i * WIDTH + l]` is state `l`'s lane `i`.
-    let mut buf = [0u64; STATE_LANES * MAX_WIDTH];
-    for (l, state) in states.iter().enumerate() {
-        for (i, &lane) in state.iter().enumerate() {
-            buf[i * S::WIDTH + l] = lane;
-        }
-    }
-    let mut st: [S; STATE_LANES] = std::array::from_fn(|i| S::load(&buf, i * S::WIDTH));
+fn grind_lane_with<S: Lanes64>(state: &[u64; STATE_LANES], lane: usize, first: u64, mask: u64) -> Option<usize> {
+    let nonces: [u64; MAX_WIDTH] = std::array::from_fn(|i| first + i as u64);
+    let mut st: [S; STATE_LANES] = std::array::from_fn(|i| S::splat(state[i]));
+    st[lane] = S::load(&nonces, 0);
     permute(&mut st);
-    for (i, lane) in st.iter().enumerate() {
-        lane.store(&mut buf, i * S::WIDTH);
-    }
-    for (l, state) in states.iter_mut().enumerate() {
-        for (i, lane) in state.iter_mut().enumerate() {
-            *lane = buf[i * S::WIDTH + l];
-        }
-    }
+    let mut out = [0u64; MAX_WIDTH];
+    st[0].store(&mut out, 0);
+    out[..S::WIDTH].iter().position(|w| w & mask == 0)
 }
 
 #[cfg(test)]
@@ -833,14 +816,19 @@ mod tests {
                     }
                 }
             }
-            let states: Vec<[u64; STATE_LANES]> = (0..S::WIDTH as u64)
-                .map(|l| std::array::from_fn(|i| (l << 32) ^ (i as u64 * 0x9E37_79B9)))
+            let state: [u64; STATE_LANES] = std::array::from_fn(|i| (i as u64 * 0x9E37_79B9) ^ 0xA5A5);
+            let outs: Vec<u64> = (0..S::WIDTH as u64)
+                .map(|i| {
+                    let mut copy = state;
+                    copy[7] = 1000 + i;
+                    keccak_f(&mut copy);
+                    copy[0]
+                })
                 .collect();
-            let mut got = states.clone();
-            permute_group::<S>(&mut got);
-            for (mut want, got) in states.into_iter().zip(got) {
-                keccak_f(&mut want);
-                assert_eq!(got, want, "{name}: permutation");
+            assert_eq!(grind_lane_with::<S>(&state, 7, 1000, 0), Some(0), "{name}: mask 0");
+            for mask in [0x3, 0xff, u64::MAX] {
+                let want = outs.iter().position(|w| w & mask == 0);
+                assert_eq!(grind_lane_with::<S>(&state, 7, 1000, mask), want, "{name}: mask {mask:#x}");
             }
         }
         check::<u64>("scalar");
