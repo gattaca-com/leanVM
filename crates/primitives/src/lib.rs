@@ -248,16 +248,16 @@ pub unsafe fn uninit_vec<T: Plain>(len: usize) -> Vec<T> {
     v
 }
 
-/// Allocate `bytes` and free them at once, touching none.
+/// Allocate `bytes` without touching them; the caller decides when to free the extent.
 ///
 /// An allocator that keeps freed extents (jemalloc with `dirty_decay_ms:-1`) is left holding one
 /// extent of that size. Buffers carved from it coalesce back when freed. A later buffer of that
 /// size then reuses their pages instead of mapping fresh ones. An allocator that unmaps on free
 /// (glibc) just maps and unmaps. A failed allocation is ignored.
-pub fn reserve_extent(bytes: usize) {
+pub fn reserve_extent(bytes: usize) -> Vec<u8> {
     let mut v = Vec::<u8>::new();
     let _ = v.try_reserve_exact(bytes);
-    std::hint::black_box(&v);
+    v
 }
 
 /// Parallel `(0..n).map(build).collect()`.
