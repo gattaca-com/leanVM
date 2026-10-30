@@ -153,6 +153,14 @@ impl Witness {
         }
     }
 
+    /// Append fixed-width entries to one stream, looking up its name once.
+    pub fn push_entries<const N: usize>(&mut self, name: &str, entries: impl IntoIterator<Item = [F192; N]>) {
+        let stream = self.0.entry(name.to_string()).or_default();
+        for entry in entries {
+            stream.push_iter(entry);
+        }
+    }
+
     /// Append every stream of `other` to the stream of the same name.
     pub fn append(&mut self, other: Self) {
         for (name, stream) in other.0 {

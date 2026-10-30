@@ -231,9 +231,7 @@ fn lean_sphincs_claim_cells((pk, message): &LeanSphincsClaim) -> [F192; 4] {
 fn push_claims(hints: &mut Hints, cells: impl ExactSizeIterator<Item = [F192; 4]>) {
     if cells.len() > 0 {
         hints.push("signers_split", &list_split(cells.len()));
-    }
-    for claim in cells {
-        hints.push("claims", &claim);
+        hints.push_entries("claims", cells);
     }
 }
 
@@ -1483,14 +1481,27 @@ impl<K: Ord + Clone> Region<K> {
         }
         let mut claimed = vec![false; signers.len()];
         let mut dups = Vec::new();
-        let raw = raw
-            .iter()
-            .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
-            .collect();
-        let children = children
-            .flatten()
-            .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
-            .collect();
+        // Each input list is sorted, so its position in the declared union only advances.
+        let mut slots = |input: &[K]| {
+            let mut pos = 0;
+            input
+                .iter()
+                .map(|claim| {
+                    while pos < signers.len() && signers[pos] < *claim {
+                        pos += 1;
+                    }
+                    if signers.get(pos) == Some(claim) && !claimed[pos] {
+                        claimed[pos] = true;
+                        pos
+                    } else {
+                        dups.push(claim.clone());
+                        signers.len() + dups.len() - 1
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let raw = slots(raw);
+        let children = children.flat_map(slots).collect();
         Ok(Self {
             signers,
             dups,
@@ -1879,9 +1890,7 @@ pub fn aggregate_with_stats(
             (offsets, *slots) = slots.split_at(len);
             if !offsets.is_empty() {
                 hints.push("signers_split", &list_split(offsets.len()));
-            }
-            for &offset in offsets {
-                hints.push("child_claim_index", &[count(offset)]);
+                hints.push_entries("child_claim_index", offsets.iter().map(|&offset| [count(offset)]));
             }
         }
         hints.push_iter("child_defer", child.defer.cells());
@@ -2876,6 +2885,16 @@ mod tests {
             plan_coverage(short, &lean_sphincs, &[], None).err(),
             Some(AggregationError::TooLarge)
         );
+    }
+
+    #[test]
+    fn coverage_slots_preserve_omitted_and_overlapping_claims() {
+        let children: &[&[u8]] = &[&[1, 2, 4], &[2, 3, 5]];
+        let region = Region::plan(&[2, 4], children.iter().copied(), Some(&[1, 3, 4])).unwrap();
+        assert_eq!(region.signers, [1, 3, 4]);
+        assert_eq!(region.raw, [3, 2]);
+        assert_eq!(region.children, [0, 4, 5, 6, 1, 7]);
+        assert_eq!(region.dups, [2, 2, 4, 2, 5]);
     }
 
     fn prove_leaf(signers: &[(LeanXmssPublicKey, LeanXmssSignature)]) -> EthereumProof {
