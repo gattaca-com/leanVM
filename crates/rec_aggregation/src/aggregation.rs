@@ -571,11 +571,11 @@ fn da_list_digest(roots: &[[u8; 32]]) -> [u8; 32] {
 }
 
 impl EthereumProof {
-    /// This aggregate's own public statement, as the VM publishes it.
-    fn public_input(&self) -> [F192; 2] {
+    /// This aggregate's public statement, using its precomputed DA digest.
+    fn public_input(&self, da_digest: [u8; 32]) -> [F192; 2] {
         statement_digest(
             signers_hash(&self.xmss_signers, &self.lean_sphincs_signers),
-            self.da_commitments_digest(),
+            da_digest,
             &self.defer,
         )
     }
@@ -1774,19 +1774,21 @@ pub fn aggregate_with_stats(
     // recomputed: the batching sumcheck below forces every batched value to be
     // the true evaluation, and the root discharges the one claim they reduce to.
     let _span = tracing::info_span!("Replay children").entered();
-    let mut statements = Vec::with_capacity(children.len());
+    let mut da_digests = Vec::with_capacity(children.len());
     for child in children {
         check_signer_set(&child.xmss_signers, &child.lean_sphincs_signers).map_err(AggregationError::InvalidChild)?;
-        statements.push(child.public_input());
+        // DA membership construction dispatches; keep it outside the child tasks.
+        da_digests.push(child.da_commitments_digest());
     }
-    // One single-threaded replay per worker: nothing inside dispatches.
+    // One statement hash and single-threaded replay per worker: nothing inside dispatches.
     let bytecode = scalar_bytecode();
     let summaries = parallel::map_collect(children.len(), |i| {
-        let public_input = public_input_bytes(&statements[i]);
-        verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof))
+        let pi = children[i].public_input(da_digests[i]);
+        let public_input = public_input_bytes(&pi);
+        (pi, verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof)))
     });
     let mut replayed = Vec::with_capacity(children.len());
-    for (pi, summary) in statements.into_iter().zip(summaries) {
+    for (pi, summary) in summaries {
         let summary = summary.map_err(|e| AggregationError::InvalidChild(AggregateVerifyError::Snark(e)))?;
         replayed.push((pi, summary));
     }
@@ -3215,7 +3217,7 @@ def main():
         let node = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
         // `cpu::verify` accepts the same proof of the same statement.
-        verify(unified_guest(), &node.public_input(), &node.proof).expect("node verifies natively");
+        verify(unified_guest(), &node.public_input(node.da_commitments_digest()), &node.proof).expect("node verifies natively");
         assert_eq!(node.xmss_signers.len(), SMALL_LEAF_SIZE + big);
     }
 
