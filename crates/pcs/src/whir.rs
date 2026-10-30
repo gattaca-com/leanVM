@@ -965,25 +965,30 @@ impl Basis {
 /// Each line of `cur_l` read also prefetches the same line of `next_l` into L2 (when not empty), so the
 /// next block streams in while this one multiplies.
 #[inline]
-fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a [F64], &'a [F64], &'a [F64])>) {
+fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a [F64], &'a [F64], &'a [F64])> + Clone) {
     // The products stay unreduced across the lanes: one reduction per output.
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     {
-        let mut acc = [Acc8::ZERO; 128];
-        let acc = &mut acc[..out.len() / 8];
-        for (w, cur, prev, next) in deltas {
-            let lines = cur.as_chunks::<8>().0.iter().zip(prev.as_chunks::<8>().0);
-            for (j, (a, (c, p))) in acc.iter_mut().zip(lines).enumerate() {
-                if !next.is_empty() {
-                    // SAFETY: a prefetch never faults, and `next` is as long as `cur`.
-                    let line = unsafe { next.as_ptr().add(8 * j) };
-                    unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(line.cast()) };
+        // Keep the unreduced accumulators and each lane's inputs together in L1.
+        for (tile, out) in out.chunks_mut(256).enumerate() {
+            let start = tile * 256;
+            let end = start + out.len();
+            let mut acc = [Acc8::ZERO; 32];
+            let acc = &mut acc[..out.len() / 8];
+            for (w, cur, prev, next) in deltas.clone() {
+                let lines = cur[start..end].as_chunks::<8>().0.iter().zip(prev[start..end].as_chunks::<8>().0);
+                for (j, (a, (c, p))) in acc.iter_mut().zip(lines).enumerate() {
+                    if !next.is_empty() {
+                        // SAFETY: the tile is inside `cur`, and `next` is as long as `cur`.
+                        let line = unsafe { next.as_ptr().add(start + 8 * j) };
+                        unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(line.cast()) };
+                    }
+                    *a ^= primitives::field::mul_base_splat8(w, &std::array::from_fn(|i| F64(c[i].0 ^ p[i].0)));
                 }
-                *a ^= primitives::field::mul_base_splat8(w, &std::array::from_fn(|i| F64(c[i].0 ^ p[i].0)));
             }
-        }
-        for (o, a) in out.as_chunks_mut::<8>().0.iter_mut().zip(acc) {
-            primitives::field::xor_into8(o, &a.reduce_each());
+            for (o, a) in out.as_chunks_mut::<8>().0.iter_mut().zip(acc) {
+                primitives::field::xor_into8(o, &a.reduce_each());
+            }
         }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
