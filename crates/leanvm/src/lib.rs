@@ -5,7 +5,7 @@
 //! End to end in [`crates/leanvm/tests/api.rs`](https://github.com/leanEthereum/leanVM/blob/main/crates/leanvm/tests/api.rs).
 
 pub use rec_aggregation::{
-    AggregateVerifyError, AggregationError, ClaimSelection, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
+    AggregateVerifyError, AggregationError, ClaimSelection, ClaimTree, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
     LeanSphincsClaim, LeanXmssClaim, MAX_DA_ROOTS, MAX_KEYS, MAX_RECURSIONS, SignatureClaims, VerifierError, aggregate,
     aggregate_with_stats, setup as setup_prover_with_capacity,
 };

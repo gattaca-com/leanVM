@@ -378,6 +378,8 @@ TW_MSG = TW_MSG_PLACEHOLDER
 HI_MUL = 2 ** 32
 STEP_MUL = 2 ** 61
 DIGEST_CELLS = 2
+# The first cell of a node's signer commitment preimage (`node_commitment`).
+NODE_TAG = 1
 
 # ----------------------------------------------------- leanXMSS (host-supplied)
 # Two layers of trees of height LX_HEIGHT over keys of LX_V chains. A layer's digest
@@ -456,6 +458,8 @@ MAX_KEYS = MAX_KEYS_PLACEHOLDER
 MAX_DA_ROOTS = MAX_DA_ROOTS_PLACEHOLDER
 DA_ROOT_COUNTS = DA_ROOT_COUNTS_PLACEHOLDER
 MAX_RECURSIONS = MAX_RECURSIONS_PLACEHOLDER
+# The child counts a node dispatches on, 0 to MAX_RECURSIONS.
+CHILD_COUNTS = CHILD_COUNTS_PLACEHOLDER
 
 
 # ---------------------------------- LeanDA ------------------------------------------
@@ -3860,56 +3864,20 @@ def claim_list_last(state, blk, k: Const):
     return digest[0], digest[1]
 
 
-@inline
-def child_claims(entries_ptr, cover, marks, origin_g, limit_g, blk, n: Const):
-    # n of a child's claims, each read at a hinted index into THIS node's table and
-    # marked in the coverage table. The index is an offset into the scheme's region
-    # and bounded by that region's size, so a child's claim can only ever land on a
-    # slot of its own scheme.
-    for j in unroll(0, n):
-        off_hint = hint_witness("child_claim_index")
-        assert log(off_hint) < log(limit_g)  # precondition as in the raw loops
-        cover[origin_g * off_hint] = marks * (GEN ** j)
-        entry = entries_ptr * (off_hint ** 4)
-        for c in unroll(0, 4):
-            blk[4 * j + c] = entry[GEN ** c]
-    return
-
-
-def child_claim_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g):
-    # The hash of one of a child's declared claim lists, over the same 64n bytes the
-    # child hashed (`claim_list_digest`), so the digest it rebuilds is the one the
-    # child's statement carries. The coverage marks count the claims off from `base`.
+def node_commitment(kids, xd_0, xd_1, sd_0, sd_1, k: Const):
+    # The signer commitment of a node with k children: NODE_TAG, the children's
+    # commitments, this node's leanXMSS then leanSPHINCS raw list digests, 2k + 5 cells.
     digest = StackBuf(KECCAK_STATE)
-    if n_g == 1:
-        keccak([0, 0], [0, 0], digest, len=0)
-    else:
-        groups, rest = list_split(n_g)
-        chain = HeapBuf((groups * GEN) ** KECCAK_STATE)
-        zero_state(chain)
-        for xq in mul_range(1, groups):
-            st = chain * xq ** KECCAK_STATE
-            nxt = st * GEN ** KECCAK_STATE
-            blk = StackBuf(4 * CLAIM_GROUP)
-            child_claims(entries_ptr, cover, base * xq ** CLAIM_GROUP, origin_g, limit_g, blk, CLAIM_GROUP)
-            keccak_cells(blk, nxt[0:KECCAK_STATE], state=st[0:KECCAK_STATE], final=0)
-        last = chain * groups ** KECCAK_STATE
-        d0, d1 = match(log(rest), range(0, CLAIM_GROUP), lambda k: child_claim_list_last(last, entries_ptr, cover, base * groups ** CLAIM_GROUP, origin_g, limit_g, k))
-        digest[0] = d0
-        digest[1] = d1
+    cells = StackBuf(2 * MAX_RECURSIONS + 5)
+    cells[0] = NODE_TAG
+    for j in unroll(0, 2 * k):
+        cells[1 + j] = kids[GEN ** j]
+    cells[2 * k + 1] = xd_0
+    cells[2 * k + 2] = xd_1
+    cells[2 * k + 3] = sd_0
+    cells[2 * k + 4] = sd_1
+    keccak_cells(cells[0:2 * k + 5], digest)
     return digest[0], digest[1]
-
-
-def child_claim_list_last(state, entries_ptr, cover, marks, origin_g, limit_g, k: Const):
-    digest = StackBuf(KECCAK_STATE)
-    if const(k == 0):
-        keccak_cells([0], digest, state=state[0:KECCAK_STATE], len=0)
-    else:
-        blk = StackBuf(4 * CLAIM_GROUP)
-        child_claims(entries_ptr, cover, marks, origin_g, limit_g, blk, k)
-        keccak_cells(blk[0:4 * k], digest, state=state[0:KECCAK_STATE])
-    return digest[0], digest[1]
-
 
 
 # ================================ LeanDA ===============================
@@ -4090,8 +4058,10 @@ def main():
     # verified against the claim in its own coverage slot; a leanXMSS signature carries
     # its own leaf index. DA roots occupy a separate region of the same table.
     #
-    # The declared lists are the signer set; the duplicate slots absorb claims a
-    # child covers that the set does not declare. The coverage table is one region
+    # The declared lists are this node's own raw claims; the signer commitment hashes
+    # each child's commitment and then the two declared list digests, so a child's
+    # claims never enter this node's tables (`node_commitment`). The duplicate slots
+    # absorb raw claims the lists do not declare. The coverage table is one region
     # per scheme, each its declared claims then its own duplicates, then DA shaped
     # the same way:
     #
@@ -4158,7 +4128,7 @@ def main():
     # indices below run over one space: leanXMSS, then leanSPHINCS, then DA.
     #
     # Each list's digest is a plain hash of its claims, 64 bytes a claim, its padding
-    # binding its length; the signer set is one permutation over the two digests.
+    # binding its length; both digests end the signer commitment hashed below.
     lx_table = HeapBuf(lx_slots_g ** 4)
     lean_sphincs_table = HeapBuf(lean_sphincs_slots_g ** 4)
     xd_0, xd_1 = claim_list_digest(lx_table, n_lx_g)
@@ -4170,13 +4140,8 @@ def main():
     for xd in mul_range(1, n_sdup_g):
         dup = lean_sphincs_table * ((n_lean_sphincs_g * xd) ** 4)
         hint_witness(dup[0:4], "dup_claims")
-    # At least one published signature claim or DA root also ensures a nonempty coverage table.
-    assert n_lx_g * n_lean_sphincs_g * n_da_g != 1
-    signers = StackBuf(KECCAK_STATE)
-    keccak([xd_0, xd_1], [sd_0, sd_1], signers)
-    signers_hash = HeapBuf(DIGEST_CELLS)
-    signers_hash[1] = signers[0]
-    signers_hash[GEN] = signers[1]
+    # A node publishes at least one raw claim, DA root or child.
+    assert n_lx_g * n_lean_sphincs_g * n_da_g * n_children_g != 1
 
     # ---- coverage ----
     # Every one of the n_total slots is written exactly once: write-once memory
@@ -4220,26 +4185,15 @@ def main():
     child_carried = HeapBuf(n_children_g ** DEFER_STMT_CELLS)
     written = HeapBuf(n_children_g * GEN)  # loop-carried write count, one per child
     written[GEN ** 0] = n_raw_x_g * n_raw_s_g * n_direct_da_g
+    # Each child's signer commitment is hinted, not rebuilt: it is pinned by the
+    # child's statement, which `verify_sub` checks the child's proof against, and this
+    # node's own commitment hashes it in place (`node_commitment`). A child's claims
+    # never enter this node's tables.
+    kids = HeapBuf(n_children_g ** DIGEST_CELLS)
     for xc in mul_range(1, n_children_g):
         base = written[xc]
-        # The child's two list lengths, then its two lists, rebuilt from THIS node's
-        # tables through hinted indices: everything hinted there is pinned by the
-        # list digests, which the child's statement carries, so a lie about any of it
-        # changes the public input its proof has to satisfy.
-        child_meta = StackBuf(2)
-        hint_witness(child_meta, "child_meta")  # n_lean_xmss, n_lean_sphincs
-        nsub_x_g = child_meta[0]
-        nsub_s_g = child_meta[1]
-        assert log(nsub_x_g) < MAX_KEYS
-        assert log(nsub_s_g) < MAX_KEYS
-        nsub_g = nsub_x_g * nsub_s_g
-        cx_0, cx_1 = child_claim_list_digest(lx_table, cover, base, 1, lx_slots_g, nsub_x_g)
-        cs_0, cs_1 = child_claim_list_digest(lean_sphincs_table, cover, base * nsub_x_g, lx_slots_g, lean_sphincs_slots_g, nsub_s_g)
-        sub_signers = StackBuf(KECCAK_STATE)
-        keccak([cx_0, cx_1], [cs_0, cs_1], sub_signers)
-        sub_hash = HeapBuf(DIGEST_CELLS)
-        sub_hash[1] = sub_signers[0]
-        sub_hash[GEN] = sub_signers[1]
+        sub_hash = kids * xc ** DIGEST_CELLS
+        hint_witness(sub_hash[0:DIGEST_CELLS], "child_signers")
         carried = child_carried * xc ** DEFER_STMT_CELLS
         hint_witness(carried[0:DEFER_STMT_CELLS], "child_defer")
         nsub_da_g = hint_witness("child_da_count")
@@ -4247,7 +4201,7 @@ def main():
         child_da = HeapBuf(nsub_da_g ** 4)
         for xd in mul_range(1, nsub_da_g):
             root = child_da * (xd ** 4)
-            root_0, root_1, vector_0, vector_1 = cover_da_root(da_roots, da_cover, da_slots_g, base * nsub_g * xd)
+            root_0, root_1, vector_0, vector_1 = cover_da_root(da_roots, da_cover, da_slots_g, base * xd)
             root[1] = root_0
             root[GEN] = root_1
             root[GEN ** 2] = vector_0
@@ -4258,8 +4212,18 @@ def main():
         child_pi[pi] = pi_0
         child_pi[pi * GEN] = pi_1
         verify_sub(pi_0, pi_1, seed_0, seed_1, g_logs_pow2, g_squares, child_fresh * xc ** DEFER_SIZE)
-        written[xc * GEN] = base * nsub_g * nsub_da_g
+        written[xc * GEN] = base * nsub_da_g
     assert written[n_children_g] == n_total_g
+
+    # ---- the signer commitment ----
+    # One hash over the node tag, every child's commitment in order, then this node's
+    # two raw list digests: a leaf is the same preimage with no children. Its length
+    # binds the child count, and the tag separates it from every other preimage here.
+    # The outer verifier rebuilds it from the claim tree the proof carries.
+    c_0, c_1 = match(log(n_children_g), range(0, CHILD_COUNTS), lambda k: node_commitment(kids, xd_0, xd_1, sd_0, sd_1, k))
+    signers_hash = HeapBuf(DIGEST_CELLS)
+    signers_hash[1] = c_0
+    signers_hash[GEN] = c_1
 
     # ---- this node's own deferred claim ----
     defer_stmt = HeapBuf(DEFER_STMT_CELLS)

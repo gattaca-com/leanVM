@@ -7,7 +7,7 @@ mod hash_chain;
 pub mod signers_cache;
 
 pub use aggregation::{
-    AggregateVerifyError, AggregationError, ClaimSelection, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
+    AggregateVerifyError, AggregationError, ClaimSelection, ClaimTree, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
     LeanSphincsClaim, LeanXmssClaim, MAX_DA_ROOTS, MAX_KEYS, MAX_RECURSIONS, SignatureClaims, aggregate,
     aggregate_with_stats, setup, warm_up,
 };
