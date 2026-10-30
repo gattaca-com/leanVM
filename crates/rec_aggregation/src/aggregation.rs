@@ -187,29 +187,68 @@ fn pack_16_bytes(bytes: &[u8]) -> F192 {
     F192::new(word_at(0), word_at(8), 0)
 }
 
-/// Claims the guest hashes a loop frame: 68 cells, four whole block pairs.
-const CLAIM_GROUP: usize = 17;
-const _: () = assert!((CLAIM_GROUP * 64).is_multiple_of(2 * primitives::hash::RATE));
+/// Cells the guest absorbs a loop frame of a variable-length run: one block pair.
+const STREAM_FRAME: usize = 17;
+const _: () = assert!((STREAM_FRAME * 16) == 2 * primitives::hash::RATE);
 
-/// How the guest splits a list of `n` claims: the whole groups of [`CLAIM_GROUP`], one
-/// a loop frame, and the claims after them. Its own product identity and range checks
-/// pin both, so this only has to agree with them (`list_split` in the guest). A list
-/// is never empty here: both claim lists are guarded at the call, since the guest
-/// hashes an empty one without a split at all.
-fn list_split(n: usize) -> [F192; 2] {
-    assert!(n > 0, "an empty list has no split");
-    [count(n / CLAIM_GROUP), count(n % CLAIM_GROUP)]
+/// The first cell of a raw claim list's preimage and of one message group's: the
+/// guest's `TAG_LIST` and `TAG_GROUP`.
+const TAG_LIST: [u8; 16] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+const TAG_GROUP: [u8; 16] = [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// The claims of one scheme that share a message: the keys that signed it, strictly
+/// sorted. On the wire a message rides once per group instead of once per claim.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClaimGroup<P> {
+    pub message: [u8; 32],
+    pub keys: Vec<P>,
 }
 
-/// One scheme's declared claims, hashed plainly: 64 bytes a claim, its pubkey then
-/// the message it signed, and an empty list hashes the empty string. The guest
-/// computes this same digest [`CLAIM_GROUP`] claims at a time (`claim_list_digest`).
-fn claim_list_digest<'a>(claims: impl Iterator<Item = ([u8; 32], &'a [u8; 32])>) -> [u8; 32] {
+/// How the guest splits a run of `len` cells: the whole frames of [`STREAM_FRAME`]
+/// cells and the cells after them (`stream_split` in the guest). Its own product
+/// identity and range checks pin both, so this only has to agree with them.
+fn stream_split(len: usize) -> [F192; 2] {
+    [count(len / STREAM_FRAME), count(len % STREAM_FRAME)]
+}
+
+/// One message group's digest: [`TAG_GROUP`], the message, then each key's 32 bytes.
+/// Keccak's padding binds the key count.
+fn group_digest<P>(group: &ClaimGroup<P>, flatten: impl Fn(&P) -> [u8; 32]) -> [u8; 32] {
     let mut hasher = primitives::hash::Hasher::new();
-    for (pk, message) in claims {
-        hasher.update(&pk).update(message);
+    hasher.update(&TAG_GROUP).update(&group.message);
+    for key in &group.keys {
+        hasher.update(&flatten(key));
     }
     hasher.finalize()
+}
+
+/// One scheme's declared claims, hashed by message group: [`TAG_LIST`] then each
+/// group's digest, so an empty list hashes the tag alone. The guest computes this same
+/// digest off its claim table (`claim_list_digest`). Both levels are length-bound by
+/// the padding and lead with their own tag, so the digest is injective on the list up
+/// to a Keccak-256 collision.
+fn claim_list_digest<P>(groups: &[ClaimGroup<P>], flatten: impl Fn(&P) -> [u8; 32]) -> [u8; 32] {
+    let mut hasher = primitives::hash::Hasher::new();
+    hasher.update(&TAG_LIST);
+    for group in groups {
+        hasher.update(&group_digest(group, &flatten));
+    }
+    hasher.finalize()
+}
+
+/// Strictly sorted `(message, key)` claims as their message groups, in order.
+fn group_claims<P: Clone>(claims: &[([u8; 32], P)]) -> Vec<ClaimGroup<P>> {
+    let mut groups: Vec<ClaimGroup<P>> = Vec::new();
+    for (message, key) in claims {
+        match groups.last_mut() {
+            Some(group) if group.message == *message => group.keys.push(key.clone()),
+            _ => groups.push(ClaimGroup {
+                message: *message,
+                keys: vec![key.clone()],
+            }),
+        }
+    }
+    groups
 }
 
 /// A claim as the four cells the guest hashes and its verifier reads: the pubkey's
@@ -223,31 +262,31 @@ fn claim_cells(pk: &[u8; 32], message: &[u8; 32]) -> [F192; 4] {
     ]
 }
 
-fn lean_xmss_claim_cells((pk, message): &LeanXmssClaim) -> [F192; 4] {
-    claim_cells(&pk.flatten(), message)
-}
-
-fn lean_sphincs_claim_cells((pk, message): &LeanSphincsClaim) -> [F192; 4] {
-    claim_cells(&pk.flatten(), message)
-}
-
-/// A scheme's declared claims as hints: the list's split, then one entry per claim.
-fn push_claims(hints: &mut Hints, cells: impl ExactSizeIterator<Item = [F192; 4]>) {
-    if cells.len() > 0 {
-        hints.push("signers_split", &list_split(cells.len()));
+/// A scheme's declared claims as hints, in the guest's order: the group count, then per
+/// group its message and key count, its claims' table slots and its run's split, then
+/// the split of the run of group digests.
+fn push_claims<P>(hints: &mut Hints, groups: &[ClaimGroup<P>], flatten: impl Fn(&P) -> [u8; 32]) {
+    hints.push("n_groups", &[count(groups.len())]);
+    for group in groups {
+        let [m0, m1] = pack_hash_state(&group.message);
+        hints.push("group_meta", &[m0, m1, count(group.keys.len())]);
+        let cells = group.keys.iter().map(|key| claim_cells(&flatten(key), &group.message));
         hints.push_entries("claims", cells);
+        hints.push("stream_split", &stream_split(3 + 2 * group.keys.len()));
     }
+    hints.push("stream_split", &stream_split(1 + 2 * groups.len()));
 }
 
 /// The claims a node commits to, in the shape of its recursion: each child's tree in
 /// the order the node verified them, then the raw claims the node verified itself,
-/// each list strictly sorted. A node publishes everything it verified; the outer
-/// verifier flattens the tree into the sorted, deduplicated set it exposes.
+/// grouped by message, groups strictly sorted by message and keys within a group. A
+/// node publishes everything it verified; the outer verifier flattens the tree into
+/// the sorted, deduplicated set it exposes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClaimTree {
     pub children: Vec<ClaimTree>,
-    pub xmss: Vec<LeanXmssClaim>,
-    pub lean_sphincs: Vec<LeanSphincsClaim>,
+    pub xmss: Vec<ClaimGroup<LeanXmssPublicKey>>,
+    pub lean_sphincs: Vec<ClaimGroup<LeanSphincsPublicKey>>,
 }
 
 /// The first cell of a node commitment's preimage: the guest's `NODE_TAG`, one canonical cell.
@@ -259,8 +298,8 @@ const NODE_TAG: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 /// own length through the hash's padding, and a leaf is the same preimage with no
 /// children, so one format covers every node.
 fn tree_commitment(tree: &ClaimTree) -> [u8; 32] {
-    let xmss = claim_list_digest(tree.xmss.iter().map(|(pk, message)| (pk.flatten(), message)));
-    let lean_sphincs = claim_list_digest(tree.lean_sphincs.iter().map(|(pk, message)| (pk.flatten(), message)));
+    let xmss = claim_list_digest(&tree.xmss, LeanXmssPublicKey::flatten);
+    let lean_sphincs = claim_list_digest(&tree.lean_sphincs, LeanSphincsPublicKey::flatten);
     let mut hasher = primitives::hash::Hasher::new();
     hasher.update(&NODE_TAG);
     for child in &tree.children {
@@ -280,8 +319,12 @@ fn flatten_claims(tree: &ClaimTree) -> (Vec<LeanXmssClaim>, Vec<LeanSphincsClaim
         for child in &tree.children {
             walk(child, xmss, lean_sphincs);
         }
-        xmss.extend_from_slice(&tree.xmss);
-        lean_sphincs.extend_from_slice(&tree.lean_sphincs);
+        for group in &tree.xmss {
+            xmss.extend(group.keys.iter().map(|key| (*key, group.message)));
+        }
+        for group in &tree.lean_sphincs {
+            lean_sphincs.extend(group.keys.iter().map(|key| (*key, group.message)));
+        }
     }
     let (mut xmss, mut lean_sphincs) = (Vec::new(), Vec::new());
     walk(tree, &mut xmss, &mut lean_sphincs);
@@ -580,14 +623,19 @@ fn wire() -> impl bincode::Options {
 /// [`MAX_RECURSIONS`] children at a node, or raw lists a node cannot hold. Soundness
 /// does not need this: a tree the guest did not commit to fails the statement check.
 fn check_claim_tree(tree: &ClaimTree) -> Result<(), AggregateVerifyError> {
-    if tree.children.len() > MAX_RECURSIONS
-        || tree.xmss.len() + tree.lean_sphincs.len() >= MAX_KEYS
-        || !tree.xmss.windows(2).all(|w| w[0] < w[1])
-        || !tree.lean_sphincs.windows(2).all(|w| w[0] < w[1])
-    {
-        return Err(AggregateVerifyError::MalformedSignerSet);
+    fn canonical<P: Ord>(groups: &[ClaimGroup<P>]) -> Option<usize> {
+        let sorted = groups.windows(2).all(|w| w[0].message < w[1].message)
+            && groups
+                .iter()
+                .all(|group| !group.keys.is_empty() && group.keys.windows(2).all(|w| w[0] < w[1]));
+        sorted.then(|| groups.iter().map(|group| group.keys.len()).sum())
     }
-    tree.children.iter().try_for_each(check_claim_tree)
+    match (canonical(&tree.xmss), canonical(&tree.lean_sphincs)) {
+        (Some(xmss), Some(lean_sphincs)) if tree.children.len() <= MAX_RECURSIONS && xmss + lean_sphincs < MAX_KEYS => {
+            tree.children.iter().try_for_each(check_claim_tree)
+        }
+        _ => Err(AggregateVerifyError::MalformedSignerSet),
+    }
 }
 
 fn check_da_roots(roots: &[[u8; 32]]) -> Result<(), AggregateVerifyError> {
@@ -1483,13 +1531,13 @@ pub(crate) type Hints = Witness;
 /// every writer as an offset into one region, bounded by that region's size, one
 /// range check per write, so no signature can reach a claim of the other scheme.
 struct Coverage {
-    xmss: Region<LeanXmssClaim>,
-    lean_sphincs: Region<LeanSphincsClaim>,
+    xmss: Region<([u8; 32], LeanXmssPublicKey)>,
+    lean_sphincs: Region<([u8; 32], LeanSphincsPublicKey)>,
 }
 
 /// One scheme's region of the coverage table.
 struct Region<K> {
-    /// The declared claims, strictly sorted.
+    /// The declared claims, strictly sorted by message then key.
     signers: Vec<K>,
     dups: Vec<K>,
     /// The slot of each raw signature, in the order given.
@@ -1544,14 +1592,23 @@ fn take_slot<K: Ord + Clone>(claims: &[K], claimed: &mut [bool], duplicates: &mu
     }
 }
 
+/// A claim in the table's order: by message, then key, so one message's claims are
+/// consecutive slots (`claim_list_digest` in the guest reads them group by group).
+fn by_message<P: Clone>(claims: &[(P, [u8; 32])]) -> Vec<([u8; 32], P)> {
+    claims.iter().map(|(key, message)| (*message, key.clone())).collect()
+}
+
 fn plan_coverage(
     raw_lean_xmss: &[LeanXmssClaim],
     raw_lean_sphincs: &[LeanSphincsClaim],
     declare: Option<&SignatureClaims>,
 ) -> Result<Coverage, AggregationError> {
     let cover = Coverage {
-        xmss: Region::plan(raw_lean_xmss, declare.map(|claims| claims.xmss.as_slice()))?,
-        lean_sphincs: Region::plan(raw_lean_sphincs, declare.map(|claims| claims.lean_sphincs.as_slice()))?,
+        xmss: Region::plan(&by_message(raw_lean_xmss), declare.map(|c| by_message(&c.xmss)).as_deref())?,
+        lean_sphincs: Region::plan(
+            &by_message(raw_lean_sphincs),
+            declare.map(|c| by_message(&c.lean_sphincs)).as_deref(),
+        )?,
     };
     if cover.n_total() >= MAX_KEYS {
         return Err(AggregationError::TooLarge);
@@ -1828,10 +1885,12 @@ pub fn aggregate_with_stats(
     hints.push("fs_seed", &[fs_seed[0], fs_seed[1]]);
     // Both lists in the guest's order, leanXMSS first: each one's split, its declared
     // claims, then its duplicates.
-    push_claims(&mut hints, cover.xmss.signers.iter().map(lean_xmss_claim_cells));
-    push_claims(&mut hints, cover.lean_sphincs.signers.iter().map(lean_sphincs_claim_cells));
-    let dups = cover.xmss.dups.iter().map(lean_xmss_claim_cells);
-    for claim in dups.chain(cover.lean_sphincs.dups.iter().map(lean_sphincs_claim_cells)) {
+    let xmss_groups = group_claims(&cover.xmss.signers);
+    let lean_sphincs_groups = group_claims(&cover.lean_sphincs.signers);
+    push_claims(&mut hints, &xmss_groups, LeanXmssPublicKey::flatten);
+    push_claims(&mut hints, &lean_sphincs_groups, LeanSphincsPublicKey::flatten);
+    let dups = cover.xmss.dups.iter().map(|(m, pk)| claim_cells(&pk.flatten(), m));
+    for claim in dups.chain(cover.lean_sphincs.dups.iter().map(|(m, pk)| claim_cells(&pk.flatten(), m))) {
         hints.push("dup_claims", &claim);
     }
     // Each slot is hinted as an offset into its scheme's region, which is how one
@@ -1963,8 +2022,8 @@ pub fn aggregate_with_stats(
 
     let tree = ClaimTree {
         children: children.iter().map(|child| child.tree.clone()).collect(),
-        xmss: cover.xmss.signers,
-        lean_sphincs: cover.lean_sphincs.signers,
+        xmss: xmss_groups,
+        lean_sphincs: lean_sphincs_groups,
     };
     let (xmss_signers, lean_sphincs_signers) = flatten_claims(&tree);
     let public_input = statement_digest(signers_hash(&tree), da_list_digest(&da_roots), &defer);
@@ -2657,7 +2716,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("LX_HEIGHT", lean_xmss::LAYER_HEIGHT.to_string());
     ps("LX_TOP", address(lean_xmss::tweak(0, lean_xmss::TOP, 0)));
     ps("MAX_KEYS", MAX_KEYS.to_string());
-    ps("CLAIM_GROUP", CLAIM_GROUP.to_string());
+    ps("STREAM_FRAME", STREAM_FRAME.to_string());
     ps("MAX_DA_ROOTS", MAX_DA_ROOTS.to_string());
     ps("DA_ROOT_COUNTS", (MAX_DA_ROOTS + 1).to_string());
     ps("MAX_RECURSIONS", MAX_RECURSIONS.to_string());
@@ -2862,8 +2921,8 @@ mod tests {
         let short = &claims[..MAX_KEYS - 1];
         let tree = |xmss: &[LeanXmssClaim], lean_sphincs: &[LeanSphincsClaim]| ClaimTree {
             children: vec![],
-            xmss: xmss.to_vec(),
-            lean_sphincs: lean_sphincs.to_vec(),
+            xmss: group_claims(&by_message(xmss)),
+            lean_sphincs: group_claims(&by_message(lean_sphincs)),
         };
         check_claim_tree(&tree(short, &[])).expect("one short of the cap");
         assert_eq!(
@@ -3197,13 +3256,13 @@ def main():
     }
 
     /// The right leaf holds more claims than one loop frame of its list hashes
-    /// ([`CLAIM_GROUP`]), so both that leaf and the parent rebuilding it run the
+    /// ([`STREAM_FRAME`]), so both that leaf and the parent rebuilding it run the
     /// list's group loop and then a partial last group, while the left leaf's list is
     /// a partial group alone.
     #[test]
     fn aggregate_two_to_one() {
         leanvm_core::init_prover();
-        let big = 2 * CLAIM_GROUP + 3;
+        let big = 2 * STREAM_FRAME + 3;
         let signers = get_signers(SMALL_LEAF_SIZE + big);
         let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
         let right = prove_leaf(&signers[SMALL_LEAF_SIZE..]);
@@ -3218,24 +3277,68 @@ def main():
     /// A claim changed anywhere in the tree changes the commitment, so the statement no
     /// longer matches the proof: the verifier rejects it, on the wire too. A forged child
     /// commitment hint fails in the guest, whose rebuilt child statement matches no proof.
+    /// Non-canonical trees (a duplicated or empty group) are rejected before hashing.
     #[test]
     fn tampered_claim_tree_is_rejected() {
         leanvm_core::init_prover();
-        let signers = get_signers(SMALL_LEAF_SIZE + 1);
-        let children = [prove_leaf(&signers[..SMALL_LEAF_SIZE]), prove_leaf(&signers[SMALL_LEAF_SIZE..])];
+        let at_a = get_signers(SMALL_LEAF_SIZE);
+        let at_b = get_signers_for(SMALL_LEAF_SIZE + 2, MESSAGE_B);
+        let mut raw = signing(&at_a, 0);
+        raw.extend(signing(&at_b[SMALL_LEAF_SIZE..], MESSAGE_B));
+        let two_messages = aggregate(&[], raw, vec![], &[], None, LOG_INV_RATE).expect("leaf aggregates");
+        let children = [two_messages, prove_leaf(&get_signers(SMALL_LEAF_SIZE + 1)[SMALL_LEAF_SIZE..])];
         let node = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
-        // A message swapped under a verified key, inside a child's list.
+        assert_eq!(node.tree.children[0].xmss.len(), 2, "two message groups");
+        let snark_rejects = |forged: &EthereumProof| {
+            check_claim_tree(&forged.tree).expect("the forged tree is canonical, so only the statement rejects it");
+            assert!(matches!(forged.verify(), Err(AggregateVerifyError::Snark(_))));
+            let received = EthereumProof::from_bytes(&forged.to_bytes()).expect("parses");
+            assert!(matches!(received.verify(), Err(AggregateVerifyError::Snark(_))));
+        };
+        let malformed = |forged: &EthereumProof| {
+            assert_eq!(forged.verify(), Err(AggregateVerifyError::MalformedSignerSet));
+            assert_eq!(
+                EthereumProof::from_bytes(&forged.to_bytes()).err(),
+                Some(AggregateVerifyError::MalformedSignerSet)
+            );
+        };
+        // A group's message swapped under its verified keys (id 1 keeps the groups sorted).
         let mut forged = node.clone();
-        forged.tree.children[0].xmss[0].1 = crate::signers_cache::message_for(7);
-        assert!(matches!(forged.verify(), Err(AggregateVerifyError::Snark(_))));
-        let received = EthereumProof::from_bytes(&forged.to_bytes()).expect("parses");
-        assert!(matches!(received.verify(), Err(AggregateVerifyError::Snark(_))));
+        forged.tree.children[0].xmss[0].message = message_for(1);
+        snark_rejects(&forged);
+        // A key moved from one message group to the other.
+        let mut forged = node.clone();
+        let groups = &mut forged.tree.children[0].xmss;
+        let moved = groups[0].keys.pop().unwrap();
+        let slot = groups[1].keys.partition_point(|k| *k < moved);
+        groups[1].keys.insert(slot, moved);
+        check_claim_tree(&forged.tree).expect("still canonical");
+        snark_rejects(&forged);
+        // A group one key shorter.
+        let mut forged = node.clone();
+        forged.tree.children[0].xmss[1].keys.pop();
+        snark_rejects(&forged);
         // A child's claims presented as the node's own raw claims: same set, other tree.
-        let mut flattened = node.clone();
-        let child = flattened.tree.children.remove(0);
-        flattened.tree.xmss = child.xmss;
-        assert!(matches!(flattened.verify(), Err(AggregateVerifyError::Snark(_))));
+        let mut forged = node.clone();
+        let child = forged.tree.children.remove(0);
+        forged.tree.xmss = child.xmss;
+        snark_rejects(&forged);
+        // A duplicated message group, and a group split in two under one message.
+        let mut forged = node.clone();
+        let dup = forged.tree.children[0].xmss[0].clone();
+        forged.tree.children[0].xmss.push(dup);
+        malformed(&forged);
+        let mut forged = node.clone();
+        let groups = &mut forged.tree.children[0].xmss;
+        let key = groups[0].keys.pop().unwrap();
+        let message = groups[0].message;
+        groups.insert(1, ClaimGroup { message, keys: vec![key] });
+        malformed(&forged);
+        // An empty group.
+        let mut forged = node.clone();
+        forged.tree.children[0].xmss[0].keys.clear();
+        malformed(&forged);
         // A forged child commitment hint: the child's proof is of another statement.
         FORGE.with(|forge| {
             *forge.borrow_mut() = Some(Box::new(|hints: &mut Hints| {
@@ -3548,12 +3651,12 @@ def main():
         }
     }
 
-    /// A list hash's split is advice the guest then dispatches on, so the claim count
-    /// after the last group has to be bounded before the `match`: a negative
+    /// A run hash's split is advice the guest then dispatches on, so the cell count
+    /// after the last frame has to be bounded before the `match`: a negative
     /// exponent that satisfies the product identity must fail the range check in
-    /// `list_split` itself, not reach the dispatch as a wild jump.
+    /// `stream_split` itself, not reach the dispatch as a wild jump.
     #[test]
-    fn list_split_rejects_a_negative_rest() {
+    fn stream_split_rejects_a_negative_rest() {
         let (helpers, _) = include_str!("../guests/lean_ethereum.py")
             .split_once("\ndef main():")
             .unwrap();
@@ -3561,7 +3664,7 @@ def main():
             r#"{helpers}
 def main():
     n_g = hint_witness("n")
-    body, rest = list_split(n_g)
+    body, rest = stream_split(n_g)
     public = GEN ** 0
     assert public[1] == body
     assert public[GEN] == rest
@@ -3572,20 +3675,20 @@ def main():
         let run = |body: F192, rest: F192| {
             let mut hints = Hints::default();
             hints.push("n", &[count(6)]);
-            hints.push("signers_split", &[body, rest]);
+            hints.push("stream_split", &[body, rest]);
             let mut program = guest.clone();
             program.set_witnesses(hints);
             program.execute([body, rest])
         };
-        // Six claims: no whole group, then six.
+        // Six cells: no whole frame, then six.
         assert!(run(count(0), count(6)).is_ok());
-        // One group and -11 claims after it: the product identity holds, the range
+        // One frame and -11 cells after it: the product identity holds, the range
         // check must not.
         let negative = F192::new(g_pow(11).inv().0, 0, 0);
         let Err(err) = run(count(1), negative) else {
             panic!("a negative last-block count was accepted");
         };
-        assert!(err.to_string().contains("list_split"), "rejected elsewhere: {err}");
+        assert!(err.to_string().contains("stream_split"), "rejected elsewhere: {err}");
     }
 
     #[test]
