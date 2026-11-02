@@ -8,7 +8,7 @@ use primitives::test_rng::Rng;
 
 use super::encode::{Encoded, Encoder, Keep};
 use super::facade::AdditiveNttF64;
-use super::openings::Kept;
+use super::openings::{Kept, gather_rows};
 use super::source::Source;
 use super::stage::transpose_lane_major;
 use super::window::Window;
@@ -213,8 +213,9 @@ fn lane_major_msg_encode_matches_per_lane_reference() {
         let msg: Vec<F64> = (0..rows * n_lanes).map(|_| F64(rng.next_u64())).collect();
 
         let row_words = n_lanes.next_multiple_of(8);
+        let blocks: Vec<usize> = (0..n_lanes).rev().collect();
         let mut got = vec![F64::ZERO; (row_words << log_rows) << log_inv_rate];
-        transpose_lane_major(&mut got[..row_words << log_rows], &msg, n_lanes, row_words, log_rows);
+        transpose_lane_major(&mut got[..row_words << log_rows], &msg, &blocks, row_words, log_rows);
         ntt.encode_interleaved_in_place(&mut got, row_words, log_inv_rate);
 
         let block_len = 1usize << log_d;
@@ -264,14 +265,15 @@ fn lane_major_encode_matches_transpose_then_in_place() {
         }
         let repeats = crate::stack_open::equal_blocks(&msg);
         let row_words = n_lanes.next_multiple_of(8);
+        let blocks: Vec<usize> = (0..n_lanes).rev().collect();
         let mut want = vec![F64::ZERO; (row_words << log_rows) << log_inv_rate];
-        transpose_lane_major(&mut want[..row_words << log_rows], &msg, n_lanes, row_words, log_rows);
+        transpose_lane_major(&mut want[..row_words << log_rows], &msg, &blocks, row_words, log_rows);
         ntt.encode_interleaved_in_place(&mut want, row_words, log_inv_rate);
 
         for keep in [Keep::Whole, Keep::BeforeDeep, Keep::Nothing] {
             let mut handed = vec![F64::ZERO; want.len()];
             let on_rows = sink_into(&mut handed, row_words);
-            let encoded = ntt.encode_lane_major(&msg, &repeats, n_lanes, row_words, log_inv_rate, keep, &on_rows);
+            let encoded = ntt.encode_lane_major(&msg, &repeats, &blocks, log_rows, row_words, log_inv_rate, keep, &on_rows);
             let Encoded { words, deep } = encoded;
             drop(on_rows);
             let keep_nothing = keep == Keep::Nothing;
@@ -282,7 +284,7 @@ fn lane_major_encode_matches_transpose_then_in_place() {
             positions.sort_unstable();
             let rows = match deep {
                 Some(plan) if words.is_empty() => {
-                    let kept = Kept::Nothing { msg: &msg, repeats: &repeats, n_lanes, plan };
+                    let kept = Kept::Nothing { msg: &msg, repeats: &repeats, blocks: &blocks, plan };
                     ntt.openings().rows(kept, &positions)
                 }
                 Some(deep) => ntt.openings().rows(Kept::BeforeDeep { words: &words, plan: deep }, &positions),
@@ -292,6 +294,69 @@ fn lane_major_encode_matches_transpose_then_in_place() {
                 }
             };
             for (&q, row) in positions.iter().zip(rows.chunks_exact(row_words)) {
+                assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
+            }
+        }
+    }
+}
+
+/// Leaving all-zero lane blocks out of the encode changes no word: the rows, widened with zero lanes where
+/// the blocks were, equal the full encode's, for every `Keep` and for a domain too small for a gathered pass.
+#[test]
+fn compact_lanes_match_the_full_encode() {
+    let mut rng = Rng::new(0xC0DE);
+    // `zeroed` blocks are all zero; the others are the encoded lanes, highest first.
+    for (log_rows, log_inv_rate, n_lanes, zeroed) in [
+        (13usize, 2usize, 47usize, &[0usize, 3, 4, 20, 21, 22, 40, 46][..]),
+        (14, 1, 40, &[1, 2, 3, 4, 5, 6, 7, 39, 20]),
+        (12, 2, 17, &[5, 16]),
+        (5, 2, 12, &[0, 1, 2, 3, 11]),
+    ] {
+        let log_d = log_rows + log_inv_rate;
+        let ntt = AdditiveNttF64::standard(log_d);
+        let mut msg: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
+        for &b in zeroed {
+            msg[b << log_rows..][..1 << log_rows].fill(F64::ZERO);
+        }
+        let repeats = crate::stack_open::equal_blocks(&msg);
+        let row_words = n_lanes.next_multiple_of(8);
+        let all: Vec<usize> = (0..n_lanes).rev().collect();
+        let mut want = vec![F64::ZERO; (row_words << log_rows) << log_inv_rate];
+        transpose_lane_major(&mut want[..row_words << log_rows], &msg, &all, row_words, log_rows);
+        ntt.encode_interleaved_in_place(&mut want, row_words, log_inv_rate);
+
+        let blocks: Vec<usize> = all.into_iter().filter(|b| !zeroed.contains(b)).collect();
+        let enc_words = blocks.len().next_multiple_of(8);
+        assert!(enc_words < row_words);
+        // Compact lane `enc_words - blocks.len() + i` is full lane `row_words - 1 - blocks[i]`.
+        let widen = |compact: &[F64]| -> Vec<F64> {
+            let mut full = vec![F64::ZERO; compact.len() / enc_words * row_words];
+            for (row, out) in compact.chunks_exact(enc_words).zip(full.chunks_exact_mut(row_words)) {
+                for (i, &b) in blocks.iter().enumerate() {
+                    out[row_words - 1 - b] = row[enc_words - blocks.len() + i];
+                }
+            }
+            full
+        };
+        for keep in [Keep::Whole, Keep::BeforeDeep, Keep::Nothing] {
+            let mut handed = vec![F64::ZERO; (enc_words << log_rows) << log_inv_rate];
+            let on_rows = sink_into(&mut handed, enc_words);
+            let encoded = ntt.encode_lane_major(&msg, &repeats, &blocks, log_rows, enc_words, log_inv_rate, keep, &on_rows);
+            let Encoded { words, deep } = encoded;
+            drop(on_rows);
+            let context = format!("log_rows={log_rows}, rate={log_inv_rate}, n_lanes={n_lanes}, keep={}", keep as u8);
+            assert_eq!(widen(&handed), want, "handed-over rows, {context}");
+            let mut positions: Vec<usize> = (0..40).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+            positions.sort_unstable();
+            let rows = match deep {
+                Some(plan) if words.is_empty() => {
+                    let kept = Kept::Nothing { msg: &msg, repeats: &repeats, blocks: &blocks, plan };
+                    ntt.openings().rows(kept, &positions)
+                }
+                Some(deep) => ntt.openings().rows(Kept::BeforeDeep { words: &words, plan: deep }, &positions),
+                None => gather_rows(&words, enc_words, &positions),
+            };
+            for (&q, row) in positions.iter().zip(widen(&rows).chunks_exact(row_words)) {
                 assert_eq!(row[..], want[q * row_words..][..row_words], "row {q}, {context}");
             }
         }

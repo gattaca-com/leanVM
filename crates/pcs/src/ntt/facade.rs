@@ -64,6 +64,7 @@ impl AdditiveNttF64 {
     /// - The result equals a transpose into block 0 followed by the in-place encode.
     /// - With [`Keep::Nothing`], if one gathered pass covers the layers before the deep pass,
     ///   the codeword is never whole: the encode runs once per half of the cosets.
+    /// - `blocks[i]` is the message block, of `2^log_rows` words, that lane `num_ntts - blocks.len() + i` encodes.
     /// - `repeats` tags the message's blocks that equal their predecessor, or is empty.
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -71,13 +72,14 @@ impl AdditiveNttF64 {
         &self,
         msg: &[F64],
         repeats: &[bool],
-        n_lanes: usize,
+        blocks: &[usize],
+        log_rows: usize,
         num_ntts: usize,
         log_inv_rate: usize,
         keep: Keep,
         on_rows: &RowSink<'_>,
     ) -> Encoded {
-        Encoder::new(&self.tw).lane_major(msg, repeats, n_lanes, num_ntts, log_inv_rate, keep, on_rows)
+        Encoder::new(&self.tw).lane_major(msg, repeats, blocks, log_rows, num_ntts, log_inv_rate, keep, on_rows)
     }
 
     /// RS-encode a message held in a buffer of its own, handing `on_rows` every finished block of rows.

@@ -22,7 +22,8 @@
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
 use crate::merkle::{self, Hash};
-use crate::ntt::{AdditiveNttF64, Encoded, Keep, Kept, Plan, gather_rows};
+use crate::ntt::{AdditiveNttF64, Encoded, Keep, Kept, Plan, gather_rows, with_sink_scratch};
+use crate::stack_open::EQUAL_BLOCK_LOG;
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
 use flux_profiler::timed;
@@ -117,8 +118,12 @@ pub struct Commitment {
 /// from the message, see [`ProverData::l0`].
 pub struct ProverData {
     pub codeword: Vec<F64>,
-    /// Words per codeword row: the committed lanes, with zero lanes in front up to the vector width.
+    /// Words per full codeword row: the committed lanes, with zero lanes in front up to the vector width.
     row_words: usize,
+    /// Words per row of `codeword`: the lanes that carry data, padded to the vector width. At most `row_words`.
+    enc_words: usize,
+    /// The stack blocks the encode took as lanes, from lane `enc_words - blocks.len()` on.
+    blocks: Vec<usize>,
     pub merkle_tree: merkle::CutTree,
     deep: Option<(AdditiveNttF64, Plan)>,
 }
@@ -134,15 +139,49 @@ impl ProverData {
         self.deep.is_some() && self.codeword.is_empty()
     }
 
-    /// The codeword as the opening reads it. `stack` is the committed message, `n_lanes` its lanes.
-    pub(crate) fn l0<'a>(&'a self, stack: &'a [F64], repeats: &'a [bool], n_lanes: usize) -> L0Codeword<'a> {
+    /// The codeword as the opening reads it. `stack` is the committed message.
+    pub(crate) fn l0<'a>(&'a self, stack: &'a [F64], repeats: &'a [bool]) -> L0Codeword<'a> {
         L0Codeword {
             words: &self.codeword,
             row_words: self.row_words,
+            enc_words: self.enc_words,
+            blocks: &self.blocks,
             deep: self.deep.as_ref(),
             stack,
             repeats,
-            n_lanes,
+        }
+    }
+}
+
+/// How a compact codeword row widens to a full row of `row_words`: the lanes the encode left out are zero.
+struct Expansion {
+    /// Compact lanes `src..src + len` are full lanes `dst..dst + len`, as `(dst, src, len)`.
+    runs: Vec<(usize, usize, usize)>,
+    enc_words: usize,
+    row_words: usize,
+}
+
+impl Expansion {
+    /// The map of a codeword of `blocks`, as [`ProverData::blocks`]. Stack block `b` is full lane `row_words - 1 - b`.
+    fn new(blocks: &[usize], enc_words: usize, row_words: usize) -> Self {
+        let pad = enc_words - blocks.len();
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for (i, &b) in blocks.iter().enumerate() {
+            let (dst, src) = (row_words - 1 - b, pad + i);
+            match runs.last_mut() {
+                Some((d, s, len)) if (*d + *len, *s + *len) == (dst, src) => *len += 1,
+                _ => runs.push((dst, src, 1)),
+            }
+        }
+        Self { runs, enc_words, row_words }
+    }
+
+    /// Write the rows of `compact` as full rows into `full`, which holds zeros.
+    fn expand(&self, compact: &[F64], full: &mut [F64]) {
+        for (row, out) in compact.chunks_exact(self.enc_words).zip(full.chunks_exact_mut(self.row_words)) {
+            for &(dst, src, len) in &self.runs {
+                out[dst..][..len].copy_from_slice(&row[src..][..len]);
+            }
         }
     }
 }
@@ -151,27 +190,34 @@ impl ProverData {
 pub(crate) struct L0Codeword<'a> {
     words: &'a [F64],
     row_words: usize,
+    enc_words: usize,
+    blocks: &'a [usize],
     deep: Option<&'a (AdditiveNttF64, Plan)>,
     stack: &'a [F64],
     /// The stack's blocks that equal their predecessor, or none.
     repeats: &'a [bool],
-    n_lanes: usize,
 }
 
 impl L0Codeword<'_> {
     /// The rows at the sorted `positions`, `row_words` words each, back to back.
     fn rows(&self, positions: &[usize]) -> Vec<F64> {
-        match self.deep {
+        let compact = match self.deep {
             Some((ntt, plan)) => {
                 let kept = if self.words.is_empty() {
-                    Kept::Nothing { msg: self.stack, repeats: self.repeats, n_lanes: self.n_lanes, plan: *plan }
+                    Kept::Nothing { msg: self.stack, repeats: self.repeats, blocks: self.blocks, plan: *plan }
                 } else {
                     Kept::BeforeDeep { words: self.words, plan: *plan }
                 };
                 ntt.openings().rows(kept, positions)
             }
-            None => gather_rows(self.words, self.row_words, positions),
+            None => gather_rows(self.words, self.enc_words, positions),
+        };
+        if self.enc_words == self.row_words {
+            return compact;
         }
+        let mut full = vec![F64::ZERO; positions.len() * self.row_words];
+        Expansion::new(self.blocks, self.enc_words, self.row_words).expand(&compact, &mut full);
+        full
     }
 }
 
@@ -210,6 +256,8 @@ const KEEP_CODEWORD_MAX_BYTES: usize = 1 << 30;
 /// never rides the proof.
 ///
 /// `repeats` tags the message's blocks of `2^EQUAL_BLOCK_LOG` words that equal their predecessor, or is empty.
+/// A lane block that is all zero inside the message is left out of the encode too, see [`data_blocks`].
+/// Its codeword lane is zero, so the leaf images, the root and the opened rows are the same.
 #[timed]
 pub fn commit(
     message: &[F64],
@@ -230,13 +278,31 @@ pub fn commit(
     let k_code = log_rows + log_inv_rate;
     let n_positions = 1usize << k_code;
     let row_words = n_lanes.next_multiple_of(8).min(1usize << log_batch_size);
+    let mut blocks = data_blocks(message, repeats, log_rows);
+    let mut enc_words = blocks.len().next_multiple_of(8).min(1usize << log_batch_size);
+    if blocks.is_empty() || enc_words == row_words {
+        // No lane is worth leaving out: encode them all, highest block first.
+        blocks = (0..n_lanes).rev().collect();
+        enc_words = row_words;
+    }
+    // The hash takes full rows, so the encode's compact rows widen before they are absorbed.
+    let expansion = (enc_words != row_words).then(|| Expansion::new(&blocks, enc_words, row_words));
 
     // Leaves are hashed as the encode finishes each block of rows.
     let tree = merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size);
-    let (codeword, deep) = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = row_words)
+    let (codeword, deep) = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = enc_words)
         .in_scope(|| {
             let ntt = AdditiveNttF64::standard(k_code);
-            let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
+            let on_rows = |row, rows: &[F64]| match &expansion {
+                None => tree.absorb(row, rows),
+                Some(expansion) => with_sink_scratch(rows.len() / enc_words * row_words, |full| {
+                    full.fill(F64::ZERO);
+                    expansion.expand(rows, full);
+                    tree.absorb(row, full)
+                }),
+            };
+            // Sized by the full rows: a kept codeword that fits only because lanes were left out would still cool
+            // the pages the bus and the level-1 commit reuse (ideas 172, 175).
             let keep = if n_positions * row_words * size_of::<F64>() > KEEP_CODEWORD_MAX_BYTES {
                 Keep::Nothing
             } else if parallel::num_threads() >= DEFER_DEEP_MIN_THREADS {
@@ -244,7 +310,7 @@ pub fn commit(
             } else {
                 Keep::Whole
             };
-            let Encoded { words, deep } = ntt.encode_lane_major(message, repeats, n_lanes, row_words, log_inv_rate, keep, &on_rows);
+            let Encoded { words, deep } = ntt.encode_lane_major(message, repeats, &blocks, log_rows, enc_words, log_inv_rate, keep, &on_rows);
             (words, deep.map(|deep| (ntt, deep)))
         });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
@@ -255,10 +321,34 @@ pub fn commit(
         ProverData {
             codeword,
             row_words,
+            enc_words,
+            blocks,
             merkle_tree,
             deep,
         },
     )
+}
+
+/// The message blocks to encode as lanes, highest first: all but the blocks that are all zero.
+///
+/// - A block is all zero if every one of its blocks of `2^EQUAL_BLOCK_LOG` words that `repeats` does not tag is.
+///   A tagged block equals its predecessor, and a block's first one is never tagged.
+/// - The scan of a block stops at its first non-zero word, and the blocks go in parallel.
+/// - Without a repeat map, or with blocks shorter than `2^EQUAL_BLOCK_LOG`, every block is kept.
+fn data_blocks(message: &[F64], repeats: &[bool], log_rows: usize) -> Vec<usize> {
+    let n_lanes = message.len() >> log_rows;
+    let per_lane = (1usize << log_rows) >> EQUAL_BLOCK_LOG;
+    let mut zero = vec![false; n_lanes];
+    if !repeats.is_empty() && per_lane >= 1 {
+        parallel::chunks_mut(&mut zero, 1, |b, zero| {
+            let lane = &message[b << log_rows..][..1 << log_rows];
+            zero[0] = (0..per_lane).all(|h| {
+                let skip = h > 0 && repeats[b * per_lane + h];
+                skip || lane[h << EQUAL_BLOCK_LOG..][..1 << EQUAL_BLOCK_LOG].iter().all(|w| *w == F64::ZERO)
+            });
+        });
+    }
+    (0..n_lanes).rev().filter(|&b| !zero[b]).collect()
 }
 
 /// What a [`LigeroWitness`] keeps of its codeword when an encode left rows out of it.
@@ -1387,7 +1477,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         n_lanes >= 1 && n_lanes <= num_interleaved_0,
         "at most 2^initial_k lanes"
     );
-    assert_eq!(prover_data.len(), block_len_0 * prover_data.row_words);
+    assert_eq!(prover_data.len(), block_len_0 * prover_data.enc_words);
     assert!((n_lanes..=num_interleaved_0).contains(&prover_data.row_words));
 
     // Nothing is absorbed on entry. The commitment was bound by the `add_root` that
@@ -1454,7 +1544,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     // The tree keeps no leaves: the rows of whole leaf groups are read back and rehashed.
     let row_words = prover_data.row_words;
     let group_0 = l0_tree.group_positions(&queries_0);
-    let group_rows_0 = prover_data.l0(&stack, &stack_repeats, n_lanes).rows(&group_0);
+    let group_rows_0 = prover_data.l0(&stack, &stack_repeats).rows(&group_0);
     let image = |q| &fetched_row(&group_0, &group_rows_0, row_words, q)[row_words - n_lanes..];
     let mut opened_rows_0 = Vec::with_capacity(queries_0.len() * num_interleaved_0);
     for &q in &queries_0 {
@@ -1714,6 +1804,39 @@ mod tests {
                         "the words the proof drops are the padding at n_lanes = {n_lanes}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Lane blocks that are all zero inside the message are left out of the encode, and nothing else shows it:
+    /// the root and the opened rows equal those of a commit that encodes every lane.
+    #[test]
+    fn zero_lanes_inside_the_stack_leave_the_commit_unchanged() {
+        let mut rng = Rng::new(0x2E80);
+        // 9 data lanes still fill 16 words, so the first case encodes in full.
+        for (n_lanes, zeroed, log_batch, compacts) in [
+            (11usize, &[3usize, 7][..], 4usize, false),
+            (11, &[3, 7, 9], 4, true),
+            (20, &[0, 4, 9, 10, 19], 5, true),
+        ] {
+            let log_rows = 12;
+            let mut msg: Vec<F64> = (0..n_lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
+            for &b in zeroed {
+                msg[b << log_rows..][..1 << log_rows].fill(F64::ZERO);
+            }
+            let exact = crate::stack_open::equal_blocks(&msg);
+            // The exact map, and a conservative one that tags nothing.
+            for (repeats, log_inv_rate) in [(&exact, 1), (&exact, 2), (&vec![false; exact.len()], 1)] {
+                let (full, full_data) = commit(&msg, &[], log_rows + log_batch, log_batch, log_inv_rate);
+                let (cm, data) = commit(&msg, repeats, log_rows + log_batch, log_batch, log_inv_rate);
+                let context = format!("n_lanes={n_lanes}, zeroed={zeroed:?}, rate={log_inv_rate}");
+                assert_eq!(data.enc_words < data.row_words, compacts, "{context}");
+                assert_eq!(cm.root, full.root, "root, {context}");
+                let mut positions: Vec<usize> =
+                    (0..30).map(|_| rng.next_u64() as usize % (1 << (log_rows + log_inv_rate))).collect();
+                positions.sort_unstable();
+                let rows = data.l0(&msg, repeats).rows(&positions);
+                assert_eq!(rows, full_data.l0(&msg, &[]).rows(&positions), "rows, {context}");
             }
         }
     }

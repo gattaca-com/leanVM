@@ -60,7 +60,7 @@ use super::window::Window;
 pub(super) struct GatheredPass<'a> {
     src: Source<'a>,
     /// The transpose of a lane-major message, if the source is one.
-    staging: Option<Stage>,
+    staging: Option<Stage<'a>>,
     layer: usize,
     g: usize,
     num_ntts: usize,

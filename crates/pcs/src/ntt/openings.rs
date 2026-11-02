@@ -17,7 +17,8 @@ pub enum Kept<'a> {
     /// The buffer as the gathered passes left it: the deep layers run again on each row read.
     BeforeDeep { words: &'a [F64], plan: Plan },
     /// No buffer: each row is recomputed from the lane-major message, which `plan` says how to encode.
-    Nothing { msg: &'a [F64], repeats: &'a [bool], n_lanes: usize, plan: Plan },
+    /// `blocks` are the message blocks the encode took as lanes.
+    Nothing { msg: &'a [F64], repeats: &'a [bool], blocks: &'a [usize], plan: Plan },
     /// A coset-major encode: each row is recomputed from the message, coset by coset.
     Cosets { msg: &'a [F64], row_words: usize, log_inv_rate: usize },
 }
@@ -89,11 +90,11 @@ impl<'t> Openings<'t> {
                 let sub_len = plan.sub_len();
                 self.finished_rows(&plan, positions, |_, sub| &words[sub * sub_len..][..sub_len])
             }
-            Kept::Nothing { msg, repeats, n_lanes, plan } => {
+            Kept::Nothing { msg, repeats, blocks, plan } => {
                 let log_sub = plan.log_d - plan.deep_start;
                 let mut subs: Vec<usize> = positions.iter().map(|q| q >> log_sub).collect();
                 subs.dedup();
-                let built = Rebuild::new(&plan, Lanes { words: msg, repeats, n_lanes }, &subs).run(self.layers);
+                let built = Rebuild::new(&plan, Lanes { words: msg, repeats, blocks, rows: 1 << (plan.log_d - plan.start) }, &subs).run(self.layers);
                 let sub_len = plan.sub_len();
                 self.finished_rows(&plan, positions, |i, _| &built[i * sub_len..][..sub_len])
             }
@@ -132,7 +133,7 @@ impl<'t> Openings<'t> {
 struct Rebuild<'a> {
     plan: Plan,
     lanes: Lanes<'a>,
-    stage: Stage,
+    stage: Stage<'a>,
     /// Each coset with queried sub-blocks: its index, those sub-blocks' places in `subs`, and their group rows.
     cosets: Vec<(usize, std::ops::Range<usize>, Vec<usize>)>,
     n_subs: usize,
@@ -151,7 +152,7 @@ impl<'a> Rebuild<'a> {
         let msg_rows = 1usize << (log_d - start);
         assert!(plan.single_gathered_pass(), "one gathered pass");
         assert!(num_ntts.is_multiple_of(8) && log_step >= LOG_BATCH, "the gathered pass is lane-major");
-        assert_eq!(lanes.words.len(), lanes.n_lanes * msg_rows);
+        assert_eq!(lanes.rows, msg_rows);
         let mut next = 0;
         let cosets = subs
             .chunk_by(|a, b| a >> g == b >> g)
