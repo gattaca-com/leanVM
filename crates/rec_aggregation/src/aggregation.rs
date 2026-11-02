@@ -105,6 +105,10 @@ const _: () = assert!(leanvm_core::leaf::N_TUPLE_BITS == leanvm_core::leaf::N_BY
 // same address types (`signatures`' shared tweak). A chain step's address leaves out the
 // chain index in leanXMSS, where it follows the value.
 const DIGIT_GROUP: usize = 3;
+/// Index bits a leanXMSS path dispatch takes, and the dispatches of one signature.
+const LX_WINDOW: usize = 8;
+const LX_WINDOWS: usize = lean_xmss::LOG_LIFETIME / LX_WINDOW;
+const _: () = assert!(lean_xmss::LAYER_HEIGHT.is_multiple_of(LX_WINDOW));
 const _: () = assert!(lean_sphincs::W * lean_sphincs::V == 128 && lean_sphincs::V % DIGIT_GROUP == 1);
 const _: () = assert!(lean_xmss::W == lean_sphincs::W && lean_xmss::V % DIGIT_GROUP == 1);
 // A leaf index is the two layers' indices, which the guest decomposes into bits at once.
@@ -1624,9 +1628,10 @@ fn digit_hints(codeword: &[u8]) -> impl Iterator<Item = F192> + '_ {
     })
 }
 
-/// One leanXMSS signature's witness: the bits of its leaf index, then per layer,
-/// bottom first, the randomizer, the codeword's digits, the chain values they start
-/// from, and the ordered children of every node on the path.
+/// One leanXMSS signature's witness: its leaf index shifted by each multiple of
+/// `LX_WINDOW` and each window's bits in the exponent, then per layer, bottom first,
+/// the randomizer, the codeword's digits, the chain values they start from, and the
+/// sibling of every node on the path.
 fn lean_xmss_hints(
     hints: &mut Hints,
     pk: &LeanXmssPublicKey,
@@ -1634,15 +1639,19 @@ fn lean_xmss_hints(
     message: &lean_xmss::Message,
 ) -> Result<(), AggregationError> {
     let pp = &pk.public_param;
-    let bits = (0..lean_xmss::LOG_LIFETIME).map(|b| F192::new(u64::from(sig.leaf_index >> b & 1), 0, 0));
-    hints.push_iter("leaf_index_bits", bits);
+    let windows = (0..LX_WINDOWS).map(|w| u64::from(sig.leaf_index) >> (LX_WINDOW * w));
+    hints.push_iter("lx_index", windows.clone().map(|high| F192::new(high, 0, 0)));
+    for high in windows {
+        hints.push("lx_windows", &[count((high & ((1 << LX_WINDOW) - 1)) as usize)]);
+    }
     let mut root: Vec<u8> = message.to_vec();
     for (layer, layer_sig) in [&sig.bottom, &sig.top].into_iter().enumerate() {
         let e = lean_xmss::layer_index(sig.leaf_index, layer);
-        let (codeword, reached) = lean_xmss::layer_root(pp, layer, e, &root, layer_sig, |pair| {
-            hints.push("siblings", &[pack_16_bytes(&pair[0]), pack_16_bytes(&pair[1])]);
-        })
-        .ok_or(AggregationError::MalformedRawSignature)?;
+        let (codeword, reached) = lean_xmss::layer_root(pp, layer, e, &root, layer_sig, |_| {})
+            .ok_or(AggregationError::MalformedRawSignature)?;
+        for sibling in &layer_sig.path {
+            hints.push("lx_path", &[pack_16_bytes(sibling)]);
+        }
         hints.push("randomizer", &[pack_16_bytes(&layer_sig.randomizer)]);
         for index in digit_hints(&codeword) {
             hints.push("digits", &[index]);
@@ -2758,6 +2767,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("LX_TARGET_SUM", lean_xmss::TARGET_SUM.to_string());
     ps("LX_HEIGHT", lean_xmss::LAYER_HEIGHT.to_string());
     ps("LX_TOP", address(lean_xmss::tweak(0, lean_xmss::TOP, 0)));
+    ps("LX_WINDOW", LX_WINDOW.to_string());
     ps("MAX_KEYS", MAX_KEYS.to_string());
     ps("STREAM_FRAME", STREAM_FRAME.to_string());
     ps("MAX_DA_ROOTS", MAX_DA_ROOTS.to_string());
@@ -3064,16 +3074,22 @@ mod tests {
         }
     }
 
-    /// A leanXMSS signature's leaf index and codeword are bound in-circuit: a node whose
-    /// hints flip a bit of the index, give it a bit that is not Boolean, or dispatch a
-    /// digit group other than the digest's fails the guest's run.
+    /// A leanXMSS signature's leaf index, path and codeword are bound in-circuit: a node
+    /// whose hints change the index or one of its shifts, dispatch a window other than
+    /// the index's or past the arms, change a sibling, or dispatch a digit group other
+    /// than the digest's fails the guest's run.
     #[test]
     fn forged_lean_xmss_hints_are_rejected() {
         leanvm_core::init_prover();
         let signers = signing(&get_signers(1), 0);
-        let forgeries: [Forgery; 3] = [
-            Box::new(|hints: &mut Hints| hints.entry_mut("leaf_index_bits", 0)[0] += F192::ONE),
-            Box::new(|hints: &mut Hints| hints.entry_mut("leaf_index_bits", 0)[1] = F192::new(2, 0, 0)),
+        let forgeries: [Forgery; 8] = [
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_index", 0)[0] += F192::ONE),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_index", 0)[1] += F192::ONE),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_index", 0)[3] += F192::ONE),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 0)[0] *= count(1)),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", LX_WINDOWS - 1)[0] *= count(1)),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 1)[0] = count(1 << LX_WINDOW)),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_path", 5)[0] += F192::ONE),
             Box::new(|hints: &mut Hints| {
                 hints.entry_mut("digits", 0)[0] *= count(1);
             }),

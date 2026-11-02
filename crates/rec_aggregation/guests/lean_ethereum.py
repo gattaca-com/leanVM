@@ -417,6 +417,11 @@ LX_V = LX_V_PLACEHOLDER
 LX_TARGET_SUM = LX_TARGET_SUM_PLACEHOLDER
 LX_HEIGHT = LX_HEIGHT_PLACEHOLDER
 LX_TOP = LX_TOP_PLACEHOLDER
+# The path is dispatched LX_WINDOW index bits at a time (`lx_window`); LX_HEIGHT is
+# a multiple of it.
+LX_WINDOW = LX_WINDOW_PLACEHOLDER
+LX_WINDOWS = 2 * LX_HEIGHT // LX_WINDOW
+LX_WINDOW_ARMS = 2 ** LX_WINDOW
 
 # -------------------------------------------------- leanSPHINCS (host-supplied)
 # The scheme's own letters, prefixed SP_: one tree of height SP_H over WOTS+C keys,
@@ -3641,23 +3646,64 @@ def merkle_path(node, pp, bits, nodes, out, off: Const, height: Const, end: Cons
 # ========================= leanXMSS signature verification ========================
 
 
+@inline
+def lx_levels(cur, pp, powers, his, out, w: Const, k: Const):
+    # The LX_WINDOW path levels from LX_WINDOW * w, whose index bits are k, from
+    # `cur` into out. A node's order against its sibling is k's bit, and a parent's
+    # address is his[w + 1] shifted up, k's higher bits added: his[v] holds
+    # `leaf_index >> LX_WINDOW v`, and nothing is above the top window.
+    for r in unroll(0, LX_WINDOW):
+        tag = const(TW_NODE + ((LX_WINDOW * w + r) % LX_HEIGHT + 1) * HI_MUL + (LX_WINDOW * w + r) // LX_HEIGHT * LX_TOP + k // 2 ** (r + 1))
+        if const(w + 1 == LX_WINDOWS):
+            at = tag
+        elif const(r + 1 == LX_WINDOW):
+            at = his[w + 1] + tag
+        else:
+            at = his[w + 1] * powers[LX_WINDOW - 1 - r] + tag
+        if const(r + 1 == LX_WINDOW):
+            parent = out
+        else:
+            parent = StackBuf(1)
+        sibling = hint_witness("lx_path")
+        if const((k // 2 ** r) % 2 == 0):
+            keccak([pp, at], [cur, sibling], parent)
+        else:
+            keccak([pp, at], [sibling, cur], parent)
+        cur = parent[0]
+    return
+
+
+@inline
+def lx_window(cur, pp, powers, his, out, w: Const, k: Const):
+    # Window w of the path (`lx_levels`). Returns his[w] as his[w + 1] and k spell
+    # it, which the dispatch stores where his[w] already is: so the index the
+    # signature's addresses use is the one its path takes.
+    lx_levels(cur, pp, powers, his, out, w, k)
+    return his[w + 1] * powers[LX_WINDOW] + const(k)
+
+
+@inline
+def lx_top_window(cur, pp, powers, his, out, w: Const, k: Const):
+    # The top window, nothing above it: his[w] is k alone.
+    lx_levels(cur, pp, powers, his, out, w, k)
+    return const(k)
+
+
 def verify_lean_xmss(signer):
     # `signer` is one 4-cell entry of the leanXMSS coverage table: the pubkey's
     # merkle root and public parameter, then the message that pubkey signed. The
     # bottom layer signs the message, the top layer the bottom root.
     pp = signer[GEN]
 
-    # The leaf index rides the signature, so every address is derived here from its
-    # bits, which are advice pinned Boolean: any index is one some signature may
-    # carry, so no outside value pins them, and the digests and the root this
-    # signature must reach bind them. nodes[l] is `leaf_index >> l`: the bottom
-    # layer's key and node indices, then from LX_HEIGHT on the top layer's.
-    bits = StackBuf(2 * LX_HEIGHT)
-    hint_witness(bits, "leaf_index_bits")
-    for b in unroll(0, 2 * LX_HEIGHT):
-        bits[b] = bits[b] * bits[b]
-    nodes = StackBuf(2 * LX_HEIGHT)
-    shifts(bits, 0, 2 * LX_HEIGHT, nodes)
+    # The leaf index rides the signature, so every address is derived here from it.
+    # It is advice: his[v] is `leaf_index >> LX_WINDOW v`, a field's value, and each
+    # window of LX_WINDOW bits is hinted again in the exponent, range checked and
+    # dispatched on by the path (`lx_window`). Each arm checks his[w] against his[w + 1]
+    # and its own bits, and the top one has nothing above it, so his[0] is the index
+    # the windows spell. Any index is one some signature may carry; the digests and
+    # the root this signature must reach bind it.
+    his = StackBuf(LX_WINDOWS)
+    hint_witness(his, "lx_index")
     powers = StackBuf(DIGIT_GROUP * CHAIN_STEPS + 1)
     for s in unroll(0, DIGIT_GROUP * CHAIN_STEPS + 1):
         powers[s] = GEN ** s
@@ -3667,12 +3713,17 @@ def verify_lean_xmss(signer):
     tags = StackBuf(LX_V)
     for i in unroll(0, LX_V):
         tags[i] = i
+    # The top layer's root is the pubkey's: its last hash writes the cell, which is
+    # the check.
+    root = StackBuf(1)
+    top_root = StackBuf(1)
+    top_root[0] = signer[1]
 
     for layer in unroll(0, 2):
         if const(layer == 0):
-            idx = nodes[0]
+            idx = his[0]
         else:
-            idx = nodes[LX_HEIGHT] + LX_TOP
+            idx = his[LX_HEIGHT // LX_WINDOW] + LX_TOP
         # D = Th(P, A, M | R), one block: 80 bytes at the bottom, and 64 at the top,
         # where M is the bottom root.
         rho = hint_witness("randomizer")
@@ -3703,12 +3754,23 @@ def verify_lean_xmss(signer):
         digest[0] = encoded  # the digits, stored where D already is
         assert digit_product == GEN ** LX_TARGET_SUM
 
-        # The one-time leaf, then the path to the layer's root.
+        # The one-time leaf, then the path to the layer's root, a window at a time.
         leaf = StackBuf(1)
         wots_leaf(pp, idx + TW_LEAF, walks, LX_V, leaf)
-        root = StackBuf(1)
-        merkle_path(leaf[0], pp, bits, nodes, root, LX_HEIGHT * layer, LX_HEIGHT, 2 * LX_HEIGHT, layer)
-    assert root[0] == signer[1]
+        cur = leaf[0]
+        for v in unroll(0, LX_HEIGHT // LX_WINDOW):
+            out = StackBuf(1)
+            if const(v + 1 == LX_HEIGHT // LX_WINDOW):
+                out = root
+                if const(layer == 1):
+                    out = top_root
+            window = hint_witness("lx_windows")
+            assert log(window) < LX_WINDOW_ARMS
+            if const(layer * (LX_HEIGHT // LX_WINDOW) + v + 1 == LX_WINDOWS):
+                his[LX_WINDOWS - 1] = match(log(window), range(0, LX_WINDOW_ARMS), lambda k: lx_top_window(cur, pp, powers, his, out, LX_WINDOWS - 1, k))
+            else:
+                his[layer * (LX_HEIGHT // LX_WINDOW) + v] = match(log(window), range(0, LX_WINDOW_ARMS), lambda k: lx_window(cur, pp, powers, his, out, layer * (LX_HEIGHT // LX_WINDOW) + v, k))
+            cur = out[0]
     return
 
 
