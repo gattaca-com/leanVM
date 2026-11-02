@@ -379,9 +379,7 @@ impl FnLower<'_> {
         // line the callee happened to end on.
         let saved_line = self.cur_line;
         self.inline_calls.push(callee.to_string());
-        for s in body.iter() {
-            self.stmt(s);
-        }
+        self.lower_stmts(&body);
         let popped = self.inline_calls.pop();
         debug_assert_eq!(popped.as_deref(), Some(callee));
         self.inline_ret = saved_ret;

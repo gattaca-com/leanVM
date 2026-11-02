@@ -1641,9 +1641,7 @@ fn lean_xmss_hints(
     let pp = &pk.public_param;
     let windows = (0..LX_WINDOWS).map(|w| u64::from(sig.leaf_index) >> (LX_WINDOW * w));
     hints.push_iter("lx_index", windows.clone().map(|high| F192::new(high, 0, 0)));
-    for high in windows {
-        hints.push("lx_windows", &[count((high & ((1 << LX_WINDOW) - 1)) as usize)]);
-    }
+    hints.push_iter("lx_windows", windows.map(|high| count((high & ((1 << LX_WINDOW) - 1)) as usize)));
     let mut root: Vec<u8> = message.to_vec();
     for (layer, layer_sig) in [&sig.bottom, &sig.top].into_iter().enumerate() {
         let e = lean_xmss::layer_index(sig.leaf_index, layer);
@@ -1653,9 +1651,7 @@ fn lean_xmss_hints(
             hints.push("lx_path", &[pack_16_bytes(sibling)]);
         }
         hints.push("randomizer", &[pack_16_bytes(&layer_sig.randomizer)]);
-        for index in digit_hints(&codeword) {
-            hints.push("digits", &[index]);
-        }
+        hints.push_iter("lx_digits", digit_hints(&codeword));
         for value in &layer_sig.chain_values {
             hints.push("chain_starts", &[pack_16_bytes(value)]);
         }
@@ -3087,11 +3083,11 @@ mod tests {
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_index", 0)[1] += F192::ONE),
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_index", 0)[3] += F192::ONE),
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 0)[0] *= count(1)),
-            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", LX_WINDOWS - 1)[0] *= count(1)),
-            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 1)[0] = count(1 << LX_WINDOW)),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 0)[LX_WINDOWS - 1] *= count(1)),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 0)[1] = count(1 << LX_WINDOW)),
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_path", 5)[0] += F192::ONE),
             Box::new(|hints: &mut Hints| {
-                hints.entry_mut("digits", 0)[0] *= count(1);
+                hints.entry_mut("lx_digits", 0)[0] *= count(1);
             }),
         ];
         for forgery in forgeries {
@@ -3340,12 +3336,24 @@ def main():
         use leanvm_core::cpu::tamper::{self, Tamper};
         leanvm_core::init_prover();
         // The right leaf's JUMP rows fill a chunk past a power of two, so its padded JUMP table has rows past its
-        // committed chunks; its memory is committed whole, the floor leaving none past it.
-        let signers = get_signers(SMALL_LEAF_SIZE + 30);
+        // committed chunks; its memory is committed whole, the floor leaving none past it. Its size is the first
+        // that does, so the fixture follows the guest's row counts.
+        let chunk = 1 << leanvm_core::witness::CHUNK_LOG;
+        let jump = leanvm_core::cpu::Stats::TABLES.iter().position(|&t| t == "JUMP").expect("a JUMP table");
+        let signers = get_signers(SMALL_LEAF_SIZE + 64);
+        let right_size = (30..64)
+            .find(|&n| {
+                let honest = signing(&signers[SMALL_LEAF_SIZE..SMALL_LEAF_SIZE + n], 0);
+                let (_, stats) =
+                    aggregate_with_stats(&[], honest, vec![], &[], None, LOG_INV_RATE, &mut GPow::new()).expect("leaf");
+                let jumps = stats.rows[jump];
+                jumps.next_multiple_of(chunk) < jumps.next_power_of_two()
+            })
+            .expect("a leaf size whose JUMP table has rows past its committed chunks");
         let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
         for forgery in [Tamper::DenseWord, Tamper::PastHeight] {
             tamper::set(forgery);
-            let right = prove_leaf(&signers[SMALL_LEAF_SIZE..]);
+            let right = prove_leaf(&signers[SMALL_LEAF_SIZE..SMALL_LEAF_SIZE + right_size]);
             let result = aggregate(&[left.clone(), right], vec![], vec![], &[], None, LOG_INV_RATE);
             assert!(
                 matches!(result, Err(AggregationError::ProofError(_))),

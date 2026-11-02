@@ -475,11 +475,99 @@ impl FnLower<'_> {
 
     /// Lower a branch body with branch-local scope ([`Self::scoped`]).
     fn branch(&mut self, body: &[Stmt]) {
-        self.scoped(|s| {
-            for st in body {
-                s.stmt(st);
+        self.scoped(|s| s.lower_stmts(body));
+    }
+
+    /// Lower a statement list. An `unroll` is spliced in place, so a run of
+    /// `match` statements its copies leave back to back is lowered as one chain
+    /// ([`Self::lower_match_chain`]).
+    pub(super) fn lower_stmts(&mut self, body: &[Stmt]) {
+        self.lower_list(body, false);
+    }
+
+    /// Lower a function's body ([`Self::lower_stmts`]), marking tail calls.
+    fn lower_body(&mut self, body: &[Stmt]) {
+        self.lower_list(body, true);
+    }
+
+    fn lower_list(&mut self, body: &[Stmt], fn_body: bool) {
+        let mut queue: std::collections::VecDeque<Stmt> = body.iter().cloned().collect();
+        while let Some(s) = queue.pop_front() {
+            // Tail position: a conditional call whose only successor is a bare
+            // `return`, in a function that returns nothing. The `mul_range` helper
+            // ends exactly like this, so its self-call stops building an unwind
+            // chain.
+            self.tail_call = fn_body
+                && !self.is_main
+                && self.return_shapes.is_empty()
+                && matches!(s.kind, StmtKind::CallIfNe(..))
+                && matches!(queue.front().map(|n| &n.kind), Some(StmtKind::Return(r)) if r.is_empty());
+            match &s.kind {
+                StmtKind::Unroll { .. } => {
+                    self.cur_line = s.line;
+                    for e in self.expand_unroll(&s).into_iter().rev() {
+                        queue.push_front(e);
+                    }
+                }
+                StmtKind::Match { targets, arms, .. } if self.chainable(arms) => {
+                    // The names the chain binds so far, and those the last match binds.
+                    let mut bound: Vec<String> = Vec::new();
+                    let mut last = target_names(targets);
+                    let mut chain = vec![s.clone()];
+                    loop {
+                        // An `unroll` next in line is spliced now, unless its bounds
+                        // read a name the chain binds.
+                        while let Some(n) = queue.front()
+                            && let StmtKind::Unroll { lo, hi, .. } = &n.kind
+                            && ![lo, hi].iter().any(|e| reads_any(e, &bound) || reads_any(e, &last))
+                        {
+                            let n = queue.pop_front().expect("peeked");
+                            self.cur_line = n.line;
+                            for e in self.expand_unroll(&n).into_iter().rev() {
+                                queue.push_front(e);
+                            }
+                        }
+                        let ready = match queue.front().map(|n| &n.kind) {
+                            Some(StmtKind::Match { x, arms, .. }) => {
+                                self.chainable(arms) && self.chain_ready(x, &bound, &last)
+                            }
+                            _ => false,
+                        };
+                        if !ready {
+                            break;
+                        }
+                        let n = queue.pop_front().expect("peeked");
+                        let StmtKind::Match { targets, .. } = &n.kind else { unreachable!() };
+                        bound.append(&mut last);
+                        last = target_names(targets);
+                        chain.push(n);
+                    }
+                    if chain.len() == 1 {
+                        self.stmt(&s);
+                    } else {
+                        self.lower_match_chain(&chain);
+                    }
+                }
+                _ => self.stmt(&s),
             }
-        });
+        }
+    }
+
+    /// The copies of an `unroll`, each its body with the counter substituted.
+    fn expand_unroll(&self, s: &Stmt) -> Vec<Stmt> {
+        let StmtKind::Unroll { var, lo, hi, body } = &s.kind else {
+            unreachable!("expand_unroll on a non-unroll statement")
+        };
+        let bound = |e: &Expr| {
+            self.try_const_index(e).unwrap_or_else(|| {
+                self.fail(format!("unroll bounds must be compile-time integers, got `{e:?}`"))
+            })
+        };
+        let (lo, hi) = (bound(lo), bound(hi));
+        if lo > hi {
+            self.fail(format!("unroll(a, b) needs a <= b, got ({lo}, {hi})"))
+        };
+        (lo..hi).flat_map(|j| subst_stmts(body, var, &Expr::Lit(j as u128))).collect()
     }
 
     /// The cell each multi-return target names, and the names still to bind.
@@ -521,23 +609,12 @@ impl FnLower<'_> {
     /// Write-once makes that sound, exactly one arm running, and
     /// [`Self::ret_targets`] says which cells those are.
     fn lower_match(&mut self, targets: &[Expr], x: &Expr, arms: &[Expr]) {
-        for arm in arms {
-            if let Expr::Call(f, _) = arm
-                && self
-                    .defs
-                    .get(f.as_str())
-                    .is_some_and(|d| !d.inline && d.return_shapes.iter().any(|s| matches!(s, Shape::StackBuf(_))))
-            {
-                self.fail("a normal function's StackBuf return cannot cross a match join; bind it with `let`");
-            }
-        }
+        self.check_match_arms(arms);
         // Calls with identical runtime args share one callee frame, dispatched
         // through a table of the callees' entries. Const args select specializations;
         // see `lower_dispatched_call` for the shared argument/return layout checks.
         // `@inline` arms instead expand into this frame, below.
-        let inline_arm =
-            |s: &Self, a: &Expr| matches!(a, Expr::Call(f, _) if s.defs.get(f.as_str()).is_some_and(|d| d.inline));
-        if arms.iter().all(|a| matches!(a, Expr::Call(..)) && !inline_arm(self, a)) {
+        if !self.chainable(arms) {
             let specialized: Vec<(String, Vec<&Expr>)> = arms
                 .iter()
                 .map(|a| {
@@ -556,45 +633,134 @@ impl FnLower<'_> {
         }
         let xo = self.expr(x);
         let (rcells, binds) = self.ret_targets(targets);
-        self.lower_match_dispatch(xo, arms.len(), |s, j| {
-            s.scoped(|s| {
-                if let [rcell] = rcells.as_slice() {
-                    s.expr_into(&arms[j], *rcell);
-                } else {
-                    let Expr::Call(f, cargs) = &arms[j] else {
-                        s.fail(format!(
-                            "a multi-target match arm must be a function call, got `{:?}`",
-                            arms[j]
-                        ));
-                    };
-                    s.inline_stack_ret = None;
-                    s.call_into(f, cargs, &rcells);
-                    // An @inline arm's aliased returns materialize into the
-                    // shared join cells (a real call wrote them directly).
-                    if let Some(binds) = s.inline_stack_ret.take() {
-                        for (b, &rc) in binds.iter().zip(&rcells) {
-                            match *b {
-                                RetBind::Gaddr(ga) => {
-                                    let c = s.materialize(ga);
-                                    s.copy(c, rc);
-                                }
-                                RetBind::Stack(base, size) => {
-                                    if size != 1 {
-                                        s.fail("a multi-cell StackBuf return cannot cross a match join")
-                                    }
-                                    // `copy` reads the run's first cell, which is where
-                                    // the arm's single returned value sits.
-                                    let src = base;
-                                    s.copy(src, rc);
-                                }
-                                RetBind::Scalar => {}
+        self.lower_match_dispatch(xo, arms.len(), |s, j| s.lower_match_arm(&arms[j], &rcells));
+        self.bind_targets(&binds);
+    }
+
+    fn check_match_arms(&self, arms: &[Expr]) {
+        for arm in arms {
+            if let Expr::Call(f, _) = arm
+                && self
+                    .defs
+                    .get(f.as_str())
+                    .is_some_and(|d| !d.inline && d.return_shapes.iter().any(|s| matches!(s, Shape::StackBuf(_))))
+            {
+                self.fail("a normal function's StackBuf return cannot cross a match join; bind it with `let`");
+            }
+        }
+    }
+
+    /// Whether a `match` dispatches through its own arms rather than a fused call:
+    /// some arm is not a call of a normal function.
+    fn chainable(&self, arms: &[Expr]) -> bool {
+        !arms
+            .iter()
+            .all(|a| matches!(a, Expr::Call(f, _) if !self.defs.get(f.as_str()).is_some_and(|d| d.inline)))
+    }
+
+    /// Whether a chained `match`'s scrutinee already sits in a cell, so lowering it
+    /// emits nothing, and reads no name the match before it binds. `bound` holds
+    /// the names the chain's earlier matches bind, which are cells by then.
+    fn chain_ready(&self, x: &Expr, bound: &[String], last: &[String]) -> bool {
+        if reads_any(x, last) {
+            return false;
+        }
+        match x {
+            Expr::Var(v) => bound.contains(v) || matches!(self.scope.bound(v).map(|b| b.val), Some(Binding::Scalar(_))),
+            Expr::Index(arr, idx) => match (self.stack_of(arr), self.try_const_index(idx)) {
+                (Some((_, size)), Some(k)) => k < size,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Arm `arm` of a dispatched `match`, its values into the cells `rcells`, with
+    /// its own branch-local scope.
+    fn lower_match_arm(&mut self, arm: &Expr, rcells: &[Off]) {
+        self.scoped(|s| {
+            if let [rcell] = rcells {
+                s.expr_into(arm, *rcell);
+            } else {
+                let Expr::Call(f, cargs) = arm else {
+                    s.fail(format!("a multi-target match arm must be a function call, got `{arm:?}`"));
+                };
+                s.inline_stack_ret = None;
+                s.call_into(f, cargs, rcells);
+                // An @inline arm's aliased returns materialize into the
+                // shared join cells (a real call wrote them directly).
+                if let Some(binds) = s.inline_stack_ret.take() {
+                    for (b, &rc) in binds.iter().zip(rcells) {
+                        match *b {
+                            RetBind::Gaddr(ga) => {
+                                let c = s.materialize(ga);
+                                s.copy(c, rc);
                             }
+                            RetBind::Stack(base, size) => {
+                                if size != 1 {
+                                    s.fail("a multi-cell StackBuf return cannot cross a match join")
+                                }
+                                // `copy` reads the run's first cell, which is where
+                                // the arm's single returned value sits.
+                                let src = base;
+                                s.copy(src, rc);
+                            }
+                            RetBind::Scalar => {}
                         }
                     }
                 }
-            });
+            }
         });
-        self.bind_targets(&binds);
+    }
+
+    /// `match` statements back to back, lowered as one chain: an arm of each
+    /// dispatches straight into the next one's table, and only the last one's arms
+    /// meet at a join. That saves each match but the last its join's `SET` and its
+    /// arms' exit `JUMP`. Sound as a sequence: exactly one arm of each runs, in
+    /// order, and every scrutinee is a cell before the chain starts
+    /// ([`Self::chain_ready`]), read only when its dispatch runs.
+    fn lower_match_chain(&mut self, chain: &[Stmt]) {
+        let ms: Vec<(&[Expr], &Expr, &[Expr], u32)> = chain
+            .iter()
+            .map(|st| match &st.kind {
+                StmtKind::Match { targets, x, arms } => (targets.as_slice(), x, arms.as_slice(), st.line),
+                _ => unreachable!("a match chain holds matches"),
+            })
+            .collect();
+        for &(_, _, arms, line) in &ms {
+            self.cur_line = line;
+            self.check_match_arms(arms);
+        }
+        self.cur_line = ms[0].3;
+        // Hoisted on purpose: these SETs must dominate every arm and the join.
+        let sfp = self.self_fp();
+        let one = self.one();
+        let join = self.fresh();
+        let jset = self.code.len();
+        self.set(join, KVal::Local(0)); // patched: the join
+        let xo = self.expr(ms[0].1);
+        let mut first = self.alloc_table(ms[0].2.len());
+        self.table_jump(xo, first, one, sfp);
+        for (i, &(targets, _, arms, line)) in ms.iter().enumerate() {
+            self.cur_line = line;
+            let (rcells, binds) = self.ret_targets(targets);
+            let next = ms.get(i + 1).map(|&(_, x, arms, _)| {
+                let at = self.code.len();
+                let xo = self.expr(x);
+                debug_assert_eq!(at, self.code.len(), "a chained scrutinee is a cell already");
+                (xo, self.alloc_table(arms.len()))
+            });
+            let exit = match next {
+                Some((xo, next_first)) => ArmExit::Dispatch(xo, next_first),
+                None => ArmExit::Join(join),
+            };
+            self.dispatch_arms(first, arms.len(), one, sfp, exit, |s, j| s.lower_match_arm(&arms[j], &rcells));
+            self.bind_targets(&binds);
+            if let Some((_, next_first)) = next {
+                first = next_first;
+            }
+        }
+        self.patch_local(jset, self.code.len());
     }
 
     /// Jump through slot `x` of the table at `first` ([`JumpTables`]): one `DEREF`
@@ -612,39 +778,60 @@ impl FnLower<'_> {
     /// The dispatch every `match` lowers through: read slot `x` of the match's jump
     /// table and jump there ([`Self::table_jump`]). Every non-final arm exits to the
     /// join. `body` lowers arm `j`, with its own branch-local scope.
-    ///
-    /// One arm runs, so the arms allocate their locals over the same cells.
-    fn lower_match_dispatch(&mut self, xo: Off, n: usize, mut body: impl FnMut(&mut Self, usize)) {
+    fn lower_match_dispatch(&mut self, xo: Off, n: usize, body: impl FnMut(&mut Self, usize)) {
         // Hoisted on purpose: these SETs must dominate the join.
         let sfp = self.self_fp();
         let one = self.one();
         let join = self.fresh();
         let jset = self.code.len();
         self.set(join, KVal::Local(0)); // patched: the join
+        let first = self.alloc_table(n);
+        self.table_jump(xo, first, one, sfp);
+        self.dispatch_arms(first, n, one, sfp, ArmExit::Join(join), body);
+        self.patch_local(jset, self.code.len());
+    }
+
+    /// `n` placeholder slots of a fresh jump table, each patched to its arm's entry.
+    fn alloc_table(&mut self, n: usize) -> usize {
         let first = self.tables.slots.len();
         let name = self.fn_name.to_string();
         self.tables.slots.extend((0..n).map(|_| KVal::At(name.clone(), 0)));
-        self.table_jump(xo, first, one, sfp);
-        // The arm blocks, each exiting to the join (the last falls through).
+        first
+    }
+
+    /// The `n` arms of the table at `first`, each entering its slot and leaving by
+    /// `exit`. One arm runs, so the arms allocate their locals over the same cells.
+    fn dispatch_arms(
+        &mut self,
+        first: usize,
+        n: usize,
+        one: Off,
+        sfp: Off,
+        exit: ArmExit,
+        mut body: impl FnMut(&mut Self, usize),
+    ) {
+        let name = self.fn_name.to_string();
         let arms_base = self.next;
         let mut arms_end = arms_base;
         for j in 0..n {
             self.next = arms_base;
             self.tables.slots[first + j] = KVal::At(name.clone(), self.code.len() as u32);
             body(self, j);
-            if j + 1 != n {
-                self.emit(LOp::Jump {
+            match exit {
+                // The last arm falls through to the join.
+                ArmExit::Join(join) if j + 1 != n => self.emit(LOp::Jump {
                     oc: one,
                     od: join,
                     of: sfp,
-                });
+                }),
+                ArmExit::Join(_) => {}
+                ArmExit::Dispatch(xo, next_first) => self.table_jump(xo, next_first, one, sfp),
             }
             arms_end = arms_end.max(self.next);
             // The next arm may reuse these cells for something other than a `HeapBuf`.
             self.heap_sizes.retain(|&o, _| o < arms_base);
         }
         self.next = arms_end;
-        self.patch_local(jset, self.code.len());
     }
 
     /// Lower `if` / `else`, arranging the blocks so the nonzero `XOR` result jumps to the correct arm.
@@ -681,9 +868,7 @@ impl FnLower<'_> {
                     }
                 }
             }
-            for st in if (ai == bi) == eq { then } else { els } {
-                self.stmt(st);
-            }
+            self.lower_stmts(if (ai == bi) == eq { then } else { els });
             return;
         }
         // `const(...)` also decides a condition only the field can read (`GEN ** 3`,
@@ -692,9 +877,7 @@ impl FnLower<'_> {
         // bindings then outlive it.
         if force_const {
             if let (Some(fa), Some(fb)) = (a.field, b.field) {
-                for st in if (fa == fb) == eq { then } else { els } {
-                    self.stmt(st);
-                }
+                self.lower_stmts(if (fa == fb) == eq { then } else { els });
                 return;
             }
             self.fail("`if const(...)` asks for a compile-time decision, but this condition is not one: both sides must be compile-time constants")
@@ -1258,21 +1441,9 @@ impl FnLower<'_> {
             // substituted as its literal. Every copy executes (this is
             // straight-line code, not a branch), so bindings simply rebind (a
             // fresh binding per iteration) and lazy caches persist.
-            StmtKind::Unroll { var, lo, hi, body } => {
-                let bound = |s: &Self, e: &Expr| {
-                    s.try_const_index(e).unwrap_or_else(|| {
-                        self.fail(format!("unroll bounds must be compile-time integers, got `{e:?}`"))
-                    })
-                };
-                let (lo, hi) = (bound(self, lo), bound(self, hi));
-                if lo > hi {
-                    self.fail(format!("unroll(a, b) needs a <= b, got ({lo}, {hi})"))
-                };
-                for j in lo..hi {
-                    for s in subst_stmts(body, var, &Expr::Lit(j as u128)) {
-                        self.stmt(&s);
-                    }
-                }
+            StmtKind::Unroll { .. } => {
+                let copies = self.expand_unroll(s);
+                self.lower_stmts(&copies);
             }
         }
     }
@@ -1537,17 +1708,7 @@ pub(crate) fn lower_func(
         const_arrays,
         tables,
     };
-    for (i, s) in f.body.iter().enumerate() {
-        // Tail position: a conditional call whose only successor is a bare
-        // `return`, in a function that returns nothing. The `mul_range` helper
-        // ends exactly like this, so its self-call stops building an unwind
-        // chain.
-        lowerer.tail_call = !lowerer.is_main
-            && f.return_shapes.is_empty()
-            && matches!(s.kind, StmtKind::CallIfNe(..))
-            && matches!(f.body.get(i + 1).map(|n| &n.kind), Some(StmtKind::Return(r)) if r.is_empty());
-        lowerer.stmt(s);
-    }
+    lowerer.lower_body(&f.body);
     if lowerer.is_main {
         lowerer.halt(); // main terminates in the final state (sentinel pc, main's frame), not by falling off
     } else if !matches!(f.body.last().map(|s| &s.kind), Some(StmtKind::Return(_))) {
@@ -1561,4 +1722,30 @@ pub(crate) fn lower_func(
         code: lowerer.code,
         frame_size: lowerer.next,
     }
+}
+
+/// Where a dispatched arm goes when it is done: the match's join, or straight into
+/// the next match of a chain, through slot `x` of its table at `first`.
+#[derive(Clone, Copy)]
+enum ArmExit {
+    Join(Off),
+    Dispatch(Off, usize),
+}
+
+/// The names a `match` binds: its plain-name targets.
+fn target_names(targets: &[Expr]) -> Vec<String> {
+    targets
+        .iter()
+        .filter_map(|t| match t {
+            Expr::Var(v) => Some(v.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `e` reads any of `names`.
+fn reads_any(e: &Expr, names: &[String]) -> bool {
+    let mut refs = Vec::new();
+    free_vars_expr(e, &mut refs);
+    refs.iter().any(|r| names.iter().any(|n| n == r))
 }
