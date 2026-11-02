@@ -5,6 +5,7 @@
 //! the column's offset.
 
 use crate::tables::ColumnOut;
+use primitives::stream::Stream;
 use ::pcs::stack_open::EQUAL_BLOCK_LOG;
 use primitives::field::F64;
 
@@ -234,6 +235,8 @@ impl Dense {
                 }
             }
         }
+        // Nothing reads the copy before the commit, so it streams past the cache.
+        let zeros = [F64::ZERO; RUN];
         let dense = primitives::filled_vec(len, |dense| {
             let (head, jagged) = dense.split_at_mut(start);
             head[padded_words..].fill(F64::ZERO);
@@ -242,19 +245,22 @@ impl Dense {
                     let n = 1usize << p.n_vars;
                     let from = placements[global].offset;
                     parallel::chunks_mut(&mut head[p.offset..p.offset + n], FILL_CHUNK, |t, out| {
-                        out.copy_from_slice(&q[from + t * FILL_CHUNK..][..out.len()]);
+                        Stream::new().copy(out, &q[from + t * FILL_CHUNK..][..out.len()]);
                     });
                 }
             }
             parallel::chunks_mut(jagged, FILL_CHUNK, |t, out| {
+                let stream = Stream::new();
                 for (r, out) in out.chunks_mut(RUN).enumerate() {
-                    match runs.get(t * (FILL_CHUNK / RUN) + r).copied().flatten() {
+                    let n = match runs.get(t * (FILL_CHUNK / RUN) + r).copied().flatten() {
                         Some((from, n)) => {
-                            out[..n].copy_from_slice(&q[from..from + n]);
-                            out[n..].fill(F64::ZERO);
+                            stream.copy(&mut out[..n], &q[from..from + n]);
+                            n
                         }
-                        None => out.fill(F64::ZERO),
-                    }
+                        None => 0,
+                    };
+                    let tail = out.len() - n;
+                    stream.copy(&mut out[n..], &zeros[..tail]);
                 }
             });
         });
