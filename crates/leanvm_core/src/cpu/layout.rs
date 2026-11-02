@@ -3,6 +3,7 @@
 //! sizes and public input. Plus the prover-side witness build.
 
 use super::*;
+use crate::witness::Column;
 use flux_profiler::timed;
 
 // ---- column schema -----------------------------------------------------------
@@ -137,9 +138,10 @@ pub struct Layout {
     pub pull: Vec<Block>,
     /// Count channel: read-count columns whose product must be nonzero (§sec:memchan).
     pub count: Vec<Block>,
-    /// Per-column placement (offset + n_vars) in the padded working stack the prover fills and reads.
+    /// Per-column placement (offset + n_vars) in the padded stack: each column's padded height `2^n_vars`. The
+    /// prover holds no padded stack, so the offsets are unused.
     pub placements: Vec<witness::Placement>,
-    /// The padded working stack's shape.
+    /// The padded stack's shape.
     pub shape: witness::StackShape,
     /// The committed stack: the same columns, the jagged ones cut to their tables' chunks. From the announced
     /// sizes alone, so reconstructable by the verifier.
@@ -155,16 +157,15 @@ pub struct Layout {
     pub rows: [usize; tables::N_TABLES],
 }
 
-/// The prover's witness: the stacked multilinear `q`, which holds every committed
-/// column at its placed offset, plus the public [`Layout`] (and the sizes needed to
-/// announce it).
+/// The prover's witness: the committed stack, which holds every committed column at its
+/// [`Layout::dense`] slot, plus the public [`Layout`] (and the sizes needed to announce it).
 pub(crate) struct Witness {
-    pub(crate) q: Vec<F64>,
-    /// Which blocks of `q` equal their predecessor, as far as the fills know ([`::pcs::stack_open::equal_blocks`]
-    /// is the exact map): the padding of each column.
+    pub(crate) dense: Vec<F64>,
+    /// Which blocks of `dense` equal their predecessor, as far as the fills know ([`::pcs::stack_open::equal_blocks`]
+    /// is the exact map).
     pub(crate) repeats: Vec<bool>,
     /// The KECCAK output lanes' values as `(global column index, values)`. They carry
-    /// data for the bus but are not committed, so they are not in `q`.
+    /// data for the bus but are not committed, so they are not in `dense`.
     pub(crate) virt: Vec<(usize, Vec<F64>)>,
     pub(crate) layout: Layout,
     pub(crate) log_mem: usize,
@@ -173,25 +174,29 @@ pub(crate) struct Witness {
 }
 
 impl Witness {
-    /// One read-only view per column, in global column order: the window into the
-    /// stack for a committed column or a KECCAK input lane (its slot of `q_keccak`),
-    /// the private buffer for an output lane.
-    pub(crate) fn columns(&self) -> Vec<&[F64]> {
-        let q_keccak = self.layout.placements[QKECCAK].offset;
-        let steps = 1 << self.layout.taus[tables::KECCAK_TABLE];
-        let mut cols: Vec<&[F64]> = self
-            .layout
+    /// One read-only view per column, in global column order: a committed column's runs in the
+    /// stack, a KECCAK input lane's slot of `q_keccak`, an output lane's private buffer.
+    ///
+    /// A jagged column reads its padding past its chunks: zero, or `g^0 = 1` for the memory's final counts.
+    pub(crate) fn columns(&self) -> Vec<Column<'_>> {
+        let l = &self.layout;
+        let q_keccak = &self.dense[dense_qkeccak_offset(l)..];
+        let steps = 1 << l.taus[tables::KECCAK_TABLE];
+        let mut cols: Vec<Column> = l
             .placements
             .iter()
             .enumerate()
             .map(|(i, p)| match keccak_value(i) {
-                Some(KeccakLane::Slot(slot)) => &self.q[q_keccak + slot * steps..][..steps],
-                _ if p.is_virtual() => &[][..],
-                _ => &self.q[p.offset..][..1 << p.n_vars],
+                Some(KeccakLane::Slot(slot)) => Column::flat(&q_keccak[slot * steps..][..steps]),
+                _ if p.is_virtual() => Column::flat(&[]),
+                _ => {
+                    let pad = if i == MFCNT { F64::ONE } else { F64::ZERO };
+                    l.dense.column(&self.dense, i, p.n_vars, pad)
+                }
             })
             .collect();
         for (i, buf) in &self.virt {
-            cols[*i] = buf;
+            cols[*i] = Column::flat(buf);
         }
         cols
     }
@@ -578,19 +583,16 @@ impl Program {
         };
         let l = layout(&self.bytecode_cols, log_mem, row_counts, mem_rows, pi);
 
-        // The stacked witness is written exactly ONCE: allocate it, carve one window
-        // per committed column, and have every fill write its column straight into
-        // place. Copying columns in afterwards would move the whole witness a second
-        // time, a gigabyte at this scale, for no gain: nothing folds the K-columns
-        // in place, so the stack can be their only home.
+        // The committed stack is written exactly ONCE: allocate it, carve each committed column's runs out of
+        // it, and have every fill write its column straight into place. The prover keeps no padded copy: a
+        // column's rows past its chunks are padding, which its readers know ([`Witness::columns`]).
         //
-        // The fill below writes every slot: `split_stack` zeroes the pad tail and hands out windows tiling the
-        // rest; `fill_table` checks that each table wrote every window it was given, and the shared columns
-        // below write theirs.
-        let mut repeats = witness::alloc_repeats(l.shape);
+        // The fill below writes every word: `Dense::split` zeroes the words no column holds; `fill_table`
+        // checks that each table wrote every window it was given, and the shared columns below write theirs.
+        let mut repeats = l.dense.alloc_repeats();
         let mut virt = Vec::new();
         let mut keccak_reduction = None;
-        let q = primitives::filled_vec(l.shape.committed_len(), |q| {
+        let dense = primitives::filled_vec(l.dense.shape.committed_len(), |dense| {
             // An output lane is neither in the stack nor in `q_keccak`, so its values need
             // storage of their own: it carries data for the bus. Every other column `q_keccak`
             // carries ([`Witness::columns`]) is filled through the slot window handed out below.
@@ -601,26 +603,28 @@ impl Program {
                 // `fill_table` asserts each table wrote all of its windows.
                 .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
                 .collect();
-            let mut windows = witness::split_stack(q, &mut repeats, &l.placements);
+            let (mut windows, padded) = l.dense.split(dense, &mut repeats, &l.placements);
             for (i, buf) in virt.iter_mut() {
-                windows[*i] = tables::ColumnOut {
-                    words: buf,
-                    repeats: &mut [],
-                };
+                windows[*i] = tables::ColumnOut::flat(buf, &mut []);
             }
-            // q_keccak's window is the committed states and then the spare slots, a slot per
+            let (mut bytecode_counts, mut q_keccak) = (None, None);
+            for (column, words, tags) in padded {
+                match column {
+                    BFCNT => bytecode_counts = Some(words),
+                    QKECCAK => q_keccak = Some((words, tags)),
+                    _ => unreachable!("only BFCNT and q_keccak are padded blocks"),
+                }
+            }
+            let bytecode_counts = bytecode_counts.expect("BFCNT is a padded block");
+            // q_keccak's block is the committed states and then the spare slots, a slot per
             // KECCAK column riding them: hand each its slot, so its fill writes it where it
             // lives and the stack never holds it twice.
             // The states stay untagged in the repeat map: a missing repeat is only a read. A spare slot
             // takes its own tags, which line up whenever a slot spans whole blocks.
-            let tables::ColumnOut { words, repeats: tags } = std::mem::take(&mut windows[QKECCAK]);
+            let (words, tags) = q_keccak.expect("q_keccak is a padded block");
             let (states, spare) = words.split_at_mut(crate::keccak::SLOTS * steps);
             let per_slot = steps >> ::pcs::stack_open::EQUAL_BLOCK_LOG;
-            let (state_tags, spare_tags) = tags.split_at_mut(crate::keccak::SLOTS * per_slot);
-            windows[QKECCAK] = tables::ColumnOut {
-                words: states,
-                repeats: state_tags,
-            };
+            let (_, spare_tags) = tags.split_at_mut(crate::keccak::SLOTS * per_slot);
             let mut spare_tags = spare_tags.chunks_mut(per_slot.max(1));
             for (k, words) in spare.chunks_exact_mut(steps).enumerate() {
                 let repeats = if per_slot > 0 {
@@ -628,7 +632,7 @@ impl Program {
                 } else {
                     &mut []
                 };
-                windows[sch.base[tables::KECCAK_TABLE] + spare_local(k)] = tables::ColumnOut { words, repeats };
+                windows[sch.base[tables::KECCAK_TABLE] + spare_local(k)] = tables::ColumnOut::flat(words, repeats);
             }
 
             // Each table fills its own columns from the trace (local indices, offset
@@ -646,27 +650,31 @@ impl Program {
                 const _: () = assert!(N_SHARED == 6, "a new shared column needs a fill here");
                 // One pass over the image fills all four of its columns, streamed out a
                 // cache line of each at a time: nothing reads them before the commitment.
+                // Only the committed rows are written: past them the cells are unwritten.
                 const LINE: usize = 8;
-                const BLOCK: usize = 1 << 10;
+                const BLOCK: usize = crate::witness::RUN;
                 let written = exec.mem.cells(BLOCK);
                 let image = windows
                     .get_disjoint_mut([MEM_LO, MEM_HI, MEM_TOP, MFCNT])
                     .expect("the image columns are distinct")
                     .map(|window| {
-                        assert_eq!(window.words.len(), cells, "a memory column spans the image");
-                        // Blocks past the written cells are all `unwritten`, so each repeats the block before it.
-                        for (b, repeat) in window.repeats.iter_mut().enumerate() {
-                            *repeat = b > 0 && (b - 1) * BLOCK >= written.len();
-                        }
-                        &mut *window.words
+                        assert_eq!(window.len, cells, "a memory column spans the image");
+                        std::mem::take(&mut window.runs)
                     });
-                parallel::for_each_chunks_mut(image, [BLOCK; 4], |b, mut image| {
+                let [lo, hi, top, counts] = image;
+                assert!(written.len() <= lo.len() * BLOCK, "the committed rows hold every written cell");
+                let mut runs: Vec<[&mut [F64]; 4]> = (lo.into_iter().zip(hi).zip(top).zip(counts))
+                    .map(|(((lo, hi), top), counts)| [lo, hi, top, counts])
+                    .collect();
+                parallel::chunks_mut(&mut runs, 1, |b, image| {
+                    let image = &mut image[0];
                     let stream = primitives::stream::Stream::new();
                     // Cells past the written ones are unwritten and never accessed.
                     let unwritten = [F64::ZERO, F64::ZERO, F64::ZERO, gpow[0]].map(|v| [v; LINE]);
                     let at = b * BLOCK;
                     for line in (at..at + BLOCK).step_by(LINE) {
-                        let mut buf = unwritten;
+                        // A chunk past a memory under one chunk holds zeros.
+                        let mut buf = if line < cells { unwritten } else { [[F64::ZERO; LINE]; 4] };
                         if let Some(cells) = written.get(line..line + LINE) {
                             for (j, cell) in cells.iter().enumerate() {
                                 // counts ended at g^{A[i]}
@@ -681,21 +689,21 @@ impl Program {
                         }
                     }
                 });
-                parallel::fill(windows[BFCNT].words, |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
+                parallel::fill(bytecode_counts, |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
             });
             // The committed Keccak states q_keccak, ALWAYS in this same stack: built from
             // the executed KECCAK rows in order (row j = step j).
             keccak_reduction = Some(crate::stage!("Build q_keccak", || {
-                keccak_blocks.place(tr.keccak.len(), windows[QKECCAK].words)
+                keccak_blocks.place(tr.keccak.len(), states)
             }));
 
             // (`execute` already asserts the run halts at the sentinel (pc, fp) =
             // (g^{B-1}, 0), exactly the boundary the public layout derives.)
-            drop(windows); // release the borrow of `q`, its repeat map and the output lanes' buffers
+            drop(windows); // release the borrow of the stack, its repeat map and the output lanes' buffers
         });
         let keccak_reduction = keccak_reduction.expect("the fill builds q_keccak");
         Witness {
-            q,
+            dense,
             repeats,
             virt,
             layout: l,

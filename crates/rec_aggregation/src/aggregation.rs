@@ -53,6 +53,7 @@ use leanvm_core::cpu::{
 use leanvm_core::leaf::{Block, Coord};
 use leanvm_core::tables::N_TABLES;
 use leanvm_core::transcript::{FiatShamirState, RATE_SCALARS};
+use leanvm_core::witness::Column;
 use primitives::field::{F64, F192, F192Unreduced, G, Weights8, dot_base, g_pow};
 use primitives::multilinear::{eq_table, fill_eq_table, mle_eval_par};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
@@ -794,8 +795,9 @@ fn bytecode_sums(points: &[F192]) -> BytecodeSums {
     let slot_window = bytecode_window();
     let kbc = bytecode_vars() - leanvm_core::leaf::N_BYTECODE_SELECTORS;
     assert!(kbc >= BLOCK_VARS, "the bytecode has fewer rows than a block");
-    let columns: Vec<&[F64]> = stacked_bytecode()[(slot_window.start << kbc)..(slot_window.end << kbc)]
+    let columns: Vec<Column> = stacked_bytecode()[(slot_window.start << kbc)..(slot_window.end << kbc)]
         .chunks(1 << kbc)
+        .map(Column::flat)
         .collect();
     let points = points.chunks_exact(bytecode_vars());
     let eq_hi = eq_tables(points.clone(), BLOCK_VARS..kbc);
