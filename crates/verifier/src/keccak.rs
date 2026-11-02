@@ -5,7 +5,7 @@
 //! in segment `m` is `eq(point, (y, m)) * weights[j] * mu[i]`. A pack is sixteen consecutive steps.
 
 use crate::field::{E, ONE, ZERO};
-use crate::hash::{KECCAK_PI, KECCAK_RC, KECCAK_RHO, ROUNDS, STATE_LANES};
+use crate::hash::{KECCAK_PI, KECCAK_RC, KECCAK_RHO, ROUNDS, STATE_LANES, keccak_rounds};
 use crate::layout::K_BITS;
 use crate::multilinear::{dot, eq_kernel, log2_ceil, multilinear_eval, poly_eval};
 use crate::transcript::{Transcript, sumcheck};
@@ -64,6 +64,17 @@ impl KeccakShape {
     /// The slot index of q_keccak: lane `l` of the state segment `m` starts from is slot `25 m + l`.
     pub fn slot_bits(&self) -> usize {
         log2_ceil((STATE_LANES * self.segments()) as u64)
+    }
+
+    /// Each slot's word in a padding step, which permutes zeros: the states it commits, then zeros.
+    pub fn padding_words(&self) -> Vec<u64> {
+        let mut words = vec![0; 1 << self.slot_bits()];
+        let mut state = [0; STATE_LANES];
+        for segment in 1..self.segments() {
+            keccak_rounds(&mut state, self.depth * (segment - 1)..self.depth * segment);
+            words[STATE_LANES * segment..][..STATE_LANES].copy_from_slice(&state);
+        }
+        words
     }
 }
 

@@ -160,6 +160,16 @@ fn claim_terms(
     // Jagged claims by group (offset, log width, chunks) and point, each column's lambdas summed.
     type Group<'a> = (usize, usize, usize, &'a [F192]);
     let mut groups: Vec<(Group, Vec<F192>)> = Vec::new();
+    fn group_of<'a, 'b>(groups: &'b mut Vec<(Group<'a>, Vec<F192>)>, key: Group<'a>) -> &'b mut [F192] {
+        let index = match groups.iter().position(|(k, _)| *k == key) {
+            Some(index) => index,
+            None => {
+                groups.push((key, vec![F192::ZERO; 1 << key.1]));
+                groups.len() - 1
+            }
+        };
+        &mut groups[index].1
+    }
     for (claim, &lambda) in claims.iter().zip(lambdas) {
         match claim {
             StackClaim::Point { offset, low_point, .. } => {
@@ -182,15 +192,24 @@ fn claim_terms(
                 point,
                 ..
             } => {
-                let key = (*offset, *log_width, *chunks, point.as_slice());
-                let index = match groups.iter().position(|(k, _)| *k == key) {
-                    Some(index) => index,
-                    None => {
-                        groups.push((key, vec![F192::ZERO; 1 << log_width]));
-                        groups.len() - 1
-                    }
-                };
-                groups[index].1[*column] += lambda;
+                group_of(&mut groups, (*offset, *log_width, *chunks, point.as_slice()))[*column] += lambda;
+            }
+            StackClaim::JaggedAt {
+                offset,
+                log_width,
+                chunks,
+                point,
+                column,
+                ..
+            } => {
+                assert_eq!(column.len(), *log_width, "a column point names a column of the group");
+                let weights = group_of(&mut groups, (*offset, *log_width, *chunks, point.as_slice()));
+                for (weight, eq) in weights
+                    .iter_mut()
+                    .zip(table(&column.iter().map(|&c| Factor::Eq(c)).collect::<Vec<_>>()))
+                {
+                    *weight += lambda * eq;
+                }
             }
         }
     }
@@ -282,6 +301,12 @@ struct Ring {
     point: Vec<F192>,
     /// Where `e` starts inside a lane block.
     x_offset: usize,
+    /// Where it ends inside a lane block, for a ring cut short.
+    x_end: usize,
+    /// The ring before it of the same claim, whose folds it shares, the two differing only in `x_end`.
+    shares: Option<usize>,
+    /// Its claim's index among the rings.
+    claim: usize,
     /// The first of its 192 terms.
     first: usize,
 }
@@ -349,22 +374,28 @@ impl Terms {
                     flush(&mut folds, &mut masses, &mut sigmas);
                 }
                 let mut transposed = false;
-                for ((ring, fold), mass) in self.rings.iter().zip(&mut folds).zip(&mut masses) {
+                for (i, ring) in self.rings.iter().enumerate() {
                     let e_hi = ring.e_hi[h];
                     if e_hi == F192::ZERO {
                         continue;
                     }
-                    *mass += e_hi;
-                    fold.get_or_insert_with(|| {
-                        if !transposed {
-                            for (col, group) in cols.iter_mut().zip(block(h).as_chunks::<8>().0) {
-                                bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
+                    masses[i] += e_hi;
+                    if folds[i].is_some() {
+                        continue;
+                    }
+                    folds[i] = Some(match ring.shares.and_then(|j| folds[j]) {
+                        Some(folded) => folded,
+                        None => {
+                            if !transposed {
+                                for (col, group) in cols.iter_mut().zip(block(h).as_chunks::<8>().0) {
+                                    bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
+                                }
+                                transposed = true;
                             }
-                            transposed = true;
+                            let mut folded = [F192::ZERO; ROWS];
+                            ring.fold.fold_columns(&cols, &mut folded);
+                            folded
                         }
-                        let mut folded = [F192::ZERO; ROWS];
-                        ring.fold.fold_columns(&cols, &mut folded);
-                        folded
                     });
                 }
             }
@@ -426,7 +457,7 @@ impl LaneLift for Terms {
                 let vars = ring.point.len().min(self.lane_vars);
                 let weights = a[ring.first..ring.first + DEGREE_E].to_vec();
                 let weight = RingWeight::from_point(weights, ring.point[..vars].to_vec());
-                (weight, ring.x_offset, 1usize << vars)
+                (weight, ring.x_offset, (1usize << vars).min(ring.x_end - ring.x_offset))
             })
             .collect();
         let n_patterns = self.patterns.len();
@@ -542,18 +573,48 @@ pub(super) fn project(
             .map(|h| pattern.claims.iter().any(|&c| gamma(c)[h] != F192::ZERO))
             .collect();
     }
+    // A ring cut short of its point's cube weighs its whole lanes as one ring and its last, cut, lane as another,
+    // since the lift sees the lanes only as their folded sum.
+    let end = ring.offset + ring.len;
+    let cut = rings.first().is_some_and(|w| ring.len < 1 << w.point().len()) && !end.is_multiple_of(block);
     for (i, weight) in rings.iter().enumerate() {
-        let factors = ring_factors(weight.point(), ring.offset, bits);
+        let point = weight.point();
+        let factors = ring_factors(point, ring.offset, bits);
         let (low, rest) = factors.split_at(low_vars);
         let (mid, lane) = rest.split_at(lane_vars - low_vars);
-        terms.rings.push(Ring {
-            fold: BitFold::new(&table(low)),
-            e_hi: table(mid),
-            point: weight.point().to_vec(),
-            x_offset: ring.offset & (block - 1),
-            first: n_claims + DEGREE_E * i,
-        });
-        extend_table(&mut lanes, lane);
+        // A coordinate past the stack's bits meets a zero bit.
+        let above = point
+            .get(bits..)
+            .unwrap_or_default()
+            .iter()
+            .fold(F192::ONE, |acc, &p| acc * (F192::ONE + p));
+        let mut lane_weights = table(lane);
+        lane_weights.iter_mut().for_each(|w| *w *= above);
+        let x_offset = ring.offset & (block - 1);
+        let whole_ring = terms.rings.len();
+        let mut push = |live: std::ops::Range<usize>, x_end: usize, shares: Option<usize>| {
+            let mut e_hi = table(mid);
+            e_hi[x_end.div_ceil(1 << low_vars).min(n_blocks)..].fill(F192::ZERO);
+            terms.rings.push(Ring {
+                fold: BitFold::new(&table(low)),
+                e_hi,
+                point: point.to_vec(),
+                x_offset,
+                x_end,
+                shares,
+                claim: i,
+                first: n_claims + DEGREE_E * (terms.rings.len()),
+            });
+            let masked = lane_weights.iter().enumerate();
+            lanes.extend(masked.map(|(l, &w)| if live.contains(&l) { w } else { F192::ZERO }));
+        };
+        if cut {
+            let whole = end / block;
+            push(0..whole, block, None);
+            push(whole..whole + 1, end % block, Some(whole_ring));
+        } else {
+            push(0..end.div_ceil(block), block, None);
+        }
     }
 
     let n_terms = terms.n_terms();
@@ -563,8 +624,8 @@ pub(super) fn project(
         for (c, slot) in row[..n_claims].iter_mut().enumerate() {
             *slot = weight_of(c);
         }
-        for (i, (weight, ring)) in rings.iter().zip(&terms.rings).enumerate() {
-            let s = weight_of(n_claims + i);
+        for (i, ring) in terms.rings.iter().enumerate() {
+            let (weight, s) = (&rings[ring.claim], weight_of(n_claims + i));
             if s != F192::ZERO {
                 for (w, slot) in row[ring.first..ring.first + DEGREE_E].iter_mut().enumerate() {
                     *slot = weight.apply(coordinate_basis(w) * s);

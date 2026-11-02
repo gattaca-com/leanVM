@@ -1404,17 +1404,6 @@ fn gen_verify(
         }
         gbase += blocks.len();
     }
-    // The committed stack leads with its padded blocks, sorted by descending kappa, then by their native column
-    // index. Transport their compact indices in that order; the guest certifies the permutation, the ordering,
-    // and the accumulated offsets before using them as claim selectors.
-    let padded = leanvm_core::cpu::PADDED_COLUMNS;
-    let mut col_order: Vec<usize> = (0..padded.len()).collect();
-    col_order.sort_by_key(|&compact| match layout.dense.slots[padded[compact]] {
-        Some(leanvm_core::witness::Slot::Padded(p)) => p.offset,
-        _ => unreachable!("a padded column is a padded block"),
-    });
-    let col_sort_order: Vec<F192> = col_order.into_iter().map(count).collect();
-
     // ---- Phase E2 hints (the stacked WHIR opening) ----
     // Share the upper Merkle tree across queries. Unknown, unused subtrees stay
     // opaque; the guest authenticates every cap leaf a query reaches.
@@ -1481,7 +1470,6 @@ fn gen_verify(
     hints.push("zc_tau_max", &[count(*taus.iter().max().unwrap())]);
     // Every table's log height, which the guest certifies against its row count.
     hints.push_iter("table_logs", taus.iter().map(|&t| count(t)));
-    hints.push("col_sort_order", &col_sort_order);
     hints.push("sort_order", &sort_order);
     Ok((hints, deferred))
 }
@@ -2070,22 +2058,22 @@ struct Term {
 
 struct ClaimDescriptor {
     buffer: usize,
-    column: usize,
     group: (usize, usize),
-    qkeccak_slot: usize,
 }
 
-/// The guest's `NO_GROUP`: a claim on a padded column. Jagged groups are numbered 0..NO_GROUP.
-const NO_GROUP: usize = leanvm_core::tables::N_TABLES + 1;
+/// The guest's groups: one per table, then the memory's, the bytecode's final counts' and q_keccak's. `NO_GROUP`
+/// marks an output lane's claim, which the opening never sees.
+const MEMORY_GROUP: usize = leanvm_core::tables::N_TABLES;
+const BFCNT_GROUP: usize = MEMORY_GROUP + 1;
+const QKECCAK_GROUP: usize = BFCNT_GROUP + 1;
+const NO_GROUP: usize = QKECCAK_GROUP + 1;
 
 // The guest's `POINT_BUF_*`, the point a pooled claim is made at: the bus's `zeta`, the table
-// sumcheck's point, the public input's, that point on a slot of `q_keccak`, and none for an
-// output lane's, which the Keccak reduction takes as its claim on the permutation's output and
-// the opening never sees.
+// sumcheck's point, the public input's, and none for an output lane's, which the Keccak reduction
+// takes as its claim on the permutation's output and the opening never sees.
 const POINT_BUF_ZETA: usize = 0;
 const POINT_BUF_RHO: usize = 1;
 const POINT_BUF_PI: usize = 2;
-const POINT_BUF_QKECCAK_RHO: usize = 3;
 const POINT_BUF_KECCAK_OUT: usize = 4;
 
 fn literals(values: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
@@ -2193,66 +2181,49 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     let ncl = nclaims + evtot + 3; // bus + constraint + the three PI memory-limb claims
 
     // ---- claim descriptor buffer ids (structural) ----
-    // A padded column's compact index is its place in PADDED_COLUMNS; a jagged one has its group and local column.
-    let col_sources_pm = leanvm_core::cpu::col_kappa_sources(kbc);
-    let mut compact_col_pm = vec![usize::MAX; col_sources_pm.len()];
-    for (compact, &global) in leanvm_core::cpu::PADDED_COLUMNS.iter().enumerate() {
-        compact_col_pm[global] = compact;
-    }
+    // Every committed column is jagged: a claim names its group and its local column there.
+    let n_columns = leanvm_core::cpu::schema().n;
     let jagged = leanvm_core::cpu::jagged_columns();
-    let mut group_of = vec![(NO_GROUP, 0); col_sources_pm.len()];
+    assert_eq!(
+        jagged.len(),
+        QKECCAK_GROUP,
+        "a group per table, then the memory's and the final counts'"
+    );
+    let mut group_of = vec![(NO_GROUP, 0); n_columns];
     for (group, columns) in jagged.iter().enumerate() {
         for (local, &global) in columns.iter().enumerate() {
             group_of[global] = (group, local);
         }
     }
-    let qkeccak_compact = compact_col_pm[leanvm_core::cpu::QKECCAK];
-    assert_ne!(qkeccak_compact, usize::MAX, "QKECCAK must be committed");
+    for (slot, global) in leanvm_core::cpu::qkeccak_columns() {
+        group_of[global] = (QKECCAK_GROUP, slot);
+    }
     let mut claims = Vec::new();
     walk_claims(&layout, kbc, |site| {
-        // A jagged column has no compact index (0 stands in, unread): its claim reads its group's weight instead.
-        let committed = |column: usize| {
-            let compact = compact_col_pm[column];
-            (if compact == usize::MAX { 0 } else { compact }, group_of[column])
-        };
         let descriptor = match site {
             ClaimSite::Framework { column, .. } => {
-                assert!(
-                    compact_col_pm[column] != usize::MAX || group_of[column].0 != NO_GROUP,
+                assert_ne!(
+                    group_of[column].0, NO_GROUP,
                     "framework claim must target a committed column"
                 );
                 ClaimDescriptor {
                     buffer: POINT_BUF_ZETA,
-                    column: committed(column).0,
-                    group: committed(column).1,
-                    qkeccak_slot: 0,
+                    group: group_of[column],
                 }
             }
             ClaimSite::TableColumn { column } => match keccak_value(column) {
-                None => ClaimDescriptor {
-                    buffer: POINT_BUF_RHO,
-                    column: committed(column).0,
-                    group: committed(column).1,
-                    qkeccak_slot: 0,
-                },
-                Some(KeccakLane::Slot(slot)) => ClaimDescriptor {
-                    buffer: POINT_BUF_QKECCAK_RHO,
-                    column: qkeccak_compact,
-                    group: (NO_GROUP, 0),
-                    qkeccak_slot: slot,
-                },
                 Some(KeccakLane::Output(_)) => ClaimDescriptor {
                     buffer: POINT_BUF_KECCAK_OUT,
-                    column: qkeccak_compact,
                     group: (NO_GROUP, 0),
-                    qkeccak_slot: 0,
+                },
+                _ => ClaimDescriptor {
+                    buffer: POINT_BUF_RHO,
+                    group: group_of[column],
                 },
             },
             ClaimSite::MemoryLimb { column } => ClaimDescriptor {
                 buffer: POINT_BUF_PI,
-                column: committed(column).0,
-                group: committed(column).1,
-                qkeccak_slot: 0,
+                group: group_of[column],
             },
         };
         claims.push(descriptor);
@@ -2519,15 +2490,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("LIG_MAX_VANISH_LEN", maxsvk.to_string());
     ps("LIG_MAX_OOD_SAMPLES", maxood.to_string());
     ps("LIG_MIN_LOG_SIZE", minm.to_string());
-    let sources = leanvm_core::cpu::col_kappa_sources(kbc);
-    let cks: Vec<(usize, usize)> = leanvm_core::cpu::PADDED_COLUMNS
-        .iter()
-        .map(|&column| sources[column].expect("a padded column is committed"))
-        .collect();
-    ps("N_COMMITTED_COLS", cks.len().to_string());
     ps("N_COLUMN_LOGS", (MU_MAX + 1).to_string());
-    ps("COL_KAPPA_SRC", literals(cks.iter().map(|&(s, _)| s)));
-    ps("COL_KAPPA_ADJ", literals(cks.iter().map(|&(_, a)| a)));
     ps("PCS_MIN_MU", leanvm_core::pcs::MIN_MU.to_string());
     ps(
         "LIG_LOG_MSG_COLS_CAP",
@@ -2664,36 +2627,38 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
         dsl_u128(F192::new(g_pow(minm).inv().0, 0, 0)).to_string(),
     );
     ps("CLAIM_POINT_BUF", literals(claims.iter().map(|c| c.buffer)));
-    ps("CLAIM_COMMITTED_COL", literals(claims.iter().map(|c| c.column)));
     ps("CLAIM_JAGGED_GROUP", literals(claims.iter().map(|c| c.group.0)));
     ps("CLAIM_JAGGED_COL", literals(claims.iter().map(|c| c.group.1)));
     // The jagged groups: their widths, and their order in the committed stack (descending width, then index).
-    let widths: Vec<usize> = jagged.iter().map(|columns| columns.len().next_power_of_two().ilog2() as usize).collect();
-    let mut order: Vec<usize> = (0..jagged.len()).collect();
+    let slot_log = leanvm_core::keccak::SLOT_LOG;
+    let widths: Vec<usize> = (jagged
+        .iter()
+        .map(|columns| columns.len().next_power_of_two().ilog2() as usize))
+    .chain([slot_log])
+    .collect();
+    let mut order: Vec<usize> = (0..widths.len()).collect();
     order.sort_by_key(|&g| (std::cmp::Reverse(widths[g]), g));
-    assert_eq!(jagged.len(), NO_GROUP, "a group per table, then the memory's");
-    ps("N_GROUPS", jagged.len().to_string());
+    assert_eq!(order[0], QKECCAK_GROUP, "q_keccak's group leads the stack");
+    ps("N_GROUPS", widths.len().to_string());
     ps("NO_GROUP", NO_GROUP.to_string());
     ps("GROUP_LOG_WIDTH", literals(&widths));
     ps("GROUP_ORDER", literals(&order));
     // The memory's group, and its final counts' column, which holds 1 past the committed rows.
-    let memory_group = jagged.len() - 1;
-    ps("MEMORY_GROUP", memory_group.to_string());
+    ps("MEMORY_GROUP", MEMORY_GROUP.to_string());
+    ps("BFCNT_GROUP", BFCNT_GROUP.to_string());
+    ps("QKECCAK_GROUP", QKECCAK_GROUP.to_string());
     ps(
         "MEM_COUNT_COL",
-        jagged[memory_group].iter().position(|&c| c == leanvm_core::cpu::MFCNT).unwrap().to_string(),
+        jagged[MEMORY_GROUP]
+            .iter()
+            .position(|&c| c == leanvm_core::cpu::MFCNT)
+            .unwrap()
+            .to_string(),
     );
     ps("CHUNK_LOG", leanvm_core::witness::CHUNK_LOG.to_string());
-    // The stack's padded blocks tile whole jagged chunks of the widest group, so no gap precedes the groups.
-    assert!(
-        kbc >= leanvm_core::witness::JAGGED_ALIGN_LOG,
-        "the bytecode's final counts are a whole aligned block"
-    );
-    let slot_log = leanvm_core::keccak::SLOT_LOG;
-    let cpqbits: Vec<usize> = claims
-        .iter()
-        .flat_map(|c| (0..slot_log).map(move |k| (c.qkeccak_slot >> k) & 1))
-        .collect();
+    // A padding step's word in each slot of q_keccak: the batch's shape does not change it.
+    let shape = keccak_gkr::Shape::new(0, leanvm_core::keccak::DEPTH);
+    ps("KECCAK_PAD_WORDS", literals(keccak_gkr::padding_words(shape)));
     // The output lanes' claims, consecutive in the pool: the reduction's claim on the output.
     let out_pool = claims
         .iter()
@@ -2702,8 +2667,6 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     assert!((0..claims.len()).all(|j| (claims[j].buffer == POINT_BUF_KECCAK_OUT)
         == (out_pool..out_pool + primitives::hash::STATE_LANES).contains(&j)));
     ps("KECCAK_OUT_POOL", out_pool.to_string());
-    ps("CLAIM_QKECCAK_SLOT_BITS", literals(&cpqbits));
-    ps("QKECCAK_COMMITTED_COL", qkeccak_compact.to_string());
     ps("QKECCAK_VARS_CAP", (33 + slot_log).to_string());
     ps("BYTECODE_LOG", kbc.to_string());
     // The stacked bytecode: nbcv/2 encoding columns per side, aligned with the bus
@@ -3203,7 +3166,9 @@ mod tests {
     }
 
     #[test]
-    fn guest_column_selectors_match_native_eq() {
+    fn guest_ring_weight_matches_its_sum() {
+        // The guest's ring-switched weight on q_keccak's group is sum_k c_k J(r^(2^k)), J the group's weight at the
+        // opening point: written out here over the chunks below the group's count, at every Frobenius power.
         leanvm_core::init_prover();
         let (helpers, _) = include_str!("../guests/lean_ethereum.py")
             .split_once("\ndef main():")
@@ -3211,54 +3176,79 @@ mod tests {
         let source = format!(
             r#"{helpers}
 def main():
-    point = HeapBuf(MAX_STACK_LOG)
-    hint_witness(point[0:MAX_STACK_LOG], "point")
-    point1 = HeapBuf(MAX_STACK_LOG)
-    for k in unroll(0, MAX_STACK_LOG):
+    zbar = HeapBuf(ZBAR_LEN)
+    hint_witness(zbar[0:ZBAR_LEN], "zbar")
+    slot = HeapBuf(QKECCAK_SLOT_LOG)
+    hint_witness(slot[0:QKECCAK_SLOT_LOG], "slot")
+    point = HeapBuf(SIZE_BITS + QKECCAK_SLOT_LOG)
+    hint_witness(point[0:SIZE_BITS + QKECCAK_SLOT_LOG], "point")
+    point1 = HeapBuf(SIZE_BITS + QKECCAK_SLOT_LOG)
+    for k in unroll(0, SIZE_BITS + QKECCAK_SLOT_LOG):
         point1[GEN ** k] = 1 + point[GEN ** k]
-    sel_eq, sel_g = selector_tables(point, point1)
-    offset = hint_witness("offset")
-    kappa_g = hint_witness("kappa")
-    weight = match(log(kappa_g), range(0, N_COLUMN_LOGS), lambda kappa: column_selector(offset, sel_eq, sel_g, kappa))
+    c_table = HeapBuf(BASE_FIELD_BITS)
+    hint_witness(c_table[0:BASE_FIELD_BITS], "c")
+    tau_g = hint_witness("tau")
+    rows = hint_witness("rows")
+    chunks_g, hbits, partial = group_height(rows)
+    weight = ring_switch_weight(zbar, slot, point, point1, c_table, tau_g, hbits, partial)
     public = GEN ** 0
     assert public[1] == weight
     return
 "#
         );
         let guest = compile(&parse_with_replacements(&source, &placeholder_map(18)).unwrap());
-        let run = |point: &[F192], offset: usize, kappa: usize, expected: F192| {
+        let mut rng = StdRng::seed_from_u64(814);
+        let mut random = || {
+            let (c0, c1, c2) = rand::Rng::random(&mut rng);
+            F192::new(c0, c1, c2)
+        };
+        let (chunk, slot_log, size) = (leanvm_core::witness::CHUNK_LOG, leanvm_core::keccak::SLOT_LOG, 34 + 6);
+        let jagged_bits = MU_MAX - chunk;
+        let eq = |a: F192, b: F192| F192::ONE + a + b;
+        let bit = |v: usize, k: usize| F192::from(F64(((v >> k) & 1) as u64));
+        for (tau, rows, mu) in [
+            (9, 300, 22),
+            (10, 1000, 22),
+            (12, 2100, 23),
+            (12, 4096, 22),
+            (14, 9000, 26),
+            (13, 0, 22),
+        ] {
+            let mut zbar: Vec<F192> = (0..tau).map(|_| random()).collect();
+            zbar.resize(33, F192::ZERO);
+            let slot: Vec<F192> = (0..slot_log).map(|_| random()).collect();
+            let mut point: Vec<F192> = (0..mu).map(|_| random()).collect();
+            point.resize(size, F192::ZERO);
+            let c: Vec<F192> = (0..64).map(|_| random()).collect();
+            let chunks = (rows as usize).div_ceil(1 << chunk);
+            let mut expected = F192::ZERO;
+            let (mut z, mut s) = (zbar.clone(), slot.clone());
+            for &c in &c {
+                let low = (0..chunk).fold(F192::ONE, |acc, b| acc * eq(z[b], point[b]));
+                let column = (0..slot_log).fold(F192::ONE, |acc, b| acc * eq(s[b], point[chunk + b]));
+                let high = (0..chunks).fold(F192::ZERO, |acc, chunk_index| {
+                    acc + (0..jagged_bits).fold(F192::ONE, |acc, n| {
+                        let b = bit(chunk_index, n);
+                        acc * eq(z[chunk + n], b) * eq(point[chunk + slot_log + n], b)
+                    })
+                });
+                expected += c * low * column * high;
+                z.iter_mut().chain(s.iter_mut()).for_each(|v| *v = *v * *v);
+            }
             let mut hints = Hints::default();
-            hints.push("point", point);
-            hints.push("offset", &[count(offset)]);
-            hints.push("kappa", &[count(kappa)]);
+            hints.push("zbar", &zbar);
+            hints.push("slot", &slot);
+            hints.push("point", &point);
+            hints.push("c", &c);
+            hints.push("tau", &[count(tau)]);
+            hints.push("rows", &[F192::new(rows, 0, 0)]);
             let mut program = guest.clone();
             program.set_witnesses(hints);
-            program.execute([expected, F192::ZERO])
-        };
-        let mut rng = StdRng::seed_from_u64(813);
-        for mu in MU_MIN..=MU_MAX {
-            let mut point: Vec<F192> = (0..mu)
-                .map(|_| {
-                    let (c0, c1, c2) = rand::Rng::random(&mut rng);
-                    F192::new(c0, c1, c2)
-                })
-                .collect();
-            point.resize(MU_MAX, F192::ZERO);
-            for kappa in 0..=mu {
-                let mask = ((1usize << mu) - 1) & !((1usize << kappa) - 1);
-                for offset in [0, mask, 0x0555_5555 & mask] {
-                    let selector: Vec<_> = (kappa..mu)
-                        .map(|k| F192::from(F64(((offset >> k) & 1) as u64)))
-                        .collect();
-                    let expected = primitives::multilinear::eq_eval(&selector, &point[kappa..mu]);
-                    assert!(
-                        run(&point, offset, kappa, expected)
-                            .unwrap()
-                            .unconstrained_reads
-                            .is_empty()
-                    );
-                }
-            }
+            let run = program.execute([expected, F192::ZERO]);
+            assert!(
+                run.is_ok_and(|run| run.unconstrained_reads.is_empty()),
+                "tau {tau}, rows {rows}, mu {mu}"
+            );
         }
     }
 

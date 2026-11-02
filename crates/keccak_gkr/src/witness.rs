@@ -396,26 +396,147 @@ fn padding(shape: Shape, written: usize) -> Option<(Extent, Vec<u64>)> {
 /// Blocks one task of [`place`] writes of a slot, at most.
 const RUN: usize = 16;
 
-/// Write the committed lanes of every block into `committed`: slot `s` of instance `i` at word
-/// `s * n + i`. Block `g` is `lanes[g]`, or `padding` past the end of `lanes`. Whatever
-/// `committed` has past the last slot is zeroed, so a caller whose spare slots carry other
-/// columns passes the states' prefix alone.
-fn place(shape: Shape, lanes: &[&[u64]], padding: Option<&[u64]>, committed: &mut [F64]) {
-    let (n, slots) = (shape.n(), shape.slots());
-    assert!(committed.len() >= slots * n && committed.len() <= 1 << shape.stack_log());
+/// A block of zero words, for the steps a chunk holds past the batch.
+static ZERO_BLOCK: [u64; BLOCK] = [0; BLOCK];
+
+/// Write the committed lanes of every block into the states of each chunk of `2^run_log` instances: slot `s` of
+/// instance `i` at word `(s << run_log) + i mod 2^run_log` of chunk `i >> run_log`. Block `g` is `lanes[g]`, or
+/// `padding` past the end of `lanes`; a chunk's instances past the batch are zero.
+fn place(shape: Shape, lanes: &[&[u64]], padding: Option<&[u64]>, run_log: usize, chunks: &mut [&mut [F64]]) {
+    let (slots, run) = (shape.slots(), 1usize << run_log);
+    assert!(run >= BLOCK && run_log <= shape.stack_log());
+    assert!(chunks.len() << run_log <= shape.n().max(run));
     assert!(lanes.iter().chain(&padding).all(|l| l.len() == lanes_len(shape.depth)));
-    let (states, spare) = committed.split_at_mut(slots * n);
-    spare.fill(F64(0));
-    // A task writes a run of blocks of one slot, which lie side by side.
-    let run = shape.n_blocks().min(RUN);
-    parallel::chunks_mut(states, run * BLOCK, |task, dst| {
-        let (slot, first) = (task / (shape.n_blocks() / run), task % (shape.n_blocks() / run) * run);
+    // A task writes a run of blocks of one slot of one chunk, which lie side by side.
+    let blocks = (run / BLOCK).min(RUN);
+    let mut pieces: Vec<&mut [F64]> = Vec::with_capacity(chunks.len() * slots * (run / BLOCK / blocks));
+    for chunk in chunks.iter_mut() {
+        assert_eq!(chunk.len(), slots << run_log, "a chunk holds a run of every slot");
+        pieces.extend(chunk.chunks_exact_mut(blocks * BLOCK));
+    }
+    let per_slot = run / BLOCK / blocks;
+    parallel::chunks_mut(&mut pieces, 1, |task, piece| {
+        let (chunk, slot, part) = (task / (slots * per_slot), task / per_slot % slots, task % per_slot);
+        let first = chunk * (run / BLOCK) + part * blocks;
         let stream = Stream::new();
-        for (i, dst) in primitives::cast_slice_mut::<F64, u64>(dst).chunks_exact_mut(BLOCK).enumerate() {
-            let src = lanes.get(first + i).copied().or(padding).expect("a padding block");
+        for (i, dst) in primitives::cast_slice_mut::<F64, u64>(piece[0])
+            .chunks_exact_mut(BLOCK)
+            .enumerate()
+        {
+            let g = first + i;
+            if g >= shape.n_blocks() {
+                stream.copy(dst, &ZERO_BLOCK);
+                continue;
+            }
+            let src = lanes.get(g).copied().or(padding).expect("a padding block");
             stream.copy(dst, &src[slot * BLOCK..][..BLOCK]);
         }
     });
+}
+
+/// Each slot's word in a padding instance, which permutes zeros: the states its segments start from, then zeros.
+pub fn padding_words(shape: Shape) -> Vec<u64> {
+    let mut words = vec![0; 1 << shape.slot_log()];
+    let mut state = [0u64; LANES];
+    for segment in 1..shape.segments() {
+        for round in shape.depth * (segment - 1)..shape.depth * segment {
+            keccak_round(&mut state, round);
+        }
+        words[LANES * segment..][..LANES].copy_from_slice(&state);
+    }
+    words
+}
+
+/// Round `round` of Keccak-f, counted from 0.
+fn keccak_round(a: &mut [u64; LANES], round: usize) {
+    let c: [u64; 5] = std::array::from_fn(|x| a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]);
+    for (i, lane) in a.iter_mut().enumerate() {
+        *lane ^= c[(i + 4) % 5] ^ c[(i + 1) % 5].rotate_left(1);
+    }
+    let mut b = [0u64; LANES];
+    for i in 0..LANES {
+        b[PI[i]] = a[i].rotate_left(RHO[i]);
+    }
+    for i in 0..LANES {
+        let (x, row) = (i % 5, i - i % 5);
+        a[i] = b[i] ^ (!b[row + (x + 1) % 5] & b[row + (x + 2) % 5]);
+    }
+    a[0] ^= RC[round];
+}
+
+/// The committed states as the openings read them: in chunks of `2^run_log` instances, a chunk holding a run of
+/// each slot in slot order, so slot `s` of instance `i` is word `(i >> run_log << (run_log + slot_log)) + (s <<
+/// run_log) + i mod 2^run_log`. Only the instances below `stored` are kept: every one past them pads, and its
+/// words are [`padding_words`].
+#[derive(Clone, Copy, Debug)]
+pub struct Committed<'a> {
+    words: &'a [F64],
+    shape: Shape,
+    run_log: usize,
+    stored: usize,
+    padding: Option<&'a [u64]>,
+}
+
+impl<'a> Committed<'a> {
+    /// The whole committed block, slot after slot: one chunk of every instance.
+    pub fn whole(shape: Shape, words: &'a [F64]) -> Self {
+        assert_eq!(
+            words.len(),
+            1 << shape.stack_log(),
+            "the openings are claims on the whole committed block"
+        );
+        Self::chunked(shape, words, shape.n_log, shape.n())
+    }
+
+    /// The chunks from the start of `words`, its first `stored` instances kept, a whole number of chunks or all of them.
+    pub fn chunked(shape: Shape, words: &'a [F64], run_log: usize, stored: usize) -> Self {
+        let run = (1usize << run_log).min(shape.n());
+        assert!(run_log >= 10.min(shape.n_log) && stored <= shape.n() && stored.is_multiple_of(run));
+        let chunks = stored.div_ceil(1 << run_log);
+        assert!(
+            words.len() >= chunks << (run_log + shape.slot_log()),
+            "the stored chunks lie in the words"
+        );
+        Self {
+            words,
+            shape,
+            run_log,
+            stored,
+            padding: None,
+        }
+    }
+
+    /// The same states, but a padding instance's words are `padding` rather than [`padding_words`]: for a test's
+    /// forgery, which the openings then carry.
+    pub fn with_padding(self, padding: &'a [u64]) -> Self {
+        assert_eq!(padding.len(), 1 << self.shape.slot_log());
+        Self {
+            padding: Some(padding),
+            ..self
+        }
+    }
+
+    /// A padding instance's word of each slot.
+    pub(crate) fn padding(&self) -> Vec<u64> {
+        self.padding.map_or_else(|| padding_words(self.shape), <[u64]>::to_vec)
+    }
+
+    pub fn stored(&self) -> usize {
+        self.stored
+    }
+
+    /// Instances a run holds.
+    pub(crate) fn run(&self) -> usize {
+        (1usize << self.run_log).min(self.shape.n())
+    }
+
+    /// Slot `slot` of instances `i..i + len`, which lie in one run below `stored`.
+    pub(crate) fn span(&self, slot: usize, i: usize, len: usize) -> &'a [F64] {
+        debug_assert!(i % self.run() + len <= self.run() && i + len <= self.stored);
+        let at =
+            (i >> self.run_log << (self.run_log + self.shape.slot_log())) + (slot << self.run_log) + i % self.run();
+        &self.words[at..][..len]
+    }
 }
 
 impl Witness {
@@ -448,9 +569,25 @@ impl Witness {
     /// If a block below `lanes.len()` was not run. A `lanes[g]` that block `g` did not leave gives
     /// the wrong witness.
     pub fn from_blocks(shape: Shape, extents: Vec<Extent>, lanes: &[&[u64]], committed: &mut [F64]) -> Self {
+        let (n, slots) = (shape.n(), shape.slots());
+        assert!(committed.len() >= slots * n && committed.len() <= 1 << shape.stack_log());
+        let (states, spare) = committed.split_at_mut(slots * n);
+        spare.fill(F64(0));
+        Self::from_blocks_into(shape, extents, lanes, shape.n_log, &mut [states])
+    }
+
+    /// [`Witness::from_blocks`], the committed lanes written into chunks of `2^run_log` instances: `chunks[c]` is
+    /// the states' runs of chunk `c`, slot `s` of its instance `i` at word `(s << run_log) + i`.
+    pub fn from_blocks_into(
+        shape: Shape,
+        extents: Vec<Extent>,
+        lanes: &[&[u64]],
+        run_log: usize,
+        chunks: &mut [&mut [F64]],
+    ) -> Self {
         let written = lanes.len();
         let padding = padding(shape, written);
-        place(shape, lanes, padding.as_ref().map(|p| &p.1[..]), committed);
+        place(shape, lanes, padding.as_ref().map(|p| &p.1[..]), run_log, chunks);
         Self::from_extents(shape, extents, written, padding.map(|(extent, _)| extent))
     }
 

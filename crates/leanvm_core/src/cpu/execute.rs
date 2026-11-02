@@ -1061,9 +1061,7 @@ impl Program {
         let rows = trace.row_counts();
         let log_bytecode = crate::log2_strict_usize(self.prog.len());
         // Sized as if every cell were committed, which is what the prover commits when the used ones fall short.
-        while super::layout::committed_log(crate::log2_strict_usize(cells), cells, log_bytecode, rows)
-            < self.min_log_committed
-        {
+        while super::layout::committed_log(cells, log_bytecode, rows) < self.min_log_committed {
             cells *= 2;
         }
         assert!(cells <= 1 << MAX_LOG_MEM, "data memory exceeds 2^{MAX_LOG_MEM} cells");

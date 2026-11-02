@@ -574,7 +574,6 @@ pub fn prove_with(
     // An underestimate only leaves some pages for the exact reservation below to fault in.
     let reserve_log_mem = crate::log2_ceil_usize(gpow.capacity());
     let reserve_mu = (layout::committed_log(
-        reserve_log_mem,
         1 << reserve_log_mem,
         crate::log2_strict_usize(program.prog.len()),
         [0; tables::N_TABLES],
@@ -655,7 +654,7 @@ pub fn prove_with(
     #[cfg(any(test, feature = "tamper"))]
     tamper::dense(tamper, &w.layout, &mut w.dense);
 
-    // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a block of `w.dense` (the
+    // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a jagged group of `w.dense` (the
     // KECCAK table is filled to the reduction's floor, so the proof shape is uniform
     // and there is no has/hasn't-KECCAK fork). The Keccak reduction's claims and
     // EVERY leanVM point claim are discharged together by ONE
@@ -722,13 +721,32 @@ pub fn prove_with(
     // PCS below in the SAME WHIR as every leanVM point claim: one ring-switched,
     // one appended to the point claims.
     let keccak_reduction = w.keccak_reduction;
-    let offset = dense_qkeccak_offset(l);
-    let q_keccak = &w.dense[offset..][..1 << l.placements[QKECCAK].n_vars];
+    let q_keccak = &l.dense.groups[l.dense.qkeccak];
+    let shape = keccak_reduction.shape;
+    let stored = (q_keccak.chunks() << witness::CHUNK_LOG).min(shape.n());
+    let words = &w.dense[q_keccak.offset..][..q_keccak.words()];
+    let states = keccak_gkr::Committed::chunked(shape, words, witness::CHUNK_LOG, stored);
+    #[cfg(any(test, feature = "tamper"))]
+    let forged = {
+        let mut padding = keccak_gkr::padding_words(shape);
+        padding[crate::keccak::SLOTS / 2] ^= 1 << 17;
+        assert!(
+            tamper != Some(tamper::Tamper::KeccakPastChunks) || stored < shape.n(),
+            "a step past the chunks"
+        );
+        padding
+    };
+    #[cfg(any(test, feature = "tamper"))]
+    let states = if tamper == Some(tamper::Tamper::KeccakPastChunks) {
+        states.with_padding(&forged)
+    } else {
+        states
+    };
     let openings = crate::stage!("Keccak reduction", || {
-        keccak_reduction.prove(&mut ps, q_keccak, &output)
+        keccak_reduction.prove_in(&mut ps, &states, &output)
     });
     drop(keccak_reduction);
-    let (ring, outputs) = openings.into_pcs_claims(offset);
+    let (ring, outputs) = qkeccak_claims(q_keccak, shape, openings);
     slots.extend(outputs);
     #[cfg(any(test, feature = "tamper"))]
     tamper::dense(tamper, &w.layout, &mut w.dense);
@@ -854,61 +872,88 @@ pub fn verify(program: &Program, public_input: &[F192; 2], proof: &Proof) -> Res
         .map_err(CpuError::Verifier)
 }
 
-/// Lift `ColumnClaim`s to located PCS claims: a claim on column `c` lives in
-/// the slot at `placements[c].offset`, with the claim's point as the low point.
+/// Lift `ColumnClaim`s to located PCS claims: a claim on column `c` is a claim on its jagged group's column.
 ///
-/// The columns `q_keccak` carries are virtual: they have no committed placement. A claim
-/// `col(r) = v` on one (at the `n_log`-dim instance point `r`) is re-routed to the equal
-/// `q_keccak` slot evaluation: an ordinary claim on the committed `QKECCAK` column at the
-/// point whose low coords are `r` and whose next `SLOT_LOG` are the slot's bits. No
-/// downstream special-casing: it folds into the one opening like every other point claim.
+/// The columns `q_keccak` carries are virtual: a claim on one is a claim on its slot, a column of
+/// `q_keccak`'s group, which pads with zero as they do. No downstream special-casing: it folds into the one
+/// opening like every other claim.
 fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::SlotClaim> {
     claims
         .into_iter()
         .map(|c| {
-            // A KECCAK value column (always virtual): its bus claim at instance point
-            // `c.point` is a claim on the slot's `2^n_log` words of QKECCAK.
-            if let Some(KeccakLane::Slot(slot)) = keccak_value(c.col) {
-                return pcs::SlotClaim::Point {
-                    offset: dense_qkeccak_offset(l) + (slot << c.point.len()),
-                    low_point: c.point,
-                    value: c.value,
-                };
+            let witness::Slot { group, column } = l.dense.slots[c.col].expect("a claimed column is committed");
+            let group = &l.dense.groups[group];
+            let chunks = group.chunks();
+            // Past its chunks the memory's final count holds g^0 = 1, a public share of the claim.
+            let mut value = c.value;
+            if c.col == MFCNT {
+                value += leaf::padding_weight(&c.point, chunks << witness::CHUNK_LOG);
             }
-            match l.dense.slots[c.col].expect("a claimed column is committed") {
-                witness::Slot::Padded(p) => pcs::SlotClaim::Point {
-                    offset: p.offset,
-                    low_point: c.point,
-                    value: c.value,
-                },
-                witness::Slot::Jagged { group, column } => {
-                    let group = &l.dense.groups[group];
-                    let chunks = group.chunks();
-                    // Past its chunks the memory's final count holds g^0 = 1, a public share of the claim.
-                    let mut value = c.value;
-                    if c.col == MFCNT {
-                        value += leaf::padding_weight(&c.point, chunks << witness::CHUNK_LOG);
-                    }
-                    pcs::SlotClaim::Jagged {
-                        offset: group.offset,
-                        log_width: group.log_width,
-                        column,
-                        chunks,
-                        point: c.point,
-                        value,
-                    }
-                }
+            pcs::SlotClaim::Jagged {
+                offset: group.offset,
+                log_width: group.log_width,
+                column,
+                chunks,
+                point: c.point,
+                value,
             }
         })
         .collect()
 }
 
-/// Where `q_keccak` sits in the committed stack.
-fn dense_qkeccak_offset(l: &Layout) -> usize {
-    match l.dense.slots[QKECCAK] {
-        Some(witness::Slot::Padded(p)) => p.offset,
-        _ => unreachable!("q_keccak is a padded block"),
+/// The Keccak reduction's openings, of `q_keccak` over every step, as claims on its group `q_keccak`, which keeps
+/// only its chunks: a step past them pads, permuting zeros, so its words are public and their share leaves each
+/// opening's value. The slices become the ring-switched claim, the words a claim on every column of the group.
+fn qkeccak_claims(
+    q_keccak: &witness::JaggedGroup,
+    shape: keccak_gkr::Shape,
+    openings: keccak_gkr::Openings,
+) -> (pcs::RingSwitchOpen, Option<pcs::SlotClaim>) {
+    let steps = shape.n_log();
+    let stored = (q_keccak.chunks() << witness::CHUNK_LOG).min(shape.n());
+    let padding = keccak_gkr::padding_words(shape);
+    let share = |point: &[F192]| {
+        let (instance, slot) = point.split_at(steps);
+        (
+            leaf::padding_weight(instance, stored),
+            primitives::multilinear::eq_table(slot),
+        )
+    };
+    let keccak_gkr::Opening { point, mut slices } = openings.inputs;
+    let (weight, slots) = share(&point);
+    for (z, slice) in slices.iter_mut().enumerate() {
+        let bits = padding.iter().zip(&slots).filter(|(word, _)| *word >> z & 1 == 1);
+        *slice += weight * bits.fold(F192::ZERO, |sum, (_, &slot)| sum + slot);
     }
+    // The point in the stack's order: a chunk's row bits, its slot, then the chunk index.
+    let (instance, slot) = point.split_at(steps);
+    let mut stack_point = instance[..steps.min(witness::CHUNK_LOG)].to_vec();
+    stack_point.resize(witness::CHUNK_LOG, F192::ZERO);
+    stack_point.extend_from_slice(slot);
+    stack_point.extend_from_slice(instance.get(witness::CHUNK_LOG..).unwrap_or_default());
+    assert_eq!(q_keccak.offset, 0, "q_keccak's group leads the stack");
+    let ring = pcs::RingSwitchOpen {
+        offset: q_keccak.offset,
+        len: q_keccak.words(),
+        claims: vec![pcs::RingSwitchClaim {
+            suffix_point: stack_point,
+            s_hat_v: Some(slices),
+        }],
+    };
+    let outputs = openings.outputs.map(|outputs| {
+        let (weight, slots) = share(&outputs.point);
+        let pad = (padding.iter().zip(&slots)).fold(F192::ZERO, |sum, (&word, &slot)| sum + slot.mul_base(F64(word)));
+        let (instance, slot) = outputs.point.split_at(steps);
+        pcs::SlotClaim::JaggedAt {
+            offset: q_keccak.offset,
+            log_width: q_keccak.log_width,
+            chunks: q_keccak.chunks(),
+            point: instance.to_vec(),
+            column: slot.to_vec(),
+            value: outputs.value + weight * pad,
+        }
+    });
+    (ring, outputs)
 }
 
 /// Test-only forgeries of the jagged commitment: the prover is honest but for the one named here.
@@ -934,6 +979,12 @@ pub mod tamper {
         WrongOutput,
         /// Flip the first `KECCAK` row's flag for output cells `2..13` in the witness, not in the bytecode.
         OutFlag,
+        /// Flip a bit of the first padding step's state after the input, which `q_keccak` commits: the step past
+        /// the real `KECCAK` rows, inside the last chunk.
+        KeccakPadding,
+        /// Have the Keccak reduction read a padding step past `q_keccak`'s chunks with a bit of its state after
+        /// the input flipped, where the commitment holds nothing.
+        KeccakPastChunks,
     }
 
     thread_local! {
@@ -994,13 +1045,22 @@ pub mod tamper {
             Some(Tamper::OutFlag) => {
                 let flag = schema().base[tables::KECCAK_TABLE] + tables::keccakt::OUT_ALL;
                 // Row 0 of the flag column, wherever the committed stack keeps it.
-                let at = match w.layout.dense.slots[flag].expect("a committed column") {
-                    witness::Slot::Padded(p) => p.offset,
-                    witness::Slot::Jagged { group, column } => {
-                        w.layout.dense.groups[group].offset + column * witness::RUN
-                    }
-                };
+                let witness::Slot { group, column } = w.layout.dense.slots[flag].expect("a committed column");
+                let at = w.layout.dense.groups[group].offset + column * witness::RUN;
                 w.dense[at].0 ^= 1;
+            }
+            Some(Tamper::KeccakPadding) => {
+                let q_keccak = &w.layout.dense.groups[w.layout.dense.qkeccak];
+                let step = q_keccak.rows;
+                assert!(
+                    step < q_keccak.chunks() << witness::CHUNK_LOG,
+                    "a padding step in the last chunk"
+                );
+                let slot = crate::keccak::SLOTS / 2;
+                let at = (step >> witness::CHUNK_LOG << (witness::CHUNK_LOG + q_keccak.log_width))
+                    + slot * witness::RUN
+                    + step % witness::RUN;
+                w.dense[q_keccak.offset + at].0 ^= 1 << 17;
             }
             _ => {}
         }
@@ -1010,9 +1070,7 @@ pub mod tamper {
     /// Forge the committed stack, or undo the forgery: the flip is its own inverse.
     pub(crate) fn dense(tamper: Option<Tamper>, l: &Layout, dense: &mut [F64]) {
         if let Some(Tamper::DenseWord) = tamper {
-            let Some(witness::Slot::Jagged { group, .. }) = l.dense.slots[MEM_LO] else {
-                unreachable!("the memory is jagged");
-            };
+            let witness::Slot { group, .. } = l.dense.slots[MEM_LO].expect("the memory is committed");
             dense[l.dense.groups[group].offset + 3].0 ^= 1;
         }
     }
@@ -1373,6 +1431,65 @@ mod tests {
         assert!(tagged >= 3, "the padding is found: {tagged} blocks tagged");
         let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &pi, &proof).expect("the proof verifies");
+    }
+
+    /// A forged padding step of q_keccak is rejected, whether its chunk holds it or the verifier takes it as public.
+    #[test]
+    fn qkeccak_padding_forgeries_are_rejected() {
+        use tamper::Tamper;
+        // 2100 steps fill three chunks of q_keccak's group, of a batch of 4096: a padding step is committed in the
+        // last chunk, and the ones past it are not.
+        let program = many_keccaks(2100);
+        let pi = [w(7), w(11)];
+        let exec = program.execute(pi).expect("the run halts");
+        assert_eq!(exec.rows()[tables::KECCAK_TABLE], 2100);
+        let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &proof).expect("the honest proof verifies");
+        for forgery in [Tamper::KeccakPadding, Tamper::KeccakPastChunks] {
+            tamper::set(forgery);
+            let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+            let verdict = verify(&program, &pi, &proof).err();
+            assert!(
+                matches!(verdict, Some(CpuError::Verifier(_))),
+                "{forgery:?}: {verdict:?}"
+            );
+            eprintln!("{forgery:?}: {verdict:?}");
+        }
+    }
+
+    /// `n` KECCAK rows over one input, each writing one cell, then XORs to fill the bytecode to a power of two.
+    fn many_keccaks(n: usize) -> Program {
+        let mut prog = vec![Op::Set { o: 2, k: w(3) }, Op::Set { o: 3, k: w(4) }];
+        for i in 0..4 {
+            prog.push(Op::Set { o: 4 + i, k: w(5) });
+        }
+        prog.push(Op::Set { o: 8, k: w(6) });
+        for c in 0..4 {
+            prog.push(Op::Set {
+                o: 9 + c,
+                k: F192::ZERO,
+            });
+        }
+        for k in 0..n as u32 {
+            prog.push(Op::Keccak {
+                m: [2, 3, 2, 3],
+                tail: 4,
+                b8: 8,
+                cap: 9,
+                out: 13 + k,
+                in_odd: false,
+                out_odd: false,
+                out_cells: OutCells::One,
+            });
+        }
+        let len = (prog.len() + 1).next_power_of_two();
+        let first = 13 + n as u32;
+        while prog.len() + 1 < len {
+            let c = first + (prog.len() - n) as u32;
+            prog.push(Op::Xor { a: 2, b: 3, c });
+        }
+        prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
+        Program::from_bytecode(prog, 64)
     }
 
     /// Each forgery of the jagged commitment is rejected: a committed word, an announced height, and a value past a

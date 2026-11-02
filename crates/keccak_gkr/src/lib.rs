@@ -107,7 +107,7 @@ mod tests;
 
 pub use keccak::iota_bit;
 pub use open::{Opening, Openings, WordOpening};
-pub use witness::{Shape, Witness};
+pub use witness::{Committed, Shape, Witness, padding_words};
 
 /// A claim on the permutation's output, from outside the reduction: `lanes[l]` is lane `l` of
 /// the output state, as words over the instances, evaluated at `instance` (an instance index's
@@ -170,12 +170,13 @@ impl Witness {
     /// all, not just the states [`Witness::generate`] wrote: the openings it leaves are claims
     /// on all of it, so they fold whatever rides those slots (§cpu).
     pub fn prove(&self, ps: &mut ProverState, committed: &[F64], output: &OutputClaim) -> Openings {
+        self.prove_in(ps, &Committed::whole(self.shape, committed), output)
+    }
+
+    /// [`Witness::prove`] over the committed states as `committed` lays them out. The openings are of every
+    /// instance, a padding one's words being public past the stored ones.
+    pub fn prove_in(&self, ps: &mut ProverState, committed: &Committed, output: &OutputClaim) -> Openings {
         let shape = self.shape;
-        assert_eq!(
-            committed.len(),
-            1 << shape.stack_log(),
-            "the openings are claims on the whole committed block"
-        );
         let (segment, r_lane) = (ps.sample_vec(shape.seg_log()), ps.sample_vec(LANE_VARS));
         let mut first = first(shape, output, segment, &r_lane);
         let instance = &output.instance;

@@ -175,19 +175,18 @@ pub(crate) struct Witness {
 
 impl Witness {
     /// One read-only view per column, in global column order: a committed column's runs in the
-    /// stack, a KECCAK input lane's slot of `q_keccak`, an output lane's private buffer.
+    /// stack, a KECCAK input lane's being its slot of `q_keccak`, an output lane's private buffer.
     ///
     /// A jagged column reads its padding past its chunks: zero, or `g^0 = 1` for the memory's final counts.
     pub(crate) fn columns(&self) -> Vec<Column<'_>> {
         let l = &self.layout;
-        let q_keccak = &self.dense[dense_qkeccak_offset(l)..];
-        let steps = 1 << l.taus[tables::KECCAK_TABLE];
+        let steps_log = l.taus[tables::KECCAK_TABLE];
         let mut cols: Vec<Column> = l
             .placements
             .iter()
             .enumerate()
             .map(|(i, p)| match keccak_value(i) {
-                Some(KeccakLane::Slot(slot)) => Column::flat(&q_keccak[slot * steps..][..steps]),
+                Some(KeccakLane::Slot(_)) => l.dense.column(&self.dense, i, steps_log, F64::ZERO),
                 _ if p.is_virtual() => Column::flat(&[]),
                 _ => {
                     let pad = if i == MFCNT { F64::ONE } else { F64::ZERO };
@@ -223,10 +222,8 @@ pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     k[MEM_TOP] = Some((1, 0));
     k[MFCNT] = Some((1, 0));
     k[BFCNT] = Some((0, log_bytecode));
-    // q_keccak is `2^(SLOT_LOG + n_steps_log)` F64 words, and tau_5 IS
-    // n_steps_log (the announced-size certification uses the same floor), so this
-    // reproduces `qkeccak_kappa`.
-    k[QKECCAK] = Some((2 + tables::KECCAK_TABLE, crate::keccak::SLOT_LOG));
+    // q_keccak is no column of its own: its slots are a jagged group (`dense_layout`).
+    k[QKECCAK] = None;
     for (t, table) in tables::tables().iter().enumerate() {
         let base = sch.base[t];
         k[base..base + table.n_committed_columns()].fill(Some((2 + t, 0)));
@@ -282,7 +279,8 @@ fn col_kappas(log_mem: usize, log_bytecode: usize, taus: [usize; tables::N_TABLE
 }
 
 /// The jagged groups' global columns: each table's committed columns but the ones `q_keccak` carries, in table
-/// order, then the memory's four.
+/// order, then the memory's four, then the bytecode's final counts. `q_keccak`'s slots follow them as a group of
+/// their own ([`qkeccak_columns`]).
 pub fn jagged_columns() -> Vec<Vec<usize>> {
     let sch = schema();
     let mut groups: Vec<Vec<usize>> = tables::tables()
@@ -295,36 +293,40 @@ pub fn jagged_columns() -> Vec<Vec<usize>> {
         })
         .collect();
     groups.push(vec![MEM_LO, MEM_HI, MEM_TOP, MFCNT]);
+    groups.push(vec![BFCNT]);
     groups
 }
 
-/// The columns the committed stack keeps as whole padded blocks: their padding is not zero.
-pub const PADDED_COLUMNS: [usize; 2] = [BFCNT, QKECCAK];
+/// The columns `q_keccak`'s slots are, as `(slot, global column)`: the KECCAK input lanes and the columns riding
+/// the spare slots. The other slots hold the states after the input.
+pub fn qkeccak_columns() -> Vec<(usize, usize)> {
+    (0..schema().n)
+        .filter_map(|col| match keccak_value(col) {
+            Some(KeccakLane::Slot(slot)) => Some((slot, col)),
+            _ => None,
+        })
+        .collect()
+}
 
-/// The committed stack the announced sizes imply ([`witness::Dense`]).
-pub fn dense_layout(
-    log_mem: usize,
-    log_bytecode: usize,
-    rows: [usize; tables::N_TABLES],
-    mem_rows: usize,
-) -> witness::Dense {
-    let kappas = col_kappas(log_mem, log_bytecode, table_logs(rows));
+/// The committed stack the announced sizes imply ([`witness::Dense`]): every column jagged, `q_keccak`'s slots
+/// a group of the KECCAK table's rows.
+pub fn dense_layout(log_bytecode: usize, rows: [usize; tables::N_TABLES], mem_rows: usize) -> witness::Dense {
     let groups = jagged_columns()
         .into_iter()
-        .zip(rows.into_iter().chain([mem_rows]))
+        .zip(rows.into_iter().chain([mem_rows, 1 << log_bytecode]))
         .collect();
-    witness::dense_of(&kappas, &PADDED_COLUMNS, groups)
+    let qkeccak = (
+        crate::keccak::SLOT_LOG,
+        rows[tables::KECCAK_TABLE],
+        &qkeccak_columns()[..],
+    );
+    witness::dense_of(schema().n, groups, qkeccak)
 }
 
 /// `log2` of the committed stack the announced sizes imply. The one part of
 /// [`layout`] a size floor needs, and far cheaper than the rest of it.
-pub(crate) fn committed_log(
-    log_mem: usize,
-    mem_rows: usize,
-    log_bytecode: usize,
-    rows: [usize; tables::N_TABLES],
-) -> usize {
-    dense_layout(log_mem, log_bytecode, rows, mem_rows).shape.mu
+pub(crate) fn committed_log(mem_rows: usize, log_bytecode: usize, rows: [usize; tables::N_TABLES]) -> usize {
+    dense_layout(log_bytecode, rows, mem_rows).shape.mu
 }
 
 /// Operand slots of a bytecode tuple, after the opcode.
@@ -523,7 +525,7 @@ pub fn layout(
     }
 
     let (placements, shape) = witness::placements_of(&col_kappas(log_mem, log_bytecode, taus));
-    let dense = dense_layout(log_mem, log_bytecode, rows, mem_rows);
+    let dense = dense_layout(log_bytecode, rows, mem_rows);
     Layout {
         push,
         pull,
@@ -580,7 +582,7 @@ impl Program {
         // `execute` sized the memory for.
         let log_bytecode = crate::log2_strict_usize(self.prog.len());
         let used = exec.mem_used.next_multiple_of(1 << witness::CHUNK_LOG).min(cells);
-        let mem_rows = if committed_log(log_mem, used, log_bytecode, row_counts) < self.min_log_committed {
+        let mem_rows = if committed_log(used, log_bytecode, row_counts) < self.min_log_committed {
             cells
         } else {
             used
@@ -593,7 +595,7 @@ impl Program {
         //
         // The fill below writes every word: `Dense::split` zeroes the words no column holds; `fill_table`
         // checks that each table wrote every window it was given, and the shared columns below write theirs.
-        let mut repeats = l.dense.alloc_repeats();
+        let repeats = l.dense.alloc_repeats();
         let mut virt = Vec::new();
         let mut keccak_reduction = None;
         let dense = primitives::filled_vec(l.dense.shape.committed_len(), |dense| {
@@ -607,36 +609,24 @@ impl Program {
                 // `fill_table` asserts each table wrote all of its windows.
                 .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
                 .collect();
-            let (mut windows, padded) = l.dense.split(dense, &mut repeats, &l.placements);
+            let (mut windows, q_keccak) = l.dense.split(dense, &l.placements);
             for (i, buf) in virt.iter_mut() {
                 windows[*i] = tables::ColumnOut::flat(buf, &mut []);
             }
-            let (mut bytecode_counts, mut q_keccak) = (None, None);
-            for (column, words, tags) in padded {
-                match column {
-                    BFCNT => bytecode_counts = Some(words),
-                    QKECCAK => q_keccak = Some((words, tags)),
-                    _ => unreachable!("only BFCNT and q_keccak are padded blocks"),
-                }
+            // A chunk of q_keccak's group holds a run of each slot: the states' first, which the Keccak witness
+            // writes, then a run of each column riding a spare slot, which its fill writes, so the stack never
+            // holds it twice. The states stay untagged in the repeat map: a missing repeat is only a read.
+            let width = crate::keccak::SLOT_LOG + witness::CHUNK_LOG;
+            let mut states: Vec<&mut [F64]> = Vec::with_capacity(q_keccak.len() >> width);
+            for k in 0..QKECCAK_SPARE {
+                windows[sch.base[tables::KECCAK_TABLE] + spare_local(k)].len = steps;
             }
-            let bytecode_counts = bytecode_counts.expect("BFCNT is a padded block");
-            // q_keccak's block is the committed states and then the spare slots, a slot per
-            // KECCAK column riding them: hand each its slot, so its fill writes it where it
-            // lives and the stack never holds it twice.
-            // The states stay untagged in the repeat map: a missing repeat is only a read. A spare slot
-            // takes its own tags, which line up whenever a slot spans whole blocks.
-            let (words, tags) = q_keccak.expect("q_keccak is a padded block");
-            let (states, spare) = words.split_at_mut(crate::keccak::SLOTS * steps);
-            let per_slot = steps >> ::pcs::stack_open::EQUAL_BLOCK_LOG;
-            let (_, spare_tags) = tags.split_at_mut(crate::keccak::SLOTS * per_slot);
-            let mut spare_tags = spare_tags.chunks_mut(per_slot.max(1));
-            for (k, words) in spare.chunks_exact_mut(steps).enumerate() {
-                let repeats = if per_slot > 0 {
-                    spare_tags.next().unwrap_or_default()
-                } else {
-                    &mut []
-                };
-                windows[sch.base[tables::KECCAK_TABLE] + spare_local(k)] = tables::ColumnOut::flat(words, repeats);
+            for chunk in q_keccak.chunks_exact_mut(1 << width) {
+                let (chunk_states, spare) = chunk.split_at_mut(crate::keccak::SLOTS * witness::RUN);
+                states.push(chunk_states);
+                for (k, run) in spare.chunks_exact_mut(witness::RUN).enumerate() {
+                    windows[sch.base[tables::KECCAK_TABLE] + spare_local(k)].runs.push(run);
+                }
             }
 
             // Each table fills its own columns from the trace (local indices, offset
@@ -648,7 +638,7 @@ impl Program {
                     tables::fill_table(*table, &ctx, &mut windows[base..base + n]);
                 }
                 // Shared columns. The 192-bit memory image splits into three K-limbs.
-                // These five plus `QKECCAK` below are every shared column, and each has to
+                // These five plus `QKECCAK`'s states below are every shared column, and each has to
                 // be written: the stack is uninitialized, so one left out would be read
                 // as indeterminate bytes rather than caught by a length mismatch.
                 const _: () = assert!(N_SHARED == 6, "a new shared column needs a fill here");
@@ -693,12 +683,21 @@ impl Program {
                         }
                     }
                 });
-                parallel::fill(bytecode_counts, |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
+                // … at g^{A[pc]}, and a chunk past a bytecode under one chunk holds zeros.
+                let bytecode = &tr.bytecode_count;
+                let mut runs = std::mem::take(&mut windows[BFCNT].runs);
+                parallel::chunks_mut(&mut runs, 1, |b, run| {
+                    for (i, word) in run[0].iter_mut().enumerate() {
+                        *word = bytecode
+                            .get(b * witness::RUN + i)
+                            .map_or(F64::ZERO, |&count| gpow[count as usize]);
+                    }
+                });
             });
             // The committed Keccak states q_keccak, ALWAYS in this same stack: built from
             // the executed KECCAK rows in order (row j = step j).
             keccak_reduction = Some(crate::stage!("Build q_keccak", || {
-                keccak_blocks.place(tr.keccak.len(), states)
+                keccak_blocks.place(tr.keccak.len(), &mut states)
             }));
 
             // (`execute` already asserts the run halts at the sentinel (pc, fp) =

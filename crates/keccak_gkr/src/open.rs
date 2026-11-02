@@ -12,7 +12,7 @@ use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim};
 use primitives::field::{F64, F192};
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 use primitives::field::F192Unreduced;
-use primitives::multilinear::{eq_table, mle_eval, poly_eval};
+use primitives::multilinear::{eq_table, mle_eval_many, poly_eval};
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 use crate::basis::byte_sums;
@@ -20,7 +20,7 @@ use crate::keccak::{BITS, LANES, along, iota_bit};
 use crate::protocol::{Claim, dot, sum};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
 use crate::prover::{affine_matrix, byte};
-use crate::witness::{BLOCK_WORDS, Shape, Witness, words};
+use crate::witness::{BLOCK_WORDS, Committed, Shape, Witness, words};
 
 /// The 64 slices of the committed stack at `point`: bit `z` of every word, as a multilinear.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +50,7 @@ impl Openings {
     pub fn into_pcs_claims(self, offset: usize) -> (RingSwitchOpen, Option<StackClaim>) {
         let ring = RingSwitchOpen {
             offset,
+            len: 1 << self.inputs.point.len(),
             claims: vec![RingSwitchClaim {
                 suffix_point: self.inputs.point,
                 s_hat_v: Some(self.inputs.slices),
@@ -319,11 +320,21 @@ fn word_weights(shape: Shape, claim: &Claim) -> Vec<F192> {
 /// word-level `claim` on the committed segment outputs among them. An opening is of the whole
 /// block, so the slots the claim puts no weight on are evaluated too: the spare ones past
 /// [`Shape::slots`] carry other columns (§cpu), and the fold that follows must see them.
-pub fn output_claim(shape: Shape, committed: &[F64], instance: &[F192], claim: &Claim) -> (Vec<F192>, F192) {
-    let n = shape.n();
-    let words = parallel::map_collect(1 << shape.slot_log(), |slot| {
-        mle_eval(&committed[slot * n..][..n], instance)
-    });
+///
+/// A slot past the stored instances holds its padding word, weighed by their `eq` mass.
+pub fn output_claim(shape: Shape, committed: &Committed, instance: &[F192], claim: &Claim) -> (Vec<F192>, F192) {
+    let run = committed.run();
+    let (low, high) = instance.split_at(run.ilog2() as usize);
+    let high = eq_table(high);
+    let runs = committed.stored() / run;
+    let jobs: Vec<(&[F64], &[F192])> = (0..1 << shape.slot_log())
+        .flat_map(|slot| (0..runs).map(move |r| (committed.span(slot, r * run, run), low)))
+        .collect();
+    let values = mle_eval_many(&jobs);
+    let mass = sum(&high[runs..]);
+    let words = (committed.padding().into_iter().enumerate())
+        .map(|(slot, pad)| dot(&values[slot * runs..][..runs], &high[..runs]) + mass.mul_base(F64(pad)))
+        .collect::<Vec<_>>();
     let value = dot(&words, &word_weights(shape, claim));
     (words, value)
 }
@@ -356,20 +367,21 @@ pub fn open_outputs(
 /// subset sum of the `eq` table over the steps whose bit is set, read eight steps at a time off
 /// their transposed bytes.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
-fn spare_slices(shape: Shape, committed: &[F64], instance: &[F192]) -> Vec<[F192; 64]> {
-    let (n, spare) = (shape.n(), (1 << shape.slot_log()) - shape.slots());
+fn spare_slices(shape: Shape, committed: &Committed, instance: &[F192]) -> Vec<[F192; 64]> {
+    let spare = (1 << shape.slot_log()) - shape.slots();
     let eq = eq_table(instance);
-    let (groups, slots) = (eq.as_chunks::<8>().0, &committed[shape.slots() * n..]);
+    let groups = eq.as_chunks::<8>().0;
     // A task per group of eight steps rather than per slot: the subset sums are the work, and one
     // group's table serves every slot, where a task per slot would rebuild it and, there being as
     // few slots as there are, leave most of the pool idle.
     parallel::fold_reduce(
-        n / 8,
+        committed.stored() / 8,
         || vec![[F192::ZERO; 64]; spare],
         |acc, group| {
             let table = byte_sums(&groups[group]);
             for (slot, acc) in acc.iter_mut().enumerate() {
-                let words = std::array::from_fn(|w| slots[slot * n + 8 * group + w].0);
+                let words = committed.span(shape.slots() + slot, 8 * group, 8);
+                let words = std::array::from_fn(|w| words[w].0);
                 let mut gathered = [0u8; 64];
                 primitives::bits::bit_transpose_64bytes(&le_bytes(&words), &mut gathered);
                 for (acc, &byte) in acc.iter_mut().zip(&gathered) {
@@ -390,12 +402,11 @@ fn spare_slices(shape: Shape, committed: &[F64], instance: &[F192]) -> Vec<[F192
 /// bit position, which a GF2P8AFFINE matrix of the steps' weights sends to one byte of the slice.
 /// A task per run of steps, whose matrices serve every spare slot.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))]
-fn spare_slices(shape: Shape, committed: &[F64], instance: &[F192]) -> Vec<[F192; 64]> {
+fn spare_slices(shape: Shape, committed: &Committed, instance: &[F192]) -> Vec<[F192; 64]> {
     const RUN: usize = 128;
-    let (n, spare) = (shape.n(), (1 << shape.slot_log()) - shape.slots());
+    let spare = (1 << shape.slot_log()) - shape.slots();
     let eq = eq_table(instance);
-    let slots = &committed[shape.slots() * n..];
-    let chunks = eq.as_chunks::<8>().0;
+    let chunks = &eq.as_chunks::<8>().0[..committed.stored() / 8];
     parallel::fold_reduce(
         chunks.len().div_ceil(RUN),
         || vec![[F192::ZERO; 64]; spare],
@@ -406,7 +417,7 @@ fn spare_slices(shape: Shape, committed: &[F64], instance: &[F192]) -> Vec<[F192
                 .map(|e| std::array::from_fn(|o| affine_matrix(std::array::from_fn(|w| byte(&e[w], o)))))
                 .collect();
             for (slot, acc) in acc.iter_mut().enumerate() {
-                let words = &slots[slot * n + 8 * first..][..8 * matrices.len()];
+                let words = committed.span(shape.slots() + slot, 8 * first, 8 * matrices.len());
                 // SAFETY: the features are enabled at compile time.
                 let sums = unsafe { slices_gfni(words, &matrices) };
                 for (acc, sum) in acc.iter_mut().zip(sums) {
@@ -455,7 +466,7 @@ fn slices_gfni(words: &[F64], matrices: &[[u64; 24]]) -> [F192; 64] {
 }
 
 /// Open the claim on the inputs: the instances of a pack first, then the slot.
-pub fn open_inputs(ps: &mut ProverState, witness: &Witness, committed: &[F64], claim: &Claim) -> Opening {
+pub fn open_inputs(ps: &mut ProverState, witness: &Witness, committed: &Committed, claim: &Claim) -> Opening {
     let shape = witness.shape;
     let pack = &claim.point[..shape.pack_vars()];
     let folded = fold_packs(witness, pack);
