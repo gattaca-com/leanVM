@@ -33,7 +33,7 @@ use hash::{Digest, ROUNDS, STATE_LANES};
 use keccak::{KeccakShape, verify_keccak};
 use layout::{
     GLOBAL_COLUMN_BASES, KECCAK_OUT, MAX_STACKED_LOG, MEMORY_0, MEMORY_1, MEMORY_2, MIN_STACKED_LOG, N_TABLES,
-    OP_KECCAK, QKECCAK, build_layout,
+    OP_KECCAK, QKECCAK, Slot, build_layout,
 };
 use multilinear::{dot, eq_eval, multilinear_eval};
 use ring_switch::ring_switch;
@@ -153,9 +153,10 @@ fn verify_stacked_opening(
 /// With the proof's own stream, which the walk reads whole, it is the proof in the form the recursion guest and the Python verifier consume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Summary {
-    /// The announced sizes: the memory's log size and each table's row count.
+    /// The announced sizes: the memory's log size, each table's row count, and the memory rows committed.
     pub log_memory: usize,
     pub table_rows: Vec<u64>,
+    pub mem_rows: u64,
     pub log_inv_rate: usize,
     /// Where the bus reads the stacked bytecode. Its value there is the claim an aggregate defers.
     pub bytecode_point: Vec<E>,
@@ -230,8 +231,8 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     let public_input = Digest(*public_input);
     let mut transcript = Transcript::new(proof, bytecode.fiat_shamir_iv, public_input, checked);
 
-    // 1] memory log-size, table row counts, and log-inv-rate in WHIR
-    let announced = transcript.next_scalars(2 + N_TABLES)?;
+    // 1] memory log-size, table row counts, log-inv-rate in WHIR, and the memory rows the commitment holds
+    let announced = transcript.next_scalars(3 + N_TABLES)?;
     require(
         announced.iter().all(|value| value.c1 == 0 && value.c2 == 0),
         VerifierError::AnnouncedHighLimb,
@@ -239,8 +240,9 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     let log_memory = announced[0].c0;
     let table_rows: Vec<u64> = announced[1..1 + N_TABLES].iter().map(|value| value.c0).collect();
     let log_inverse_rate = announced[1 + N_TABLES].c0;
+    let mem_rows = announced[2 + N_TABLES].c0;
     require((1..=4).contains(&log_inverse_rate), VerifierError::PcsInverseRate)?;
-    let layout = build_layout(bytecode, log_memory, &table_rows)?;
+    let layout = build_layout(bytecode, log_memory, &table_rows, mem_rows)?;
     require(
         (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&layout.stack_log),
         VerifierError::CommittedSize,
@@ -283,7 +285,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     // evaluates itself, so the prover sends nothing. Both public words are 128-bit, so the top limb's claim is zero.
     let public_challenge = transcript.sample();
     let (first, second) = public_input.halves();
-    let mut public_point = vec![ZERO; layout.placements[MEMORY_0].expect("memory is committed").variables];
+    let mut public_point = vec![ZERO; layout.log_memory];
     public_point[0] = public_challenge;
     let public_pairs = [(first.c0, second.c0), (first.c1, second.c1), (first.c2, second.c2)];
     for (column, (low, high)) in [MEMORY_0, MEMORY_1, MEMORY_2].into_iter().zip(public_pairs) {
@@ -318,7 +320,9 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     let (ringswitch_target, ringswitch_weight) = ring_switch(point, &slices, &mut transcript);
     // That claim is supported on q_keccak's region of the stack, so its weight carries the
     // placement's selector, and it leads the batch, taking the first power.
-    let qkeccak = layout.placements[QKECCAK].expect("q_keccak is committed");
+    let Some(Slot::Padded(qkeccak)) = layout.slots[QKECCAK] else {
+        unreachable!("q_keccak is a padded block");
+    };
     let ringswitch: StackClaim = (
         Box::new(move |x| qkeccak.eq_above(x) * ringswitch_weight(&x[..qkeccak.variables])),
         ringswitch_target,
@@ -336,6 +340,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     Ok(Summary {
         log_memory: layout.log_memory,
         table_rows,
+        mem_rows,
         log_inv_rate: log_inverse_rate as usize,
         bytecode_point: bus.bytecode_point,
         keccak_scalars,

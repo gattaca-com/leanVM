@@ -1252,6 +1252,7 @@ fn gen_verify(
         program.bytecode_cols(),
         summary.log_memory,
         std::array::from_fn(|t| summary.table_rows[t] as usize),
+        summary.mem_rows as usize,
         public_input,
     );
     let sides: [&[Block]; 3] = [&layout.push, &layout.pull, &layout.count];
@@ -1263,9 +1264,9 @@ fn gen_verify(
     // the placeholder map is SHAPE-INDEPENDENT (the definition of generic). A
     // child that verifies and has an arm fits them; one that does not need not.
     let fits = side_layouts.iter().all(|side| side.mu <= MU_CAP) && proof_stream.len() <= STREAM_CAP;
-    if !(MU_MIN..=MU_MAX).contains(&layout.shape.mu) || !fits {
+    if !(MU_MIN..=MU_MAX).contains(&layout.dense.shape.mu) || !fits {
         return Err(AggregationError::ChildOutOfRange {
-            log_committed: layout.shape.mu,
+            log_committed: layout.dense.shape.mu,
         });
     }
 
@@ -1277,7 +1278,7 @@ fn gen_verify(
 
     let taus = layout.taus;
     // ---- the stacked opening: config + the opening summary ----
-    let stack = whir_shape(layout.shape.mu, summary.log_inv_rate);
+    let stack = whir_shape(layout.dense.shape.mu, summary.log_inv_rate);
 
     // ---- hints ----
     // The program's whole share of a bytecode leaf: ONE value, the stacked
@@ -2067,7 +2068,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     // table sizes let us derive it before the guest's bytecode exists.
     let stand_in = vec![leanvm_core::cpu::Op::Xor { a: 0, b: 0, c: 0 }; 1 << kbc];
     let stand_in = leanvm_core::cpu::bytecode_columns(&stand_in);
-    let layout = leanvm_core::cpu::layout(&stand_in, 20, [1 << 10; N_TABLES], [F192::ZERO, F192::ZERO]);
+    let layout = leanvm_core::cpu::layout(&stand_in, 20, [1 << 10; N_TABLES], 1 << 20, [F192::ZERO, F192::ZERO]);
     let sides: [&[Block]; 3] = [&layout.push, &layout.pull, &layout.count];
 
     // ---- flattened block/coord descriptors (structural) ----

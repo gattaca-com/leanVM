@@ -98,6 +98,170 @@ pub fn placements_of(kappas: &[Option<usize>]) -> (Vec<Placement>, StackShape) {
     (placements, StackShape { mu, n_lanes })
 }
 
+/// Rows of a jagged chunk: a column's run inside one chunk of its group.
+pub const CHUNK_LOG: usize = ::pcs::stack_open::CHUNK_LOG;
+/// The jagged groups start at a multiple of `2^JAGGED_ALIGN_LOG` words, which every group's chunk divides.
+pub const JAGGED_ALIGN_LOG: usize = 15;
+
+/// A jagged group: a table's committed columns (or the memory's), cut into chunks of `2^CHUNK_LOG` rows. A chunk
+/// holds `2^log_width` column runs one after another, the runs past the last column zero.
+#[derive(Clone, Debug)]
+pub struct JaggedGroup {
+    /// Global column indices, in local order.
+    pub columns: Vec<usize>,
+    pub log_width: usize,
+    pub rows: usize,
+    pub offset: usize,
+}
+
+impl JaggedGroup {
+    pub fn chunks(&self) -> usize {
+        self.rows.div_ceil(1 << CHUNK_LOG)
+    }
+
+    pub fn words(&self) -> usize {
+        self.chunks() << (CHUNK_LOG + self.log_width)
+    }
+}
+
+/// Where a committed column lives in the committed (dense) stack.
+#[derive(Clone, Copy, Debug)]
+pub enum Slot {
+    /// A whole `2^n_vars` block, as in the padded working stack.
+    Padded(Placement),
+    /// Local column `column` of jagged group `group`.
+    Jagged { group: usize, column: usize },
+}
+
+/// The committed stack: the padded blocks by descending size, then the jagged groups by descending width.
+///
+/// The prover works on the padded stack ([`placements_of`]) and commits this one, a copy that leaves every row
+/// past a group's chunks out. Both sides derive it from the announced sizes alone.
+#[derive(Clone, Debug)]
+pub struct Dense {
+    pub groups: Vec<JaggedGroup>,
+    pub slots: Vec<Option<Slot>>,
+    pub shape: StackShape,
+    pub placed: usize,
+}
+
+/// The committed stack for the columns' log sizes `kappas`: the `padded` columns as whole blocks, every column of a
+/// `groups` entry (its global columns and its rows) jagged.
+pub fn dense_of(kappas: &[Option<usize>], padded: &[usize], groups: Vec<(Vec<usize>, usize)>) -> Dense {
+    let padded_kappas: Vec<Option<usize>> = padded.iter().map(|&c| kappas[c]).collect();
+    let (padded_offsets, padded_words) = stack_offsets(&padded_kappas);
+    let mut groups: Vec<JaggedGroup> = groups
+        .into_iter()
+        .map(|(columns, rows)| JaggedGroup {
+            log_width: crate::log2_ceil_usize(columns.len()),
+            columns,
+            rows,
+            offset: 0,
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&g| (std::cmp::Reverse(groups[g].log_width), g));
+    let mut placed = padded_words.next_multiple_of(1 << JAGGED_ALIGN_LOG);
+    for &g in &order {
+        groups[g].offset = placed;
+        placed += groups[g].words();
+    }
+    let mut slots = vec![None; kappas.len()];
+    for (&column, &offset) in padded.iter().zip(&padded_offsets) {
+        let n_vars = kappas[column].expect("a padded column is committed");
+        slots[column] = Some(Slot::Padded(Placement { n_vars, offset }));
+    }
+    for (g, group) in groups.iter().enumerate() {
+        for (column, &global) in group.columns.iter().enumerate() {
+            slots[global] = Some(Slot::Jagged { group: g, column });
+        }
+    }
+    let mu = crate::log2_ceil_usize(placed.max(1)).max(crate::pcs::MIN_MU);
+    let n_lanes = placed.div_ceil(1 << (mu - crate::pcs::LOG_BATCH)).max(1);
+    Dense {
+        groups,
+        slots,
+        shape: StackShape { mu, n_lanes },
+        placed,
+    }
+}
+
+impl Dense {
+    /// The committed stack from the padded one `q`, laid out by `placements` with repeat map `q_repeats`, and its
+    /// own repeat map.
+    ///
+    /// A run of a column past its padded block (a table under one chunk) and a run past a group's columns are
+    /// zero. A padded block keeps its tags; in the jagged region only the zero runs that follow another are tagged.
+    pub fn gather(&self, q: &[F64], q_repeats: &[bool], placements: &[Placement]) -> (Vec<F64>, Vec<bool>) {
+        const RUN: usize = 1 << CHUNK_LOG;
+        let len = self.shape.committed_len();
+        let mut repeats = vec![false; len >> EQUAL_BLOCK_LOG];
+        // Each run of the jagged region: the padded words it copies (start, length), or none for zeros.
+        let start = self.groups.iter().map(|g| g.offset).min().unwrap_or(self.placed);
+        let mut runs: Vec<Option<(usize, usize)>> = vec![None; (len - start) / RUN];
+        for group in &self.groups {
+            for chunk in 0..group.chunks() {
+                for column in 0..1 << group.log_width {
+                    let at = group.offset + (chunk << (CHUNK_LOG + group.log_width)) + column * RUN;
+                    let run = (at - start) / RUN;
+                    match group.columns.get(column) {
+                        Some(&global) => {
+                            let p = placements[global];
+                            let height = 1usize << p.n_vars;
+                            let first = chunk * RUN;
+                            runs[run] = (first < height).then(|| (p.offset + first, RUN.min(height - first)));
+                        }
+                        None if column > group.columns.len() => {
+                            if let Some(tag) = repeats.get_mut(at >> EQUAL_BLOCK_LOG) {
+                                *tag = RUN >= 1 << EQUAL_BLOCK_LOG;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        let mut padded_words = 0;
+        for (global, slot) in self.slots.iter().enumerate() {
+            if let Some(Slot::Padded(p)) = *slot {
+                let n = 1usize << p.n_vars;
+                padded_words += n;
+                let from = placements[global].offset;
+                if n >= 1 << EQUAL_BLOCK_LOG && from.is_multiple_of(1 << EQUAL_BLOCK_LOG) {
+                    let blocks = n >> EQUAL_BLOCK_LOG;
+                    repeats[p.offset >> EQUAL_BLOCK_LOG..][..blocks]
+                        .copy_from_slice(&q_repeats[from >> EQUAL_BLOCK_LOG..][..blocks]);
+                }
+            }
+        }
+        let dense = primitives::filled_vec(len, |dense| {
+            let (head, jagged) = dense.split_at_mut(start);
+            head[padded_words..].fill(F64::ZERO);
+            for (global, slot) in self.slots.iter().enumerate() {
+                if let Some(Slot::Padded(p)) = *slot {
+                    let n = 1usize << p.n_vars;
+                    let from = placements[global].offset;
+                    parallel::chunks_mut(&mut head[p.offset..p.offset + n], FILL_CHUNK, |t, out| {
+                        out.copy_from_slice(&q[from + t * FILL_CHUNK..][..out.len()]);
+                    });
+                }
+            }
+            parallel::chunks_mut(jagged, FILL_CHUNK, |t, out| {
+                for (r, out) in out.chunks_mut(RUN).enumerate() {
+                    match runs.get(t * (FILL_CHUNK / RUN) + r).copied().flatten() {
+                        Some((from, n)) => {
+                            out[..n].copy_from_slice(&q[from..from + n]);
+                            out[n..].fill(F64::ZERO);
+                        }
+                        None => out.fill(F64::ZERO),
+                    }
+                }
+            });
+        });
+        (dense, repeats)
+    }
+}
+
 /// Chunk width for the bulk writes below: big enough to amortize the dispatch,
 /// small enough to spread one column across cores.
 const FILL_CHUNK: usize = 1 << 16;

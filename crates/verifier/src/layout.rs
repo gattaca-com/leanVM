@@ -4,7 +4,7 @@ use crate::bytecode::Bytecode;
 use crate::field::{E, GEN, ONE, ZERO};
 use crate::hash::{STATE_LANES, keccak_f};
 use crate::keccak::KeccakShape;
-use crate::multilinear::{Placement, log2_ceil, log2_strict, stack_offsets};
+use crate::multilinear::{CHUNK_LOG, JaggedSlot, Placement, log2_ceil, log2_strict, stack_offsets};
 use crate::{VerifierError, require};
 use std::collections::BTreeMap;
 use std::ops::Add;
@@ -84,6 +84,37 @@ pub const MAX_TABLE_LOG: usize = 32;
 pub const MIN_STACKED_LOG: usize = 15;
 pub const MAX_STACKED_LOG: usize = 28;
 
+/// The jagged groups start at a multiple of `2^JAGGED_ALIGN_LOG` words, which every group's chunk divides.
+pub const JAGGED_ALIGN_LOG: usize = 15;
+
+/// Where a committed column lives in the stack.
+#[derive(Clone, Copy, Debug)]
+pub enum Slot {
+    /// A `2^variables` block at an aligned offset: `q_keccak` and the bytecode's final counts.
+    Padded(Placement),
+    /// A column of a jagged group, which commits only its group's chunks.
+    Jagged(JaggedSlot),
+}
+
+/// A jagged group: a table's committed columns (or the memory's), cut into chunks of `2^CHUNK_LOG` rows.
+#[derive(Clone, Debug)]
+pub struct JaggedGroup {
+    pub columns: Vec<usize>, // global indices, in local order
+    pub log_width: usize,    // a chunk holds 2^log_width column runs, the last ones zero
+    pub rows: u64,
+    pub offset: u64,
+}
+
+impl JaggedGroup {
+    pub fn chunks(&self) -> u64 {
+        self.rows.div_ceil(1 << CHUNK_LOG)
+    }
+
+    pub fn words(&self) -> u64 {
+        self.chunks() << (CHUNK_LOG + self.log_width)
+    }
+}
+
 pub struct Layout<'a> {
     pub log_memory: usize,
     pub log_bytecode: usize,
@@ -93,7 +124,7 @@ pub struct Layout<'a> {
     pub pull: Vec<BusBlock>,
     pub count: Vec<BusBlock>,
     /// Where each column sits, `None` for a column nothing commits: the `KECCAK` output lanes.
-    pub placements: Vec<Option<Placement>>,
+    pub slots: Vec<Option<Slot>>,
     pub stack_log: usize,
     pub placed: u64, // the words the columns fill, from the bottom of the stack
     pub table_log_heights: Vec<usize>,
@@ -479,11 +510,14 @@ pub fn build_layout<'a>(
     bytecode: &'a Bytecode,
     log_memory: u64,
     table_rows: &[u64],
+    mem_rows: u64,
 ) -> Result<Layout<'a>, VerifierError> {
     let log_bytecode = log2_strict(bytecode.len() as u64)?;
     require(
         (16..=32).contains(&log_memory)
             && table_rows.iter().all(|&rows| rows <= 1 << MAX_TABLE_LOG)
+            && mem_rows <= 1 << log_memory
+            && mem_rows.is_multiple_of(1 << CHUNK_LOG)
             && (BUS_BITS..=32 + BUS_BITS).contains(&log_bytecode),
         VerifierError::AnnouncedTableSizes,
     )?;
@@ -535,25 +569,61 @@ pub fn build_layout<'a>(
     // lane is not committed at all, nothing ever opening it.
     let base = GLOBAL_COLUMN_BASES[OP_KECCAK];
     let outputs = base + KECCAK_OUT..base + KECCAK_OUT + STATE_LANES;
-    let blocks: Vec<usize> = (0..kappas.len())
-        .filter(|column| qkeccak_slot(*column).is_none() && !outputs.contains(column))
-        .collect();
-    let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();
-    let (block_offsets, total_log) = stack_offsets(&block_kappas);
-    let offsets: BTreeMap<usize, u64> = blocks.into_iter().zip(block_offsets).collect();
-    let stack_log = MIN_STACKED_LOG.max(total_log); // Floor at the PCS minimum
-    let placed = block_kappas.iter().map(|&kappa| 1 << kappa).sum();
-    let placement = |(column, &kappa): (usize, &usize)| {
-        let index = match qkeccak_slot(column) {
-            Some(slot) => offsets[&QKECCAK] + ((slot as u64) << kappa),
-            None => *offsets.get(&column)?,
-        };
-        Some(Placement {
-            variables: kappa,
-            index,
+    let committed = |column: &usize| qkeccak_slot(*column).is_none() && !outputs.contains(column);
+
+    // The padded blocks lead, by descending size, then the jagged groups follow from an aligned offset.
+    let padded = [BYTECODE_FINAL_COUNTERS, QKECCAK];
+    let (padded_offsets, _) = stack_offsets(&padded.map(|column| kappas[column]));
+    let padded_words: u64 = padded.iter().map(|&column| 1 << kappas[column]).sum();
+    let mut groups: Vec<JaggedGroup> = (0..N_TABLES)
+        .map(|t| {
+            let first = GLOBAL_COLUMN_BASES[t];
+            (first..first + TABLE_WIDTHS[t]).filter(committed).collect::<Vec<_>>()
         })
-    };
-    let placements = kappas.iter().enumerate().map(placement).collect();
+        .chain([vec![MEMORY_0, MEMORY_1, MEMORY_2, MEMORY_FINAL_COUNTERS]])
+        .zip(table_rows.iter().copied().chain([mem_rows]))
+        .map(|(columns, rows)| JaggedGroup {
+            log_width: log2_ceil(columns.len() as u64),
+            columns,
+            rows,
+            offset: 0,
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&g| (std::cmp::Reverse(groups[g].log_width), g));
+    let mut placed = padded_words.next_multiple_of(1 << JAGGED_ALIGN_LOG);
+    for &g in &order {
+        groups[g].offset = placed;
+        placed += groups[g].words();
+    }
+    let stack_log = MIN_STACKED_LOG.max(log2_ceil(placed)); // Floor at the PCS minimum
+
+    let mut slots: Vec<Option<Slot>> = vec![None; kappas.len()];
+    for (&column, &offset) in padded.iter().zip(&padded_offsets) {
+        slots[column] = Some(Slot::Padded(Placement {
+            variables: kappas[column],
+            index: offset,
+        }));
+    }
+    for (column, slot) in slots.iter_mut().enumerate() {
+        if let Some(k) = qkeccak_slot(column) {
+            let variables = kappas[column];
+            *slot = Some(Slot::Padded(Placement {
+                variables,
+                index: padded_offsets[1] + ((k as u64) << variables),
+            }));
+        }
+    }
+    for group in &groups {
+        for (local, &column) in group.columns.iter().enumerate() {
+            slots[column] = Some(Slot::Jagged(JaggedSlot {
+                offset: group.offset,
+                log_width: group.log_width,
+                column: local,
+                chunks: group.chunks(),
+            }));
+        }
+    }
     Ok(Layout {
         log_memory,
         log_bytecode,
@@ -562,7 +632,7 @@ pub fn build_layout<'a>(
         push,
         pull,
         count,
-        placements,
+        slots,
         stack_log,
         placed,
         table_log_heights,

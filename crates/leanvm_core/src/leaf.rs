@@ -77,7 +77,7 @@ impl Block {
 }
 
 /// `pad_n(point)`, the multilinear extension of `[z ≥ n]`, `n ≤ 2^|point|` (lemma lem:suffix).
-fn padding_weight(point: &[F192], n: usize) -> F192 {
+pub(crate) fn padding_weight(point: &[F192], n: usize) -> F192 {
     let bit = |k: usize| F192::new(((n >> k) & 1) as u64, 0, 0);
     let low = point.iter().enumerate().fold(F192::ONE, |pad, (k, &r)| {
         (F192::ONE + bit(k)) * r + (F192::ONE + bit(k) + r) * pad

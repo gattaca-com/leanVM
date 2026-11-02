@@ -71,6 +71,9 @@ pub fn equal_blocks(stack: &[F64]) -> Vec<bool> {
 // Claim types
 // ---------------------------------------------------------------------------
 
+/// Rows of a jagged chunk: a column's run inside one chunk of its group.
+pub const CHUNK_LOG: usize = 10;
+
 /// An owning point claim folded into the stacked mixed opening.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StackClaim {
@@ -82,19 +85,39 @@ pub enum StackClaim {
         low_point: Vec<F192>,
         value: F192,
     },
+    /// A column of a jagged group at `point`. The group is `chunks` chunks of `2^CHUNK_LOG` rows from `offset`, a
+    /// chunk holding `2^log_width` column runs one after another, so row `i` of the column sits at
+    /// `offset + (i >> CHUNK_LOG)·2^(CHUNK_LOG + log_width) + column·2^CHUNK_LOG + (i mod 2^CHUNK_LOG)`.
+    /// Its weight is `eq(point, i)` there, the point zero-extended; `offset` is a multiple of a chunk.
+    Jagged {
+        offset: usize,
+        log_width: usize,
+        column: usize,
+        chunks: usize,
+        point: Vec<F192>,
+        value: F192,
+    },
 }
 
 impl StackClaim {
     #[inline]
     pub fn value(&self) -> F192 {
-        let StackClaim::Point { value, .. } = self;
-        *value
+        match self {
+            StackClaim::Point { value, .. } | StackClaim::Jagged { value, .. } => *value,
+        }
     }
 
-    /// The aligned dyadic range of the stack its weight is supported on.
+    /// The range of the stack its weight is supported on.
     fn range(&self) -> (usize, usize) {
-        let StackClaim::Point { offset, low_point, .. } = self;
-        (*offset, *offset + (1usize << low_point.len()))
+        match self {
+            StackClaim::Point { offset, low_point, .. } => (*offset, *offset + (1usize << low_point.len())),
+            StackClaim::Jagged {
+                offset,
+                log_width,
+                chunks,
+                ..
+            } => (*offset, *offset + (chunks << (CHUNK_LOG + log_width))),
+        }
     }
 }
 
@@ -231,15 +254,7 @@ pub fn open_batch_mixed_whir_stacked(
 
     // 4. One WHIR over the full stack against the combined claim (the
     //    prover takes the stack; no copy).
-    super::whir::recursive_prover_with_prepared_basis(
-        config,
-        log_n,
-        stack,
-        initial_basis,
-        target,
-        prover_data,
-        ps,
-    );
+    super::whir::recursive_prover_with_prepared_basis(config, log_n, stack, initial_basis, target, prover_data, ps);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +372,7 @@ mod tests {
                         shapes.push((0, lane_vars + spanned, None));
                     }
                 }
-                let claims: Vec<_> = shapes
+                let mut claims: Vec<_> = shapes
                     .into_iter()
                     .map(|(offset, vars, point)| StackClaim::Point {
                         offset,
@@ -365,18 +380,61 @@ mod tests {
                         value: rng.ext(),
                     })
                     .collect();
+                // Jagged groups: two columns of one group at one point, a lone column of a wider group whose point
+                // is shorter than a chunk, and a column whose point is longer than the group.
+                let chunk = 1usize << CHUNK_LOG;
+                if stack.len() >= 8 * chunk {
+                    let shared = rng.ext_vec(CHUNK_LOG + 1);
+                    let groups = [
+                        (0, 1, 0, 3, shared.clone()),
+                        (0, 1, 1, 3, shared),
+                        (6 * chunk, 1, 1, 1, rng.ext_vec(CHUNK_LOG - 2)),
+                        (2 * chunk, 0, 0, 1, rng.ext_vec(CHUNK_LOG + 3)),
+                    ];
+                    claims.extend(groups.into_iter().map(|(offset, log_width, column, chunks, point)| {
+                        StackClaim::Jagged {
+                            offset,
+                            log_width,
+                            column,
+                            chunks,
+                            point,
+                            value: rng.ext(),
+                        }
+                    }));
+                }
                 let lambdas = rng.ext_vec(claims.len());
 
                 // Oracle: the dense weight written out naively, one eq entry at a time.
                 let mut dense = vec![F192::ZERO; stack.len()];
                 ring_switch::combine_deferred_chunk(&rs_outputs, 0, &mut dense[offset..offset + qkeccak_len]);
+                let eq_at = |point: &[F192], j: usize, lambda: F192| {
+                    point.iter().enumerate().fold(lambda, |w, (i, &p_i)| {
+                        w * if (j >> i) & 1 == 1 { p_i } else { F192::ONE + p_i }
+                    })
+                };
                 for (claim, &lambda) in claims.iter().zip(&lambdas) {
-                    let StackClaim::Point { offset, low_point, .. } = claim;
-                    for j in 0..1usize << low_point.len() {
-                        let w = low_point.iter().enumerate().fold(lambda, |w, (i, &p_i)| {
-                            w * if (j >> i) & 1 == 1 { p_i } else { F192::ONE + p_i }
-                        });
-                        dense[offset + j] += w;
+                    match claim {
+                        StackClaim::Point { offset, low_point, .. } => {
+                            for j in 0..1usize << low_point.len() {
+                                dense[offset + j] += eq_at(low_point, j, lambda);
+                            }
+                        }
+                        StackClaim::Jagged {
+                            offset,
+                            log_width,
+                            column,
+                            chunks,
+                            point,
+                            ..
+                        } => {
+                            for row in (0..chunks << CHUNK_LOG).filter(|row| row >> point.len() == 0) {
+                                let at = offset
+                                    + (row >> CHUNK_LOG << (CHUNK_LOG + log_width))
+                                    + (column << CHUNK_LOG)
+                                    + (row & ((1 << CHUNK_LOG) - 1));
+                                dense[at] += eq_at(point, row, lambda);
+                            }
+                        }
                     }
                 }
 

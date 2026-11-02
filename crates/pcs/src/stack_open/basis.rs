@@ -19,7 +19,7 @@ use primitives::field::{
     Acc8, F64, F192, F192Unreduced, F192x8, Weights8, dot_base, fold_lones8_ext, msg_lone8_ext, xor_into8,
 };
 
-use super::{RingSwitchOpen, StackClaim};
+use super::{CHUNK_LOG, RingSwitchOpen, StackClaim};
 use crate::ring_switch::{RingWeight, coordinate_basis};
 use crate::tensor_algebra::{DEGREE_E, transpose_s_hat};
 use crate::whir::{InitialBasis, LaneLift, LiftBlock, adjacent_dots};
@@ -76,10 +76,137 @@ fn table(factors: &[Factor]) -> Vec<F192> {
     out
 }
 
-/// A claim's factors on the low `bits` bits of the stack index.
-fn claim_factors(claim: &StackClaim, bits: usize) -> Vec<Factor> {
-    let StackClaim::Point { offset, low_point, .. } = claim;
-    ring_factors(low_point, *offset, bits)
+/// A point claim's factors on the low `bits` bits of the stack index.
+fn point_factors(offset: usize, low_point: &[F192], bits: usize) -> Vec<Factor> {
+    ring_factors(low_point, offset, bits)
+}
+
+/// One term of the claims' weight before the patterns group them: its factors on a block's low bits, its
+/// `gamma` over the blocks of a lane, and its weight on each lane.
+struct ClaimTerm {
+    low: Vec<Factor>,
+    gamma: Vec<F192>,
+    lanes: Vec<F192>,
+}
+
+/// The terms of a jagged group's claims at one point: one per lane the group reaches.
+///
+/// A block of `2^low_vars` words lies inside one column run, so the weight on it is `eq` of the point's low
+/// coordinates against the block's words, times `lambda` of the run's column and `eq` of the point's other
+/// coordinates against the block's row bits. The low factor is the group's; the rest is the term's `gamma`.
+#[allow(clippy::too_many_arguments)]
+fn jagged_terms(
+    offset: usize,
+    log_width: usize,
+    chunks: usize,
+    point: &[F192],
+    column_lambdas: &[F192],
+    lane_vars: usize,
+    low_vars: usize,
+    lane_bits: usize,
+) -> Vec<ClaimTerm> {
+    let low: Vec<Factor> = (0..low_vars)
+        .map(|k| point.get(k).map_or(Factor::Fixed(false), |&p| Factor::Eq(p)))
+        .collect();
+    let high = table(
+        &point
+            .get(low_vars..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|&p| Factor::Eq(p))
+            .collect::<Vec<_>>(),
+    );
+    let n_blocks = 1usize << (lane_vars - low_vars);
+    let mut lanes: Vec<Option<Vec<F192>>> = vec![None; 1 << lane_bits];
+    let end = offset + (chunks << (CHUNK_LOG + log_width));
+    for at in (offset..end).step_by(1 << low_vars) {
+        let relative = at - offset;
+        let column = (relative >> CHUNK_LOG) & ((1 << log_width) - 1);
+        let row = (relative >> (CHUNK_LOG + log_width) << CHUNK_LOG) | (relative & ((1 << CHUNK_LOG) - 1));
+        let (Some(&lambda), Some(&eq)) = (column_lambdas.get(column), high.get(row >> low_vars)) else {
+            continue;
+        };
+        if lambda == F192::ZERO || eq == F192::ZERO {
+            continue;
+        }
+        let gamma = lanes[at >> lane_vars].get_or_insert_with(|| vec![F192::ZERO; n_blocks]);
+        gamma[(at >> low_vars) & (n_blocks - 1)] += lambda * eq;
+    }
+    lanes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(l, gamma)| {
+            let mut weights = vec![F192::ZERO; 1 << lane_bits];
+            weights[l] = F192::ONE;
+            gamma.map(|gamma| ClaimTerm {
+                low: low.clone(),
+                gamma,
+                lanes: weights,
+            })
+        })
+        .collect()
+}
+
+/// Every claim as terms: a point claim is one, a jagged group's claims at one point share one per lane.
+fn claim_terms(
+    claims: &[StackClaim],
+    lambdas: &[F192],
+    lane_vars: usize,
+    low_vars: usize,
+    lane_bits: usize,
+) -> Vec<ClaimTerm> {
+    let bits = lane_vars + lane_bits;
+    let mut terms = Vec::new();
+    // Jagged claims by group (offset, log width, chunks) and point, each column's lambdas summed.
+    type Group<'a> = (usize, usize, usize, &'a [F192]);
+    let mut groups: Vec<(Group, Vec<F192>)> = Vec::new();
+    for (claim, &lambda) in claims.iter().zip(lambdas) {
+        match claim {
+            StackClaim::Point { offset, low_point, .. } => {
+                let factors = point_factors(*offset, low_point, bits);
+                let (low, rest) = factors.split_at(low_vars);
+                let (mid, lane) = rest.split_at(lane_vars - low_vars);
+                let mut lanes = table(lane);
+                lanes.iter_mut().for_each(|l| *l *= lambda);
+                terms.push(ClaimTerm {
+                    low: low.to_vec(),
+                    gamma: table(mid),
+                    lanes,
+                });
+            }
+            StackClaim::Jagged {
+                offset,
+                log_width,
+                column,
+                chunks,
+                point,
+                ..
+            } => {
+                let key = (*offset, *log_width, *chunks, point.as_slice());
+                let index = match groups.iter().position(|(k, _)| *k == key) {
+                    Some(index) => index,
+                    None => {
+                        groups.push((key, vec![F192::ZERO; 1 << log_width]));
+                        groups.len() - 1
+                    }
+                };
+                groups[index].1[*column] += lambda;
+            }
+        }
+    }
+    for ((offset, log_width, chunks, point), column_lambdas) in groups {
+        terms.extend(jagged_terms(
+            offset,
+            log_width,
+            chunks,
+            point,
+            &column_lambdas,
+            lane_vars,
+            low_vars,
+            lane_bits,
+        ));
+    }
+    terms
 }
 
 /// A ring claim's factors on the low `bits` bits of the stack index.
@@ -387,19 +514,16 @@ pub(super) fn project(
     };
     // The claims' lane weights, then the rings', each `1 << lane_bits` long.
     let mut lanes: Vec<F192> = Vec::new();
-    for (c, claim) in claims.iter().enumerate() {
-        let factors = claim_factors(claim, bits);
-        let (low, rest) = factors.split_at(low_vars);
-        let (mid, lane) = rest.split_at(lane_vars - low_vars);
-        extend_table(&mut terms.gamma, mid);
-        let at = lanes.len();
-        extend_table(&mut lanes, lane);
-        lanes[at..].iter_mut().for_each(|l| *l *= lambdas[c]);
-        match terms.patterns.iter_mut().find(|p| p.factors == low) {
+    let claim_terms = claim_terms(claims, lambdas, lane_vars, low_vars, lane_bits);
+    let n_claims = claim_terms.len();
+    for (c, term) in claim_terms.into_iter().enumerate() {
+        terms.gamma.extend(term.gamma);
+        lanes.extend(term.lanes);
+        match terms.patterns.iter_mut().find(|p| p.factors == term.low) {
             Some(pattern) => pattern.claims.push(c),
             None => terms.patterns.push(Pattern {
-                low: Low::new(low),
-                factors: low.to_vec(),
+                low: Low::new(&term.low),
+                factors: term.low,
                 claims: vec![c],
                 active: Vec::new(),
             }),
@@ -427,7 +551,7 @@ pub(super) fn project(
             e_hi: table(mid),
             point: weight.point().to_vec(),
             x_offset: ring.offset & (block - 1),
-            first: claims.len() + DEGREE_E * i,
+            first: n_claims + DEGREE_E * i,
         });
         extend_table(&mut lanes, lane);
     }
@@ -436,11 +560,11 @@ pub(super) fn project(
     let mut a = vec![F192::ZERO; n_lanes * n_terms];
     for (l, row) in a.chunks_exact_mut(n_terms).enumerate() {
         let weight_of = |t: usize| lanes[(t << lane_bits) + l];
-        for (c, slot) in row[..claims.len()].iter_mut().enumerate() {
+        for (c, slot) in row[..n_claims].iter_mut().enumerate() {
             *slot = weight_of(c);
         }
         for (i, (weight, ring)) in rings.iter().zip(&terms.rings).enumerate() {
-            let s = weight_of(claims.len() + i);
+            let s = weight_of(n_claims + i);
             if s != F192::ZERO {
                 for (w, slot) in row[ring.first..ring.first + DEGREE_E].iter_mut().enumerate() {
                     *slot = weight.apply(coordinate_basis(w) * s);

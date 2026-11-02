@@ -1041,9 +1041,11 @@ impl Program {
         });
         let mem_used = touched.map_or(m.used, |c| m.used.max(c + 1));
         let mut cells = mem_used.next_power_of_two().max(1 << MIN_LOG_MEM);
-        let taus = super::layout::table_logs(trace.row_counts());
+        let rows = trace.row_counts();
         let log_bytecode = crate::log2_strict_usize(self.prog.len());
-        while super::layout::committed_log(crate::log2_strict_usize(cells), log_bytecode, taus) < self.min_log_committed
+        // Sized as if every cell were committed, which is what the prover commits when the used ones fall short.
+        while super::layout::committed_log(crate::log2_strict_usize(cells), cells, log_bytecode, rows)
+            < self.min_log_committed
         {
             cells *= 2;
         }
