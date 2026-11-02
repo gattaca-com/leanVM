@@ -446,8 +446,13 @@ impl LeafHasher {
     }
 
     /// Hash the rows `expansion` widens.
+    ///
+    /// The full row's words before its first run are zero, so they join the leaf's shared zero prefix.
+    /// A wider prefix may fill one more whole block, which every leaf then shares.
     fn expanding(expansion: &Expansion, leaf_bytes: usize) -> Self {
-        Self::staged(8 * expansion.enc_words, 8 * expansion.row_words, leaf_bytes, expansion.runs.clone())
+        let lead = expansion.runs.iter().map(|&(dst, _, _)| dst).min().unwrap_or(0);
+        let runs = expansion.runs.iter().map(|&(dst, src, len)| (dst - lead, src, len)).collect();
+        Self::staged(8 * expansion.enc_words, 8 * (expansion.row_words - lead), leaf_bytes, runs)
     }
 
     /// `row_bytes` are the bytes of an absorbed row, `full_bytes` of the row the leaf commits.
@@ -456,7 +461,8 @@ impl LeafHasher {
         let zero_blocks = (leaf_bytes - full_bytes) / RATE;
         let state = zero_prefix_state(zero_blocks);
         let image = leaf_bytes - zero_blocks * RATE;
-        if image == row_bytes {
+        // A row is its own image only if the runs lay it down whole, from the image's start.
+        if image == row_bytes && runs == [(0, 0, row_bytes / 8)] {
             Self::Direct { row_bytes, state }
         } else {
             assert!(image <= STAGE_TILE_BYTES, "a padded leaf fits the tile");
@@ -649,6 +655,9 @@ mod tests {
             (2048, vec![10, 9, 2, 1, 0], 8, 16, 64),
             (64, vec![6, 5, 4], 8, 8, 40),
             (1 << 13, vec![30, 28, 27, 3], 8, 32, 64),
+            // Every lane is encoded, but the row's zero lanes in front fill a whole block of the leaf.
+            (1 << 12, (0..45).rev().collect(), 48, 48, 64),
+            (1 << 10, (0..46).rev().collect(), 48, 48, 64),
         ] {
             let data: Vec<F64> = (0..enc_words * num_leaves)
                 .map(|i| F64(i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u64 | 1))
