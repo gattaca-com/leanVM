@@ -11,7 +11,7 @@
 //!   supported on `[offset, offset + 2^|low_point|)`),
 //! - **ring-switched claims** ([`RingSwitchOpen`]): bit-MLE evaluation claims
 //!   on the packed sub-block `q_keccak = stack[offset .. offset + 2^qkeccak_vars]`,
-//!   reduced per claim by [`super::ring_switch::prove_prepare`] and the
+//!   of which only the first `len` words are weighed, reduced per claim by [`super::ring_switch::prove_prepare`] and the
 //!   deferred finish path to an inner-product
 //!   claim `<q_keccak, rs_eq_ind> = sumcheck_claim` against the transparent
 //!   E-valued weight `rs_eq_ind`.
@@ -38,6 +38,8 @@
 //! b(x) = eq(sel, x_hi) * sum_i lambda^i * MLE(rs_eq_ind_i)(x_lo)
 //!      + sum_j lambda^(n_rs + j) * eq(claim_j, x)
 //! ```
+//!
+//! with `rs_eq_ind_i` cut to zero past the ring's `len` words.
 //!
 //! which is exactly what a dense `b_stack` scatter would produce (each claim's
 //! weight lives on its aligned slice, so scattering the low-dimensional eq /
@@ -97,13 +99,24 @@ pub enum StackClaim {
         point: Vec<F192>,
         value: F192,
     },
+    /// A [`StackClaim::Jagged`] on every column of its group, column `j` weighted by `eq(column, j)`.
+    JaggedAt {
+        offset: usize,
+        log_width: usize,
+        chunks: usize,
+        point: Vec<F192>,
+        column: Vec<F192>,
+        value: F192,
+    },
 }
 
 impl StackClaim {
     #[inline]
     pub fn value(&self) -> F192 {
         match self {
-            StackClaim::Point { value, .. } | StackClaim::Jagged { value, .. } => *value,
+            StackClaim::Point { value, .. } | StackClaim::Jagged { value, .. } | StackClaim::JaggedAt { value, .. } => {
+                *value
+            }
         }
     }
 
@@ -112,6 +125,12 @@ impl StackClaim {
         match self {
             StackClaim::Point { offset, low_point, .. } => (*offset, *offset + (1usize << low_point.len())),
             StackClaim::Jagged {
+                offset,
+                log_width,
+                chunks,
+                ..
+            }
+            | StackClaim::JaggedAt {
                 offset,
                 log_width,
                 chunks,
@@ -142,6 +161,9 @@ pub struct RingSwitchOpen {
     /// q_keccak's offset inside the committed stack; must be a multiple of
     /// `2^qkeccak_vars` (an aligned slice).
     pub offset: usize,
+    /// The words from `offset` the claims weigh: at most `2^qkeccak_vars`, a whole number of `2^CHUNK_LOG`-word
+    /// blocks unless it is all of them. The weight is zero past them, the claims being on those words alone.
+    pub len: usize,
     pub claims: Vec<RingSwitchClaim>,
 }
 
@@ -189,8 +211,12 @@ pub fn open_batch_mixed_whir_stacked(
         "q_keccak offset must be 2^qkeccak_vars-aligned"
     );
     assert!(
-        ring.offset + qkeccak_len <= stack.len(),
-        "q_keccak slice must fit inside the stack"
+        ring.claims.is_empty() || (ring.len <= qkeccak_len && ring.offset + ring.len <= stack.len()),
+        "q_keccak's words must fit inside the stack"
+    );
+    assert!(
+        ring.len == qkeccak_len || ring.len.is_multiple_of(1 << CHUNK_LOG),
+        "a cut ring weight ends on a block"
     );
     assert!(
         point_claims.iter().all(|c| c.range().1 <= stack.len()),
@@ -204,7 +230,7 @@ pub fn open_batch_mixed_whir_stacked(
 
     // 1. Ring-switch reduction: prepare every claim's s_hat_v (the caller bound
     //    them upstream), then sample one shared linear map.
-    let qkeccak = &stack[ring.offset..ring.offset + qkeccak_len];
+    let qkeccak = stack.get(ring.offset..ring.offset + qkeccak_len).unwrap_or_default();
     let mut rs_states = Vec::with_capacity(ring.claims.len());
     for claim in &ring.claims {
         assert_eq!(
@@ -320,6 +346,7 @@ mod tests {
             (8, 5, 6),
             (10, 37, 12),
             (12, 5, 13),
+            (11, 5, 15),
         ] {
             let lane_block = 1usize << lane_vars;
             let mut stack: Vec<F64> = (0..lanes * lane_block).map(|_| F64(rng.next_u64())).collect();
@@ -331,12 +358,21 @@ mod tests {
             }
             let repeats = equal_blocks(&stack);
             let qkeccak_len = 1usize << qkeccak_vars;
-            for offset in [0, qkeccak_len] {
-                if offset + qkeccak_len > stack.len() {
-                    continue;
-                }
+            // The whole block, and blocks cut short: on a lane's end, inside a lane, and past the stack's bits.
+            let chunk = 1usize << CHUNK_LOG;
+            let cases = [0, qkeccak_len]
+                .into_iter()
+                .filter(|offset| offset + qkeccak_len <= stack.len())
+                .map(|offset| (offset, qkeccak_len))
+                .chain(
+                    [3 * chunk, 5 * chunk, 9 * chunk, 10 * chunk]
+                        .into_iter()
+                        .filter_map(|len| (len < qkeccak_len && len <= stack.len()).then_some((0, len))),
+                );
+            for (offset, len) in cases {
                 let ring = RingSwitchOpen {
                     offset,
+                    len,
                     claims: (0..2)
                         .map(|_| RingSwitchClaim {
                             suffix_point: rng.ext_vec(qkeccak_vars),
@@ -349,16 +385,18 @@ mod tests {
                     .claims
                     .iter()
                     .map(|claim| {
-                        let state =
-                            ring_switch::prove_prepare(&stack[offset..offset + qkeccak_len], &claim.suffix_point, None);
+                        let mut words = stack[offset..offset + len].to_vec();
+                        words.resize(qkeccak_len, F64::ZERO);
+                        let state = ring_switch::prove_prepare(&words, &claim.suffix_point, None);
                         ring_switch::prove_finish_deferred(state, &coordinates, rng.ext())
                     })
                     .collect();
                 let last_lane = (lanes - 1) * lane_block;
                 let shared = rng.ext_vec(lane_vars);
+                let ring_shape = (offset, qkeccak_vars, None);
                 let mut shapes = vec![
-                    (offset, qkeccak_vars, None),
-                    (offset, qkeccak_vars, None),
+                    ring_shape.clone(),
+                    ring_shape,
                     (last_lane, lane_vars, Some(shared.clone())),
                     (0, lane_vars, Some(shared)),
                     (last_lane, lane_vars, None),
@@ -374,6 +412,7 @@ mod tests {
                 }
                 let mut claims: Vec<_> = shapes
                     .into_iter()
+                    .filter(|&(offset, vars, _)| offset + (1 << vars) <= stack.len())
                     .map(|(offset, vars, point)| StackClaim::Point {
                         offset,
                         low_point: point.unwrap_or_else(|| rng.ext_vec(vars)),
@@ -382,7 +421,6 @@ mod tests {
                     .collect();
                 // Jagged groups: two columns of one group at one point, a lone column of a wider group whose point
                 // is shorter than a chunk, and a column whose point is longer than the group.
-                let chunk = 1usize << CHUNK_LOG;
                 if stack.len() >= 8 * chunk {
                     let shared = rng.ext_vec(CHUNK_LOG + 1);
                     let groups = [
@@ -401,18 +439,42 @@ mod tests {
                             value: rng.ext(),
                         }
                     }));
+                    // A claim on every column of a group at once.
+                    claims.push(StackClaim::JaggedAt {
+                        offset: 4 * chunk,
+                        log_width: 1,
+                        chunks: 2,
+                        point: rng.ext_vec(CHUNK_LOG + 1),
+                        column: rng.ext_vec(1),
+                        value: rng.ext(),
+                    });
                 }
                 let lambdas = rng.ext_vec(claims.len());
 
                 // Oracle: the dense weight written out naively, one eq entry at a time.
                 let mut dense = vec![F192::ZERO; stack.len()];
-                ring_switch::combine_deferred_chunk(&rs_outputs, 0, &mut dense[offset..offset + qkeccak_len]);
+                ring_switch::combine_deferred_chunk(&rs_outputs, 0, &mut dense[offset..offset + len]);
                 let eq_at = |point: &[F192], j: usize, lambda: F192| {
                     point.iter().enumerate().fold(lambda, |w, (i, &p_i)| {
                         w * if (j >> i) & 1 == 1 { p_i } else { F192::ONE + p_i }
                     })
                 };
                 for (claim, &lambda) in claims.iter().zip(&lambdas) {
+                    let jagged = |dense: &mut [F192],
+                                  offset: usize,
+                                  log_width: usize,
+                                  column: usize,
+                                  chunks: usize,
+                                  point: &[F192],
+                                  lambda: F192| {
+                        for row in (0..chunks << CHUNK_LOG).filter(|row| row >> point.len() == 0) {
+                            let at = offset
+                                + (row >> CHUNK_LOG << (CHUNK_LOG + log_width))
+                                + (column << CHUNK_LOG)
+                                + (row & ((1 << CHUNK_LOG) - 1));
+                            dense[at] += eq_at(point, row, lambda);
+                        }
+                    };
                     match claim {
                         StackClaim::Point { offset, low_point, .. } => {
                             for j in 0..1usize << low_point.len() {
@@ -426,13 +488,25 @@ mod tests {
                             chunks,
                             point,
                             ..
+                        } => jagged(&mut dense, *offset, *log_width, *column, *chunks, point, lambda),
+                        StackClaim::JaggedAt {
+                            offset,
+                            log_width,
+                            chunks,
+                            point,
+                            column,
+                            ..
                         } => {
-                            for row in (0..chunks << CHUNK_LOG).filter(|row| row >> point.len() == 0) {
-                                let at = offset
-                                    + (row >> CHUNK_LOG << (CHUNK_LOG + log_width))
-                                    + (column << CHUNK_LOG)
-                                    + (row & ((1 << CHUNK_LOG) - 1));
-                                dense[at] += eq_at(point, row, lambda);
+                            for j in 0..1 << log_width {
+                                jagged(
+                                    &mut dense,
+                                    *offset,
+                                    *log_width,
+                                    j,
+                                    *chunks,
+                                    point,
+                                    eq_at(column, j, lambda),
+                                );
                             }
                         }
                     }
@@ -442,8 +516,9 @@ mod tests {
                 let projected = basis::project(&stack, repeats.clone(), lane_vars, &claims, &lambdas, &ring, &rings);
                 let target = rng.ext();
                 let (mut prover, msg) = SumcheckProver::new(stack.clone(), projected, target, lane_block);
-                let context =
-                    format!("lane_vars={lane_vars}, lanes={lanes}, qkeccak_vars={qkeccak_vars}, offset={offset}");
+                let context = format!(
+                    "lane_vars={lane_vars}, lanes={lanes}, qkeccak_vars={qkeccak_vars}, offset={offset}, len={len}"
+                );
                 let mut f: Vec<F192> = stack.iter().map(|&word| F192::from(word)).collect();
                 assert_eq!(msg, blocks_msg(&f, &dense, lane_block), "{context}, round 0");
                 for round in 1..=LANE_ROUNDS {

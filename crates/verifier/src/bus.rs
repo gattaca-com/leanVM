@@ -3,11 +3,10 @@
 use crate::field::{E, ONE, ZERO};
 use crate::layout::{
     BUS_BITS, BYTECODE_FINAL_COUNTERS, BusBlock, Form, Layout, MEMORY_0, MEMORY_1, MEMORY_2, MEMORY_FINAL_COUNTERS,
-    SEP_BYTECODE, SEP_MEM, SEP_STATE, Slot, Table, col_form, constant, gpow,
+    SEP_BYTECODE, SEP_MEM, SEP_STATE, Table, col_form, constant, gpow,
 };
 use crate::multilinear::{
-    CHUNK_LOG, Placement, dot, eq_eval, eq_kernel, index_mle, multilinear_eval, padding_weight, poly_eval,
-    stack_offsets,
+    CHUNK_LOG, Placement, dot, eq_kernel, index_mle, multilinear_eval, padding_weight, poly_eval, stack_offsets,
 };
 use crate::transcript::{Transcript, sumcheck};
 use crate::{StackClaim, VerifierError, require};
@@ -91,20 +90,13 @@ impl ColumnClaim {
     /// A jagged column commits only its group's chunks. Past them it holds zero, but for the memory's final counts,
     /// whose untouched cells hold `g^0 = 1`: their share of the claim is public and leaves its value.
     pub fn on_stack(&self, layout: &Layout) -> Option<StackClaim<'static>> {
-        match layout.slots[self.column]? {
-            Slot::Padded(placement) => {
-                let point = placement.stack_point(&self.point, layout.stack_log);
-                Some((Box::new(move |x| eq_eval(&point, x)), self.value))
-            }
-            Slot::Jagged(slot) => {
-                let mut value = self.value;
-                if self.column == MEMORY_FINAL_COUNTERS {
-                    value += padding_weight(&self.point, slot.chunks << CHUNK_LOG);
-                }
-                let point = self.point.clone();
-                Some((Box::new(move |x| slot.weight(&point, x)), value))
-            }
+        let slot = layout.slots[self.column]?;
+        let mut value = self.value;
+        if self.column == MEMORY_FINAL_COUNTERS {
+            value += padding_weight(&self.point, slot.chunks << CHUNK_LOG);
         }
+        let point = self.point.clone();
+        Some((Box::new(move |x| slot.weight(&point, x)), value))
     }
 }
 

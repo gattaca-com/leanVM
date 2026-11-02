@@ -33,10 +33,10 @@ use hash::{Digest, ROUNDS, STATE_LANES};
 use keccak::{KeccakShape, verify_keccak};
 use layout::{
     GLOBAL_COLUMN_BASES, KECCAK_OUT, MAX_STACKED_LOG, MEMORY_0, MEMORY_1, MEMORY_2, MIN_STACKED_LOG, N_TABLES,
-    OP_KECCAK, QKECCAK, Slot, build_layout,
+    OP_KECCAK, build_layout,
 };
-use multilinear::{dot, eq_eval, multilinear_eval};
-use ring_switch::ring_switch;
+use multilinear::{CHUNK_LOG, dot, eq_eval, eq_kernel, multilinear_eval, padding_weight};
+use ring_switch::{frobenius_weight, ring_switch};
 use std::ops::Range;
 use transcript::Transcript;
 use whir::verify_whir;
@@ -217,7 +217,8 @@ pub fn verify_keccak_batch(
     let output = transcript.next_scalars(STATE_LANES)?;
     let openings = verify_keccak(&mut transcript, shape, &instance, &output)?;
     let (point, slices) = openings.inputs;
-    let (target, weight) = ring_switch(point, &slices, &mut transcript);
+    let (target, coefficients) = ring_switch(&slices, &mut transcript);
+    let weight = move |x: &[E]| frobenius_weight(&point, &coefficients, |r| eq_eval(r, x));
     let mut claims: Vec<StackClaim> = vec![(Box::new(weight), target)];
     if let Some((point, word)) = openings.outputs {
         claims.push((Box::new(move |x| eq_eval(&point, x)), word));
@@ -307,28 +308,52 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         &values[KECCAK_OUT..KECCAK_OUT + STATE_LANES],
     )?;
     let keccak_scalars = keccak_start..transcript.stream_offset();
-    if let Some((point, value)) = openings.outputs {
-        claims.push(ColumnClaim {
-            column: QKECCAK,
-            point,
-            value,
-        });
-    }
 
-    // 7] Ring-switching
-    let (point, slices) = openings.inputs;
-    let (ringswitch_target, ringswitch_weight) = ring_switch(point, &slices, &mut transcript);
-    // That claim is supported on q_keccak's region of the stack, so its weight carries the
-    // placement's selector, and it leads the batch, taking the first power.
-    let Some(Slot::Padded(qkeccak)) = layout.slots[QKECCAK] else {
-        unreachable!("q_keccak is a padded block");
+    // 7] Ring-switching. Both openings are of q_keccak over every step, but its group commits only its chunks: past
+    // them a step pads, permuting zeros, so its words are public and their share leaves each claim's value.
+    let shape = layout.keccak;
+    let qkeccak = layout.qkeccak.clone();
+    let stored = (qkeccak.chunks() << CHUNK_LOG).min(1 << shape.log_steps);
+    let padding = shape.padding_words();
+    let padding_share = |point: &[E]| {
+        let (steps, slot) = point.split_at(shape.log_steps);
+        let weight = padding_weight(steps, stored);
+        (weight, eq_kernel(slot))
     };
+    let (point, mut slices) = openings.inputs;
+    let (weight, slots) = padding_share(&point);
+    for (z, slice) in slices.iter_mut().enumerate() {
+        let bits = padding.iter().zip(&slots).filter(|(word, _)| *word >> z & 1 == 1);
+        *slice += weight * E::sum(bits.map(|(_, &slot)| slot));
+    }
+    let (ringswitch_target, coefficients) = ring_switch(&slices, &mut transcript);
+    // That claim leads the batch, taking the first power. Its weight is the group's at each Frobenius power of the
+    // point: the steps are the group's rows and the slot is its column.
+    let group = qkeccak.clone();
     let ringswitch: StackClaim = (
-        Box::new(move |x| qkeccak.eq_above(x) * ringswitch_weight(&x[..qkeccak.variables])),
+        Box::new(move |x| {
+            frobenius_weight(&point, &coefficients, |r| {
+                let (steps, slot) = r.split_at(shape.log_steps);
+                group.weight(steps, slot, x)
+            })
+        }),
         ringswitch_target,
     );
     let mut stack_claims = vec![ringswitch];
     stack_claims.extend(claims.iter().filter_map(|claim| claim.on_stack(&layout)));
+    if let Some((point, word)) = openings.outputs {
+        let (weight, slots) = padding_share(&point);
+        let words = padding.iter().map(|&word| E::new(word, 0, 0));
+        let value = word + weight * E::sum(words.zip(slots).map(|(word, slot)| word * slot));
+        let claim: StackClaim = (
+            Box::new(move |x| {
+                let (steps, slot) = point.split_at(shape.log_steps);
+                qkeccak.weight(steps, slot, x)
+            }),
+            value,
+        );
+        stack_claims.push(claim);
+    }
     verify_stacked_opening(
         &mut transcript,
         root,

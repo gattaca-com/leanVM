@@ -101,14 +101,13 @@ pub fn placements_of(kappas: &[Option<usize>]) -> (Vec<Placement>, StackShape) {
 
 /// Rows of a jagged chunk: a column's run inside one chunk of its group.
 pub const CHUNK_LOG: usize = ::pcs::stack_open::CHUNK_LOG;
-/// The jagged groups start at a multiple of `2^JAGGED_ALIGN_LOG` words, which every group's chunk divides.
-pub const JAGGED_ALIGN_LOG: usize = 15;
 
-/// A jagged group: a table's committed columns (or the memory's), cut into chunks of `2^CHUNK_LOG` rows. A chunk
-/// holds `2^log_width` column runs one after another, the runs past the last column zero.
+/// A jagged group: a table's committed columns, the memory's, the bytecode's final counts, or the slots of
+/// `q_keccak`, cut into chunks of `2^CHUNK_LOG` rows. A chunk holds `2^log_width` column runs one after another,
+/// the runs past the last column zero.
 #[derive(Clone, Debug)]
 pub struct JaggedGroup {
-    /// Global column indices, in local order.
+    /// Global column indices, in local order. Empty for `q_keccak`'s, whose runs are its slots.
     pub columns: Vec<usize>,
     pub log_width: usize,
     pub rows: usize,
@@ -125,32 +124,35 @@ impl JaggedGroup {
     }
 }
 
-/// Where a committed column lives in the committed (dense) stack.
+/// Where a committed column lives in the committed stack: local column `column` of jagged group `group`.
 #[derive(Clone, Copy, Debug)]
-pub enum Slot {
-    /// A whole `2^n_vars` block, its padding rows included.
-    Padded(Placement),
-    /// Local column `column` of jagged group `group`.
-    Jagged { group: usize, column: usize },
+pub struct Slot {
+    pub group: usize,
+    pub column: usize,
 }
 
-/// The committed stack: the padded blocks by descending size, then the jagged groups by descending width.
+/// The committed stack: the jagged groups by descending width, `q_keccak`'s first.
 ///
 /// It leaves every row past a group's chunks out. The prover fills it directly and reads its columns as
 /// [`Column`] views, so no padded copy of a committed column exists. Both sides derive it from the announced sizes.
 #[derive(Clone, Debug)]
 pub struct Dense {
     pub groups: Vec<JaggedGroup>,
+    /// The group of `q_keccak`'s slots.
+    pub qkeccak: usize,
     pub slots: Vec<Option<Slot>>,
     pub shape: StackShape,
     pub placed: usize,
 }
 
-/// The committed stack for the columns' log sizes `kappas`: the `padded` columns as whole blocks, every column of a
-/// `groups` entry (its global columns and its rows) jagged.
-pub fn dense_of(kappas: &[Option<usize>], padded: &[usize], groups: Vec<(Vec<usize>, usize)>) -> Dense {
-    let padded_kappas: Vec<Option<usize>> = padded.iter().map(|&c| kappas[c]).collect();
-    let (padded_offsets, padded_words) = stack_offsets(&padded_kappas);
+/// The committed stack of `n_columns` columns: every column of a `groups` entry (its global columns and its rows)
+/// jagged, then `q_keccak`'s group of `2^slot_log` slots and `steps` rows, each of `slot_columns` (slot, global
+/// column) a column too.
+pub fn dense_of(
+    n_columns: usize,
+    groups: Vec<(Vec<usize>, usize)>,
+    (slot_log, steps, slot_columns): (usize, usize, &[(usize, usize)]),
+) -> Dense {
     let mut groups: Vec<JaggedGroup> = groups
         .into_iter()
         .map(|(columns, rows)| JaggedGroup {
@@ -160,27 +162,34 @@ pub fn dense_of(kappas: &[Option<usize>], padded: &[usize], groups: Vec<(Vec<usi
             offset: 0,
         })
         .collect();
+    let qkeccak = groups.len();
+    groups.push(JaggedGroup {
+        columns: Vec::new(),
+        log_width: slot_log,
+        rows: steps,
+        offset: 0,
+    });
     let mut order: Vec<usize> = (0..groups.len()).collect();
     order.sort_by_key(|&g| (std::cmp::Reverse(groups[g].log_width), g));
-    let mut placed = padded_words.next_multiple_of(1 << JAGGED_ALIGN_LOG);
+    let mut placed = 0;
     for &g in &order {
         groups[g].offset = placed;
         placed += groups[g].words();
     }
-    let mut slots = vec![None; kappas.len()];
-    for (&column, &offset) in padded.iter().zip(&padded_offsets) {
-        let n_vars = kappas[column].expect("a padded column is committed");
-        slots[column] = Some(Slot::Padded(Placement { n_vars, offset }));
-    }
+    let mut slots = vec![None; n_columns];
     for (g, group) in groups.iter().enumerate() {
         for (column, &global) in group.columns.iter().enumerate() {
-            slots[global] = Some(Slot::Jagged { group: g, column });
+            slots[global] = Some(Slot { group: g, column });
         }
+    }
+    for &(column, global) in slot_columns {
+        slots[global] = Some(Slot { group: qkeccak, column });
     }
     let mu = crate::log2_ceil_usize(placed.max(1)).max(crate::pcs::MIN_MU);
     let n_lanes = placed.div_ceil(1 << (mu - crate::pcs::LOG_BATCH)).max(1);
     Dense {
         groups,
+        qkeccak,
         slots,
         shape: StackShape { mu, n_lanes },
         placed,
@@ -320,11 +329,10 @@ impl<'a> Column<'a> {
 }
 
 impl Dense {
-    /// The committed stack's repeat map. In the jagged region only the zero runs that follow another are tagged.
-    /// A padded block's fill sets its own tags.
+    /// The committed stack's repeat map: only the zero runs that follow another are tagged.
     pub fn alloc_repeats(&self) -> Vec<bool> {
         let mut repeats = vec![false; self.shape.committed_len() >> EQUAL_BLOCK_LOG];
-        for group in &self.groups {
+        for group in self.groups.iter().filter(|group| !group.columns.is_empty()) {
             for chunk in 0..group.chunks() {
                 for column in group.columns.len() + 1..1 << group.log_width {
                     let at = group.offset + (chunk << (CHUNK_LOG + group.log_width)) + column * RUN;
@@ -339,45 +347,27 @@ impl Dense {
 
     /// Carve the committed stack `dense` into one window per jagged column, its runs, and zero every word no
     /// column holds. Returns the windows in global column order, `len` the column's padded height from
-    /// `placements`, and each padded block as `(global column, words, tags)`.
+    /// `placements`, and `q_keccak`'s group whole, which holds no window.
     ///
-    /// A jagged window's rows past its runs are held nowhere, and it takes no tags.
-    #[allow(clippy::type_complexity)]
-    pub fn split<'a>(
-        &self,
-        dense: &'a mut [F64],
-        repeats: &'a mut [bool],
-        placements: &[Placement],
-    ) -> (Vec<ColumnOut<'a>>, Vec<(usize, &'a mut [F64], &'a mut [bool])>) {
+    /// A window's rows past its runs are held nowhere, and it takes no tags.
+    pub fn split<'a>(&self, dense: &'a mut [F64], placements: &[Placement]) -> (Vec<ColumnOut<'a>>, &'a mut [F64]) {
         let total = dense.len();
         let mut windows: Vec<ColumnOut> = Vec::with_capacity(self.slots.len());
         windows.resize_with(self.slots.len(), ColumnOut::default);
-        let mut padded: Vec<(usize, Placement)> = (self.slots.iter().enumerate())
-            .filter_map(|(c, slot)| match *slot {
-                Some(Slot::Padded(p)) => Some((c, p)),
-                _ => None,
-            })
-            .collect();
-        padded.sort_unstable_by_key(|&(_, p)| p.offset);
-        let mut groups: Vec<&JaggedGroup> = self.groups.iter().collect();
+        let mut groups: Vec<(usize, &JaggedGroup)> = self.groups.iter().enumerate().collect();
         // A group without chunks shares its offset with the next one.
-        groups.sort_unstable_by_key(|g| (g.offset, g.words()));
-        let start = groups.first().map_or(self.placed, |g| g.offset);
-        let (mut head, mut rest) = dense.split_at_mut(start);
-        let mut tags = &mut repeats[..];
-        let mut blocks = Vec::with_capacity(padded.len());
-        let mut at = 0;
-        for (column, p) in padded {
-            assert_eq!(p.offset, at, "the padded blocks tile from 0");
-            let (words, tail) = head.split_at_mut(1 << p.n_vars);
-            let (block_tags, tag_tail) = tags.split_at_mut(words.len() >> EQUAL_BLOCK_LOG);
-            blocks.push((column, words, block_tags));
-            (head, tags, at) = (tail, tag_tail, at + (1 << p.n_vars));
-        }
-        let mut zeros: Vec<&mut [F64]> = head.chunks_mut(RUN).collect();
-        for group in groups {
+        groups.sort_unstable_by_key(|(_, g)| (g.offset, g.words()));
+        let mut rest = dense;
+        let mut zeros: Vec<&mut [F64]> = Vec::new();
+        let mut qkeccak = None;
+        for (g, group) in groups {
             assert_eq!(total - rest.len(), group.offset, "the groups tile");
             let (words, tail) = rest.split_at_mut(group.words());
+            rest = tail;
+            if g == self.qkeccak {
+                qkeccak = Some(words);
+                continue;
+            }
             let width = 1 << group.log_width;
             for (r, run) in words.chunks_exact_mut(RUN).enumerate() {
                 match group.columns.get(r % width) {
@@ -388,7 +378,6 @@ impl Dense {
             for &global in &group.columns {
                 windows[global].len = 1 << placements[global].n_vars;
             }
-            rest = tail;
         }
         zeros.extend(rest.chunks_mut(RUN));
         // Nothing reads the stack before the commit, so the zeros stream past the cache.
@@ -399,21 +388,17 @@ impl Dense {
                 stream.copy(run, &ZEROS[..n]);
             }
         });
-        (windows, blocks)
+        (windows, qkeccak.expect("q_keccak's group"))
     }
 
     /// Global column `column` of `2^n_vars` rows, from the committed stack `dense`, its rows past its chunks `pad`.
     pub fn column<'a>(&self, dense: &'a [F64], column: usize, n_vars: usize, pad: F64) -> Column<'a> {
         let len = 1usize << n_vars;
-        match self.slots[column].expect("a committed column") {
-            Slot::Padded(p) => Column::flat(&dense[p.offset..][..len]),
-            Slot::Jagged { group, column } => {
-                let group = &self.groups[group];
-                let stored = (group.chunks() << CHUNK_LOG).min(len);
-                let words = dense.get(group.offset + column * RUN..).unwrap_or_default();
-                Column::strided(words, CHUNK_LOG + group.log_width, stored, len, pad)
-            }
-        }
+        let Slot { group, column } = self.slots[column].expect("a committed column");
+        let group = &self.groups[group];
+        let stored = (group.chunks() << CHUNK_LOG).min(len);
+        let words = dense.get(group.offset + column * RUN..).unwrap_or_default();
+        Column::strided(words, CHUNK_LOG + group.log_width, stored, len, pad)
     }
 }
 

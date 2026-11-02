@@ -265,3 +265,73 @@ fn a_broken_committed_state_is_rejected() {
     }
     assert!(!accepts(&committed, F192::ONE), "the output");
 }
+
+/// States laid out in chunks, kept only up to a chunk past the last input, give the openings the whole block gives:
+/// a padding instance's words are [`crate::padding_words`], at every depth. The spare slots hold a column of their own.
+#[test]
+fn chunked_states_open_as_the_whole_block() {
+    use primitives::field::F64;
+    let mut rng = Rng::new(80);
+    for (n, depth) in [(0, 12), (700, 12), (1100, 8), (2600, 12), (4100, 6)] {
+        let inputs: Vec<[u64; LANES]> = (0..n).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
+        let shape = Shape::new(n, depth);
+        let (run_log, slot_log) = (10, shape.slot_log());
+        let chunks = n.div_ceil(1 << run_log);
+        let stored = (chunks << run_log).min(shape.n());
+        let mut whole = vec![F64(0); 1 << shape.stack_log()];
+        let reference = Witness::generate(shape, &inputs, &mut whole);
+        let spare = |slot: usize, i: usize| F64((slot * 0x1_0000 + i) as u64 * 0x9E37_79B9);
+        for slot in shape.slots()..1 << slot_log {
+            for i in 0..shape.n() {
+                whole[slot * shape.n() + i] = if i < stored { spare(slot, i) } else { F64(0) };
+            }
+        }
+        let pad = crate::padding_words(shape);
+        for slot in 0..shape.slots() {
+            assert!(
+                whole[slot * shape.n() + stored..][..shape.n() - stored]
+                    .iter()
+                    .all(|w| w.0 == pad[slot])
+            );
+        }
+
+        let mut words = vec![F64(0xdead); chunks << (run_log + slot_log)];
+        let witness = {
+            let mut states: Vec<&mut [F64]> = words
+                .chunks_exact_mut(1 << (run_log + slot_log))
+                .map(|chunk| &mut chunk[..shape.slots() << run_log])
+                .collect();
+            let written = n.div_ceil(BLOCK);
+            let extent = Extent::new(0, written, shape.depth());
+            let lanes: Vec<Vec<u64>> = (0..written)
+                .map(|g| {
+                    let mut out = vec![0; crate::witness::lanes_len(depth)];
+                    let inputs = &inputs[g * BLOCK..((g + 1) * BLOCK).min(n)];
+                    crate::witness::block_lanes_into(depth, inputs, extent.slot(g), &mut out);
+                    out
+                })
+                .collect();
+            let lanes: Vec<&[u64]> = lanes.iter().map(Vec::as_slice).collect();
+            Witness::from_blocks_into(shape, vec![extent], &lanes, run_log, &mut states)
+        };
+        for (c, chunk) in words.chunks_exact_mut(1 << (run_log + slot_log)).enumerate() {
+            for slot in shape.slots()..1 << slot_log {
+                for (r, word) in chunk[slot << run_log..][..1 << run_log].iter_mut().enumerate() {
+                    *word = spare(slot, (c << run_log) + r);
+                }
+            }
+        }
+        let stream = |witness: &Witness, committed: &crate::Committed| {
+            let mut ps = ProverState::from_label(LABEL);
+            let output = crate::OutputClaim::of_inputs(shape, &inputs, ps.sample_vec(shape.n_log()));
+            ps.add_scalars(&output.lanes);
+            let openings = witness.prove_in(&mut ps, committed, &output);
+            (openings, ps.into_proof())
+        };
+        let chunked = crate::Committed::chunked(shape, &words, run_log, stored);
+        assert!(
+            stream(&witness, &chunked) == stream(&reference, &crate::Committed::whole(shape, &whole)),
+            "{n} instances, depth {depth}"
+        );
+    }
+}

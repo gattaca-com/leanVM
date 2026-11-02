@@ -332,16 +332,17 @@ pub(crate) fn while_executing<R>(
 
 impl Blocks {
     /// Write the committed states of the `steps` steps these blocks hold, padded with
-    /// all-zero steps, and hand the reduction its witness. `q_keccak` is the states' part of
-    /// the committed block, its first [`SLOTS`] slots: the spare slots past them belong to the
-    /// columns that ride there and are written by their own fill.
-    pub(crate) fn place(self, steps: usize, q_keccak: &mut [F64]) -> PreparedReductionWitness {
+    /// all-zero steps, and hand the reduction its witness. `chunks` are the states' part of each
+    /// chunk of `q_keccak`'s group, a run of `2^CHUNK_LOG` steps of each of its first [`SLOTS`]
+    /// slots: the spare slots past them belong to the columns that ride there and are written by
+    /// their own fill. The steps past the chunks pad, and are not written.
+    pub(crate) fn place(self, steps: usize, chunks: &mut [&mut [F64]]) -> PreparedReductionWitness {
         assert_eq!(self.steps, steps, "the blocks are of another run");
         let shape = shape(self.steps);
         assert_eq!(
-            q_keccak.len(),
-            shape.slots() * shape.n(),
-            "the committed states are the wrong size"
+            chunks.len(),
+            steps.div_ceil(crate::witness::RUN),
+            "a chunk per run of steps"
         );
         let blocks = self.steps.div_ceil(BLOCK);
         assert_eq!(self.order.len(), blocks, "a place per block");
@@ -360,7 +361,7 @@ impl Blocks {
             })
             .collect();
         let lanes: Vec<&[u64]> = self.order.iter().map(|&d| ran[d]).collect();
-        Witness::from_ordered_blocks(shape, self.extents, self.order, &lanes, q_keccak)
+        Witness::from_ordered_blocks_into(shape, self.extents, self.order, &lanes, crate::witness::CHUNK_LOG, chunks)
     }
 }
 
@@ -391,32 +392,54 @@ mod tests {
 
     /// The witness built behind a run is the one a single pass over its steps builds: the same
     /// committed column and the same reduction, whether the steps fill whole blocks, leave a
-    /// partial one, or leave blocks of the batch with no step at all.
+    /// partial one, or leave blocks of the batch with no step at all. The run places its states in
+    /// chunks of `q_keccak`'s group, keeping a chunk past its last step.
     #[test]
     fn blocks_built_while_executing_match_one_pass() {
+        use crate::witness::{CHUNK_LOG, RUN};
         for n in [0, 1, 511, 512, 513, 1500, 4099] {
             let instances = sample_instances(n);
-            let (expected, reference) = build_qkeccak(&instances);
+            let (mut expected, reference) = build_qkeccak(&instances);
             let ((), blocks) = while_executing(|step| {
                 for state in &instances {
                     step(state, crate::cpu::OutCells::One);
                 }
             });
-            let mut q_keccak = vec![f(0xdead_beef); expected.len()];
-            let states = SLOTS * (1 << n_steps_log(n));
-            let witness = blocks.place(n, &mut q_keccak[..states]);
-            assert_eq!(q_keccak[..states], expected[..states], "{n} steps");
+            let steps = 1usize << n_steps_log(n);
+            let (chunks, width) = (n.div_ceil(RUN), CHUNK_LOG + SLOT_LOG);
+            let stored = (chunks << CHUNK_LOG).min(steps);
+            let mut q_keccak = vec![f(0xdead_beef); chunks << width];
+            let mut states: Vec<&mut [F64]> = q_keccak
+                .chunks_exact_mut(1 << width)
+                .map(|chunk| &mut chunk[..SLOTS * RUN])
+                .collect();
+            let witness = blocks.place(n, &mut states);
             // What the columns riding the spare slots left there is none of the reduction's
             // business, but both openings fold it, so the two runs have to see the same.
-            q_keccak[states..].fill(f(0x5151_5151));
+            for i in 0..stored {
+                let at = |slot: usize| (i >> CHUNK_LOG << width) + (slot << CHUNK_LOG) + i % RUN;
+                for slot in 0..SLOTS {
+                    assert_eq!(
+                        q_keccak[at(slot)],
+                        expected[slot * steps + i],
+                        "{n} steps, slot {slot}, step {i}"
+                    );
+                }
+                for slot in SLOTS..1 << SLOT_LOG {
+                    q_keccak[at(slot)] = f(0x5151_5151);
+                    expected[slot * steps + i] = f(0x5151_5151);
+                }
+            }
             let point = (0..n_steps_log(n)).map(|i| F192::new(3 + i as u64, 5, 7)).collect();
             let output = OutputClaim::of_inputs(shape(n), &instances, point);
-            let stream = |witness: &Witness| {
+            let stream = |witness: &Witness, committed: &keccak_gkr::Committed| {
                 let mut ps = ProverState::from_label(b"blocks");
-                let openings = witness.prove(&mut ps, &q_keccak, &output);
+                let openings = witness.prove_in(&mut ps, committed, &output);
                 (openings, ps.into_proof())
             };
-            assert!(stream(&witness) == stream(&reference), "{n} steps");
+            let chunked = keccak_gkr::Committed::chunked(shape(n), &q_keccak, CHUNK_LOG, stored);
+            let whole = keccak_gkr::Committed::whole(shape(n), &expected);
+            assert!(stream(&witness, &chunked) == stream(&reference, &whole), "{n} steps");
         }
     }
 

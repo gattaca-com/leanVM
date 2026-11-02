@@ -119,11 +119,6 @@ pub struct Placement {
 }
 
 impl Placement {
-    pub fn stack_point(&self, point: &[E], stack_log: usize) -> Vec<E> {
-        let above = selector_point(self.index >> self.variables, stack_log - self.variables);
-        [point, &above].concat()
-    }
-
     /// eq weight of the coordinates above the window.
     pub fn eq_above(&self, point: &[E]) -> E {
         let bits = selector_point(self.index >> self.variables, point.len() - self.variables);
@@ -179,15 +174,20 @@ pub struct JaggedSlot {
 impl JaggedSlot {
     /// The stack weight of a claim at `point` on this column, at the stack point `x`.
     pub fn weight(&self, point: &[E], x: &[E]) -> E {
-        let at = |v: &[E], k: usize| v.get(k).copied().unwrap_or(ZERO);
-        let low = (0..CHUNK_LOG).fold(ONE, |acc, k| acc * (ONE + at(point, k) + at(x, k)));
-        let column = (0..self.log_width).fold(ONE, |acc, k| {
-            acc * eq_bit(at(x, CHUNK_LOG + k), (self.column >> k) as u64 & 1)
-        });
-        let high = x.get(CHUNK_LOG + self.log_width..).unwrap_or(&[]);
-        let base = self.offset >> (CHUNK_LOG + self.log_width);
-        low * column * jagged_indicator(point.get(CHUNK_LOG..).unwrap_or(&[]), high, base, self.chunks)
+        let column = selector_point(self.column as u64, self.log_width);
+        jagged_weight(self.offset, self.log_width, self.chunks, point, &column, x)
     }
+}
+
+/// The stack weight, at `x`, of a claim at `point` on the jagged group of `chunks` chunks from `offset`, a chunk
+/// holding `2^log_width` column runs, its column weighted by `eq(column, .)`.
+pub fn jagged_weight(offset: u64, log_width: usize, chunks: u64, point: &[E], column: &[E], x: &[E]) -> E {
+    let at = |v: &[E], k: usize| v.get(k).copied().unwrap_or(ZERO);
+    let low = (0..CHUNK_LOG).fold(ONE, |acc, k| acc * (ONE + at(point, k) + at(x, k)));
+    let column = (0..log_width).fold(ONE, |acc, k| acc * (ONE + column[k] + at(x, CHUNK_LOG + k)));
+    let high = x.get(CHUNK_LOG + log_width..).unwrap_or(&[]);
+    let base = offset >> (CHUNK_LOG + log_width);
+    low * column * jagged_indicator(point.get(CHUNK_LOG..).unwrap_or(&[]), high, base, chunks)
 }
 
 pub fn stack_offsets(sizes: &[usize]) -> (Vec<u64>, usize) {

@@ -505,11 +505,6 @@ pub fn prove_prepare(
     suffix_point: &[F192],
     precomputed_s_hat_v: Option<&[F192]>,
 ) -> RingSwitchProveState {
-    assert_eq!(
-        packed_witness.len(),
-        1usize << suffix_point.len(),
-        "packed witness must have 2^|suffix_point| words"
-    );
     let (eq_lo, eq_hi) = build_eq_split_ext(suffix_point);
     let s_hat_v = match precomputed_s_hat_v {
         Some(v) => {
@@ -517,6 +512,11 @@ pub fn prove_prepare(
             v.to_vec()
         }
         None => {
+            assert_eq!(
+                packed_witness.len(),
+                1usize << suffix_point.len(),
+                "packed witness must have 2^|suffix_point| words"
+            );
             let mask = eq_lo.len() - 1;
             let shift = eq_lo.len().trailing_zeros();
             let full: Vec<F192> = parallel::map_collect(packed_witness.len(), |y| eq_lo[y & mask] * eq_hi[y >> shift]);

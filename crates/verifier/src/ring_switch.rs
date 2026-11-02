@@ -16,19 +16,16 @@ fn ring_map(mut value: E, challenges: &[E]) -> E {
     value
 }
 
-/// The weight `W(u) = Phi(eq(r, u))`, extended and evaluated by the opening at
-/// `r_prime`: `sum_k c_k prod_n (1 + r_n^(2^k) + r'_n)`.
-fn ring_weight(r: &[E], r_prime: &[E], coefficients: &[E]) -> E {
-    assert_eq!(r.len(), r_prime.len());
+/// `sum_k c_k W(r^(2^k))`, the Frobenius powers taken coordinate by coordinate: the extension of `Phi(W(r, u))` from
+/// the cube's points `u`, for a weight `W` with coefficients in F2, as an eq or a jagged weight has.
+pub fn frobenius_weight(r: &[E], coefficients: &[E], weight: impl Fn(&[E]) -> E) -> E {
     let mut total = ZERO;
     let mut frobenius = r.to_vec();
     for &c in coefficients {
-        let mut product = c;
-        for (value, &challenge) in frobenius.iter_mut().zip(r_prime) {
-            product *= ONE + *value + challenge;
+        total += c * weight(&frobenius);
+        for value in frobenius.iter_mut() {
             *value = value.square();
         }
-        total += product;
     }
     total
 }
@@ -36,8 +33,9 @@ fn ring_weight(r: &[E], r_prime: &[E], coefficients: &[E]) -> E {
 /// The 64 claims s\[i\] = z(i, point) become the one dense claim `sum_u W(u) qkeccak(u) = target`.
 ///
 /// Draw Phi once they are fixed, then take the target `T = sum_i x^i Phi(s_i)` against the
-/// MLE-friendly weight `W(u) = Phi(eq(point, u))`. Returns the target and W as a closure.
-pub fn ring_switch(point: Vec<E>, s: &[E], transcript: &mut Transcript) -> (E, impl Fn(&[E]) -> E + use<>) {
+/// MLE-friendly weight `W(u) = Phi(eq(point, u))`, whose extension is [`frobenius_weight`] over
+/// the coefficients returned.
+pub fn ring_switch(s: &[E], transcript: &mut Transcript) -> (E, Vec<E>) {
     let challenges = transcript.samples(RING_MAP_SHIFTS.len());
     // The same map as a Frobenius sum, `Phi(a) = sum_k c_k a^(2^k)` for k < 64.
     let coefficient = |k: usize| {
@@ -49,6 +47,5 @@ pub fn ring_switch(point: Vec<E>, s: &[E], transcript: &mut Transcript) -> (E, i
     };
     let coefficients: Vec<E> = (0..K_BITS).map(coefficient).collect();
     let images: Vec<E> = s.iter().map(|&value| ring_map(value, &challenges)).collect();
-    let target = poly_eval(&images, GEN);
-    (target, move |r_prime: &[E]| ring_weight(&point, r_prime, &coefficients))
+    (poly_eval(&images, GEN), coefficients)
 }
