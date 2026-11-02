@@ -1113,9 +1113,6 @@ mod tests {
         let program = partial_keccak_program(false);
         let pi = [w(7), w(11)];
         let exec = program.execute(pi).unwrap();
-        let mut lanes = [0; primitives::hash::STATE_LANES];
-        lanes[0] = 3;
-        lanes[1] = 4;
         let input: [F192; STATE_CELLS] = std::array::from_fn(|c| match c {
             0 | 2 => w(3),
             1 | 3 => w(4),
@@ -1156,7 +1153,8 @@ mod tests {
         use verifier::VerifierError::{GkrLayer, KeccakProduct};
         let bus = |e: &verifier::VerifierError| matches!(e, GkrLayer(_));
         let reduction = |e: &verifier::VerifierError| *e == KeccakProduct;
-        let cases: [(Tamper, &Program, &dyn Fn(&verifier::VerifierError) -> bool); 5] = [
+        type Rejects<'a> = &'a dyn Fn(&verifier::VerifierError) -> bool;
+        let cases: [(Tamper, &Program, Rejects); 5] = [
             (Tamper::UnrequestedWrite, &reading, &bus),
             (Tamper::WrongOutput, &partial, &bus),
             (Tamper::WrongOutput, &full, &reduction),
