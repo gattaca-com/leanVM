@@ -254,6 +254,11 @@ impl<'a> Column<'a> {
         self.pad[0]
     }
 
+    /// Whether the rows lie in one contiguous run.
+    pub fn is_contiguous(&self) -> bool {
+        self.stride_log == CHUNK_LOG
+    }
+
     /// Whether both are the same column.
     pub fn same(&self, other: &Self) -> bool {
         std::ptr::eq(self.words, other.words) && (self.stride_log, self.stored, self.len) == (other.stride_log, other.stored, other.len)
@@ -300,8 +305,7 @@ impl<'a> Column<'a> {
 
     /// The stored rows from `start`, as contiguous pieces: `(first row, words)`, the first cut at `start`.
     pub fn pieces(&self, start: usize) -> impl Iterator<Item = (usize, &'a [F64])> + '_ {
-        let contiguous = self.stride_log == CHUNK_LOG;
-        let step = if contiguous { self.stored.max(1) } else { RUN };
+        let step = if self.is_contiguous() { self.stored.max(1) } else { RUN };
         (start / step * step..self.stored).step_by(step).map(move |first| {
             let from = first.max(start);
             let end = (first + step).min(self.stored);
