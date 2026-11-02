@@ -1070,7 +1070,7 @@ def verify_merkle_path(leaf, direction_bits, depth: Const):
         selected = path_ptr + direction_bits[GEN ** level] * path_step
         selected[GEN ** (4 * level)] = node[0]
         selected[GEN ** (4 * level + 1)] = node[1]
-        node = StackBuf(KECCAK_STATE)
+        node = StackBuf(2)
         keccak(path[4 * level:4 * level + 2], path[4 * level + 2:4 * level + 4], node)
     return node
 
@@ -1078,45 +1078,37 @@ def verify_merkle_path(leaf, direction_bits, depth: Const):
 def verify_merkle_cap(cap, flags, depth: Const):
     # Unrolled over the cap's nodes, so every address is an immediate. Every node's
     # hinted digest (node k at heap cells 2k, 2k+1) is read once into a frame run,
-    # and an internal node's run is KECCAK_STATE cells long so that its hash can
-    # write its state there, the digest landing on (and so asserting) the hinted
-    # value. An active (flagged) node is hashed; an inactive one pins its children's
-    # flags to zero, so every active node's parent is active too, up to the root,
-    # which is always hashed. The queries flag the parents of the cap leaves they
-    # reach. The run is sized per depth, the cap depths a configuration reaches.
+    # node k at cells 2(k - 1), 2k - 1, and an internal node's hash writes its digest
+    # there, landing on (and so asserting) the hinted value. An active (flagged) node
+    # is hashed; an inactive one pins its children's flags to zero, so every active
+    # node's parent is active too, up to the root, which is always hashed. The queries
+    # flag the parents of the cap leaves they reach. The run is sized per depth, the
+    # cap depths a configuration reaches.
     if depth != 0:
         n_leaves = 2 ** depth
         if const(depth == 4):
-            runs = StackBuf(15 * 16 - 13)
+            runs = StackBuf(4 * 16 - 2)
         elif const(depth == 5):
-            runs = StackBuf(15 * 32 - 13)
+            runs = StackBuf(4 * 32 - 2)
         elif const(depth == 6):
-            runs = StackBuf(15 * 64 - 13)
+            runs = StackBuf(4 * 64 - 2)
         elif const(depth == 7):
-            runs = StackBuf(15 * 128 - 13)
+            runs = StackBuf(4 * 128 - 2)
         else:
-            runs = StackBuf(15 * 256 - 13)
-        # internal node k (1 <= k < n_leaves) at KECCAK_STATE * (k - 1), leaf k after them
+            runs = StackBuf(4 * 256 - 2)
         for node in unroll(1, 2 * n_leaves):
-            if const(node // n_leaves == 0):
-                at = KECCAK_STATE * (node - 1)
-            else:
-                at = KECCAK_STATE * (n_leaves - 1) + 2 * (node - n_leaves)
+            at = 2 * (node - 1)
             runs[at] = cap[GEN ** (2 * node)]
             runs[at + 1] = cap[GEN ** (2 * node + 1)]
         for node in unroll(1, n_leaves):
-            if const(2 * node // n_leaves == 0):
-                left = KECCAK_STATE * (2 * node - 1)
-                right = KECCAK_STATE * (2 * node)
-            else:
-                left = KECCAK_STATE * (n_leaves - 1) + 2 * (2 * node - n_leaves)
-                right = left + 2
-            at = KECCAK_STATE * (node - 1)
+            left = 2 * (2 * node - 1)
+            right = left + 2
+            at = 2 * (node - 1)
             if const(node == 1):
-                keccak(runs[left:left + 2], runs[right:right + 2], runs[at:at + KECCAK_STATE])
+                keccak(runs[left:left + 2], runs[right:right + 2], runs[at:at + 2])
             else:
                 if flags[GEN ** node] != 0:
-                    keccak(runs[left:left + 2], runs[right:right + 2], runs[at:at + KECCAK_STATE])
+                    keccak(runs[left:left + 2], runs[right:right + 2], runs[at:at + 2])
                 else:
                     if const(2 * node // n_leaves == 0):  # node has flagged children
                         flags[GEN ** (2 * node)] = 0
@@ -1248,7 +1240,7 @@ def opening_query(cap, flags, row_eq_weights, direction_bits, base: Const, inter
             part += row_word * row_eq_weights[GEN ** l]
         row_dot += row_eq_weights[GEN ** (lo_len + h)] * part
     # Hash the packed row.
-    leaf_hash_state = StackBuf(KECCAK_STATE)
+    leaf_hash_state = StackBuf(2)
     keccak_cells(packed_row[0:leaf_cells], leaf_hash_state)
     path_depth = depth - cap_depth
     node = verify_merkle_path(leaf_hash_state, direction_bits, path_depth)
@@ -3568,7 +3560,7 @@ def is_child(node, kids, k: Const, bit):
 @inline
 def chain_tip(walks, i: Const):
     # Chain i's tip, in the last of its CHAIN_STEPS slots of `walks`.
-    tip = walks[((i + 1) * CHAIN_STEPS - 1) * KECCAK_STATE]
+    tip = walks[(i + 1) * CHAIN_STEPS - 1]
     return tip
 
 
@@ -3580,15 +3572,15 @@ def walk(at, pp, walks, tags, i: Const, k: Const, lx: Const):
     # leanXMSS one only s, at[s] computed once per key, i riding after the value, read
     # off `tags` so a dispatch arm names it rather than setting it again.
     if const(k == CHAIN_STEPS):
-        hint_witness(walks[((i + 1) * CHAIN_STEPS - 1) * KECCAK_STATE:((i + 1) * CHAIN_STEPS - 1) * KECCAK_STATE + 1], "chain_starts")
+        hint_witness(walks[(i + 1) * CHAIN_STEPS - 1:(i + 1) * CHAIN_STEPS], "chain_starts")
     else:
         value = hint_witness("chain_starts")
         for s in unroll(k, CHAIN_STEPS):
-            o = (CHAIN_STEPS * i + s) * KECCAK_STATE
+            o = CHAIN_STEPS * i + s
             if const(lx == 1):
-                keccak([pp, at[s]], [value, tags[i]], walks[o:o + KECCAK_STATE])
+                keccak([pp, at[s]], [value, tags[i]], walks[o:o + 1])
             else:
-                keccak([pp, at + const(TW_CHAIN + i * HI_MUL + s * STEP_MUL)], [value, 0], walks[o:o + KECCAK_STATE], len=48)
+                keccak([pp, at + const(TW_CHAIN + i * HI_MUL + s * STEP_MUL)], [value, 0], walks[o:o + 1], len=48)
             value = walks[o]
     return
 
@@ -3637,7 +3629,7 @@ def merkle_path(node, pp, bits, nodes, out, off: Const, height: Const, end: Cons
         if const(level + 1 == height):
             parent = out
         else:
-            parent = StackBuf(KECCAK_STATE)
+            parent = StackBuf(1)
         if const(off + level + 1 == end):
             keccak([pp, const(TW_NODE + (level + 1) * HI_MUL + top * LX_TOP)], kids, parent)
         else:
@@ -3684,7 +3676,7 @@ def verify_lean_xmss(signer):
         # D = Th(P, A, M | R), one block: 80 bytes at the bottom, and 64 at the top,
         # where M is the bottom root.
         rho = hint_witness("randomizer")
-        digest = StackBuf(KECCAK_STATE)
+        digest = StackBuf(1)
         if const(layer == 0):
             keccak([pp, idx + TW_MSG], [signer[GEN ** 2], signer[GEN ** 3]], digest, tail=[rho, 0, 0, 0], len=80)
         else:
@@ -3698,7 +3690,7 @@ def verify_lean_xmss(signer):
         steps = StackBuf(CHAIN_STEPS)
         for st in unroll(0, CHAIN_STEPS):
             steps[st] = idx + const(TW_CHAIN + st * STEP_MUL)
-        walks = StackBuf(LX_V * CHAIN_STEPS * KECCAK_STATE)
+        walks = StackBuf(LX_V * CHAIN_STEPS)
         digit_product = 1
         encoded = 0
         for p in unroll(0, LX_V // DIGIT_GROUP):
@@ -3712,9 +3704,9 @@ def verify_lean_xmss(signer):
         assert digit_product == GEN ** LX_TARGET_SUM
 
         # The one-time leaf, then the path to the layer's root.
-        leaf = StackBuf(KECCAK_STATE)
+        leaf = StackBuf(1)
         wots_leaf(pp, idx + TW_LEAF, walks, LX_V, leaf)
-        root = StackBuf(KECCAK_STATE)
+        root = StackBuf(1)
         merkle_path(leaf[0], pp, bits, nodes, root, LX_HEIGHT * layer, LX_HEIGHT, 2 * LX_HEIGHT, layer)
     assert root[0] == signer[1]
     return
@@ -3758,7 +3750,7 @@ def sp_forest_top(at, pp, tws, tops, t: Const, i: Const):
     else:
         value = hint_witness("sp_forest_values")
         for s in unroll(SP_FTOP - SP_CODEWORDS[SP_FCHAINS * t + i], SP_FTOP):
-            out = StackBuf(KECCAK_STATE)
+            out = StackBuf(1)
             keccak([pp, at + tws[SP_FTOP * i + s]], [value, 0], out, len=48)
             value = out[0]
         if const(i // 2 != 0):
@@ -3778,7 +3770,7 @@ def sp_forest_key(at, pp, tws, t: Const, w: Const):
     for i in unroll(2, SP_FCHAINS):
         top = sp_forest_top(at, pp, tws, tops, t, i)  # in `tops`
     # P, A and the six tops: 128 bytes, one block.
-    leaf = StackBuf(KECCAK_STATE)
+    leaf = StackBuf(1)
     keccak([pp, at + tws[SP_FCHAINS * SP_FTOP]], [top_0, top_1], leaf, tail=tops)
     if const(w // 8 == 0):
         weight = const(t * 2 ** (8 * w))
@@ -3799,7 +3791,7 @@ def sp_fold(node, at, pp, out, tws, slot: Const, index: Const, height: Const, tw
     cur = node
     for level in unroll(0, height - 1):
         sibling = hint_witness("sp_forest_nodes")
-        parent = StackBuf(KECCAK_STATE)
+        parent = StackBuf(1)
         if const(preset == 1):
             address = at + tws[(height - 1) * index + level]
         else:
@@ -3839,7 +3831,7 @@ def verify_sig_lean_sphincs(signer, byte_bits):
     # ---- the message digest, which chooses the few-time key and what it opens ----
     # D = H(P | A | m | rho), 80 bytes in one block.
     rho = hint_witness("sp_rand")
-    digest = StackBuf(KECCAK_STATE)
+    digest = StackBuf(2)
     keccak([pp, TW_MSG], [signer[GEN ** 2], signer[GEN ** 3]], digest, tail=[rho, 0, 0, 0], len=80)
 
     # The digest's first cell is the sixteen codewords and its second is bit
@@ -3908,7 +3900,7 @@ def verify_sig_lean_sphincs(signer, byte_bits):
                 encoded_words = encoded_words + weight
             key_mark[1], key_weight = match(log(key_mark[0]), range(0, SP_KEYS), lambda a: sp_subtree_arm(node, key_at, pp, subtops, sub_tws, c, j, a))
             bound = bound + key_weight
-        leaf = StackBuf(KECCAK_STATE)
+        leaf = StackBuf(1)
         keccak_cells(subtops, leaf)
         leaf_mark[1], leaf_weight = match(log(leaf_mark[0]), range(0, SP_LEAVES), lambda s: sp_tree_arm(leaf[0], leaf_at, pp, tops, sub_tws, c, s))
         if const(c + 1 == SP_TREES):
@@ -3923,7 +3915,7 @@ def verify_sig_lean_sphincs(signer, byte_bits):
     hint_witness(ctr_bytes, "sp_counter")
     ctr = sp_from_bytes(byte_bits, ctr_bytes, SP_COUNTER_BYTES, SP_BYTE_VALUES)
     tops[2 + 2 * SP_TREES] = ctr
-    encoding = StackBuf(KECCAK_STATE)
+    encoding = StackBuf(1)
     keccak_cells(tops, encoding, len=SP_ENCODING_BYTES)
 
     # The codeword: DIGIT_GROUP digits at a time, hinted in the exponent, range
@@ -3931,7 +3923,7 @@ def verify_sig_lean_sphincs(signer, byte_bits):
     # and folding its digits in: their sums into a product that must be the target
     # sum, and the digits, each group where the digest holds it, into D. The
     # one-time leaf's input is P, A, then the chains' tips.
-    walks = StackBuf(SP_V * CHAIN_STEPS * KECCAK_STATE)
+    walks = StackBuf(SP_V * CHAIN_STEPS)
     powers = StackBuf(DIGIT_GROUP * CHAIN_STEPS + 1)
     for s in unroll(0, DIGIT_GROUP * CHAIN_STEPS + 1):
         powers[s] = GEN ** s
@@ -3951,9 +3943,9 @@ def verify_sig_lean_sphincs(signer, byte_bits):
     assert digit_product == GEN ** SP_TARGET_SUM
 
     # ---- the tree: the path from that one-time key to the public key's root ----
-    leaf = StackBuf(KECCAK_STATE)
+    leaf = StackBuf(1)
     wots_leaf(pp, idx + TW_LEAF, walks, SP_V, leaf)
-    root = StackBuf(KECCAK_STATE)
+    root = StackBuf(1)
     merkle_path(leaf[0], pp, bits, nodes, root, 0, SP_H, SP_H, 0)
     assert root[0] == signer[1]
     return

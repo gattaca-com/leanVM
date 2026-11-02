@@ -157,6 +157,18 @@ impl FlushBuilder {
         self.pair(push, pull);
     }
 
+    /// [`Self::memory_coords`] when the column `flag` is 1. At 0 the push carries the count as the pull
+    /// does, so the pair cancels and touches no cell: the push's count coordinate is
+    /// `count·(1 + flag·(g + 1))`, which is `g·count` at 1 and `count` at 0.
+    pub(crate) fn memory_coords_if(&mut self, flag: usize, addr: Coord, count: usize, vals: [Coord; 3]) {
+        let counted = Coord::Sum(vec![Col(count), Prod(flag, count, 1), Prod(flag, count, 0)]);
+        let mut push = vec![Const(SEP_MEM), addr.clone(), counted];
+        let mut pull = vec![Const(SEP_MEM), addr, Col(count)];
+        push.extend_from_slice(&vals);
+        pull.extend_from_slice(&vals);
+        self.pair(push, pull);
+    }
+
     /// Memory access: read the three-limb word at `addr`.
     pub(crate) fn memory(&mut self, addr: Coord, count: usize, val0: usize, val1: usize, val2: usize) {
         self.memory_coords(addr, count, [Col(val0), Col(val1), Col(val2)]);
@@ -478,12 +490,13 @@ const KECCAK_CELLS: [(usize, u32); crate::keccak::ROW_CELLS] = {
 };
 
 /// A `KECCAK` instruction: its offset operands `m`, `tail`, `b8`, `cap` and `out` in the order of
-/// their bytecode slots, and its two layout flags.
+/// their bytecode slots, its two layout flags, and how many output cells it writes.
 #[derive(Clone, Copy)]
 pub(crate) struct KeccakOp {
     offsets: [u32; 8],
     pub(crate) in_odd: bool,
     pub(crate) out_odd: bool,
+    pub(crate) out_cells: crate::cpu::OutCells,
 }
 
 impl KeccakOp {
@@ -497,10 +510,12 @@ impl KeccakOp {
                 out,
                 in_odd,
                 out_odd,
+                out_cells,
             } => Self {
                 offsets: [m[0], m[1], m[2], m[3], tail, b8, cap, out],
                 in_odd,
                 out_odd,
+                out_cells,
             },
             op => unreachable!("not a KECCAK: {op:?}"),
         }
@@ -957,7 +972,9 @@ pub(crate) mod keccakt {
     pub const V_OUT: usize = V_IN + STATE_LANES; // … and the 25 output lanes
     pub const R0: usize = V_OUT + STATE_LANES; // one read count per cell, in flush order
     pub const RBC: usize = R0 + ROW_CELLS;
-    pub const N: usize = RBC + 1;
+    pub const OUT_TWO: usize = RBC + 1; // whether output cell 1 is written …
+    pub const OUT_ALL: usize = OUT_TWO + 1; // … and cells 2..13, both bound by the bytecode read
+    pub const N: usize = OUT_ALL + 1;
 }
 
 /// A cell limb holding lane `even` in the even layout and `odd` in the odd one, as `flag`
@@ -1008,9 +1025,10 @@ impl Table for KeccakTable {
         use crate::keccak::{STATE_CELLS, cell_lanes};
         use keccakt::*;
         f.state_step(PC, FP);
-        let operands: Vec<Coord> = (O_M0..=OUT_ODD).map(Col).collect();
+        let operands: Vec<Coord> = (O_M0..=OUT_ODD).chain([OUT_TWO, OUT_ALL]).map(Col).collect();
         f.bytecode(PC, RBC, OP_KECCAK, &operands);
-        // Thirteen cells read, then thirteen written. A consecutive cell is a free ×g on the
+        // Thirteen cells read, then up to thirteen written: output cell 0 always, cell 1 as
+        // `OUT_TWO` says, the rest as `OUT_ALL` says. A consecutive cell is a free ×g on the
         // product's g-power.
         let (even, odd) = (cell_lanes(false), cell_lanes(true));
         for (c, &(operand, step)) in KECCAK_CELLS.iter().enumerate() {
@@ -1021,11 +1039,19 @@ impl Table for KeccakTable {
             };
             let lo = layout_limb(even[s].0, odd[s].0, values, flag, free);
             let hi = layout_limb(even[s].1, odd[s].1, values, flag, free);
-            f.memory_coords(Prod(FP, O_M0 + operand, step), R0 + c, [lo, hi, Const(F64::ZERO)]);
+            let (addr, vals) = (Prod(FP, O_M0 + operand, step), [lo, hi, Const(F64::ZERO)]);
+            match c.checked_sub(STATE_CELLS) {
+                None | Some(0) => f.memory_coords(addr, R0 + c, vals),
+                Some(1) => f.memory_coords_if(OUT_TWO, addr, R0 + c, vals),
+                Some(_) => f.memory_coords_if(OUT_ALL, addr, R0 + c, vals),
+            }
         }
     }
-    /// Every column but the input lanes, which are `q_keccak`'s and have no window here.
+    /// Every column but the input lanes, which are `q_keccak`'s and have no window here. A row
+    /// that writes all thirteen output cells has its output lanes read back from them; any other
+    /// permutes its input again, as its output is not all in memory.
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]) {
+        use crate::cpu::OutCells;
         use crate::keccak::read_state;
         use keccakt::*;
         let rows = &ctx.trace.keccak;
@@ -1043,11 +1069,20 @@ impl Table for KeccakTable {
         });
         ctx.cols(out, rows, V_OUT, |r| {
             let k = op(r);
-            let base = (r.fp + k.offsets[7]) as usize;
-            read_state(k.out_odd, |c| ctx.mem.word(base + c)).map(F64)
+            if k.out_cells == OutCells::All {
+                let base = (r.fp + k.offsets[7]) as usize;
+                return read_state(k.out_odd, |c| ctx.mem.word(base + c)).map(F64);
+            }
+            let mut lanes = read_state(k.in_odd, |c| ctx.mem.word(k.cell(r.fp, c) as usize));
+            primitives::hash::keccak_f(&mut lanes);
+            lanes.map(F64)
         });
         ctx.cols(out, rows, R0, |r| r.r.map(|k| ctx.g_at(k)));
         ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        ctx.cols(out, rows, OUT_TWO, |r| {
+            let (two, all) = op(r).out_cells.flags();
+            [flag(two), flag(all)]
+        });
     }
 }
 
