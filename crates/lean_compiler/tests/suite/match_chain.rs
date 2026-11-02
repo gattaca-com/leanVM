@@ -65,3 +65,37 @@ fn consecutive_matches_chain() {
         assert_eq!(split, chained + 1 + jump, "scrutinees {ks:?}");
     }
 }
+
+/// An `@inline` body may hold a `match`: each call site expands its own dispatch,
+/// with its own table, into the caller's frame.
+#[test]
+fn an_inline_body_may_dispatch() {
+    let src = "\
+@inline
+def bump(x, acc):
+    acc = match(log(x), range(0, 4), lambda k: acc + const(k + 1))
+    return acc * GEN
+
+def main():
+    xs = StackBuf(2)
+    hint_witness(xs, \"xs\")
+    assert log(xs[0]) < 4
+    assert log(xs[1]) < 4
+    a = bump(xs[0], 0)
+    b = bump(xs[1], a)
+    p = GEN ** 0
+    p[1] = a
+    p[GEN] = b
+    return
+";
+    for (k0, k1) in [(0, 3), (2, 1)] {
+        let mut program = compile(&parse(src).expect("parse"));
+        program.set_witness("xs", vec![vec![F192::from(g_pow(k0)), F192::from(g_pow(k1))]]);
+        // `acc * GEN` doubles a polynomial: one bit up, no reduction at this size.
+        let a = ((k0 as u64) + 1) << 1;
+        let b = (a ^ (k1 as u64 + 1)) << 1;
+        let want = [F192::from(F64(a)), F192::from(F64(b))];
+        let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &want, &proof).expect("verifies");
+    }
+}

@@ -49,8 +49,10 @@ fn stmt_inline_safe(s: &Stmt) -> bool {
         | StmtKind::AssertEq(..)
         | StmtKind::AssertNe(..)
         | StmtKind::AssertLt(..)
-        // Ordinary calls allocate their own frames.
-        | StmtKind::Call(..) => true,
+        // Ordinary calls allocate their own frames, and a dispatch's arms share
+        // the caller's cells like any other branch.
+        | StmtKind::Call(..)
+        | StmtKind::Match { .. } => true,
         StmtKind::If { then, els, .. } => then.iter().all(stmt_inline_safe) && els.iter().all(stmt_inline_safe),
         StmtKind::Unroll { body, .. } => body.iter().all(stmt_inline_safe),
         _ => false,
@@ -336,7 +338,7 @@ impl FnLower<'_> {
             ))
         };
         if !body_inlinable(&body) {
-            self.fail(format!("`@inline {callee}` requires one tail `return`, with no nested returns, tuple assignments, mul_range loops, or match"))
+            self.fail(format!("`@inline {callee}` requires one tail `return`, with no nested returns, tuple assignments, or mul_range loops"))
         };
         if self.inline_calls.iter().any(|f| f == callee) {
             self.fail(format!(
