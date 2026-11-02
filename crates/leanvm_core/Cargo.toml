@@ -18,6 +18,10 @@ verifier.workspace = true
 tracing.workspace = true
 libc.workspace = true
 
+[features]
+# Forgeries of the jagged commitment, for the tests of a crate that verifies its proofs.
+tamper = []
+
 [dev-dependencies]
 lean_compiler.workspace = true
 bincode.workspace = true

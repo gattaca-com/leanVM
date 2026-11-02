@@ -637,19 +637,19 @@ pub fn prove_with(
     let mut ps = ProverState::new(digest_words(&fs_seed(program)), digest_words(&public_input));
 
     // Announce the prover's sizes, then commit, before sampling any challenge.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "tamper"))]
     let tamper = tamper::take();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "tamper"))]
     let (announced_rows, announced_mem_rows) = tamper::sizes(tamper, &mut w);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "tamper")))]
     let (announced_rows, announced_mem_rows) = (w.layout.rows, w.layout.mem_rows);
     announce_public(&mut ps, w.log_mem, announced_rows, log_inv_rate, announced_mem_rows);
     // The committed stack: the padded one's columns, the jagged ones cut to their chunks.
-    #[cfg_attr(not(test), allow(unused_mut))]
+    #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
     let (mut dense, dense_repeats) = crate::stage!("Gather dense", || {
         w.layout.dense.gather(&w.q, &w.repeats, &w.layout.placements)
     });
-    #[cfg(test)]
+    #[cfg(any(test, feature = "tamper"))]
     tamper::dense(tamper, &w.layout, &mut dense);
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
     drop(pcs::reserve_level1(dense_shape.mu, log_inv_rate));
@@ -913,8 +913,8 @@ fn dense_qkeccak_offset(l: &Layout) -> usize {
 }
 
 /// Test-only forgeries of the jagged commitment: the prover is honest but for the one named here.
-#[cfg(test)]
-mod tamper {
+#[cfg(any(test, feature = "tamper"))]
+pub mod tamper {
     use super::*;
 
     #[derive(Clone, Copy, Debug)]
@@ -925,8 +925,9 @@ mod tamper {
         TableRows,
         /// Announce the memory rows a chunk higher.
         MemRows,
-        /// Write a value to the first memory cell past the committed rows. The bus balances it, a cell no
-        /// instruction reads being pushed and pulled alike, so only the commitment can catch it.
+        /// Write a value past a column's committed rows that the bus and the constraints accept: to the first
+        /// memory cell past the committed rows, pushed and pulled alike as no instruction reads it, or else to the
+        /// JUMP inverse hint of the first padding row past the JUMP chunks, which only a zero condition multiplies.
         PastHeight,
     }
 
@@ -939,12 +940,12 @@ mod tamper {
         NEXT.with(|next| next.set(Some(tamper)));
     }
 
-    pub(super) fn take() -> Option<Tamper> {
+    pub(crate) fn take() -> Option<Tamper> {
         NEXT.with(|next| next.take())
     }
 
     /// The sizes to announce, and the padded witness forged past its committed rows.
-    pub(super) fn sizes(tamper: Option<Tamper>, w: &mut layout::Witness) -> ([usize; tables::N_TABLES], usize) {
+    pub(crate) fn sizes(tamper: Option<Tamper>, w: &mut layout::Witness) -> ([usize; tables::N_TABLES], usize) {
         let (mut rows, mut mem_rows) = (w.layout.rows, w.layout.mem_rows);
         match tamper {
             Some(Tamper::TableRows) => {
@@ -953,9 +954,16 @@ mod tamper {
             }
             Some(Tamper::MemRows) => mem_rows += 1 << witness::CHUNK_LOG,
             Some(Tamper::PastHeight) => {
-                let column = w.layout.placements[MEM_LO];
-                assert!(mem_rows < 1 << column.n_vars, "the memory has uncommitted rows");
-                w.q[column.offset + mem_rows] = F64(5);
+                let memory = w.layout.placements[MEM_LO];
+                let jump = tables::JUMP_TABLE;
+                let inverse = w.layout.placements[schema().base[jump] + tables::jump::W];
+                let committed_jumps = rows[jump].next_multiple_of(1 << witness::CHUNK_LOG);
+                if mem_rows < 1 << memory.n_vars {
+                    w.q[memory.offset + mem_rows] = F64(5);
+                } else {
+                    assert!(committed_jumps < 1 << inverse.n_vars, "a column has uncommitted rows");
+                    w.q[inverse.offset + committed_jumps] = F64(5);
+                }
             }
             _ => {}
         }
@@ -963,7 +971,7 @@ mod tamper {
     }
 
     /// The committed stack, forged.
-    pub(super) fn dense(tamper: Option<Tamper>, l: &Layout, dense: &mut [F64]) {
+    pub(crate) fn dense(tamper: Option<Tamper>, l: &Layout, dense: &mut [F64]) {
         if let Some(Tamper::DenseWord) = tamper {
             let Some(witness::Slot::Jagged { group, .. }) = l.dense.slots[MEM_LO] else {
                 unreachable!("the memory is jagged");
