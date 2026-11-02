@@ -21,8 +21,8 @@
 //! Soundness note: [`WhirSecurityConfig`] analyzes the actual challenge
 //! field size `q = 2^192`; the committed alphabet remains `K = GF(2^64)`.
 
-use crate::merkle::{self, Hash};
-use crate::ntt::{AdditiveNttF64, Encoded, Keep, Kept, Plan, gather_rows, with_sink_scratch};
+use crate::merkle::{self, Expansion, Hash};
+use crate::ntt::{AdditiveNttF64, Encoded, Keep, Kept, Plan, gather_rows};
 use crate::stack_open::EQUAL_BLOCK_LOG;
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
@@ -153,39 +153,6 @@ impl ProverData {
     }
 }
 
-/// How a compact codeword row widens to a full row of `row_words`: the lanes the encode left out are zero.
-struct Expansion {
-    /// Compact lanes `src..src + len` are full lanes `dst..dst + len`, as `(dst, src, len)`.
-    runs: Vec<(usize, usize, usize)>,
-    enc_words: usize,
-    row_words: usize,
-}
-
-impl Expansion {
-    /// The map of a codeword of `blocks`, as [`ProverData::blocks`]. Stack block `b` is full lane `row_words - 1 - b`.
-    fn new(blocks: &[usize], enc_words: usize, row_words: usize) -> Self {
-        let pad = enc_words - blocks.len();
-        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
-        for (i, &b) in blocks.iter().enumerate() {
-            let (dst, src) = (row_words - 1 - b, pad + i);
-            match runs.last_mut() {
-                Some((d, s, len)) if (*d + *len, *s + *len) == (dst, src) => *len += 1,
-                _ => runs.push((dst, src, 1)),
-            }
-        }
-        Self { runs, enc_words, row_words }
-    }
-
-    /// Write the rows of `compact` as full rows into `full`, which holds zeros.
-    fn expand(&self, compact: &[F64], full: &mut [F64]) {
-        for (row, out) in compact.chunks_exact(self.enc_words).zip(full.chunks_exact_mut(self.row_words)) {
-            for &(dst, src, len) in &self.runs {
-                out[dst..][..len].copy_from_slice(&row[src..][..len]);
-            }
-        }
-    }
-}
-
 /// The L0 codeword as the opening reads it: kept whole or before its deep layers, or recomputed from the message.
 pub(crate) struct L0Codeword<'a> {
     words: &'a [F64],
@@ -286,21 +253,17 @@ pub fn commit(
         enc_words = row_words;
     }
     // The hash takes full rows, so the encode's compact rows widen before they are absorbed.
-    let expansion = (enc_words != row_words).then(|| Expansion::new(&blocks, enc_words, row_words));
-
-    // Leaves are hashed as the encode finishes each block of rows.
-    let tree = merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size);
+    // Leaves are hashed as the encode finishes each block of rows, which the hasher widens as it stages them.
+    let tree = if enc_words == row_words {
+        merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size)
+    } else {
+        let expansion = Expansion::new(&blocks, enc_words, row_words);
+        merkle::MerkleBuilder::with_expansion(n_positions, 1usize << log_batch_size, &expansion)
+    };
     let (codeword, deep) = tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = enc_words)
         .in_scope(|| {
             let ntt = AdditiveNttF64::standard(k_code);
-            let on_rows = |row, rows: &[F64]| match &expansion {
-                None => tree.absorb(row, rows),
-                Some(expansion) => with_sink_scratch(rows.len() / enc_words * row_words, |full| {
-                    full.fill(F64::ZERO);
-                    expansion.expand(rows, full);
-                    tree.absorb(row, full)
-                }),
-            };
+            let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
             // Sized by the full rows: a kept codeword that fits only because lanes were left out would still cool
             // the pages the bus and the level-1 commit reuse (ideas 172, 175).
             let keep = if n_positions * row_words * size_of::<F64>() > KEEP_CODEWORD_MAX_BYTES {

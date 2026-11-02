@@ -75,6 +75,5 @@ mod window;
 pub use encode::{Encoded, Keep, RowSink};
 pub use facade::AdditiveNttF64;
 pub(crate) use kernels::transpose_butterfly_lanes;
-pub(crate) use scratch::with_sink_scratch;
 pub use openings::{Kept, Openings, gather_rows};
 pub use plan::Plan;
