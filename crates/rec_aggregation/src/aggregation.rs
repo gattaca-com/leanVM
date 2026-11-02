@@ -100,17 +100,20 @@ const _: () = assert!(MAX_DA_ROOTS < MAX_KEYS);
 // the guest and another in the statement, and nothing else would notice.
 const _: () = assert!(leanvm_core::leaf::N_TUPLE_BITS == leanvm_core::leaf::N_BYTECODE_SELECTORS);
 // Both schemes' one-time keys go through the guest's one WOTS+C walk: the same chain
-// length, digits dispatched DIGIT_GROUP at a time and the last chain alone, and the
-// same address types (`signatures`' shared tweak). A chain step's address leaves out the
-// chain index in leanXMSS, where it follows the value.
+// length, digits dispatched a group at a time and the rest together, and the same
+// address types (`signatures`' shared tweak). A chain step's address leaves out the
+// chain index in leanXMSS, where it follows the value. leanSPHINCS groups
+// DIGIT_GROUP digits, leanXMSS LX_DIGIT_GROUP.
 const DIGIT_GROUP: usize = 3;
 /// Index bits a leanXMSS path dispatch takes, and the dispatches of one signature.
 const LX_WINDOW: usize = 8;
 const LX_WINDOWS: usize = lean_xmss::LOG_LIFETIME / LX_WINDOW;
 const _: () = assert!(lean_xmss::LAYER_HEIGHT.is_multiple_of(LX_WINDOW));
 const _: () = assert!(lean_sphincs::W * lean_sphincs::V == 128 && lean_sphincs::V % DIGIT_GROUP == 1);
-const _: () = assert!(lean_xmss::W == lean_sphincs::W && lean_xmss::V % DIGIT_GROUP == 1);
-// A leaf index is the two layers' indices, which the guest decomposes into bits at once.
+/// leanXMSS dispatches its digits `LX_DIGIT_GROUP` at a time, then the rest together.
+const LX_DIGIT_GROUP: usize = 4;
+const _: () = assert!(lean_xmss::W == lean_sphincs::W && !lean_xmss::V.is_multiple_of(LX_DIGIT_GROUP));
+// A leaf index is the two layers' indices, which the guest takes a window at a time.
 const _: () = assert!(lean_xmss::LOG_LIFETIME == 32);
 // The guest takes the leanSPHINCS message digest's first cell as its sixteen
 // codewords, and reads the index and what the digest leaves unused from the bits
@@ -1620,11 +1623,11 @@ fn plan_coverage(
     Ok(cover)
 }
 
-/// The digits of a WOTS+C codeword as the guest dispatches on them: `DIGIT_GROUP` at
-/// a time, then the last alone, each group's index little endian in base
+/// The digits of a WOTS+C codeword as the guest dispatches on them: `group` at a
+/// time, then the rest together, each group's index little endian in base
 /// `CHAIN_LEN`, in the exponent.
-fn digit_hints(codeword: &[u8]) -> impl Iterator<Item = F192> + '_ {
-    codeword.chunks(DIGIT_GROUP).map(|group| {
+fn digit_hints(codeword: &[u8], group: usize) -> impl Iterator<Item = F192> + '_ {
+    codeword.chunks(group).map(|group| {
         let index = group
             .iter()
             .rev()
@@ -1656,7 +1659,7 @@ fn lean_xmss_hints(
             hints.push("lx_path", &[pack_16_bytes(sibling)]);
         }
         hints.push("randomizer", &[pack_16_bytes(&layer_sig.randomizer)]);
-        hints.push_iter("lx_digits", digit_hints(&codeword));
+        hints.push_iter("lx_digits", digit_hints(&codeword, LX_DIGIT_GROUP));
         for value in &layer_sig.chain_values {
             hints.push("chain_starts", &[pack_16_bytes(value)]);
         }
@@ -1718,7 +1721,7 @@ fn push_lean_sphincs_hints(
     let codeword = lean_sphincs::encode(pp, idx as u32, &forest_key, sig.counter)
         .ok_or(AggregationError::MalformedRawSignature)?;
     hints.push_iter("sp_counter", exponent_bytes(u64::from(sig.counter), 32));
-    for index in digit_hints(&codeword) {
+    for index in digit_hints(&codeword, DIGIT_GROUP) {
         hints.push("digits", &[index]);
     }
     for opened in &sig.wots {
@@ -2711,9 +2714,11 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     // and the hash types they share, as the address lane holds them.
     ps("W", lean_xmss::W.to_string());
     ps("DIGIT_GROUP", DIGIT_GROUP.to_string());
-    let digit_sums: Vec<String> = (0..lean_xmss::CHAIN_LEN.pow(DIGIT_GROUP as u32))
+    ps("LX_DIGIT_GROUP", LX_DIGIT_GROUP.to_string());
+    let widest = DIGIT_GROUP.max(LX_DIGIT_GROUP);
+    let digit_sums: Vec<String> = (0..lean_xmss::CHAIN_LEN.pow(widest as u32))
         .map(|k| {
-            let digits = (0..DIGIT_GROUP).map(|r| k / lean_xmss::CHAIN_LEN.pow(r as u32) % lean_xmss::CHAIN_LEN);
+            let digits = (0..widest).map(|r| k / lean_xmss::CHAIN_LEN.pow(r as u32) % lean_xmss::CHAIN_LEN);
             digits.sum::<usize>().to_string()
         })
         .collect();
