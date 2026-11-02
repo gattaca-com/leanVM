@@ -386,7 +386,8 @@ STREAM_FRAME = STREAM_FRAME_PLACEHOLDER
 
 # --------------------------------------------------------- WOTS+C (host-supplied)
 # Both schemes' one-time keys: chains of CHAIN_LENGTH positions, whose digits are
-# dispatched DIGIT_GROUP at a time, the last chain alone, and the leanSPHINCS
+# dispatched a group at a time, the rest together (leanSPHINCS DIGIT_GROUP at a
+# time, leanXMSS LX_DIGIT_GROUP), and the leanSPHINCS
 # address, a cell whose low lane is lo:32 | hi:24 | type:5 | step:3, its high lane
 # zero. TW_* hold the type. Every 16-byte native value is one canonical cell.
 W = W_PLACEHOLDER
@@ -394,7 +395,7 @@ CHAIN_LENGTH = 2 ** W
 CHAIN_STEPS = CHAIN_LENGTH - 1
 DIGIT_GROUP = DIGIT_GROUP_PLACEHOLDER
 DIGIT_GROUPS = CHAIN_LENGTH ** DIGIT_GROUP
-# The digit sum of group k, at k.
+# The digit sum of group k, at k, for k of either scheme's groups.
 DIGIT_SUMS = DIGIT_SUMS_PLACEHOLDER
 TW_CHAIN = TW_CHAIN_PLACEHOLDER
 TW_LEAF = TW_LEAF_PLACEHOLDER
@@ -417,6 +418,11 @@ LX_V = LX_V_PLACEHOLDER
 LX_TARGET_SUM = LX_TARGET_SUM_PLACEHOLDER
 LX_HEIGHT = LX_HEIGHT_PLACEHOLDER
 LX_TOP = LX_TOP_PLACEHOLDER
+# leanXMSS dispatches its digits LX_DIGIT_GROUP at a time, then the LX_DIGIT_TAIL left.
+LX_DIGIT_GROUP = LX_DIGIT_GROUP_PLACEHOLDER
+LX_DIGIT_GROUPS = CHAIN_LENGTH ** LX_DIGIT_GROUP
+LX_DIGIT_TAIL = LX_V % LX_DIGIT_GROUP
+LX_TAIL_GROUPS = CHAIN_LENGTH ** LX_DIGIT_TAIL
 # The path is dispatched LX_WINDOW index bits at a time (`lx_window`); LX_HEIGHT is
 # a multiple of it.
 LX_WINDOW = LX_WINDOW_PLACEHOLDER
@@ -3592,7 +3598,7 @@ def walk(at, pp, walks, tags, i: Const, k: Const, lx: Const):
 
 @inline
 def walk_group(at, pp, walks, tags, first: Const, n: Const, k: Const, lx: Const, powers, product, encoded):
-    # The n <= DIGIT_GROUP chains from `first` on, at the digits of k, one
+    # The n chains from `first` on, at the digits of k, one
     # dispatch for all of them. Folds the digits' sum into `product`, in the
     # exponent (`powers[s]` is GEN ** s), and the digits into `encoded`, where the
     # encoding digest holds them.
@@ -3708,8 +3714,8 @@ def verify_lean_xmss(signer):
     hint_witness(windows, "lx_windows")
     for w in unroll(0, LX_WINDOWS):
         assert log(windows[w]) < LX_WINDOW_ARMS
-    powers = StackBuf(DIGIT_GROUP * CHAIN_STEPS + 1)
-    for s in unroll(0, DIGIT_GROUP * CHAIN_STEPS + 1):
+    powers = StackBuf(LX_DIGIT_GROUP * CHAIN_STEPS + 1)
+    for s in unroll(0, LX_DIGIT_GROUP * CHAIN_STEPS + 1):
         powers[s] = GEN ** s
     # The chain indices, both layers': a constant a dispatch arm sets lives inside a
     # branch, so every arm that walks chain i sets i again. Written once here they are
@@ -3737,7 +3743,7 @@ def verify_lean_xmss(signer):
         else:
             keccak([pp, idx + TW_MSG], [root[0], rho], digest)
 
-        # The codeword: DIGIT_GROUP digits at a time, hinted in the exponent, range
+        # The codeword: LX_DIGIT_GROUP digits at a time, hinted in the exponent, range
         # checked and dispatched once, the arm walking every chain's remaining steps
         # and folding its digits in: their sums into a product that must be the
         # target sum, and the digits, each where the digest holds it, into D, which
@@ -3746,17 +3752,17 @@ def verify_lean_xmss(signer):
         steps = StackBuf(CHAIN_STEPS)
         for st in unroll(0, CHAIN_STEPS):
             steps[st] = idx + const(TW_CHAIN + st * STEP_MUL)
-        groups = StackBuf(LX_V // DIGIT_GROUP + 1)
+        groups = StackBuf(LX_V // LX_DIGIT_GROUP + 1)
         hint_witness(groups, "lx_digits")
-        for p in unroll(0, LX_V // DIGIT_GROUP):
-            assert log(groups[p]) < DIGIT_GROUPS
-        assert log(groups[LX_V // DIGIT_GROUP]) < CHAIN_LENGTH
+        for p in unroll(0, LX_V // LX_DIGIT_GROUP):
+            assert log(groups[p]) < LX_DIGIT_GROUPS
+        assert log(groups[LX_V // LX_DIGIT_GROUP]) < LX_TAIL_GROUPS
         walks = StackBuf(LX_V * CHAIN_STEPS)
         digit_product = 1
         encoded = 0
-        for p in unroll(0, LX_V // DIGIT_GROUP):
-            digit_product, encoded = match(log(groups[p]), range(0, DIGIT_GROUPS), lambda k: walk_group(steps, pp, walks, tags, DIGIT_GROUP * p, DIGIT_GROUP, k, 1, powers, digit_product, encoded))
-        digit_product, encoded = match(log(groups[LX_V // DIGIT_GROUP]), range(0, CHAIN_LENGTH), lambda k: walk_group(steps, pp, walks, tags, LX_V - 1, 1, k, 1, powers, digit_product, encoded))
+        for p in unroll(0, LX_V // LX_DIGIT_GROUP):
+            digit_product, encoded = match(log(groups[p]), range(0, LX_DIGIT_GROUPS), lambda k: walk_group(steps, pp, walks, tags, LX_DIGIT_GROUP * p, LX_DIGIT_GROUP, k, 1, powers, digit_product, encoded))
+        digit_product, encoded = match(log(groups[LX_V // LX_DIGIT_GROUP]), range(0, LX_TAIL_GROUPS), lambda k: walk_group(steps, pp, walks, tags, LX_V - LX_DIGIT_TAIL, LX_DIGIT_TAIL, k, 1, powers, digit_product, encoded))
         digest[0] = encoded  # the digits, stored where D already is
         assert digit_product == GEN ** LX_TARGET_SUM
 
