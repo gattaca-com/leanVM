@@ -254,7 +254,8 @@ pub fn commit(
     }
     // The hash takes full rows, so the encode's compact rows widen before they are absorbed.
     // Leaves are hashed as the encode finishes each block of rows, which the hasher widens as it stages them.
-    let tree = if enc_words == row_words {
+    // The widening also drops the row's zero lanes in front, so they join the leaf's shared zero blocks.
+    let tree = if enc_words == row_words && n_lanes == row_words {
         merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size)
     } else {
         let expansion = Expansion::new(&blocks, enc_words, row_words);
