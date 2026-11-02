@@ -175,7 +175,7 @@ def combine(a, b, k: Const):
     return s[k % 2]
 ```
 
-An `@inline` function is **expanded at each call site** instead of emitting a real call: no frame, no argument/return `DEREF`s, no call/return `JUMP`s. Its body must end with one top-level `return`. Builtins, ordinary calls, nested inline calls, `if`, and `unroll` are allowed; `mul_range` loops, `match`, tuple assignments within the body, and nested/early returns are rejected. Ordinary calls retain their own frames; nested inline calls expand recursively, with direct or indirect recursive expansion rejected.
+An `@inline` function is **expanded at each call site** instead of emitting a real call: no frame, no argument/return `DEREF`s, no call/return `JUMP`s. Its body must end with one top-level `return`. Builtins, ordinary calls, nested inline calls, `if`, `unroll` and `match` are allowed; `mul_range` loops, tuple assignments within the body, and nested/early returns are rejected. A `match` in an inline function that is itself a match arm is copied into every arm, with all of its own arms. Ordinary calls retain their own frames; nested inline calls expand recursively, with direct or indirect recursive expansion rejected.
 
 An `@inline` function may also **return a `StackBuf`**: the caller's binding aliases the returned cell run (zero copies), and `StackBuf` arguments alias likewise.
 

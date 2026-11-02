@@ -114,6 +114,9 @@ const _: () = assert!(lean_sphincs::W * lean_sphincs::V == 128 && lean_sphincs::
 /// leanXMSS dispatches its digits `LX_DIGIT_GROUP` at a time, then the rest together.
 const LX_DIGIT_GROUP: usize = 4;
 const _: () = assert!(lean_xmss::W == lean_sphincs::W && !lean_xmss::V.is_multiple_of(LX_DIGIT_GROUP));
+// The guest reads a power-of-two chain index off its powers of GEN, telling one by
+// whether it divides 2^6 (`LX_TAG_BITS`).
+const _: () = assert!(lean_xmss::V < 1 << 6);
 // A leaf index is the two layers' indices, which the guest takes a window at a time.
 const _: () = assert!(lean_xmss::LOG_LIFETIME == 32);
 // The guest takes the leanSPHINCS message digest's first cell as its sixteen

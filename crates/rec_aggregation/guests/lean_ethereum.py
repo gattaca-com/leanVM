@@ -423,6 +423,9 @@ LX_DIGIT_GROUP = LX_DIGIT_GROUP_PLACEHOLDER
 LX_DIGIT_GROUPS = CHAIN_LENGTH ** LX_DIGIT_GROUP
 LX_DIGIT_TAIL = LX_V % LX_DIGIT_GROUP
 LX_TAIL_GROUPS = CHAIN_LENGTH ** LX_DIGIT_TAIL
+# Chain indices are below 2 ** LX_TAG_BITS, so i is a power of two exactly when it
+# divides that.
+LX_TAG_BITS = 6
 # The path is dispatched LX_WINDOW index bits at a time (`lx_window`); LX_HEIGHT is
 # a multiple of it.
 LX_WINDOW = LX_WINDOW_PLACEHOLDER
@@ -3569,27 +3572,38 @@ def is_child(node, kids, k: Const, bit):
 
 
 @inline
-def chain_tip(walks, i: Const):
-    # Chain i's tip, in the last of its CHAIN_STEPS slots of `walks`.
-    tip = walks[(i + 1) * CHAIN_STEPS - 1]
+def chain_tip(walks, v: Const, i: Const):
+    # Chain i's tip of a key of v chains: `walks` holds each chain's other steps, then
+    # the v tips side by side, so a leaf hash reads a run of them in place.
+    tip = walks[(CHAIN_STEPS - 1) * v + i]
     return tip
 
 
 @inline
-def walk(at, pp, walks, tags, i: Const, k: Const, lx: Const):
+def walk(at, pp, walks, tags, powers, i: Const, k: Const, lx: Const):
     # Walk chain i from position k to its end, the step leaving position s landing in
-    # chain i's slot s of `walks`, so the tip is chain_tip(walks, i) whatever k is. A
-    # leanSPHINCS step's address carries i and s, its input ending after the value; a
-    # leanXMSS one only s, at[s] computed once per key, i riding after the value, read
-    # off `tags` so a dispatch arm names it rather than setting it again.
+    # chain i's slot s of `walks`, the last in the tip run, so the tip is
+    # chain_tip(walks, v, i) whatever k is. A leanSPHINCS step's address carries i
+    # and s, its input ending after the value; a leanXMSS one only s, at[s] computed
+    # once per key, i riding after the value, read off `tags` so a dispatch arm names
+    # it rather than setting it again. A power of two is read off `powers` instead,
+    # `powers[b]` holding GEN ** b, which is 2 ** b.
+    v = lx * LX_V + (1 - lx) * SP_V
     if const(k == CHAIN_STEPS):
-        hint_witness(walks[(i + 1) * CHAIN_STEPS - 1:(i + 1) * CHAIN_STEPS], "chain_starts")
+        hint_witness(walks[(CHAIN_STEPS - 1) * v + i:(CHAIN_STEPS - 1) * v + i + 1], "chain_starts")
     else:
+        if const(lx == 1):
+            tag = tags[i]
+            for b in unroll(0, LX_TAG_BITS):
+                if const(2 ** b == i):
+                    tag = powers[b]
         value = hint_witness("chain_starts")
         for s in unroll(k, CHAIN_STEPS):
-            o = CHAIN_STEPS * i + s
+            o = (CHAIN_STEPS - 1) * i + s
+            if const(s + 1 == CHAIN_STEPS):
+                o = (CHAIN_STEPS - 1) * v + i
             if const(lx == 1):
-                keccak([pp, at[s]], [value, tags[i]], walks[o:o + 1])
+                keccak([pp, at[s]], [value, tag], walks[o:o + 1])
             else:
                 keccak([pp, at + const(TW_CHAIN + i * HI_MUL + s * STEP_MUL)], [value, 0], walks[o:o + 1], len=48)
             value = walks[o]
@@ -3603,26 +3617,26 @@ def walk_group(at, pp, walks, tags, first: Const, n: Const, k: Const, lx: Const,
     # exponent (`powers[s]` is GEN ** s), and the digits into `encoded`, where the
     # encoding digest holds them.
     for r in unroll(0, n):
-        walk(at, pp, walks, tags, first + r, (k // CHAIN_LENGTH ** r) % CHAIN_LENGTH, lx)
+        walk(at, pp, walks, tags, powers, first + r, (k // CHAIN_LENGTH ** r) % CHAIN_LENGTH, lx)
     return product * powers[DIGIT_SUMS[k]], encoded + const(k * CHAIN_LENGTH ** first)
 
 
 @inline
-def leaf_word(p0, p1, walks, j: Const):
-    # Word j of a one-time leaf's input: the prefix (p0, p1), then the chain tips.
+def leaf_word(p0, p1, walks, n: Const, j: Const):
+    # Word j of a one-time leaf's input: the prefix (p0, p1), then the n chain tips.
     w = p0
     if const(j == 1):
         w = p1
     if const(j != 0):
         if const(j != 1):
-            w = chain_tip(walks, j - 2)
+            w = chain_tip(walks, n, j - 2)
     return w
 
 
 @inline
 def wots_leaf(p0, p1, walks, n: Const, leaf):
     # The hash of the prefix (p0, p1) and the n chain tips, each read where its walk left it.
-    keccak_cells([leaf_word(p0, p1, walks, j) for j in unroll(0, n + 2)], leaf)
+    keccak_cells([leaf_word(p0, p1, walks, n, j) for j in unroll(0, n + 2)], leaf)
     return
 
 
@@ -3695,10 +3709,12 @@ def lx_top_window(cur, pp, powers, his, out, w: Const, k: Const):
     return const(k)
 
 
+@inline
 def verify_lean_xmss(signer):
     # `signer` is one 4-cell entry of the leanXMSS coverage table: the pubkey's
     # merkle root and public parameter, then the message that pubkey signed. The
-    # bottom layer signs the message, the top layer the bottom root.
+    # bottom layer signs the message, the top layer the bottom root. Inlined in the
+    # raw signature loop, whose frame needs no call into another.
     pp = signer[GEN]
 
     # The leaf index rides the signature, so every address is derived here from it.
@@ -3719,21 +3735,27 @@ def verify_lean_xmss(signer):
         powers[s] = GEN ** s
     # The chain indices, both layers': a constant a dispatch arm sets lives inside a
     # branch, so every arm that walks chain i sets i again. Written once here they are
-    # frame cells the arms read for nothing.
+    # frame cells the arms read for nothing. A power of two is in `powers` already.
     tags = StackBuf(LX_V)
-    for i in unroll(0, LX_V):
-        tags[i] = i
+    tags[0] = 0
+    for i in unroll(1, LX_V):
+        if const(2 ** LX_TAG_BITS % i != 0):
+            tags[i] = i
     # The top layer's root is the pubkey's: its last hash writes the cell, which is
-    # the check.
+    # the check. Each layer's last digit dispatch writes its digit sum into `target`,
+    # which is the target sum check.
     root = StackBuf(1)
     top_root = StackBuf(1)
     top_root[0] = signer[1]
+    target = StackBuf(1)
+    target[0] = GEN ** LX_TARGET_SUM
 
     for layer in unroll(0, 2):
+        # The layer's key index; the top layer's flag rides each address constant.
         if const(layer == 0):
             idx = his[0]
         else:
-            idx = his[LX_HEIGHT // LX_WINDOW] + LX_TOP
+            idx = his[LX_HEIGHT // LX_WINDOW]
         # D = Th(P, A, M | R), one block: 80 bytes at the bottom, and 64 at the top,
         # where M is the bottom root.
         rho = hint_witness("randomizer")
@@ -3741,7 +3763,7 @@ def verify_lean_xmss(signer):
         if const(layer == 0):
             keccak([pp, idx + TW_MSG], [signer[GEN ** 2], signer[GEN ** 3]], digest, tail=[rho, 0, 0, 0], len=80)
         else:
-            keccak([pp, idx + TW_MSG], [root[0], rho], digest)
+            keccak([pp, idx + const(TW_MSG + LX_TOP)], [root[0], rho], digest)
 
         # The codeword: LX_DIGIT_GROUP digits at a time, hinted in the exponent, range
         # checked and dispatched once, the arm walking every chain's remaining steps
@@ -3751,7 +3773,7 @@ def verify_lean_xmss(signer):
         # each arm entering the next.
         steps = StackBuf(CHAIN_STEPS)
         for st in unroll(0, CHAIN_STEPS):
-            steps[st] = idx + const(TW_CHAIN + st * STEP_MUL)
+            steps[st] = idx + const(TW_CHAIN + st * STEP_MUL + layer * LX_TOP)
         groups = StackBuf(LX_V // LX_DIGIT_GROUP + 1)
         hint_witness(groups, "lx_digits")
         for p in unroll(0, LX_V // LX_DIGIT_GROUP):
@@ -3762,14 +3784,13 @@ def verify_lean_xmss(signer):
         encoded = 0
         for p in unroll(0, LX_V // LX_DIGIT_GROUP):
             digit_product, encoded = match(log(groups[p]), range(0, LX_DIGIT_GROUPS), lambda k: walk_group(steps, pp, walks, tags, LX_DIGIT_GROUP * p, LX_DIGIT_GROUP, k, 1, powers, digit_product, encoded))
-        digit_product, encoded = match(log(groups[LX_V // LX_DIGIT_GROUP]), range(0, LX_TAIL_GROUPS), lambda k: walk_group(steps, pp, walks, tags, LX_V - LX_DIGIT_TAIL, LX_DIGIT_TAIL, k, 1, powers, digit_product, encoded))
-        digest[0] = encoded  # the digits, stored where D already is
-        assert digit_product == GEN ** LX_TARGET_SUM
+        # The last arm stores the digits where D already is.
+        target[0], digest[0] = match(log(groups[LX_V // LX_DIGIT_GROUP]), range(0, LX_TAIL_GROUPS), lambda k: walk_group(steps, pp, walks, tags, LX_V - LX_DIGIT_TAIL, LX_DIGIT_TAIL, k, 1, powers, digit_product, encoded))
 
         # The one-time leaf, then the path to the layer's root, a window at a time,
         # the two dispatches back to back.
         leaf = StackBuf(1)
-        wots_leaf(pp, idx + TW_LEAF, walks, LX_V, leaf)
+        wots_leaf(pp, idx + const(TW_LEAF + layer * LX_TOP), walks, LX_V, leaf)
         mid = StackBuf(1)
         if const(layer == 0):
             his[0] = match(log(windows[0]), range(0, LX_WINDOW_ARMS), lambda k: lx_window(leaf[0], pp, powers, his, mid, 0, k))
