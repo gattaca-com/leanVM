@@ -704,11 +704,9 @@ fn prove_run(
     );
     let mut ps = ProverState::new(digest_words(&fs_seed(program)), digest_words(&public_input));
 
+    // Announce the prover's sizes, then commit, before sampling any challenge.
     #[cfg(any(test, feature = "tamper"))]
     let tamper = tamper::take();
-    #[cfg(any(test, feature = "tamper"))]
-    tamper::witness(tamper, &mut w);
-    // Announce the prover's sizes, then commit, before sampling any challenge.
     #[cfg(any(test, feature = "tamper"))]
     let (announced_rows, announced_mem_rows) = tamper::sizes(tamper, &mut w);
     #[cfg(not(any(test, feature = "tamper")))]
@@ -725,20 +723,18 @@ fn prove_run(
     #[cfg(any(test, feature = "tamper"))]
     tamper::ungate(tamper, &mut w.layout);
     announce_public(&mut ps, w.log_mem, announced_rows, log_inv_rate, announced_mem_rows);
-    // The committed stack: the padded one's columns, the jagged ones cut to their chunks.
-    #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
-    let (mut dense, dense_repeats) = crate::stage!("Gather dense", || {
-        w.layout.dense.gather(&w.q, &w.repeats, &w.layout.placements)
-    });
     #[cfg(any(test, feature = "tamper"))]
-    tamper::dense(tamper, &w.layout, &mut dense);
+    tamper::dense(tamper, &w.layout, &mut w.dense);
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
     drop(pcs::reserve_level1(dense_shape.mu, log_inv_rate));
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, &dense, &dense_repeats, dense_shape, log_inv_rate)
+        pcs::commit(&mut ps, &w.dense, &w.repeats, dense_shape, log_inv_rate)
     });
+    // The readers see the honest stack; only the opening sees the forged one.
+    #[cfg(any(test, feature = "tamper"))]
+    tamper::dense(tamper, &w.layout, &mut w.dense);
 
-    // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
+    // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a block of `w.dense` (the
     // KECCAK table is filled to the reduction's floor, so the proof shape is uniform
     // and there is no has/hasn't-KECCAK fork). The Keccak reduction's claims and
     // EVERY leanVM point claim are discharged together by ONE
@@ -746,7 +742,7 @@ fn prove_run(
     // memory bus: their virtual value columns route to q_keccak (inputs) and to the
     // reduction's output claim (outputs), so no separate pin claims are needed.
     let (owners, spans) = bus_wiring(program, &w.layout);
-    // The columns are windows into `w.q`, so both stages read them in place: the
+    // The columns are views of the committed stack, so both stages read them in place: the
     // table sumcheck lifts each K-column into a fresh `E` copy on the round it
     // joins and never writes the K-columns back.
     let (bus, table_claims) = {
@@ -805,17 +801,18 @@ fn prove_run(
     // PCS below in the SAME WHIR as every leanVM point claim: one ring-switched,
     // one appended to the point claims.
     let keccak_reduction = w.keccak_reduction;
-    let witness::Placement { offset, n_vars } = w.layout.placements[QKECCAK];
-    let q_keccak = &w.q[offset..][..1 << n_vars];
+    let offset = dense_qkeccak_offset(l);
+    let q_keccak = &w.dense[offset..][..1 << l.placements[QKECCAK].n_vars];
     let openings = crate::stage!("Keccak reduction", || {
         keccak_reduction.prove(&mut ps, q_keccak, &output)
     });
     drop(keccak_reduction);
-    drop(w.q);
-    let (ring, outputs) = openings.into_pcs_claims(dense_qkeccak_offset(l));
+    let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
+    #[cfg(any(test, feature = "tamper"))]
+    tamper::dense(tamper, &w.layout, &mut w.dense);
     crate::stage!("PCS open", || {
-        pcs::open(&mut ps, committed, dense, dense_repeats, &slots, &ring)
+        pcs::open(&mut ps, committed, w.dense, w.repeats, &slots, &ring)
     });
     Ok((
         ps.into_proof(),
@@ -1056,15 +1053,7 @@ pub mod tamper {
         NEXT.with(|next| next.get())
     }
 
-    /// The witness forged before its commitment, which the readers then share.
-    pub(crate) fn witness(tamper: Option<Tamper>, w: &mut layout::Witness) {
-        if tamper == Some(Tamper::OutFlag) {
-            let flag = w.layout.placements[schema().base[tables::KECCAK_TABLE] + tables::keccakt::OUT_ALL];
-            w.q[flag.offset].0 ^= 1;
-        }
-    }
-
-    /// The sizes to announce, and the padded witness forged past its committed rows.
+    /// The sizes to announce, and the readers' witness forged past its committed rows.
     pub(crate) fn sizes(tamper: Option<Tamper>, w: &mut layout::Witness) -> ([usize; tables::N_TABLES], usize) {
         let (mut rows, mut mem_rows) = (w.layout.rows, w.layout.mem_rows);
         match tamper {
@@ -1076,14 +1065,32 @@ pub mod tamper {
             Some(Tamper::PastHeight) => {
                 let memory = w.layout.placements[MEM_LO];
                 let jump = tables::JUMP_TABLE;
-                let inverse = w.layout.placements[schema().base[jump] + tables::jump::W];
+                let inverse = schema().base[jump] + tables::jump::W;
                 let committed_jumps = rows[jump].next_multiple_of(1 << witness::CHUNK_LOG);
-                if mem_rows < 1 << memory.n_vars {
-                    w.q[memory.offset + mem_rows] = F64(5);
+                // The readers see the forged column in full, the commitment only its chunks.
+                let (column, row) = if mem_rows < 1 << memory.n_vars {
+                    (MEM_LO, mem_rows)
                 } else {
-                    assert!(committed_jumps < 1 << inverse.n_vars, "a column has uncommitted rows");
-                    w.q[inverse.offset + committed_jumps] = F64(5);
-                }
+                    assert!(
+                        committed_jumps < 1 << w.layout.placements[inverse].n_vars,
+                        "a column has uncommitted rows"
+                    );
+                    (inverse, committed_jumps)
+                };
+                let mut forged = w.columns()[column].to_vec();
+                forged[row] = F64(5);
+                w.virt.push((column, forged));
+            }
+            Some(Tamper::OutFlag) => {
+                let flag = schema().base[tables::KECCAK_TABLE] + tables::keccakt::OUT_ALL;
+                // Row 0 of the flag column, wherever the committed stack keeps it.
+                let at = match w.layout.dense.slots[flag].expect("a committed column") {
+                    witness::Slot::Padded(p) => p.offset,
+                    witness::Slot::Jagged { group, column } => {
+                        w.layout.dense.groups[group].offset + column * witness::RUN
+                    }
+                };
+                w.dense[at].0 ^= 1;
             }
             _ => {}
         }
@@ -1110,7 +1117,7 @@ pub mod tamper {
         }
     }
 
-    /// The committed stack, forged.
+    /// Forge the committed stack, or undo the forgery: the flip is its own inverse.
     pub(crate) fn dense(tamper: Option<Tamper>, l: &Layout, dense: &mut [F64]) {
         if let Some(Tamper::DenseWord) = tamper {
             let Some(witness::Slot::Jagged { group, .. }) = l.dense.slots[MEM_LO] else {
@@ -1483,8 +1490,9 @@ mod tests {
         assert_eq!(exec.mem.word(4), x * y, "MUL computes the E product");
     }
 
-    /// The producer's repeat map of the stack tags real repeats only, and finds the padding: a program whose
-    /// tables end in whole padded blocks, each tagged, with the proof still valid.
+    /// The producer's repeat map of the stack tags real repeats only, and finds the padding, with the proof still
+    /// valid. The committed stack leaves the tables' padding rows out, so the tags are the padding of the spare
+    /// `q_keccak` slots and the zero runs of the jagged chunks.
     #[test]
     fn witness_repeat_map_tags_real_repeats() {
         let steps = 17usize;
@@ -1542,7 +1550,7 @@ mod tests {
             program.execute_with(execute::Hints::Whole(&program.witness, pi), GPow::new(), step)
         });
         let witness = program.build(&exec.unwrap(), blocks);
-        let real = ::pcs::stack_open::equal_blocks(&witness.q);
+        let real = ::pcs::stack_open::equal_blocks(&witness.dense);
         assert_eq!(witness.repeats.len(), real.len());
         assert!(
             witness
@@ -1553,7 +1561,8 @@ mod tests {
             "a tagged block is a repeat"
         );
         let tagged = witness.repeats.iter().filter(|&&t| t).count();
-        assert!(tagged >= 6, "the padding is found: {tagged} blocks tagged");
+        // KECCAK's 29 columns leave 3 zero runs in its group's 32, and the 2 after the first are tagged.
+        assert!(tagged >= 2, "the padding is found: {tagged} blocks tagged");
         let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &pi, &proof).expect("the proof verifies");
     }

@@ -211,13 +211,28 @@ pub struct FillCtx<'a> {
     written: [std::sync::atomic::AtomicU64; 2],
 }
 
-/// Where one column's values go: its window in the stacked witness, or a private
-/// buffer if the column is virtual, and the window's slice of the stack's repeat map
-/// ([`crate::witness::split_stack`]), which is empty for a virtual column or a window under one block.
+/// Where one column's values go: its runs in the committed stack ([`crate::witness::Dense::split`]), or a
+/// contiguous window cut into runs. Rows past the runs are held nowhere: they are padding rows that hold zero.
 #[derive(Default)]
 pub struct ColumnOut<'a> {
-    pub words: &'a mut [F64],
+    /// Runs of `2^CHUNK_LOG` rows, but a contiguous window under one run is one shorter run.
+    pub runs: Vec<&'a mut [F64]>,
+    /// The column's padded height `2^tau`, zero for a column with no window.
+    pub len: usize,
+    /// The repeat map's tags of a contiguous window's blocks. Empty for a jagged column, a private buffer, or a
+    /// window under one block.
     pub repeats: &'a mut [bool],
+}
+
+impl<'a> ColumnOut<'a> {
+    /// The contiguous window `words`, with its blocks' tags.
+    pub fn flat(words: &'a mut [F64], repeats: &'a mut [bool]) -> Self {
+        Self {
+            len: words.len(),
+            runs: words.chunks_mut(crate::witness::RUN).collect(),
+            repeats,
+        }
+    }
 }
 
 impl<'a> FillCtx<'a> {
@@ -286,7 +301,7 @@ impl<'a> FillCtx<'a> {
     ) {
         let n = self.height;
         for k in 0..N {
-            assert_eq!(out[at + k].words.len(), n, "column {} has the wrong window length", at + k);
+            assert_eq!(out[at + k].len, n, "column {} has the wrong window length", at + k);
             let col = at + k;
             self.written[col / 64].fetch_or(1 << (col % 64), std::sync::atomic::Ordering::Relaxed);
         }
@@ -309,9 +324,9 @@ const FILL_ROWS: usize = 64;
 const FILL_TASK: usize = 1 << 12;
 
 /// Write `f(i)` to row `i` of the `N` windows for `i < n_rows`, then `padding` to the end of each.
-/// Rows are gathered into line-sized runs per column and streamed out: the windows are the stacked
-/// witness, which nothing reads until the commit, so a fetch of a line before its write is wasted.
-/// The windows are equal and a power of two long.
+/// Rows are gathered into line-sized runs per column and streamed out: the windows are the committed
+/// stack, which nothing reads until the commit, so a fetch of a line before its write is wasted.
+/// The windows are equal and a power of two long. A window's run past its length holds zeros.
 ///
 /// A padded block whose predecessor is also padded repeats it, and is tagged so in the window's `repeats`.
 pub(crate) fn fill_columns<const N: usize>(
@@ -320,33 +335,57 @@ pub(crate) fn fill_columns<const N: usize>(
     padding: [F64; N],
     f: impl Fn(usize) -> [F64; N] + Sync,
 ) {
-    let n = windows[0].words.len();
-    assert!(n.is_power_of_two() && windows.iter().all(|w| w.words.len() == n));
+    const RUN: usize = crate::witness::RUN;
+    let n = windows[0].len;
+    assert!(n.is_power_of_two() && windows.iter().all(|w| w.len == n));
     assert!(n_rows <= n);
-    for window in windows.iter_mut() {
+    for (window, &pad) in windows.iter_mut().zip(&padding) {
         for (b, repeat) in window.repeats.iter_mut().enumerate() {
             *repeat = b > 0 && (b - 1) << EQUAL_BLOCK_LOG >= n_rows;
         }
+        // The rows past the runs read as zero, so they have to be padding rows that hold zero.
+        let stored = (window.runs.len() * RUN).min(n);
+        assert!(stored >= n_rows && (stored == n || pad == F64::ZERO), "a window drops a row");
     }
-    let (task, run) = (n.min(FILL_TASK), n.min(FILL_ROWS));
-    parallel::for_each_chunks_mut(windows.each_mut().map(|w| &mut *w.words), [task; N], |t, dst| {
+    // Run `r` of every window, gathered per task.
+    let n_runs = windows.iter().map(|w| w.runs.len()).max().unwrap_or(0);
+    let mut tasks: Vec<[Option<&mut [F64]>; N]> = (0..n_runs).map(|_| std::array::from_fn(|_| None)).collect();
+    for (k, window) in windows.iter_mut().enumerate() {
+        for (task, run) in tasks.iter_mut().zip(std::mem::take(&mut window.runs)) {
+            task[k] = Some(run);
+        }
+    }
+    const TASK_RUNS: usize = FILL_TASK / RUN;
+    parallel::chunks_mut(&mut tasks, TASK_RUNS, |t, tasks| {
         let stream = Stream::new();
         let padded: [[F64; FILL_ROWS]; N] = std::array::from_fn(|k| [padding[k]; FILL_ROWS]);
         let mut gathered = [[F64::ZERO; FILL_ROWS]; N];
-        for base in (t * task..(t + 1) * task).step_by(run) {
-            let run_rows = if base >= n_rows {
-                &padded
-            } else {
-                for j in 0..run {
-                    let row = if base + j < n_rows { f(base + j) } else { padding };
-                    for k in 0..N {
-                        gathered[k][j] = row[k];
+        for (i, runs) in tasks.iter_mut().enumerate() {
+            let first = (t * TASK_RUNS + i) * RUN;
+            let len = runs.iter().flatten().map(|run| run.len()).max().unwrap_or(0);
+            for line in (0..len).step_by(FILL_ROWS) {
+                let (base, m) = (first + line, FILL_ROWS.min(len - line));
+                let rows = if base >= n_rows && base + m <= n {
+                    &padded
+                } else {
+                    for j in 0..m {
+                        let row = match base + j {
+                            r if r < n_rows => f(r),
+                            r if r < n => padding,
+                            _ => [F64::ZERO; N],
+                        };
+                        for k in 0..N {
+                            gathered[k][j] = row[k];
+                        }
+                    }
+                    &gathered
+                };
+                for (run, rows) in runs.iter_mut().zip(rows) {
+                    if let Some(run) = run.as_deref_mut().filter(|run| line < run.len()) {
+                        let m = m.min(run.len() - line);
+                        stream.copy(&mut run[line..line + m], &rows[..m]);
                     }
                 }
-                &gathered
-            };
-            for k in 0..N {
-                stream.copy(&mut dst[k][base - t * task..][..run], &run_rows[k][..run]);
             }
         }
     });
@@ -365,7 +404,7 @@ pub(crate) fn fill_table(table: &dyn Table, ctx: &FillCtx, out: &mut [ColumnOut]
         .map(|w| w.load(std::sync::atomic::Ordering::Relaxed));
     let written = written[0] as u128 | (written[1] as u128) << 64;
     // A column with no window is held elsewhere (a KECCAK input lane, by `q_keccak`).
-    let windows = (0..n).filter(|&c| !out[c].words.is_empty()).fold(0u128, |m, c| m | 1 << c);
+    let windows = (0..n).filter(|&c| out[c].len != 0).fold(0u128, |m, c| m | 1 << c);
     assert_eq!(written, windows, "a table left one of its columns unwritten");
 }
 

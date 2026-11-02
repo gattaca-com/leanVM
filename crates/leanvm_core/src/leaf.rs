@@ -11,6 +11,7 @@ use crate::PAR_THRESHOLD;
 use crate::constraints::{self, TableBlocks};
 use crate::gkr;
 use crate::transcript::ProverState;
+use crate::witness::Column;
 use flux_profiler::timed;
 use primitives::field::{
     Acc8, F64, F64x8, F192, F192Unreduced, F192x8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
@@ -209,8 +210,8 @@ pub fn layout(blocks: &[Block]) -> Layout {
 /// slice read at `z`; `GCol` folds its `g^k` factor into the coefficient.
 #[derive(Default)]
 struct Terms<'a> {
-    lins: Vec<(&'a [F64], F192)>,
-    prods: Vec<(&'a [F64], &'a [F64], F192)>,
+    lins: Vec<(Column<'a>, F192)>,
+    prods: Vec<(Column<'a>, Column<'a>, F192)>,
     // First padded row, address powers, address coefficient, and the remaining fingerprint.
     memory_tail: Option<(usize, &'a [F64], F192, F192)>,
 }
@@ -221,7 +222,7 @@ struct Terms<'a> {
 fn push_terms<'a>(
     c: &'a Coord,
     w: F192,
-    cols: &[&'a [F64]],
+    cols: &[Column<'a>],
     gpow: &'a [F64],
     terms: &mut Terms<'a>,
     constant: &mut F192,
@@ -231,8 +232,8 @@ fn push_terms<'a>(
         Coord::Col(i) => terms.lins.push((cols[*i], w)),
         Coord::GCol(i, k) => terms.lins.push((cols[*i], w.mul_base(g_pow(*k as usize)))),
         Coord::Prod(i, j, k) => terms.prods.push((cols[*i], cols[*j], w.mul_base(g_pow(*k as usize)))),
-        Coord::Index => terms.lins.push((gpow, w)),
-        Coord::Public(vals) => terms.lins.push((vals.as_slice(), w)),
+        Coord::Index => terms.lins.push((Column::flat(gpow), w)),
+        Coord::Public(vals) => terms.lins.push((Column::flat(vals.as_slice()), w)),
         Coord::Sum(cs) => {
             for c in cs {
                 push_terms(c, w, cols, gpow, terms, constant);
@@ -412,10 +413,10 @@ fn leaf_row((constant, terms): &(F192, Terms), z: usize) -> F192 {
     }
     let mut acc = F192Unreduced::ZERO;
     for (k, c) in &terms.lins {
-        acc ^= c.mul_base_unreduced(k[z]);
+        acc ^= c.mul_base_unreduced(k.get(z));
     }
     for (a, b, c) in &terms.prods {
-        acc ^= c.mul_base_unreduced(a[z] * b[z]);
+        acc ^= c.mul_base_unreduced(a.get(z) * b.get(z));
     }
     *constant + acc.reduce()
 }
@@ -428,15 +429,12 @@ fn leaf_rows8((constant, terms): &(F192, Terms), z: usize) -> F192x8 {
     {
         return mul_base_splat8(weight, index[z..z + 8].try_into().unwrap()).reduce_lanes() + F192x8::splat(value);
     }
-    fn eight(k: &[F64], z: usize) -> &[F64; 8] {
-        k[z..z + 8].try_into().expect("eight words")
-    }
     let mut acc = Acc8::ZERO;
     for (k, c) in &terms.lins {
-        acc ^= mul_base_splat8(*c, eight(k, z));
+        acc ^= mul_base_splat8(*c, k.eight(z));
     }
     for (a, b, c) in &terms.prods {
-        acc ^= mul_base_splat8(*c, &mul_f64x8(eight(a, z), eight(b, z)));
+        acc ^= mul_base_splat8(*c, &mul_f64x8(a.eight(z), b.eight(z)));
     }
     acc.reduce_lanes() + F192x8::splat(*constant)
 }
@@ -463,7 +461,7 @@ fn twin_terms<'a>(
     [push, pull]: [&'a Block; 2],
     [push_tail, pull_tail]: [&Terms; 2],
     w: &[F192],
-    cols: &[&'a [F64]],
+    cols: &[Column<'a>],
     gpow: &'a [F64],
 ) -> Option<(F192, Terms<'a>)> {
     if (push.kappa, push.live, push.gate, push.coords.len()) != (pull.kappa, pull.live, pull.gate, pull.coords.len()) {
@@ -479,9 +477,9 @@ fn twin_terms<'a>(
         push_terms(c, w[i], cols, gpow, &mut terms, &mut constant);
     }
     // `g·c` against `c` is one product by `w_i (g + 1)`.
-    let mut lins: Vec<(&[F64], F192)> = Vec::with_capacity(terms.lins.len());
+    let mut lins: Vec<(Column, F192)> = Vec::with_capacity(terms.lins.len());
     for (k, c) in terms.lins {
-        match lins.iter_mut().find(|(l, _)| std::ptr::eq(*l, k)) {
+        match lins.iter_mut().find(|(l, _)| l.same(&k)) {
             Some((_, sum)) => *sum += c,
             None => lins.push((k, c)),
         }
@@ -636,7 +634,7 @@ impl gkr::LeafColumns for ColumnLeaves<'_> {
 /// `memory_len` bounds the real prefix of columns `MEM_LO..=MFCNT`; their suffixes must each be constant.
 pub fn build_leaves<'a>(
     sides: &[(&'a [Block], &'a Layout); 2],
-    cols: &[&'a [F64]],
+    cols: &[Column<'a>],
     w: &[F192],
     beta: F192,
     gpow: &'a [F64],
@@ -712,7 +710,7 @@ pub fn build_leaves<'a>(
                             match c {
                                 Coord::Const(v) => value += weight.mul_base(*v),
                                 Coord::Index => index += weight,
-                                Coord::Col(i) if *i <= crate::cpu::MFCNT => value += weight.mul_base(cols[*i][start]),
+                                Coord::Col(i) if *i <= crate::cpu::MFCNT => value += weight.mul_base(cols[*i].get(start)),
                                 _ => unreachable!("memory blocks contain only memory columns and the index"),
                             }
                         }
@@ -1272,22 +1270,28 @@ fn fresh_coords<'a>(
 }
 
 /// Evaluate columns with a constant suffix, splitting only their real prefix into aligned cubes.
-fn mle_eval_padded_many(jobs: &[(&[F64], &[F192], usize)]) -> Vec<F192> {
+fn mle_eval_padded_many(jobs: &[(Column, &[F192], usize)]) -> Vec<F192> {
     let mut tasks = Vec::new();
     let mut weights = Vec::new();
     let mut out = vec![F192::ZERO; jobs.len()];
     for (j, &(values, point, real)) in jobs.iter().enumerate() {
         assert!(real <= values.len());
+        // The rows past the stored ones are the column's padding, a constant.
+        let real = real.min(values.stored());
         if real < values.len() {
-            out[j] = padding_weight(point, real).mul_base(values[real]);
+            out[j] = padding_weight(point, real).mul_base(values.get(real));
         }
-        let mut at = 0;
-        while at < real {
-            let k = (real - at).ilog2() as usize;
-            let n = 1 << k;
-            tasks.push((&values[at..at + n], &point[..k]));
-            weights.push((j, eq_eval_bits(at >> k, &point[k..])));
-            at += n;
+        // Each contiguous piece of the real rows splits into aligned power-of-two runs.
+        for (first, piece) in values.pieces(0).take_while(|&(first, _)| first < real) {
+            let piece = &piece[..piece.len().min(real - first)];
+            let mut at = 0;
+            while at < piece.len() {
+                let k = (piece.len() - at).ilog2() as usize;
+                let n = 1 << k;
+                tasks.push((&piece[at..at + n], &point[..k]));
+                weights.push((j, eq_eval_bits((first + at) >> k, &point[k..])));
+                at += n;
+            }
         }
     }
     for ((j, weight), value) in weights.into_iter().zip(mle_eval_many(&tasks)) {
@@ -1377,30 +1381,27 @@ pub fn stacked_bytecode_table(blocks: &[Block]) -> Vec<F64> {
 /// The count side reads its base-field leaves directly from the columns. Only product levels
 /// are stored, with whole blocks of identity padding left implicit.
 #[timed]
-fn build_count_leaves<'a>(blocks: &[Block], lay: &Layout, cols: &[&'a [F64]]) -> gkr::Leaves<'a, F64> {
-    // `(offset, end, column)` of each block, the column cut to its live rows, by offset. Its rows past them
-    // are left to the gaps, so they have to hold the identity.
-    let mut segments: Vec<(usize, usize, &[F64])> = blocks
-        .iter()
-        .enumerate()
-        .map(|(b, blk)| {
-            let [Coord::Col(i)] = blk.coords.as_slice() else {
-                panic!("a count block is one column");
-            };
-            (
-                lay.offsets[b],
-                lay.offsets[b] + (1usize << blk.kappa),
-                &cols[*i][..blk.live],
-            )
-        })
-        .collect();
+fn build_count_leaves<'a>(blocks: &[Block], lay: &Layout, cols: &[Column<'a>]) -> gkr::Leaves<'a, F64> {
+    // `(offset, column piece)` of each block, the column cut to its rows, by offset. A column's rows past its
+    // stored ones are its padding, which has to be the identity: they are left to the gaps.
+    let mut segments: Vec<(usize, &[F64])> = Vec::new();
+    for (b, blk) in blocks.iter().enumerate() {
+        let [Coord::Col(i)] = blk.coords.as_slice() else {
+            panic!("a count block is one column");
+        };
+        let column = cols[*i];
+        assert!(blk.live <= column.stored() || column.pad() == F64::ONE, "a count pads with the identity");
+        for (first, piece) in column.pieces(0).take_while(|&(first, _)| first < blk.live) {
+            segments.push((lay.offsets[b] + first, &piece[..piece.len().min(blk.live - first)]));
+        }
+    }
     segments.sort_unstable_by_key(|segment| segment.0);
-    let explicit = segments.iter().map(|segment| segment.1).max().unwrap_or(1);
+    let explicit = (blocks.iter().enumerate())
+        .map(|(b, blk)| lay.offsets[b] + (1usize << blk.kappa))
+        .max()
+        .unwrap_or(1);
     let block_count = explicit.div_ceil(gkr::BLOCK_VALUES);
-    let columns = gkr::Columns {
-        segments: segments.into_iter().map(|(off, _, data)| (off, data)).collect(),
-        len: explicit,
-    };
+    let columns = gkr::Columns { segments, len: explicit };
     let mut ones = Vec::new();
     let mut end = 0;
     for &(off, data) in &columns.segments {
@@ -1509,7 +1510,7 @@ pub fn prove_balance(
     push: &[Block],
     pull: &[Block],
     count: &[Block],
-    cols: &[&[F64]],
+    cols: &[Column],
     owners: &[Vec<Option<(usize, usize)>>; 3],
     tables: &[(usize, usize)],
     rows: &[usize],
@@ -1595,7 +1596,7 @@ pub fn prove_balance(
         for (s, &(blocks, ..)) in sides.iter().enumerate() {
             fresh_coords(blocks, &owners[s], &claims, &bus_gkr.point, &mut jobs, &mut publics);
         }
-        let tasks: Vec<(&[F64], &[F192], usize)> = jobs
+        let tasks: Vec<(Column, &[F192], usize)> = jobs
             .iter()
             .map(|&(col, kappa)| {
                 (
@@ -1611,7 +1612,7 @@ pub fn prove_balance(
             .chain(
                 publics
                     .iter()
-                    .map(|&(vals, kappa)| (&vals[..], &bus_gkr.point[..kappa], vals.len())),
+                    .map(|&(vals, kappa)| (Column::flat(&vals[..]), &bus_gkr.point[..kappa], vals.len())),
             )
             .collect();
         let values = mle_eval_padded_many(&tasks);
@@ -1686,7 +1687,7 @@ pub fn prove_balance(
 #[allow(clippy::type_complexity)]
 #[timed]
 fn tables_and_prods_at(
-    cols: &[&[F64]],
+    cols: &[Column],
     tables: &[(usize, usize)],
     rows: &[usize],
     forms: &[Vec<BusForm>; 3],
@@ -1751,7 +1752,7 @@ fn tables_and_prods_at(
                         }
                     };
                     for h in task * BLOCKS..((task + 1) * BLOCKS).min(real) {
-                        let span = |c: usize| &cols[base + c][h * block..(h + 1) * block];
+                        let span = |c: usize| cols[base + c].span(h * block, block);
                         for (c, slot) in acc[..n_cols].iter_mut().enumerate() {
                             let d = dot(span(c));
                             keep(out, c, h, d);
@@ -1792,7 +1793,7 @@ fn tables_and_prods_at(
                 };
                 if real < high.len() {
                     let mass = high[real..].iter().fold(F192::ZERO, |acc, &w| acc + w);
-                    let row = |c: usize| cols[base + c][real * block];
+                    let row = |c: usize| cols[base + c].get(real * block);
                     let constants = (0..n_cols)
                         .map(row)
                         .chain(pairs.iter().map(|&(a, b)| row(a) * row(b)));
@@ -1856,7 +1857,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let cols = std::array::from_fn::<_, 4, _>(|c| &values[c * n..(c + 1) * n]);
+            let cols = std::array::from_fn::<_, 4, _>(|c| Column::flat(&values[c * n..(c + 1) * n]));
             let (dense, _) = build_leaves(&[(blocks, &lay); 2], &cols, &weights, F192::Y, &index, false, n);
             let (sparse, from_columns) =
                 build_leaves(&[(blocks, &lay); 2], &cols, &weights, F192::Y, &index, true, real);
@@ -1900,7 +1901,7 @@ mod tests {
                 })
                 .collect();
             let dense = std::array::from_fn::<_, 3, _>(|c| (&values[c * 4096..(c + 1) * 4096], &point[..]));
-            let padded = dense.map(|(v, p)| (v, p, real));
+            let padded = dense.map(|(v, p)| (Column::flat(v), p, real));
             assert_eq!(mle_eval_padded_many(&padded), mle_eval_many(&dense), "real={real}");
         }
     }
@@ -1925,7 +1926,7 @@ mod tests {
                 .enumerate()
                 .map(|(b, &(_, rows))| (0..rows).map(|i| F64((13 * i + 97 * b + 2) as u64)).collect())
                 .collect();
-            let cols: Vec<&[F64]> = values.iter().map(Vec::as_slice).collect();
+            let cols: Vec<Column> = values.iter().map(|v| Column::flat(v)).collect();
             let blocks: Vec<Block> = case
                 .iter()
                 .enumerate()

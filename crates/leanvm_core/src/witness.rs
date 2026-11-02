@@ -128,7 +128,7 @@ impl JaggedGroup {
 /// Where a committed column lives in the committed (dense) stack.
 #[derive(Clone, Copy, Debug)]
 pub enum Slot {
-    /// A whole `2^n_vars` block, as in the padded working stack.
+    /// A whole `2^n_vars` block, its padding rows included.
     Padded(Placement),
     /// Local column `column` of jagged group `group`.
     Jagged { group: usize, column: usize },
@@ -136,8 +136,8 @@ pub enum Slot {
 
 /// The committed stack: the padded blocks by descending size, then the jagged groups by descending width.
 ///
-/// The prover works on the padded stack ([`placements_of`]) and commits this one, a copy that leaves every row
-/// past a group's chunks out. Both sides derive it from the announced sizes alone.
+/// It leaves every row past a group's chunks out. The prover fills it directly and reads its columns as
+/// [`Column`] views, so no padded copy of a committed column exists. Both sides derive it from the announced sizes.
 #[derive(Clone, Debug)]
 pub struct Dense {
     pub groups: Vec<JaggedGroup>,
@@ -187,143 +187,235 @@ pub fn dense_of(kappas: &[Option<usize>], padded: &[usize], groups: Vec<(Vec<usi
     }
 }
 
+/// Rows of a column's run in the committed stack.
+pub const RUN: usize = 1 << CHUNK_LOG;
+
+/// A run of zeros and a run of ones: the rows a column holds past its runs.
+static ZEROS: [F64; RUN] = [F64::ZERO; RUN];
+static ONES: [F64; RUN] = [F64::ONE; RUN];
+
+/// A column as the prover reads it: runs of [`RUN`] rows `2^stride_log` words apart, then its padding value.
+///
+/// A jagged column's runs are its chunks in the committed stack. A contiguous column is one long run. Rows
+/// past the runs are never stored: they read from a static run of the padding value.
+#[derive(Clone, Copy, Debug)]
+pub struct Column<'a> {
+    words: &'a [F64],
+    stride_log: usize,
+    stored: usize,
+    len: usize,
+    pad: &'static [F64; RUN],
+}
+
+impl<'a> Column<'a> {
+    /// The contiguous column `words`.
+    pub fn flat(words: &'a [F64]) -> Self {
+        Self {
+            words,
+            stride_log: CHUNK_LOG,
+            stored: words.len(),
+            len: words.len(),
+            pad: &ZEROS,
+        }
+    }
+
+    /// A column of `len` rows whose first `stored` sit in runs from `words` on, `2^stride_log` words apart. The
+    /// rows past them hold `pad`, zero or one.
+    pub fn strided(words: &'a [F64], stride_log: usize, stored: usize, len: usize, pad: F64) -> Self {
+        assert!(stored <= len && stride_log >= CHUNK_LOG);
+        let pad = match pad {
+            F64::ZERO => &ZEROS,
+            F64::ONE => &ONES,
+            _ => panic!("a column pads with zero or one"),
+        };
+        Self {
+            words,
+            stride_log,
+            stored,
+            len,
+            pad,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The rows held in runs: every row past them is [`Self::pad`].
+    pub fn stored(&self) -> usize {
+        self.stored
+    }
+
+    pub fn pad(&self) -> F64 {
+        self.pad[0]
+    }
+
+    /// Whether both are the same column.
+    pub fn same(&self, other: &Self) -> bool {
+        std::ptr::eq(self.words, other.words) && (self.stride_log, self.stored, self.len) == (other.stride_log, other.stored, other.len)
+    }
+
+    #[inline(always)]
+    fn at(&self, i: usize) -> usize {
+        ((i >> CHUNK_LOG) << self.stride_log) | (i & (RUN - 1))
+    }
+
+    /// Row `i`.
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> F64 {
+        debug_assert!(i < self.len);
+        if i < self.stored { self.words[self.at(i)] } else { self.pad[0] }
+    }
+
+    /// Rows `i..i + n`, which lie in one run.
+    #[inline(always)]
+    pub fn span(&self, i: usize, n: usize) -> &'a [F64] {
+        debug_assert!((i & (RUN - 1)) + n <= RUN);
+        if i < self.stored {
+            &self.words[self.at(i)..][..n]
+        } else {
+            &self.pad[..n]
+        }
+    }
+
+    /// Rows `i..i + 8`, which lie in one run.
+    #[inline(always)]
+    pub fn eight(&self, i: usize) -> &'a [F64; 8] {
+        self.span(i, 8).try_into().expect("eight rows")
+    }
+
+    /// Where row `i` lives, for a prefetch: computed without a bounds check, it may point past the column.
+    #[inline(always)]
+    pub fn ptr(&self, i: usize) -> *const F64 {
+        if i < self.stored {
+            self.words.as_ptr().wrapping_add(self.at(i))
+        } else {
+            self.pad.as_ptr()
+        }
+    }
+
+    /// The stored rows from `start`, as contiguous pieces: `(first row, words)`, the first cut at `start`.
+    pub fn pieces(&self, start: usize) -> impl Iterator<Item = (usize, &'a [F64])> + '_ {
+        let contiguous = self.stride_log == CHUNK_LOG;
+        let step = if contiguous { self.stored.max(1) } else { RUN };
+        (start / step * step..self.stored).step_by(step).map(move |first| {
+            let from = first.max(start);
+            let end = (first + step).min(self.stored);
+            (from, &self.words[self.at(from)..][..end - from])
+        })
+    }
+
+    /// Every row, padding included. For tests and forgeries only: the prover never pads a column out.
+    pub fn to_vec(&self) -> Vec<F64> {
+        (0..self.len).map(|i| self.get(i)).collect()
+    }
+}
+
 impl Dense {
-    /// The committed stack from the padded one `q`, laid out by `placements` with repeat map `q_repeats`, and its
-    /// own repeat map.
-    ///
-    /// A run of a column past its padded block (a table under one chunk) and a run past a group's columns are
-    /// zero. A padded block keeps its tags; in the jagged region only the zero runs that follow another are tagged.
-    pub fn gather(&self, q: &[F64], q_repeats: &[bool], placements: &[Placement]) -> (Vec<F64>, Vec<bool>) {
-        const RUN: usize = 1 << CHUNK_LOG;
-        let len = self.shape.committed_len();
-        let mut repeats = vec![false; len >> EQUAL_BLOCK_LOG];
-        // Each run of the jagged region: the padded words it copies (start, length), or none for zeros.
-        let start = self.groups.iter().map(|g| g.offset).min().unwrap_or(self.placed);
-        let mut runs: Vec<Option<(usize, usize)>> = vec![None; (len - start) / RUN];
+    /// The committed stack's repeat map. In the jagged region only the zero runs that follow another are tagged.
+    /// A padded block's fill sets its own tags.
+    pub fn alloc_repeats(&self) -> Vec<bool> {
+        let mut repeats = vec![false; self.shape.committed_len() >> EQUAL_BLOCK_LOG];
         for group in &self.groups {
             for chunk in 0..group.chunks() {
-                for column in 0..1 << group.log_width {
+                for column in group.columns.len() + 1..1 << group.log_width {
                     let at = group.offset + (chunk << (CHUNK_LOG + group.log_width)) + column * RUN;
-                    let run = (at - start) / RUN;
-                    match group.columns.get(column) {
-                        Some(&global) => {
-                            let p = placements[global];
-                            let height = 1usize << p.n_vars;
-                            let first = chunk * RUN;
-                            runs[run] = (first < height).then(|| (p.offset + first, RUN.min(height - first)));
-                        }
-                        None if column > group.columns.len() => {
-                            if let Some(tag) = repeats.get_mut(at >> EQUAL_BLOCK_LOG) {
-                                *tag = RUN >= 1 << EQUAL_BLOCK_LOG;
-                            }
-                        }
-                        None => {}
+                    if let Some(tag) = repeats.get_mut(at >> EQUAL_BLOCK_LOG) {
+                        *tag = RUN >= 1 << EQUAL_BLOCK_LOG;
                     }
                 }
             }
         }
-        let mut padded_words = 0;
-        for (global, slot) in self.slots.iter().enumerate() {
-            if let Some(Slot::Padded(p)) = *slot {
-                let n = 1usize << p.n_vars;
-                padded_words += n;
-                let from = placements[global].offset;
-                if n >= 1 << EQUAL_BLOCK_LOG && from.is_multiple_of(1 << EQUAL_BLOCK_LOG) {
-                    let blocks = n >> EQUAL_BLOCK_LOG;
-                    repeats[p.offset >> EQUAL_BLOCK_LOG..][..blocks]
-                        .copy_from_slice(&q_repeats[from >> EQUAL_BLOCK_LOG..][..blocks]);
+        repeats
+    }
+
+    /// Carve the committed stack `dense` into one window per jagged column, its runs, and zero every word no
+    /// column holds. Returns the windows in global column order, `len` the column's padded height from
+    /// `placements`, and each padded block as `(global column, words, tags)`.
+    ///
+    /// A jagged window's rows past its runs are held nowhere, and it takes no tags.
+    #[allow(clippy::type_complexity)]
+    pub fn split<'a>(
+        &self,
+        dense: &'a mut [F64],
+        repeats: &'a mut [bool],
+        placements: &[Placement],
+    ) -> (Vec<ColumnOut<'a>>, Vec<(usize, &'a mut [F64], &'a mut [bool])>) {
+        let total = dense.len();
+        let mut windows: Vec<ColumnOut> = Vec::with_capacity(self.slots.len());
+        windows.resize_with(self.slots.len(), ColumnOut::default);
+        let mut padded: Vec<(usize, Placement)> = (self.slots.iter().enumerate())
+            .filter_map(|(c, slot)| match *slot {
+                Some(Slot::Padded(p)) => Some((c, p)),
+                _ => None,
+            })
+            .collect();
+        padded.sort_unstable_by_key(|&(_, p)| p.offset);
+        let mut groups: Vec<&JaggedGroup> = self.groups.iter().collect();
+        // A group without chunks shares its offset with the next one.
+        groups.sort_unstable_by_key(|g| (g.offset, g.words()));
+        let start = groups.first().map_or(self.placed, |g| g.offset);
+        let (mut head, mut rest) = dense.split_at_mut(start);
+        let mut tags = &mut repeats[..];
+        let mut blocks = Vec::with_capacity(padded.len());
+        let mut at = 0;
+        for (column, p) in padded {
+            assert_eq!(p.offset, at, "the padded blocks tile from 0");
+            let (words, tail) = head.split_at_mut(1 << p.n_vars);
+            let (block_tags, tag_tail) = tags.split_at_mut(words.len() >> EQUAL_BLOCK_LOG);
+            blocks.push((column, words, block_tags));
+            (head, tags, at) = (tail, tag_tail, at + (1 << p.n_vars));
+        }
+        let mut zeros: Vec<&mut [F64]> = head.chunks_mut(RUN).collect();
+        for group in groups {
+            assert_eq!(total - rest.len(), group.offset, "the groups tile");
+            let (words, tail) = rest.split_at_mut(group.words());
+            let width = 1 << group.log_width;
+            for (r, run) in words.chunks_exact_mut(RUN).enumerate() {
+                match group.columns.get(r % width) {
+                    Some(&global) => windows[global].runs.push(run),
+                    None => zeros.push(run),
                 }
+            }
+            for &global in &group.columns {
+                windows[global].len = 1 << placements[global].n_vars;
+            }
+            rest = tail;
+        }
+        zeros.extend(rest.chunks_mut(RUN));
+        // Nothing reads the stack before the commit, so the zeros stream past the cache.
+        parallel::chunks_mut(&mut zeros, FILL_CHUNK / RUN, |_, runs| {
+            let stream = Stream::new();
+            for run in runs {
+                let n = run.len();
+                stream.copy(run, &ZEROS[..n]);
+            }
+        });
+        (windows, blocks)
+    }
+
+    /// Global column `column` of `2^n_vars` rows, from the committed stack `dense`, its rows past its chunks `pad`.
+    pub fn column<'a>(&self, dense: &'a [F64], column: usize, n_vars: usize, pad: F64) -> Column<'a> {
+        let len = 1usize << n_vars;
+        match self.slots[column].expect("a committed column") {
+            Slot::Padded(p) => Column::flat(&dense[p.offset..][..len]),
+            Slot::Jagged { group, column } => {
+                let group = &self.groups[group];
+                let stored = (group.chunks() << CHUNK_LOG).min(len);
+                let words = dense.get(group.offset + column * RUN..).unwrap_or_default();
+                Column::strided(words, CHUNK_LOG + group.log_width, stored, len, pad)
             }
         }
-        // Nothing reads the copy before the commit, so it streams past the cache.
-        let zeros = [F64::ZERO; RUN];
-        let dense = primitives::filled_vec(len, |dense| {
-            let (head, jagged) = dense.split_at_mut(start);
-            head[padded_words..].fill(F64::ZERO);
-            for (global, slot) in self.slots.iter().enumerate() {
-                if let Some(Slot::Padded(p)) = *slot {
-                    let n = 1usize << p.n_vars;
-                    let from = placements[global].offset;
-                    parallel::chunks_mut(&mut head[p.offset..p.offset + n], FILL_CHUNK, |t, out| {
-                        Stream::new().copy(out, &q[from + t * FILL_CHUNK..][..out.len()]);
-                    });
-                }
-            }
-            parallel::chunks_mut(jagged, FILL_CHUNK, |t, out| {
-                let stream = Stream::new();
-                for (r, out) in out.chunks_mut(RUN).enumerate() {
-                    let n = match runs.get(t * (FILL_CHUNK / RUN) + r).copied().flatten() {
-                        Some((from, n)) => {
-                            stream.copy(&mut out[..n], &q[from..from + n]);
-                            n
-                        }
-                        None => 0,
-                    };
-                    let tail = out.len() - n;
-                    stream.copy(&mut out[n..], &zeros[..tail]);
-                }
-            });
-        });
-        (dense, repeats)
     }
 }
 
-/// Chunk width for the bulk writes below: big enough to amortize the dispatch,
+/// Chunk width for the bulk writes above: big enough to amortize the dispatch,
 /// small enough to spread one column across cores.
 const FILL_CHUNK: usize = 1 << 16;
-
-/// The stack's repeat map, all false: one tag per block of `2^EQUAL_BLOCK_LOG` words.
-pub fn alloc_repeats(shape: StackShape) -> Vec<bool> {
-    vec![false; shape.committed_len() >> EQUAL_BLOCK_LOG]
-}
-
-/// Carve the stack into one mutable window per committed column, in column order,
-/// and zero the pad tail past the last one. A virtual column gets an empty window:
-/// it is not in the stack, so its values need storage of their own.
-///
-/// `repeats` is the stack's repeat map ([`::pcs::stack_open::equal_blocks`] is its reference): each column
-/// gets its blocks' tags to set, and the zero pad tail is tagged here. A block shared by columns smaller
-/// than a block stays untagged, as does the first block of a column.
-///
-/// Writing each column into its final place is what lets the whole witness be
-/// written once. Copying columns in afterwards would move the entire stack a
-/// second time (a gigabyte at scale) for nothing, and allocating the stack zeroed
-/// would memset all `2^m` slots only for the columns to overwrite them.
-///
-/// Safe over an unwritten stack: [`placements_of`]
-/// tiles the columns from offset 0, checked here, so consecutive `split_at_mut`
-/// hands out disjoint windows covering `[0, placed)` and this zeroes the rest.
-pub fn split_stack<'a>(q: &'a mut [F64], repeats: &'a mut [bool], placements: &[Placement]) -> Vec<ColumnOut<'a>> {
-    let mut order: Vec<usize> = (0..placements.len()).filter(|&i| !placements[i].is_virtual()).collect();
-    order.sort_unstable_by_key(|&i| placements[i].offset);
-
-    let mut windows: Vec<ColumnOut> = Vec::with_capacity(placements.len());
-    windows.resize_with(placements.len(), || ColumnOut {
-        words: &mut [],
-        repeats: &mut [],
-    });
-    let total = repeats.len();
-    let (mut rest, mut tags) = (q, repeats);
-    let mut placed = 0usize;
-    for &i in &order {
-        assert_eq!(
-            placements[i].offset, placed,
-            "the stacked columns must tile from 0 with no gap"
-        );
-        let (words, tail) = rest.split_at_mut(1 << placements[i].n_vars);
-        let (repeats, tag_tail) = tags.split_at_mut(words.len() >> EQUAL_BLOCK_LOG);
-        windows[i] = ColumnOut { words, repeats };
-        (rest, tags) = (tail, tag_tail);
-        placed += 1 << placements[i].n_vars;
-    }
-    parallel::chunks_mut(rest, FILL_CHUNK, |_, pad| pad.fill(F64::ZERO));
-    // The pad's blocks are zeros, so a block repeats its predecessor once that is in the pad too.
-    let first = total - tags.len();
-    for (b, tag) in (first..).zip(tags.iter_mut()) {
-        *tag = b > 0 && (b - 1) << EQUAL_BLOCK_LOG >= placed;
-    }
-    windows
-}
 
 #[cfg(test)]
 mod tests {
