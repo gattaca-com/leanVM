@@ -1646,9 +1646,7 @@ fn lean_xmss_hints(
     let pp = &pk.public_param;
     let windows = (0..LX_WINDOWS).map(|w| u64::from(sig.leaf_index) >> (LX_WINDOW * w));
     hints.push_iter("lx_index", windows.clone().map(|high| F192::new(high, 0, 0)));
-    for high in windows {
-        hints.push("lx_windows", &[count((high & ((1 << LX_WINDOW) - 1)) as usize)]);
-    }
+    hints.push_iter("lx_windows", windows.map(|high| count((high & ((1 << LX_WINDOW) - 1)) as usize)));
     let mut root: Vec<u8> = message.to_vec();
     for (layer, layer_sig) in [&sig.bottom, &sig.top].into_iter().enumerate() {
         let e = lean_xmss::layer_index(sig.leaf_index, layer);
@@ -1658,9 +1656,7 @@ fn lean_xmss_hints(
             hints.push("lx_path", &[pack_16_bytes(sibling)]);
         }
         hints.push("randomizer", &[pack_16_bytes(&layer_sig.randomizer)]);
-        for index in digit_hints(&codeword) {
-            hints.push("digits", &[index]);
-        }
+        hints.push_iter("lx_digits", digit_hints(&codeword));
         for value in &layer_sig.chain_values {
             hints.push("chain_starts", &[pack_16_bytes(value)]);
         }
@@ -3057,11 +3053,11 @@ mod tests {
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_index", 0)[1] += F192::ONE),
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_index", 0)[3] += F192::ONE),
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 0)[0] *= count(1)),
-            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", LX_WINDOWS - 1)[0] *= count(1)),
-            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 1)[0] = count(1 << LX_WINDOW)),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 0)[LX_WINDOWS - 1] *= count(1)),
+            Box::new(|hints: &mut Hints| hints.entry_mut("lx_windows", 0)[1] = count(1 << LX_WINDOW)),
             Box::new(|hints: &mut Hints| hints.entry_mut("lx_path", 5)[0] += F192::ONE),
             Box::new(|hints: &mut Hints| {
-                hints.entry_mut("digits", 0)[0] *= count(1);
+                hints.entry_mut("lx_digits", 0)[0] *= count(1);
             }),
         ];
         for forgery in forgeries {

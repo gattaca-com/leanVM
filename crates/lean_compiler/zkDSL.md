@@ -323,6 +323,8 @@ A branch body with statements in it goes in a function, and the arm calls it. A 
 
 **Lowering** reads the arm's entry from a *jump table* in memory and jumps there: `DEREF` slot `x` of the match's table, then `JUMP`, so a dispatch costs 3 cycles (with the `SET` of the join), independent of the arm count, and the arms sit anywhere, unaligned and of any length. Every `match` has its table, one cell per arm, in `main`'s frame, which sits at a fixed address (`fp = g^0`): slot `j` of a table at offset `t` is the cell `g^(t+j)`, which is `x·g^t` for `x = g^j`, one `DEREF` with `t` as its immediate. The program begins, before `main` and in its frame, by writing every slot, one `SET` each, so a program pays once for each arm in its bytecode, however often its matches run.
 
+**Chained matches.** `match` statements back to back in one statement list, `unroll` copies included, lower as one chain: each arm of one match ends with the next match's dispatch (its `DEREF` and `JUMP`) instead of a `JUMP` to its own join, and only the last match's arms meet at a join. That saves each match but the last its join's `SET` and its arm's exit `JUMP`. A match joins the chain only if its scrutinee is already a cell (a name holding one, or a `StackBuf` element) that the match before it does not bind, so range-check every scrutinee before the first match. Any statement in between, even a free one, starts a new chain. Fused-call matches never chain.
+
 **Soundness**: nothing in the dispatch bounds `x`, so a scrutinee outside `[0, n)` jumps to an arbitrary pc. A hinted value must be range-checked first (`assert log(x) < n`, 3 cycles), as in leanVM.
 
 **Dispatched-call fusion.** When *every* arm is a call to the same function with identical runtime arguments (the common `lambda k: f(a, b, k)`, where only a `Const` argument varies), the compiler builds the callee frame **once** and the dispatch jumps straight into the selected specialization's entry, which returns past the join. Its table holds the callees' entries, shared by every fused call to the same callees, and the jump enters the callee's frame: the same 3 cycles instead of a full call, with no per-arm frame setup, call jump, or return jump. An `@inline` callee does not fuse: it expands, as above.
@@ -517,7 +519,7 @@ Three builtins have the prover compute the values at witness generation instead 
 | `assert a != b` | 3 (`XOR`, `MUL`, `SET`), no branch, one hinted inverse |
 | `assert log x < k` | 3 (+1 `SET` amortized per bound per frame; a runtime bound costs 1 `MUL` instead) |
 | `if a == b: …` | 3 (+2 to skip a non-empty `else`; +2 amortized `self-fp` per branching function); **0 if the condition is compile-time** |
-| `… = match(log(x), …)` | ≈ 7 for the dispatch + the arm; results written into the targets directly. Uniform-call arms (`lambda k: f(a, b, k)`) **fuse**: one shared frame + dispatch to entry, each arm just `SET`+`JUMP`; `@inline` arms run in place, with no frame |
+| `… = match(log(x), …)` | ≈ 7 for the dispatch + the arm, 2 fewer in a chain of back-to-back matches; results written into the targets directly. Uniform-call arms (`lambda k: f(a, b, k)`) **fuse**: one shared frame + dispatch to entry, each arm just `SET`+`JUMP`; `@inline` arms run in place, with no frame |
 | function call | ≈ `n_args + n_returns + 4` (0 when the callee is `@inline`) |
 | `mul_range` iteration | body + ≈ 1 `MUL` + 1 `XOR` + call overhead |
 | `unroll` iteration | body only (compile-time replication) |

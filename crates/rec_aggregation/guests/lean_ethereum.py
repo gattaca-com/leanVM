@@ -3529,6 +3529,10 @@ def verify_lean_xmss(signer):
     # the root this signature must reach bind it.
     his = StackBuf(LX_WINDOWS)
     hint_witness(his, "lx_index")
+    windows = StackBuf(LX_WINDOWS)
+    hint_witness(windows, "lx_windows")
+    for w in unroll(0, LX_WINDOWS):
+        assert log(windows[w]) < LX_WINDOW_ARMS
     powers = StackBuf(DIGIT_GROUP * CHAIN_STEPS + 1)
     for s in unroll(0, DIGIT_GROUP * CHAIN_STEPS + 1):
         powers[s] = GEN ** s
@@ -3562,40 +3566,36 @@ def verify_lean_xmss(signer):
         # checked and dispatched once, the arm walking every chain's remaining steps
         # and folding its digits in: their sums into a product that must be the
         # target sum, and the digits, each where the digest holds it, into D, which
-        # also checks the digits past LX_V are zero.
+        # also checks the digits past LX_V are zero. The dispatches run back to back,
+        # each arm entering the next.
         steps = StackBuf(CHAIN_STEPS)
         for st in unroll(0, CHAIN_STEPS):
             steps[st] = idx + const(TW_CHAIN + st * STEP_MUL)
+        groups = StackBuf(LX_V // DIGIT_GROUP + 1)
+        hint_witness(groups, "lx_digits")
+        for p in unroll(0, LX_V // DIGIT_GROUP):
+            assert log(groups[p]) < DIGIT_GROUPS
+        assert log(groups[LX_V // DIGIT_GROUP]) < CHAIN_LENGTH
         walks = StackBuf(LX_V * CHAIN_STEPS)
         digit_product = 1
         encoded = 0
         for p in unroll(0, LX_V // DIGIT_GROUP):
-            group = hint_witness("digits")
-            assert log(group) < DIGIT_GROUPS
-            digit_product, encoded = match(log(group), range(0, DIGIT_GROUPS), lambda k: walk_group(steps, pp, walks, tags, DIGIT_GROUP * p, DIGIT_GROUP, k, 1, powers, digit_product, encoded))
-        group = hint_witness("digits")
-        assert log(group) < CHAIN_LENGTH
-        digit_product, encoded = match(log(group), range(0, CHAIN_LENGTH), lambda k: walk_group(steps, pp, walks, tags, LX_V - 1, 1, k, 1, powers, digit_product, encoded))
+            digit_product, encoded = match(log(groups[p]), range(0, DIGIT_GROUPS), lambda k: walk_group(steps, pp, walks, tags, DIGIT_GROUP * p, DIGIT_GROUP, k, 1, powers, digit_product, encoded))
+        digit_product, encoded = match(log(groups[LX_V // DIGIT_GROUP]), range(0, CHAIN_LENGTH), lambda k: walk_group(steps, pp, walks, tags, LX_V - 1, 1, k, 1, powers, digit_product, encoded))
         digest[0] = encoded  # the digits, stored where D already is
         assert digit_product == GEN ** LX_TARGET_SUM
 
-        # The one-time leaf, then the path to the layer's root, a window at a time.
+        # The one-time leaf, then the path to the layer's root, a window at a time,
+        # the two dispatches back to back.
         leaf = StackBuf(1)
         wots_leaf(pp, idx + TW_LEAF, walks, LX_V, leaf)
-        cur = leaf[0]
-        for v in unroll(0, LX_HEIGHT // LX_WINDOW):
-            out = StackBuf(1)
-            if const(v + 1 == LX_HEIGHT // LX_WINDOW):
-                out = root
-                if const(layer == 1):
-                    out = top_root
-            window = hint_witness("lx_windows")
-            assert log(window) < LX_WINDOW_ARMS
-            if const(layer * (LX_HEIGHT // LX_WINDOW) + v + 1 == LX_WINDOWS):
-                his[LX_WINDOWS - 1] = match(log(window), range(0, LX_WINDOW_ARMS), lambda k: lx_top_window(cur, pp, powers, his, out, LX_WINDOWS - 1, k))
-            else:
-                his[layer * (LX_HEIGHT // LX_WINDOW) + v] = match(log(window), range(0, LX_WINDOW_ARMS), lambda k: lx_window(cur, pp, powers, his, out, layer * (LX_HEIGHT // LX_WINDOW) + v, k))
-            cur = out[0]
+        mid = StackBuf(1)
+        if const(layer == 0):
+            his[0] = match(log(windows[0]), range(0, LX_WINDOW_ARMS), lambda k: lx_window(leaf[0], pp, powers, his, mid, 0, k))
+            his[1] = match(log(windows[1]), range(0, LX_WINDOW_ARMS), lambda k: lx_window(mid[0], pp, powers, his, root, 1, k))
+        else:
+            his[2] = match(log(windows[2]), range(0, LX_WINDOW_ARMS), lambda k: lx_window(leaf[0], pp, powers, his, mid, 2, k))
+            his[3] = match(log(windows[3]), range(0, LX_WINDOW_ARMS), lambda k: lx_top_window(mid[0], pp, powers, his, top_root, 3, k))
     return
 
 
