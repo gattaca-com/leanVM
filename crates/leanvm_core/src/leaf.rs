@@ -11,7 +11,7 @@ use crate::PAR_THRESHOLD;
 use crate::constraints::{self, TableBlocks};
 use crate::gkr;
 use crate::transcript::ProverState;
-use crate::witness::Column;
+use crate::witness::{CHUNK_LOG, Column, RUN};
 use flux_profiler::timed;
 use primitives::field::{
     Acc8, F64, F64x8, F192, F192Unreduced, F192x8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
@@ -1245,8 +1245,12 @@ fn fresh_coords<'a>(
 
 /// Evaluate columns with a constant suffix, splitting only their real prefix into aligned cubes.
 fn mle_eval_padded_many(jobs: &[(Column, &[F192], usize)]) -> Vec<F192> {
+    /// Runs of a strided column per task of its whole-run sum.
+    const TASK_RUNS: usize = 32;
     let mut tasks = Vec::new();
     let mut weights = Vec::new();
+    // Per strided job with whole runs: the eq tables of its point below and above a run, and its run count.
+    let mut strided = Vec::new();
     let mut out = vec![F192::ZERO; jobs.len()];
     for (j, &(values, point, real)) in jobs.iter().enumerate() {
         assert!(real <= values.len());
@@ -1255,8 +1259,16 @@ fn mle_eval_padded_many(jobs: &[(Column, &[F192], usize)]) -> Vec<F192> {
         if real < values.len() {
             out[j] = padding_weight(point, real).mul_base(values.get(real));
         }
-        // Each contiguous piece of the real rows splits into aligned power-of-two runs.
-        for (first, piece) in values.pieces(0).take_while(|&(first, _)| first < real) {
+        // A strided column's whole runs are dots against one eq table, weighted by the runs' eq above it.
+        let mut start = 0;
+        if !values.is_contiguous() && real >= RUN {
+            let runs = real / RUN;
+            let low: Vec<Weights8> = eq_table(&point[..CHUNK_LOG]).as_chunks::<8>().0.iter().map(Weights8::new).collect();
+            strided.push((j, values, low, eq_table(&point[CHUNK_LOG..]), runs));
+            start = runs * RUN;
+        }
+        // Each contiguous piece of the other real rows splits into aligned power-of-two runs.
+        for (first, piece) in values.pieces(start).take_while(|&(first, _)| first < real) {
             let piece = &piece[..piece.len().min(real - first)];
             let mut at = 0;
             while at < piece.len() {
@@ -1270,6 +1282,19 @@ fn mle_eval_padded_many(jobs: &[(Column, &[F192], usize)]) -> Vec<F192> {
     }
     for ((j, weight), value) in weights.into_iter().zip(mle_eval_many(&tasks)) {
         out[j] += weight * value;
+    }
+    let parts: Vec<(usize, usize)> = (strided.iter().enumerate())
+        .flat_map(|(s, &(.., runs))| (0..runs.div_ceil(TASK_RUNS)).map(move |g| (s, g)))
+        .collect();
+    let sums = parallel::map_collect(parts.len(), |t| {
+        let (s, g) = parts[t];
+        let (_, values, low, high, runs) = &strided[s];
+        (g * TASK_RUNS..((g + 1) * TASK_RUNS).min(*runs)).fold(F192::ZERO, |acc, b| {
+            acc + high[b] * dot_base(low, values.span(b * RUN, RUN)).reduce()
+        })
+    });
+    for (&(s, _), v) in parts.iter().zip(sums) {
+        out[strided[s].0] += v;
     }
     out
 }
@@ -1857,6 +1882,28 @@ mod tests {
                         assert_eq!(a.to_array(), b.to_array(), "real={real}");
                     }
                 });
+            }
+        }
+    }
+
+    /// A strided column, its chunks of two columns interleaved and its padding one, reads as its padded form.
+    #[test]
+    fn strided_mles_match_their_padded_columns() {
+        let point = std::array::from_fn::<_, 13, _>(|i| F192::new(i as u64 + 2, 3, 5));
+        let interleaved: Vec<F64> = (0..2 * 4096).map(|i| F64((i as u64).wrapping_mul(0x9e3779b9) | 1)).collect();
+        for (stored, real) in [(4096, 8192), (4096, 3072), (3072, 8192), (1024, 1500), (0, 8192)] {
+            for column in 0..2 {
+                let view = Column::strided(&interleaved[column * RUN..], CHUNK_LOG + 1, stored, 8192, F64::ONE);
+                let padded = view.to_vec();
+                let tail = (real..8192).all(|i| padded[i] == padded[real.min(8191)]);
+                if !tail {
+                    continue;
+                }
+                assert_eq!(
+                    mle_eval_padded_many(&[(view, &point[..], real)]),
+                    mle_eval_many(&[(&padded[..], &point[..])]),
+                    "stored={stored} real={real}"
+                );
             }
         }
     }
