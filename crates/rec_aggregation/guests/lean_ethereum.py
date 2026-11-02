@@ -333,8 +333,10 @@ QKECCAK_VARS_CAP = QKECCAK_VARS_CAP_PLACEHOLDER
 # in GROUP_ORDER. A pooled claim on a jagged column names its group and its column there
 # (CLAIM_JAGGED_GROUP, CLAIM_JAGGED_COL); a claim on a padded one has NO_GROUP. The memory's final
 # counts (column MEM_COUNT_COL) hold 1 past the committed rows. The jagged indicator walks
-# the JAGGED_BITS chunk-index bits a row count of COUNT_BITS bits can reach, and a claim's
-# point, zero-extended, is ZBAR_LEN coordinates.
+# JAGGED_BITS chunk-index bits: the opening's dispatch holds the stack to 2^MAX_STACK_LOG
+# words, so a group's chunk index, its offset in its chunks and its row count past the
+# chunk bits all fit them, and so does a claim's point past the chunk bits, its length a
+# column log under N_COLUMN_LOGS. That point, zero-extended, is ZBAR_LEN coordinates.
 CHUNK_LOG = CHUNK_LOG_PLACEHOLDER
 N_GROUPS = N_GROUPS_PLACEHOLDER
 NO_GROUP = NO_GROUP_PLACEHOLDER
@@ -344,7 +346,7 @@ GROUP_LOG_WIDTH = GROUP_LOG_WIDTH_PLACEHOLDER
 GROUP_ORDER = GROUP_ORDER_PLACEHOLDER
 CLAIM_JAGGED_GROUP = CLAIM_JAGGED_GROUP_PLACEHOLDER
 CLAIM_JAGGED_COL = CLAIM_JAGGED_COL_PLACEHOLDER
-JAGGED_BITS = COUNT_BITS - CHUNK_LOG
+JAGGED_BITS = MAX_STACK_LOG - CHUNK_LOG
 ZBAR_LEN = COUNT_BITS
 COL_EQ_STRIDE = 64  # a group's column eq table, 2^(lw+1) - 2 cells for lw <= 5
 
