@@ -51,7 +51,7 @@ use lean_da::{BLOB_SYMBOLS, CELL_SYMBOLS, CELLS_PER_ROW, CODEWORD_SYMBOLS};
 pub use lean_da::{DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS};
 use leanvm_core::constraints::{BLOCK, BLOCK_VARS, partial_evals, xi_offsets};
 use leanvm_core::cpu::{
-    GPow, KeccakLane, Program, ProveError, Witness, from_scalar, keccak_value, prove_with, public_input_bytes,
+    GPow, KeccakLane, Program, ProveError, Witness, from_scalar, keccak_value, prove_fed, public_input_bytes,
     scalar_proof, to_scalar,
 };
 use leanvm_core::leaf::{Block, Coord};
@@ -891,45 +891,71 @@ struct BytecodeSums {
 /// `bytecode_vars()` values each, end to end.
 ///
 /// Children that are leaves all carry the same claim, so a node over leaves reads the table once for them.
+#[cfg(test)]
 fn bytecode_sums(points: &[F192]) -> BytecodeSums {
+    let points: Vec<&[F192]> = points.chunks_exact(bytecode_vars()).collect();
+    let parts: Vec<_> = (0..points.len())
+        .map(|t| (!points[..t].contains(&points[t])).then(|| point_sums(points[t])))
+        .collect();
+    BytecodeSums::assemble(&points, parts)
+}
+
+/// The stacked bytecode polynomial at `point`, from its `BLOCK` sums.
+fn sums_value(sums: &[F192], point: &[F192]) -> F192 {
+    eq_table(&point[..BLOCK_VARS])
+        .iter()
+        .zip(sums)
+        .fold(F192::ZERO, |acc, (&eq, &sum)| acc + eq * sum)
+}
+
+/// One point's part of [`BytecodeSums`]: its `eq_hi` table and its `BLOCK` sums.
+fn point_sums(point: &[F192]) -> (Vec<F192>, Vec<F192>) {
     let slot_window = bytecode_window();
     let kbc = bytecode_vars() - leanvm_core::leaf::N_BYTECODE_SELECTORS;
     assert!(kbc >= BLOCK_VARS, "the bytecode has fewer rows than a block");
     let columns: Vec<&[F64]> = stacked_bytecode()[(slot_window.start << kbc)..(slot_window.end << kbc)]
         .chunks(1 << kbc)
         .collect();
-    let points = points.chunks_exact(bytecode_vars());
-    let eq_hi = eq_tables(points.clone(), BLOCK_VARS..kbc);
     // Rows `(high, low)` with `low` the first `BLOCK_VARS` variables, which the first rounds bind. Per claim,
     // the weight splits into a factor on each of slot, high and low rows, so those rounds run on the
     // slot and high rows summed out.
-    let mut sums = Vec::with_capacity(points.len() * BLOCK);
-    for (t, (point, eq_hi)) in points.clone().zip(eq_hi.chunks_exact(1 << (kbc - BLOCK_VARS))).enumerate() {
-        if let Some(same) = points.clone().take(t).position(|earlier| earlier == point) {
-            sums.extend_from_within(same * BLOCK..(same + 1) * BLOCK);
-            continue;
-        }
-        let per_slot = partial_evals(&columns, eq_hi, eq_hi.len());
-        let weights: Vec<F192> = slot_window.clone().map(|slot| slot_eq(point, kbc, slot)).collect();
-        sums.extend((0..BLOCK).map(|low| {
+    let eq_hi = primitives::filled_vec(1 << (kbc - BLOCK_VARS), |table| {
+        fill_eq_table(&point[BLOCK_VARS..kbc], F192::ONE, table);
+    });
+    let per_slot = partial_evals(&columns, &eq_hi, eq_hi.len());
+    let weights: Vec<F192> = slot_window.map(|slot| slot_eq(point, kbc, slot)).collect();
+    let sums = (0..BLOCK)
+        .map(|low| {
             (0..columns.len())
                 .fold(F192Unreduced::ZERO, |acc, s| {
                     acc ^ weights[s].mul_unreduced(per_slot[s * BLOCK + low])
                 })
                 .reduce()
-        }));
-    }
-    BytecodeSums { eq_hi, sums }
+        })
+        .collect();
+    (eq_hi, sums)
 }
 
 impl BytecodeSums {
-    /// The stacked bytecode polynomial at claim `t`'s `point`: its `sums` against the weights on the low rows,
-    /// the same value as [`bytecode_mle`] without another pass over the table.
+    /// The sums of `points` from their parts in order. A point with no part takes that of the first equal
+    /// point with one: equal points have equal parts.
+    fn assemble(points: &[&[F192]], parts: Vec<Option<(Vec<F192>, Vec<F192>)>>) -> Self {
+        assert_eq!(points.len(), parts.len(), "a part or none per point");
+        let (mut eq_hi, mut sums) = (Vec::new(), Vec::with_capacity(points.len() * BLOCK));
+        for point in points {
+            let f = (0..points.len())
+                .find(|&f| parts[f].is_some() && points[f] == *point)
+                .expect("an equal point has a part");
+            let (eq, s) = parts[f].as_ref().expect("found with a part");
+            eq_hi.extend_from_slice(eq);
+            sums.extend_from_slice(s);
+        }
+        Self { eq_hi, sums }
+    }
+
+    #[cfg(test)]
     fn value(&self, t: usize, point: &[F192]) -> F192 {
-        eq_table(&point[..BLOCK_VARS])
-            .iter()
-            .zip(&self.sums[t * BLOCK..][..BLOCK])
-            .fold(F192::ZERO, |acc, (&eq, &sum)| acc + eq * sum)
+        sums_value(&self.sums[t * BLOCK..][..BLOCK], point)
     }
 }
 
@@ -1841,26 +1867,16 @@ pub fn aggregate_with_stats(
     // so `prove` below returns the error. Its deferred claim is likewise not
     // recomputed: the batching sumcheck below forces every batched value to be
     // the true evaluation, and the root discharges the one claim they reduce to.
-    let _span = tracing::info_span!("Replay children").entered();
+    let _span = tracing::info_span!("Check children").entered();
     let mut da_digests = Vec::with_capacity(children.len());
     for child in children {
         check_claim_tree(&child.tree).map_err(AggregationError::InvalidChild)?;
         // DA membership construction dispatches; keep it outside the child tasks.
         da_digests.push(child.da_commitments_digest());
     }
-    // One statement hash and single-threaded replay per worker: nothing inside dispatches.
-    let bytecode = scalar_bytecode();
-    let summaries = parallel::map_collect(children.len(), |i| {
-        let pi = children[i].public_input(da_digests[i]);
-        let public_input = public_input_bytes(&pi);
-        (pi, verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof)))
-    });
-    let mut replayed = Vec::with_capacity(children.len());
-    for (pi, summary) in summaries {
-        let summary = summary.map_err(|e| AggregationError::InvalidChild(AggregateVerifyError::Snark(e)))?;
-        replayed.push((pi, summary));
+    if children.iter().any(|child| child.defer.bytecode_point.len() != bytecode_vars()) {
+        return Err(AggregationError::InvalidChild(AggregateVerifyError::MalformedClaim));
     }
-
     drop(_span);
 
     let _span = tracing::info_span!("Build witness").entered();
@@ -1878,6 +1894,9 @@ pub fn aggregate_with_stats(
         return Err(AggregationError::TooLarge);
     }
 
+    // The hints the guest pops before its first signature or child. The rest go to the run as they
+    // are made, in fragments (`prove_fed`): a stream's entries keep their order, so the guest pops
+    // what one witness would hold.
     let mut hints = Hints::default();
     hints.push(
         "meta",
@@ -1904,73 +1923,9 @@ pub fn aggregate_with_stats(
     for claim in dups.chain(cover.lean_sphincs.dups.iter().map(|(m, pk)| claim_cells(&pk.flatten(), m))) {
         hints.push("dup_claims", &claim);
     }
-    // Each slot is hinted as an offset into its scheme's region, which is how one
-    // range check keeps a scheme's writers off the other's claims.
-    // Workers fill one arena per chunk of signatures, which append in signature order.
-    let chunk = parallel::recommended_chunk_size(raw_lean_xmss.len()).max(1);
-    let chunks = parallel::map_collect(raw_lean_xmss.len().div_ceil(chunk), |c| {
-        let mut sub = Hints::default();
-        for i in c * chunk..((c + 1) * chunk).min(raw_lean_xmss.len()) {
-            let (pk, message, sig) = &raw_lean_xmss[i];
-            sub.push("raw_index", &[count(cover.xmss.raw[i])]);
-            lean_xmss_hints(&mut sub, pk, sig, message)?;
-        }
-        Ok(sub)
-    });
-    for sub in chunks {
-        hints.append(sub?);
-    }
-    for (&offset, (pk, message, sig)) in cover.lean_sphincs.raw.iter().zip(&raw_lean_sphincs) {
-        hints.push("sp_raw_index", &[count(offset)]);
-        push_lean_sphincs_hints(&mut hints, &(*pk, *message), sig)?;
-    }
-
-    // One single-threaded `gen_verify` per worker, like the replay: the children are independent.
-    // Both claims of each child, in the batch's order: the fresh one, then the one it carried. The fresh
-    // claim's value is read off the sums the batch needs anyway.
-    let mut claim_points = Vec::with_capacity(2 * children.len() * bytecode_vars());
-    for ((_, summary), child) in replayed.iter().zip(children) {
-        let (fresh, carried) = (&summary.bytecode_point, &child.defer.bytecode_point);
-        if fresh.len() != bytecode_vars() || carried.len() != bytecode_vars() {
-            return Err(AggregationError::InvalidChild(AggregateVerifyError::MalformedClaim));
-        }
-        claim_points.extend(fresh.iter().copied().map(from_scalar));
-        claim_points.extend_from_slice(carried);
-    }
-    let bytecode = bytecode_sums(&claim_points);
-    let bytecode_values: Vec<F192> = claim_points
-        .chunks_exact(2 * bytecode_vars())
-        .enumerate()
-        .map(|(i, pair)| bytecode.value(2 * i, &pair[..bytecode_vars()]))
-        .collect();
-    let mut generated = parallel::map_collect(children.len(), |i| {
-        let (pi, summary) = &replayed[i];
-        gen_verify(guest, *pi, &children[i].proof.stream, summary, bytecode_values[i])
-    })
-    .into_iter();
-    let mut subs = Vec::with_capacity(children.len());
-    let mut carried = Vec::with_capacity(children.len());
-    for child in children {
-        hints.push("child_signers", &signers_hash(&child.tree));
-        hints.push_iter("child_defer", child.defer.cells());
-        hints.push("child_da_count", &[count(child.da_roots.len())]);
-        let (sub_hints, defer) = generated.next().expect("one result per child")?;
-        hints.append(sub_hints);
-        subs.push(defer);
-        carried.push(&child.defer);
-    }
-
     drop(_span);
 
-    let defer = if children.is_empty() {
-        let leaf = DeferredClaim::leaf();
-        hints.push("leaf_defer", &[leaf.bytecode_value]);
-        leaf
-    } else {
-        let _span = tracing::info_span!("Batch deferred claims").entered();
-        aggregate_deferred_claims(&subs, &carried, bytecode, &mut hints)
-    };
-
+    // The DA hints have streams of their own, so they go with the first fragment, where the guest pops them.
     let direct_root = if blobs.is_empty() {
         None
     } else {
@@ -2037,24 +1992,251 @@ pub fn aggregate_with_stats(
         lean_sphincs: lean_sphincs_groups,
     };
     let (xmss_signers, lean_sphincs_signers) = flatten_claims(&tree);
-    let public_input = statement_digest(signers_hash(&tree), da_list_digest(&da_roots), &defer);
+    let signers = signers_hash(&tree);
+    let da_digest = da_list_digest(&da_roots);
+
+    // Every hint after the first fragment, sent as it is made. The signatures and the children are
+    // made on threads of their own beside the executing one, and the statement closes the last fragment.
+    let produce = |sink: &mut Sink| -> Result<Option<(Hints, DeferredClaim, [F192; 2])>, AggregationError> {
+        if !sink.send(hints) {
+            return Ok(None);
+        }
+        // One thread keeps ahead of the run on signatures. A child takes as long to make as to run, so it takes two.
+        let threads = (parallel::num_threads() / 2).max(1);
+        // Each slot is hinted as an offset into its scheme's region, which is how one
+        // range check keeps a scheme's writers off the other's claims.
+        let chunks = raw_lean_xmss.len().div_ceil(SIGNATURE_FRAGMENT);
+        let mut failed = None;
+        ordered_map(
+            chunks,
+            1,
+            |c| {
+                let mut sub = Hints::default();
+                for i in c * SIGNATURE_FRAGMENT..((c + 1) * SIGNATURE_FRAGMENT).min(raw_lean_xmss.len()) {
+                    let (pk, message, sig) = &raw_lean_xmss[i];
+                    sub.push("raw_index", &[count(cover.xmss.raw[i])]);
+                    lean_xmss_hints(&mut sub, pk, sig, message)?;
+                }
+                Ok(sub)
+            },
+            |sub| match sub {
+                Ok(sub) => sink.send(sub),
+                Err(e) => {
+                    failed = Some(e);
+                    false
+                }
+            },
+        );
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        if !raw_lean_sphincs.is_empty() {
+            let mut sub = Hints::default();
+            for (&offset, (pk, message, sig)) in cover.lean_sphincs.raw.iter().zip(&raw_lean_sphincs) {
+                sub.push("sp_raw_index", &[count(offset)]);
+                push_lean_sphincs_hints(&mut sub, &(*pk, *message), sig)?;
+            }
+            if !sink.send(sub) {
+                return Ok(None);
+            }
+        }
+
+        // Per child, on one thread: the statement hash, the replay, the bytecode table read for its claims,
+        // whose sums the batch takes at the end and whose fresh value `gen_verify` takes, then `gen_verify`.
+        // Nothing inside dispatches. The children are independent.
+        let bytecode = scalar_bytecode();
+        let mut subs = Vec::with_capacity(children.len());
+        let mut fresh_points = Vec::with_capacity(children.len());
+        let mut parts = Vec::with_capacity(2 * children.len());
+        let mut k = 0;
+        ordered_map(
+            children.len(),
+            threads,
+            |i| {
+                let child = &children[i];
+                let pi = child.public_input(da_digests[i]);
+                let public_input = public_input_bytes(&pi);
+                let summary = verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&child.proof))
+                    .map_err(|e| AggregationError::InvalidChild(AggregateVerifyError::Snark(e)))?;
+                if summary.bytecode_point.len() != bytecode_vars() {
+                    return Err(AggregationError::InvalidChild(AggregateVerifyError::MalformedClaim));
+                }
+                let fresh: Vec<F192> = summary.bytecode_point.iter().copied().map(from_scalar).collect();
+                let fresh_part = point_sums(&fresh);
+                let value = sums_value(&fresh_part.1, &fresh);
+                // Children that are leaves all carry the same claim, so a node over leaves reads it once.
+                let carried = &child.defer.bytecode_point;
+                let carried_part = (!children[..i].iter().any(|c| &c.defer.bytecode_point == carried))
+                    .then(|| point_sums(carried));
+                let generated = gen_verify(guest, pi, &child.proof.stream, &summary, value)?;
+                Ok((generated, fresh, fresh_part, carried_part))
+            },
+            |generated| {
+                let child = &children[k];
+                k += 1;
+                match generated {
+                    Ok(((sub_hints, defer), fresh, fresh_part, carried_part)) => {
+                        let mut sub = Hints::default();
+                        sub.push("child_signers", &signers_hash(&child.tree));
+                        sub.push_iter("child_defer", child.defer.cells());
+                        sub.push("child_da_count", &[count(child.da_roots.len())]);
+                        sub.append(sub_hints);
+                        subs.push(defer);
+                        fresh_points.push(fresh);
+                        parts.extend([Some(fresh_part), carried_part]);
+                        sink.send(sub)
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        false
+                    }
+                }
+            },
+        );
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        if subs.len() < children.len() {
+            return Ok(None);
+        }
+
+        let mut last = Hints::default();
+        let defer = if children.is_empty() {
+            let leaf = DeferredClaim::leaf();
+            last.push("leaf_defer", &[leaf.bytecode_value]);
+            leaf
+        } else {
+            let _span = tracing::info_span!("Batch deferred claims").entered();
+            let carried: Vec<&DeferredClaim> = children.iter().map(|child| &child.defer).collect();
+            // Both claims of each child, in the batch's order: the fresh one, then the one it carried.
+            let claim_points: Vec<&[F192]> = fresh_points
+                .iter()
+                .zip(children)
+                .flat_map(|(fresh, child)| [&fresh[..], &child.defer.bytecode_point[..]])
+                .collect();
+            let bytecode = BytecodeSums::assemble(&claim_points, parts);
+            aggregate_deferred_claims(&subs, &carried, bytecode, &mut last)
+        };
+        let public_input = statement_digest(signers, da_digest, &defer);
+        Ok(Some((last, defer, public_input)))
+    };
+
     #[cfg(test)]
     if let Some(forge) = FORGE.with(|forge| forge.borrow_mut().take()) {
+        let mut sink = Sink::Whole(Hints::default());
+        let (last, defer, public_input) = produce(&mut sink)?.expect("a whole witness takes every fragment");
+        let Sink::Whole(mut hints) = sink else { unreachable!() };
+        hints.append(last);
         forge(&mut hints);
+        let (proof, stats) = leanvm_core::cpu::prove_with(guest, &hints, public_input, log_inv_rate, gpow)
+            .map_err(AggregationError::ProofError)?;
+        return Ok((
+            EthereumProof {
+                tree,
+                xmss_signers,
+                lean_sphincs_signers,
+                da_roots,
+                defer,
+                proof,
+            },
+            stats,
+        ));
     }
-    let (proof, stats) =
-        prove_with(guest, &hints, public_input, log_inv_rate, gpow).map_err(AggregationError::ProofError)?;
+    let (produced, proved) = prove_fed(guest, log_inv_rate, gpow, |feed| {
+        let mut sink = Sink::Feed(feed);
+        let produced = parallel::serial(|| produce(&mut sink))?;
+        if let (Sink::Feed(feed), Some((last, defer, public_input))) = (sink, produced) {
+            feed.finish(last, public_input);
+            return Ok(Some(defer));
+        }
+        Ok(None)
+    });
+    // A producer's error is why the run stopped, so it comes first.
+    let defer = produced?;
+    let (proof, stats) = proved.map_err(AggregationError::ProofError)?;
     Ok((
         EthereumProof {
             tree,
             xmss_signers,
             lean_sphincs_signers,
             da_roots,
-            defer,
+            defer: defer.expect("a finished run had every fragment"),
             proof,
         },
         stats,
     ))
+}
+
+/// Signatures per fragment of a fed run's hints: enough to amortize a fragment, few enough that the run starts early.
+const SIGNATURE_FRAGMENT: usize = 16;
+
+/// Where a node's hints go as they are made: to the running proof, or into one witness.
+enum Sink {
+    Feed(leanvm_core::cpu::Feed),
+    #[cfg(test)]
+    Whole(Hints),
+}
+
+impl Sink {
+    /// `false` once the run has stopped.
+    fn send(&mut self, hints: Hints) -> bool {
+        match self {
+            Self::Feed(feed) => feed.send(hints),
+            #[cfg(test)]
+            Self::Whole(whole) => {
+                whole.append(hints);
+                true
+            }
+        }
+    }
+}
+
+/// `f` over `0..n` on `threads` threads of their own, beside the pool, whose kernels cannot nest.
+/// `sink` takes the results in order, each once it and those before it are done. A `false` from `sink`
+/// stops the rest. A panic in `f` is resumed here.
+fn ordered_map<T: Send>(n: usize, threads: usize, f: impl Fn(usize) -> T + Sync, mut sink: impl FnMut(T) -> bool) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let slots: std::sync::Mutex<Vec<Option<std::thread::Result<T>>>> =
+        std::sync::Mutex::new((0..n).map(|_| None).collect());
+    let ready = std::sync::Condvar::new();
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(n) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n || stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parallel::serial(|| f(i))));
+                    slots.lock().expect("no panic holds the slots")[i] = Some(result);
+                    ready.notify_all();
+                }
+            });
+        }
+        for i in 0..n {
+            let mut guard = slots.lock().expect("no panic holds the slots");
+            let result = loop {
+                if let Some(result) = guard[i].take() {
+                    break result;
+                }
+                guard = ready.wait(guard).expect("no panic holds the slots");
+            };
+            drop(guard);
+            let more = match result {
+                Ok(t) => sink(t),
+                Err(panic) => {
+                    stop.store(true, Ordering::Relaxed);
+                    std::panic::resume_unwind(panic)
+                }
+            };
+            if !more {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    });
 }
 struct CoordinateDescriptor {
     kind: usize,
@@ -3305,6 +3487,23 @@ def main():
         // `cpu::verify` accepts the same proof of the same statement.
         verify(unified_guest(), &node.public_input(node.da_commitments_digest()), &node.proof).expect("node verifies natively");
         assert_eq!(node.xmss_signers.len(), SMALL_LEAF_SIZE + big);
+    }
+
+    /// Hints fed to the run as they are made give the proof one whole witness gives, at a leaf and at a node.
+    #[test]
+    fn fed_hints_prove_what_one_witness_proves() {
+        leanvm_core::init_prover();
+        let signers = get_signers(2 * SMALL_LEAF_SIZE);
+        let whole = || FORGE.with(|forge| *forge.borrow_mut() = Some(Box::new(|_: &mut Hints| {})));
+        let leaf = |signers: &[_]| prove_leaf(signers);
+        let fed = leaf(&signers[..SMALL_LEAF_SIZE]);
+        whole();
+        assert!(fed.to_bytes() == leaf(&signers[..SMALL_LEAF_SIZE]).to_bytes(), "the leaves differ");
+        let children = [fed, leaf(&signers[SMALL_LEAF_SIZE..])];
+        let node = || aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
+        let fed = node();
+        whole();
+        assert!(fed.to_bytes() == node().to_bytes(), "the nodes differ");
     }
 
     /// A child whose first KECCAK row's flag for output cells `2..13` disagrees with the bytecode
