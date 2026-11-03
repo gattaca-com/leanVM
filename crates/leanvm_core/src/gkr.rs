@@ -1645,7 +1645,14 @@ pub fn prove_product_triple_from<C: TreeField>(
             }
         }
         RootShape::FirstTwoShared => {
-            assert_eq!(roots[0], roots[1], "FirstTwoShared needs the two products to agree");
+            #[cfg(any(test, feature = "tamper"))]
+            let forging = crate::cpu::tamper::forging();
+            #[cfg(not(any(test, feature = "tamper")))]
+            let forging = false;
+            assert!(
+                forging || roots[0] == roots[1],
+                "FirstTwoShared needs the two products to agree"
+            );
             ps.add_scalar(roots[0]);
             ps.add_scalar(roots[2]);
         }

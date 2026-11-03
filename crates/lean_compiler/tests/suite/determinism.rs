@@ -32,10 +32,10 @@ use leanvm_core::cpu::Program;
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
     ("conditionals", "4f88f144b73dfb5e6453c12fb3f1b20bbc99835d2b7e8b30c0b80a8c4d558c40"),
-    ("const_params", "f28aa76ef2b1415821a2573704d2590e8ac85e87d47c795b270a6fa7ff6625bb"),
+    ("const_params", "9e2168aed0eab72821f98f91e0406e226bf4d108acf15ee5c96868b93fd7e16e"),
     ("fibonacci", "edb68f2529e0a1cb12169b8f629eae2e196a26151917af0d8d8572ded22b3a64"),
-    ("hash_heap_chain", "309365f5b90a6cf1fadde436e9df7d6022398b243cdd17f46c1b672044a63bdf"),
-    ("hash_slices", "b8f40cefc0466e7be412e27be0fa513ff02bab648dd1c55fcad8b15a8983b5d6"),
+    ("hash_heap_chain", "f281889e8c3abdbacef18b6a5974345576874a12d90e46c8806b1803ea3b1556"),
+    ("hash_slices", "9d4604cc5e6f978b3dc855143f3bedf4a3396e44c32c1df7dcfd543781fcd15f"),
     ("heapbuf_dyn", "95e1a69f54106145fc4f845e9076117ba3e891305dc30e20de6e2aa989ecb8e7"),
     ("hint", "ac78fc8dfcef7129fd40c591da640ed26c1798b4ca435fabe9994571c8fb0bcc"),
     ("identities", "6b5cdc55c458e318c8ea5b87f7cd212135e44698a0fd397bae5d835fa84b815a"),
@@ -44,8 +44,8 @@ const GOLDEN: &[(&str, &str)] = &[
     ("nested", "fa19f657b534a8bdaf894854617f65d46f35cfd49f0d19e93d2dda7a1f2b1b01"),
     ("runtime_loop", "187513c18352d40beae1bd224cac7140b9a9c0bf2847a0b4fe86f5982c741757"),
     ("scoping", "c680d0661bd5b8417ff6615c3b53dde83b15bb6554790429f68e8ed823699587"),
-    ("unroll", "26d5455233a7e92a04dcee57798b2e8091dfd08bfcab9667952431ec20cf5252"),
-    ("wots_walk", "f497f7276970efe06306bb21a324626d615e91ec78fc1d8fd7f9e74c383d4d12"),
+    ("unroll", "1590c0f17ba3d6a5111f0da62efca5f2a3a2c5fe31d2f0866150c49b7ae1009a"),
+    ("wots_walk", "3d744fdff3883e8f4bbb253dc0df1f7c062bb84a521b6269c115fbc7a9396a08"),
 ];
 
 fn digest(p: &Program) -> String {

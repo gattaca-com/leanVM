@@ -287,7 +287,7 @@ pub(crate) fn committed_log(log_mem: usize, log_bytecode: usize, taus: [usize; t
 }
 
 /// Operand slots of a bytecode tuple, after the opcode.
-pub const BYTECODE_OPERANDS: usize = 10;
+pub const BYTECODE_OPERANDS: usize = 12;
 
 /// The public bytecode columns, shared by the seed and finalize blocks.
 pub type BytecodeColumns = [std::sync::Arc<Vec<F64>>; 1 + BYTECODE_OPERANDS];
@@ -299,7 +299,7 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
     let g_at = primitives::field::g_pow32_by_lookup;
 
     // The opcode, then the operand slots: offsets as g-powers, a `SET` immediate as its three
-    // limbs, the `DEREF` store-mode flags and `KECCAK`'s layout flags as 0 or 1. Unused slots
+    // limbs, the `DEREF` store-mode flags and `KECCAK`'s layout and output flags as 0 or 1. Unused slots
     // are zero.
     let flag = |b: bool| F64(u64::from(b));
     let row = |op: &Op| -> [F64; 1 + BYTECODE_OPERANDS] {
@@ -331,8 +331,10 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
                 out,
                 in_odd,
                 out_odd,
+                out_cells,
             } => {
                 let [m0, m1, m2, m3] = m.map(g_at);
+                let (out_two, out_all) = out_cells.flags();
                 put(&[
                     m0,
                     m1,
@@ -344,13 +346,15 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
                     g_at(out),
                     flag(in_odd),
                     flag(out_odd),
+                    flag(out_two),
+                    flag(out_all),
                 ]);
                 OP_KECCAK
             }
         };
         row
     };
-    // One pass writes all eleven columns.
+    // One pass writes all thirteen columns.
     let chunk = parallel::recommended_chunk_size(prog.len());
     let columns = primitives::filled_vecs([prog.len(); 1 + BYTECODE_OPERANDS], |columns| {
         parallel::for_each_chunks_mut(columns, [chunk; 1 + BYTECODE_OPERANDS], |t, mut columns| {
@@ -364,7 +368,7 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
     columns.map(std::sync::Arc::new)
 }
 
-/// The stacked bytecode polynomial: the eleven columns at their bus tuple
+/// The stacked bytecode polynomial: the thirteen columns at their bus tuple
 /// coordinates, which is what makes the program's whole share of a bus leaf one
 /// evaluation at `(ζ, α⃗)` (see [`crate::leaf::stacked_bytecode_table`]).
 ///

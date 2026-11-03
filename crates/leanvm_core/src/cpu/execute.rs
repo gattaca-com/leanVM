@@ -930,13 +930,22 @@ impl Program {
                         pc += 1;
                     }
                 }
-                Op::Keccak { .. } => {
+                Op::Keccak { out_cells, .. } => {
                     use crate::keccak::{ROW_CELLS, STATE_CELLS};
                     let k = crate::tables::KeccakOp::of(op);
                     let cells: [u32; ROW_CELLS] = std::array::from_fn(|c| k.cell(fp, c));
+                    // The output cells written: the rest are left alone, and their flushes cancel.
+                    #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
+                    let mut written = STATE_CELLS + out_cells.cells();
+                    #[cfg(any(test, feature = "tamper"))]
+                    let tamper = super::tamper::peek();
+                    #[cfg(any(test, feature = "tamper"))]
+                    if tamper == Some(super::tamper::Tamper::UnrequestedWrite) {
+                        written = ROW_CELLS;
+                    }
                     // The output cells are usually untouched and cold: fetch them while the permutation runs.
                     #[cfg(target_arch = "x86_64")]
-                    for &c in &cells[STATE_CELLS..] {
+                    for &c in &cells[STATE_CELLS..written] {
                         // SAFETY: a prefetch of any address is harmless.
                         unsafe {
                             let line = m.cells.0.as_ptr().wrapping_add(c as usize).cast();
@@ -957,13 +966,21 @@ impl Program {
                     let mut lanes = crate::keccak::state_of_cells(&input, k.in_odd);
                     keccak_step(&lanes);
                     primitives::hash::keccak_f(&mut lanes);
-                    let output = crate::keccak::cells_of_state(&lanes, k.out_odd);
-                    for (c, &v) in output.iter().enumerate() {
+                    #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
+                    let mut output = crate::keccak::cells_of_state(&lanes, k.out_odd);
+                    #[cfg(any(test, feature = "tamper"))]
+                    if tamper == Some(super::tamper::Tamper::WrongOutput) {
+                        output[0].c1 ^= 1;
+                    }
+                    for (c, &v) in output[..written - STATE_CELLS].iter().enumerate() {
                         m.put(cells[STATE_CELLS + c], v)?;
                     }
                     // In flush order, so a cell two operands alias still pairs each
-                    // read with its own count.
-                    let r: [u32; ROW_CELLS] = std::array::from_fn(|c| m.bump_access_count(cells[c]));
+                    // read with its own count. A cell not written keeps count 0.
+                    let mut r = [0; ROW_CELLS];
+                    for (count, &cell) in r.iter_mut().zip(&cells[..written]) {
+                        *count = m.bump_access_count(cell);
+                    }
                     keccak.push(Krow {
                         pc,
                         fp,
