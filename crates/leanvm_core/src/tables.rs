@@ -436,6 +436,8 @@ pub fn tables() -> [&'static dyn Table; N_TABLES] {
 
 /// Index of the KECCAK table in [`tables`].
 pub(crate) const KECCAK_TABLE: usize = 5;
+#[cfg(any(test, feature = "tamper"))]
+pub(crate) const JUMP_TABLE: usize = 4;
 
 /// Each table's least log height: 0, but the Keccak reduction's block of steps for `KECCAK`.
 pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, crate::keccak::MIN_STEPS.ilog2() as usize, 0];
@@ -785,7 +787,7 @@ impl Table for DerefTable {
 
 struct JumpTable;
 
-mod jump {
+pub(crate) mod jump {
     pub const PC: usize = 0;
     pub const FP: usize = 1;
     pub const OC: usize = 2;

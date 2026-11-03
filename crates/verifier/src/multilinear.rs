@@ -131,6 +131,65 @@ impl Placement {
     }
 }
 
+/// Rows of a jagged chunk: a column's run inside one chunk of its group.
+pub const CHUNK_LOG: usize = 10;
+
+/// `eq(z, b)` for a field point and a bit.
+fn eq_bit(z: E, bit: u64) -> E {
+    if bit == 1 { z } else { ONE + z }
+}
+
+/// The jagged indicator `G(z, y; a, n) = Σ_{B < n} eq(z, B)·eq(y, a + B)`, both points zero-extended.
+///
+/// A read-once branching program over the bits, low first. Its state is the carry of `a + B` and whether
+/// `B < n` on the bits read so far. A sum `a + B` past `y`'s cube meets a zero coordinate and weighs nothing.
+pub fn jagged_indicator(z: &[E], y: &[E], a: u64, n: u64) -> E {
+    let bits = z.len().max(y.len()).max((u64::BITS - (a | n).leading_zeros()) as usize);
+    let at = |v: &[E], k: usize| v.get(k).copied().unwrap_or(ZERO);
+    let bit = |v: u64, k: usize| v.checked_shr(k as u32).unwrap_or(0) & 1;
+    // state[carry][below]
+    let mut state = [[ONE, ZERO], [ZERO, ZERO]];
+    for k in 0..bits {
+        let (zk, yk, ak, nk) = (at(z, k), at(y, k), bit(a, k), bit(n, k));
+        let mut next = [[ZERO; 2]; 2];
+        for (carry, row) in state.iter().enumerate() {
+            for (below, &mass) in row.iter().enumerate() {
+                for b in 0..2 {
+                    let sum = ak + b + carry as u64;
+                    let below = if b == nk { below } else { usize::from(b < nk) };
+                    next[(sum >> 1) as usize][below] += mass * eq_bit(zk, b) * eq_bit(yk, sum & 1);
+                }
+            }
+        }
+        state = next;
+    }
+    state[0][1]
+}
+
+/// Where a column of a jagged group sits: row `i` at `offset + (i >> CHUNK_LOG)·2^(CHUNK_LOG + log_width) + column·2^CHUNK_LOG + (i mod 2^CHUNK_LOG)`.
+#[derive(Clone, Copy, Debug)]
+pub struct JaggedSlot {
+    pub offset: u64,
+    pub log_width: usize,
+    pub column: usize,
+    /// The group's chunks, `⌈rows / 2^CHUNK_LOG⌉`: every row below `chunks << CHUNK_LOG` is committed.
+    pub chunks: u64,
+}
+
+impl JaggedSlot {
+    /// The stack weight of a claim at `point` on this column, at the stack point `x`.
+    pub fn weight(&self, point: &[E], x: &[E]) -> E {
+        let at = |v: &[E], k: usize| v.get(k).copied().unwrap_or(ZERO);
+        let low = (0..CHUNK_LOG).fold(ONE, |acc, k| acc * (ONE + at(point, k) + at(x, k)));
+        let column = (0..self.log_width).fold(ONE, |acc, k| {
+            acc * eq_bit(at(x, CHUNK_LOG + k), (self.column >> k) as u64 & 1)
+        });
+        let high = x.get(CHUNK_LOG + self.log_width..).unwrap_or(&[]);
+        let base = self.offset >> (CHUNK_LOG + self.log_width);
+        low * column * jagged_indicator(point.get(CHUNK_LOG..).unwrap_or(&[]), high, base, self.chunks)
+    }
+}
+
 pub fn stack_offsets(sizes: &[usize]) -> (Vec<u64>, usize) {
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     order.sort_by_key(|&index| (std::cmp::Reverse(sizes[index]), index));
@@ -145,4 +204,49 @@ pub fn stack_offsets(sizes: &[usize]) -> (Vec<u64>, usize) {
 
 fn selector_point(selector: u64, length: usize) -> Vec<E> {
     (0..length).map(|bit| E::new(selector >> bit & 1, 0, 0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The branching program has to equal the sum it stands for, the weight of every committed row written out:
+    /// across unaligned bases, counts that are and are not powers of two, a point shorter or longer than the
+    /// cube, and sums that run past the cube.
+    #[test]
+    fn jagged_indicator_is_the_written_out_sum() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut points = |n: usize| -> Vec<E> { (0..n).map(|_| E::new(random(), random(), random())).collect() };
+        let eq_index = |point: &[E], index: u64| -> E {
+            if index >> point.len() != 0 {
+                return ZERO;
+            }
+            (0..point.len()).fold(ONE, |acc, k| acc * eq_bit(point[k], index >> k & 1))
+        };
+        for (z_len, y_len, a, n) in [
+            (3, 5, 0, 8),
+            (3, 5, 5, 7),
+            (4, 5, 13, 11),
+            (2, 6, 33, 3),
+            (5, 4, 3, 13),
+            (4, 4, 9, 9),
+            (0, 3, 6, 1),
+            (3, 3, 0, 0),
+        ] {
+            let z = points(z_len);
+            let y = points(y_len);
+            let sum = E::sum((0..n).map(|b| eq_index(&z, b) * eq_index(&y, a + b)));
+            assert_eq!(
+                jagged_indicator(&z, &y, a, n),
+                sum,
+                "z {z_len}, y {y_len}, a {a}, n {n}"
+            );
+        }
+    }
 }

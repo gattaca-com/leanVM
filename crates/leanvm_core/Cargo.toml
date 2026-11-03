@@ -19,7 +19,7 @@ tracing.workspace = true
 libc.workspace = true
 
 [features]
-# Forgeries of a KECCAK's output cells, for the tests of a crate that verifies its proofs.
+# Forgeries of the jagged commitment, for the tests of a crate that verifies its proofs.
 tamper = []
 
 [dev-dependencies]

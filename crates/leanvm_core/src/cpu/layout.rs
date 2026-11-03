@@ -137,12 +137,15 @@ pub struct Layout {
     pub pull: Vec<Block>,
     /// Count channel: read-count columns whose product must be nonzero (§sec:memchan).
     pub count: Vec<Block>,
-    /// Per-column placement (offset + n_vars) in the stacked witness; from the
-    /// columns' log-sizes alone, so reconstructable by the verifier.
+    /// Per-column placement (offset + n_vars) in the padded working stack the prover fills and reads.
     pub placements: Vec<witness::Placement>,
-    /// The stacked witness's shape: its announced `2^mu` size, plus how many lane
-    /// blocks of it the prover actually commits (see [`witness::StackShape`]).
+    /// The padded working stack's shape.
     pub shape: witness::StackShape,
+    /// The committed stack: the same columns, the jagged ones cut to their tables' chunks. From the announced
+    /// sizes alone, so reconstructable by the verifier.
+    pub dense: witness::Dense,
+    /// The memory rows the committed stack holds, a multiple of a chunk: the cells past them are unwritten.
+    pub mem_rows: usize,
     /// Public input: the first two memory cells `m[0], m[1]` (each a 192-bit
     /// word), bound to the committed memory at verification (§sec:e2e-pi).
     pub pi: [F192; 2],
@@ -193,14 +196,9 @@ impl Witness {
         cols
     }
 
-    /// Committed data before the zero-pad to `2^m`: the real witness size.
+    /// Committed data before the zero-pad to `2^m`: the words of the committed stack the columns fill.
     pub(crate) fn committed_size(&self) -> usize {
-        self.layout
-            .placements
-            .iter()
-            .filter(|p| !p.is_virtual())
-            .map(|p| 1usize << p.n_vars)
-            .sum()
+        self.layout.dense.placed
     }
 }
 
@@ -278,12 +276,50 @@ fn col_kappas(log_mem: usize, log_bytecode: usize, taus: [usize; tables::N_TABLE
         .collect()
 }
 
-/// `log2` of the stacked witness the announced sizes imply. The one part of
+/// The jagged groups' global columns: each table's committed columns but the ones `q_keccak` carries, in table
+/// order, then the memory's four.
+pub fn jagged_columns() -> Vec<Vec<usize>> {
+    let sch = schema();
+    let mut groups: Vec<Vec<usize>> = tables::tables()
+        .iter()
+        .enumerate()
+        .map(|(t, table)| {
+            (sch.base[t]..sch.base[t] + table.n_committed_columns())
+                .filter(|&col| keccak_value(col).is_none())
+                .collect()
+        })
+        .collect();
+    groups.push(vec![MEM_LO, MEM_HI, MEM_TOP, MFCNT]);
+    groups
+}
+
+/// The columns the committed stack keeps as whole padded blocks: their padding is not zero.
+pub const PADDED_COLUMNS: [usize; 2] = [BFCNT, QKECCAK];
+
+/// The committed stack the announced sizes imply ([`witness::Dense`]).
+pub fn dense_layout(
+    log_mem: usize,
+    log_bytecode: usize,
+    rows: [usize; tables::N_TABLES],
+    mem_rows: usize,
+) -> witness::Dense {
+    let kappas = col_kappas(log_mem, log_bytecode, table_logs(rows));
+    let groups = jagged_columns()
+        .into_iter()
+        .zip(rows.into_iter().chain([mem_rows]))
+        .collect();
+    witness::dense_of(&kappas, &PADDED_COLUMNS, groups)
+}
+
+/// `log2` of the committed stack the announced sizes imply. The one part of
 /// [`layout`] a size floor needs, and far cheaper than the rest of it.
-pub(crate) fn committed_log(log_mem: usize, log_bytecode: usize, taus: [usize; tables::N_TABLES]) -> usize {
-    crate::witness::placements_of(&col_kappas(log_mem, log_bytecode, taus))
-        .1
-        .mu
+pub(crate) fn committed_log(
+    log_mem: usize,
+    mem_rows: usize,
+    log_bytecode: usize,
+    rows: [usize; tables::N_TABLES],
+) -> usize {
+    dense_layout(log_mem, log_bytecode, rows, mem_rows).shape.mu
 }
 
 /// Operand slots of a bytecode tuple, after the opcode.
@@ -398,7 +434,13 @@ pub(crate) fn stacked_columns(cols: &BytecodeColumns) -> Vec<F64> {
 /// this needs no committed witness: both prover and verifier reconstruct exactly the
 /// same structure.
 #[timed]
-pub fn layout(prog_cols: &BytecodeColumns, log_mem: usize, rows: [usize; tables::N_TABLES], pi: [F192; 2]) -> Layout {
+pub fn layout(
+    prog_cols: &BytecodeColumns,
+    log_mem: usize,
+    rows: [usize; tables::N_TABLES],
+    mem_rows: usize,
+    pi: [F192; 2],
+) -> Layout {
     let taus = table_logs(rows);
     let bytecode_size = prog_cols[0].len();
     let log_bytecode = crate::log2_strict_usize(bytecode_size);
@@ -497,12 +539,15 @@ pub fn layout(prog_cols: &BytecodeColumns, log_mem: usize, rows: [usize; tables:
     }
 
     let (placements, shape) = witness::placements_of(&col_kappas(log_mem, log_bytecode, taus));
+    let dense = dense_layout(log_mem, log_bytecode, rows, mem_rows);
     Layout {
         push,
         pull,
         count: count_blocks,
         placements,
         shape,
+        dense,
+        mem_rows,
         pi,
         taus,
         rows,
@@ -565,7 +610,16 @@ impl Program {
             "a table exceeds 2^{MAX_LOG_ROWS} rows"
         );
         let pi = [exec.mem.word(0), exec.mem.word(1)];
-        let l = layout(&self.bytecode_cols, log_mem, row_counts, pi);
+        // The committed memory rows: the used cells, but the whole memory where only that clears the floor
+        // `execute` sized the memory for.
+        let log_bytecode = crate::log2_strict_usize(self.prog.len());
+        let used = exec.mem_used.next_multiple_of(1 << witness::CHUNK_LOG).min(cells);
+        let mem_rows = if committed_log(log_mem, used, log_bytecode, row_counts) < self.min_log_committed {
+            cells
+        } else {
+            used
+        };
+        let l = layout(&self.bytecode_cols, log_mem, row_counts, mem_rows, pi);
 
         // The stacked witness is written exactly ONCE: allocate it, carve one window
         // per committed column, and have every fill write its column straight into

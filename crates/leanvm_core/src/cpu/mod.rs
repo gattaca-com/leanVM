@@ -98,12 +98,19 @@ fn digest_words(halves: &[F192; 2]) -> [F64; 4] {
 /// ([`layout::table_logs`]). The public statement (program + input) is not announced
 /// here; it seeds the transcript at construction (see [`fs_seed`]). The boundary
 /// states are derived from the program, so they need no binding.
-fn announce_public(ps: &mut ProverState, log_mem: usize, rows: [usize; tables::N_TABLES], log_inv_rate: usize) {
+fn announce_public(
+    ps: &mut ProverState,
+    log_mem: usize,
+    rows: [usize; tables::N_TABLES],
+    log_inv_rate: usize,
+    mem_rows: usize,
+) {
     ps.add_scalar(F192::new(log_mem as u64, 0, 0));
     for n in rows {
         ps.add_scalar(F192::new(n as u64, 0, 0));
     }
     ps.add_scalar(F192::new(log_inv_rate as u64, 0, 0));
+    ps.add_scalar(F192::new(mem_rows as u64, 0, 0));
 }
 
 /// One witness stream: its entries back to back in `data`, entry `i` ending at `ends[i]`.
@@ -634,8 +641,10 @@ fn prove_run(
     }
     // Estimate from prepared memory and fixed bytecode, allowing room for instruction columns.
     // An underestimate only leaves some pages for the exact reservation below to fault in.
+    let reserve_log_mem = crate::log2_ceil_usize(gpow.capacity());
     let reserve_mu = (layout::committed_log(
-        crate::log2_ceil_usize(gpow.capacity()),
+        reserve_log_mem,
+        1 << reserve_log_mem,
         crate::log2_strict_usize(program.prog.len()),
         [0; tables::N_TABLES],
     ) + 1)
@@ -680,9 +689,10 @@ fn prove_run(
     *gpow = std::mem::take(&mut exec.gpow);
     // Build witness was the last reader of the cells.
     gpow.cells = Some(exec.mem.into_cells());
-    if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&w.layout.shape.mu) {
+    let dense_shape = w.layout.dense.shape;
+    if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&dense_shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
-            log_committed: w.layout.shape.mu,
+            log_committed: dense_shape.mu,
         });
     }
     let committed_size = w.committed_size();
@@ -699,6 +709,10 @@ fn prove_run(
     #[cfg(any(test, feature = "tamper"))]
     tamper::witness(tamper, &mut w);
     // Announce the prover's sizes, then commit, before sampling any challenge.
+    #[cfg(any(test, feature = "tamper"))]
+    let (announced_rows, announced_mem_rows) = tamper::sizes(tamper, &mut w);
+    #[cfg(not(any(test, feature = "tamper")))]
+    let (announced_rows, announced_mem_rows) = (w.layout.rows, w.layout.mem_rows);
     // The rows past the last one a gate is 1 at hold the identity in its blocks, so their leaves are skipped.
     // A forgery may set a gate the bytecode does not, so its leaves are all computed.
     #[cfg(any(test, feature = "tamper"))]
@@ -710,11 +724,18 @@ fn prove_run(
     }
     #[cfg(any(test, feature = "tamper"))]
     tamper::ungate(tamper, &mut w.layout);
-    announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
+    announce_public(&mut ps, w.log_mem, announced_rows, log_inv_rate, announced_mem_rows);
+    // The committed stack: the padded one's columns, the jagged ones cut to their chunks.
+    #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
+    let (mut dense, dense_repeats) = crate::stage!("Gather dense", || {
+        w.layout.dense.gather(&w.q, &w.repeats, &w.layout.placements)
+    });
+    #[cfg(any(test, feature = "tamper"))]
+    tamper::dense(tamper, &w.layout, &mut dense);
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
-    drop(pcs::reserve_level1(w.layout.shape.mu, log_inv_rate));
+    drop(pcs::reserve_level1(dense_shape.mu, log_inv_rate));
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, &w.q, &w.repeats, w.layout.shape, log_inv_rate)
+        pcs::commit(&mut ps, &dense, &dense_repeats, dense_shape, log_inv_rate)
     });
 
     // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
@@ -790,9 +811,12 @@ fn prove_run(
         keccak_reduction.prove(&mut ps, q_keccak, &output)
     });
     drop(keccak_reduction);
-    let (ring, outputs) = openings.into_pcs_claims(offset);
+    drop(w.q);
+    let (ring, outputs) = openings.into_pcs_claims(dense_qkeccak_offset(l));
     slots.extend(outputs);
-    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, w.repeats, &slots, &ring) });
+    crate::stage!("PCS open", || {
+        pcs::open(&mut ps, committed, dense, dense_repeats, &slots, &ring)
+    });
     Ok((
         ps.into_proof(),
         Stats {
@@ -928,27 +952,65 @@ fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::SlotClaim> {
             // `c.point` is a claim on the slot's `2^n_log` words of QKECCAK.
             if let Some(KeccakLane::Slot(slot)) = keccak_value(c.col) {
                 return pcs::SlotClaim::Point {
-                    offset: l.placements[QKECCAK].offset + (slot << c.point.len()),
+                    offset: dense_qkeccak_offset(l) + (slot << c.point.len()),
                     low_point: c.point,
                     value: c.value,
                 };
             }
-            pcs::SlotClaim::Point {
-                offset: l.placements[c.col].offset,
-                low_point: c.point,
-                value: c.value,
+            match l.dense.slots[c.col].expect("a claimed column is committed") {
+                witness::Slot::Padded(p) => pcs::SlotClaim::Point {
+                    offset: p.offset,
+                    low_point: c.point,
+                    value: c.value,
+                },
+                witness::Slot::Jagged { group, column } => {
+                    let group = &l.dense.groups[group];
+                    let chunks = group.chunks();
+                    // Past its chunks the memory's final count holds g^0 = 1, a public share of the claim.
+                    let mut value = c.value;
+                    if c.col == MFCNT {
+                        value += leaf::padding_weight(&c.point, chunks << witness::CHUNK_LOG);
+                    }
+                    pcs::SlotClaim::Jagged {
+                        offset: group.offset,
+                        log_width: group.log_width,
+                        column,
+                        chunks,
+                        point: c.point,
+                        value,
+                    }
+                }
             }
         })
         .collect()
 }
 
-/// Test-only forgeries of a `KECCAK`'s output cells or a `DOT2`'s result: the prover is honest but for the one named here.
+/// Where `q_keccak` sits in the committed stack.
+fn dense_qkeccak_offset(l: &Layout) -> usize {
+    match l.dense.slots[QKECCAK] {
+        Some(witness::Slot::Padded(p)) => p.offset,
+        _ => unreachable!("q_keccak is a padded block"),
+    }
+}
+
+/// Test-only forgeries of the jagged commitment, a `KECCAK`'s output cells or a `DOT2`'s result: the prover is honest
+/// but for the one named here.
 #[cfg(any(test, feature = "tamper"))]
 pub mod tamper {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Tamper {
+        /// Flip a committed word of the memory's group.
+        DenseWord,
+        /// Announce one row more for the first table that has rows.
+        TableRows,
+        /// Announce the memory rows a chunk higher.
+        MemRows,
+        /// Write a value past a column's committed rows that the bus and the constraints accept: to the first
+        /// memory cell past the committed rows, pushed and pulled alike as no instruction reads it, or else to the
+        /// JUMP inverse hint of the first padding row past the JUMP chunks, which only a zero condition multiplies.
+        PastHeight,
         /// Have every `KECCAK` write all thirteen output cells, whatever its bytecode requests.
         UnrequestedWrite,
         /// [`Tamper::UnrequestedWrite`], and have the bus flush every cell written, as if no output cell were gated.
@@ -1002,6 +1064,32 @@ pub mod tamper {
         }
     }
 
+    /// The sizes to announce, and the padded witness forged past its committed rows.
+    pub(crate) fn sizes(tamper: Option<Tamper>, w: &mut layout::Witness) -> ([usize; tables::N_TABLES], usize) {
+        let (mut rows, mut mem_rows) = (w.layout.rows, w.layout.mem_rows);
+        match tamper {
+            Some(Tamper::TableRows) => {
+                let t = rows.iter().position(|&r| r > 0).expect("a table with rows");
+                rows[t] += 1;
+            }
+            Some(Tamper::MemRows) => mem_rows += 1 << witness::CHUNK_LOG,
+            Some(Tamper::PastHeight) => {
+                let memory = w.layout.placements[MEM_LO];
+                let jump = tables::JUMP_TABLE;
+                let inverse = w.layout.placements[schema().base[jump] + tables::jump::W];
+                let committed_jumps = rows[jump].next_multiple_of(1 << witness::CHUNK_LOG);
+                if mem_rows < 1 << memory.n_vars {
+                    w.q[memory.offset + mem_rows] = F64(5);
+                } else {
+                    assert!(committed_jumps < 1 << inverse.n_vars, "a column has uncommitted rows");
+                    w.q[inverse.offset + committed_jumps] = F64(5);
+                }
+            }
+            _ => {}
+        }
+        (rows, mem_rows)
+    }
+
     /// Flush the gated blocks' cells where their gates are 0 too: each coordinate divided by the gate.
     pub(crate) fn ungate(tamper: Option<Tamper>, l: &mut Layout) {
         fn divide(c: &Coord, gate: usize) -> Coord {
@@ -1019,6 +1107,16 @@ pub mod tamper {
             if let Some(gate) = blk.gate.take() {
                 blk.coords = blk.coords.iter().map(|c| divide(c, gate)).collect();
             }
+        }
+    }
+
+    /// The committed stack, forged.
+    pub(crate) fn dense(tamper: Option<Tamper>, l: &Layout, dense: &mut [F64]) {
+        if let Some(Tamper::DenseWord) = tamper {
+            let Some(witness::Slot::Jagged { group, .. }) = l.dense.slots[MEM_LO] else {
+                unreachable!("the memory is jagged");
+            };
+            dense[l.dense.groups[group].offset + 3].0 ^= 1;
         }
     }
 }
@@ -1425,10 +1523,17 @@ mod tests {
         // 4150 SETs in all, so the SET table pads from row 4150 to 8192: past 4 blocks.
         let n_set = 4150;
         while prog.len() < n_set + steps + 11 {
-            prog.push(Op::Set { o: 16 + prog.len() as u32, k: w(prog.len() as u64) });
+            prog.push(Op::Set {
+                o: 16 + prog.len() as u32,
+                k: w(prog.len() as u64),
+            });
         }
         while prog.len() < 8191 {
-            prog.push(Op::Xor { a: 2, b: 3, c: 16 + prog.len() as u32 });
+            prog.push(Op::Xor {
+                a: 2,
+                b: 3,
+                c: 16 + prog.len() as u32,
+            });
         }
         prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
         let program = Program::from_bytecode(prog, 20_300);
@@ -1440,7 +1545,11 @@ mod tests {
         let real = ::pcs::stack_open::equal_blocks(&witness.q);
         assert_eq!(witness.repeats.len(), real.len());
         assert!(
-            witness.repeats.iter().zip(&real).all(|(&tagged, &real)| real || !tagged),
+            witness
+                .repeats
+                .iter()
+                .zip(&real)
+                .all(|(&tagged, &real)| real || !tagged),
             "a tagged block is a repeat"
         );
         let tagged = witness.repeats.iter().filter(|&&t| t).count();
@@ -1503,5 +1612,31 @@ mod tests {
         assert!(live_two < count(0) + count(1) + crate::keccak::BLOCK_ROWS, "the rows writing two follow");
         let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &pi, &proof).expect("sorted rows verify");
+    }
+
+    /// Each forgery of the jagged commitment is rejected: a committed word, an announced height, and a value past a
+    /// column's committed rows that the bus and the constraints accept.
+    #[test]
+    fn jagged_forgeries_are_rejected() {
+        use tamper::Tamper;
+        let program = keccak_program(w(3), w(4), [w(5); 4], w(6));
+        let pi = [w(7), w(11)];
+        let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &proof).expect("the honest proof verifies");
+        use verifier::VerifierError::{MerkleOpeningShape, TableSumcheckTerminal, WhirTerminal};
+        for (forgery, error) in [
+            (Tamper::DenseWord, WhirTerminal),
+            (Tamper::TableRows, TableSumcheckTerminal),
+            (Tamper::MemRows, MerkleOpeningShape),
+            (Tamper::PastHeight, WhirTerminal),
+        ] {
+            tamper::set(forgery);
+            let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+            let verdict = verify(&program, &pi, &proof).err();
+            assert!(
+                matches!(verdict, Some(CpuError::Verifier(e)) if e == error),
+                "{forgery:?}: {verdict:?}"
+            );
+        }
     }
 }
