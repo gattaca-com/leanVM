@@ -299,6 +299,33 @@ fn flushes_jump() -> Flushes {
     flushes
 }
 
+fn flushes_dot2() -> Flushes {
+    let [pc, fp, o_a, o_p, o_w, o_acc, o_c, ptr, a_0, a_1] = cols(
+        DOT2_COLUMNS,
+        ["pc", "fp", "o_a", "o_p", "o_w", "o_acc", "o_c", "ptr", "a_0", "a_1"],
+    );
+    let [cnt_a, cnt_p, cnt_w0, cnt_w1, cnt_acc, cnt_c, cnt_bc] = cols(
+        DOT2_COLUMNS,
+        ["cnt_a", "cnt_p", "cnt_w0", "cnt_w1", "cnt_acc", "cnt_c", "cnt_bc"],
+    );
+    let w0 = cols(DOT2_COLUMNS, ["w0_0", "w0_1", "w0_2"]);
+    let w1 = cols(DOT2_COLUMNS, ["w1_0", "w1_1", "w1_2"]);
+    let acc = cols(DOT2_COLUMNS, ["acc_0", "acc_1", "acc_2"]);
+    let mut flushes = Flushes::default();
+    flushes.state_step(pc, fp);
+    let operands = vec![col(o_a, 0), col(o_p, 0), col(o_w, 0), col(o_acc, 0), col(o_c, 0)];
+    flushes.bytecode(pc, cnt_bc, OP_DOT2, operands);
+    // The lane cell is read with a zero top limb, so both lanes are in K.
+    flushes.memory_cols(prod(fp, o_a, 0), cnt_a, &[a_0, a_1]);
+    flushes.memory_cols(prod(fp, o_p, 0), cnt_p, &[ptr]);
+    flushes.memory_cols(prod(ptr, o_w, 0), cnt_w0, &w0);
+    flushes.memory_cols(prod(ptr, o_w, 1), cnt_w1, &w1);
+    flushes.memory_cols(prod(fp, o_acc, 0), cnt_acc, &acc);
+    let result = std::array::from_fn(|i| col(acc[i], 0) + prod(a_0, w0[i], 0) + prod(a_1, w1[i], 0));
+    flushes.memory(prod(fp, o_c, 0), cnt_c, result);
+    flushes
+}
+
 fn keccak_constraints(columns: &[E]) -> Vec<E> {
     let [fp, o_out] = cols(KECCAK_HEAD, ["fp", "o_out"]).map(|index| columns[index]);
     vec![columns[KECCAK_ADDR] + fp * o_out]
@@ -407,7 +434,8 @@ pub const OP_SET: usize = 2;
 pub const OP_DEREF: usize = 3;
 pub const OP_JUMP: usize = 4;
 pub const OP_KECCAK: usize = 5;
-pub const N_TABLES: usize = 6;
+pub const OP_DOT2: usize = 6;
+pub const N_TABLES: usize = 7;
 
 #[rustfmt::skip]
 const ARITH_COLUMNS: &[&str] = &["pc", "fp", "o_a", "o_b", "o_c", "va_0", "va_1", "va_2", "vb_0", "vb_1", "vb_2", "cnt_a", "cnt_b", "cnt_c", "cnt_bc"];
@@ -416,6 +444,8 @@ const SET_COLUMNS: &[&str] = &["pc", "fp", "o", "k_0", "k_1", "k_2", "cnt", "cnt
 const DEREF_COLUMNS: &[&str] = &["pc", "fp", "o1", "o2", "o3", "f_pc", "f_fp", "ptr", "v3_0", "v3_1", "v3_2", "cnt_ptr", "cnt_target", "cnt_local", "cnt_bc"];
 #[rustfmt::skip]
 const JUMP_COLUMNS: &[&str] = &["pc", "fp", "o_c", "o_d", "o_f", "v_cond", "v_pc", "v_fp", "cnt_c", "cnt_d", "cnt_f", "cnt_bc", "w", "b"];
+#[rustfmt::skip]
+const DOT2_COLUMNS: &[&str] = &["pc", "fp", "o_a", "o_p", "o_w", "o_acc", "o_c", "ptr", "a_0", "a_1", "w0_0", "w0_1", "w0_2", "w1_0", "w1_1", "w1_2", "acc_0", "acc_1", "acc_2", "cnt_a", "cnt_p", "cnt_w0", "cnt_w1", "cnt_acc", "cnt_c", "cnt_bc"];
 // KECCAK's columns: these, then the input lanes `in_l`, the output lanes `out_l`, a read count `cnt_c` for each cell
 // read then each written, `cnt_bc`, and the bytecode's flags `out_two` and `out_all` for the output cells written. The fifty value lanes are not committed in the table: an input lane is one of
 // q_keccak's slots, and the output lanes' claims are the Keccak reduction's claim on the output.
@@ -499,6 +529,7 @@ pub fn tables() -> Vec<Table> {
         table(OP_DEREF, named(DEREF_COLUMNS), flushes_deref(), |_| vec![]),
         table(OP_JUMP, named(JUMP_COLUMNS), flushes_jump(), jump_constraints),
         keccak,
+        table(OP_DOT2, named(DOT2_COLUMNS), flushes_dot2(), |_| vec![]),
     ]
 }
 
@@ -509,6 +540,7 @@ const TABLE_WIDTHS: [usize; N_TABLES] = [
     DEREF_COLUMNS.len(),
     JUMP_COLUMNS.len(),
     KECCAK_ADDR + 1,
+    DOT2_COLUMNS.len(),
 ];
 pub const GLOBAL_COLUMN_BASES: [usize; N_TABLES] = {
     let mut bases = [NUM_GLOBAL_COLUMNS; N_TABLES];
@@ -521,7 +553,7 @@ pub const GLOBAL_COLUMN_BASES: [usize; N_TABLES] = {
 };
 
 /// Each table's least log height: 0, but the Keccak reduction's block of steps for KECCAK.
-const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, KECCAK_MIN_STEPS_LOG];
+const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, KECCAK_MIN_STEPS_LOG, 0];
 
 pub fn build_layout<'a>(
     bytecode: &'a Bytecode,

@@ -959,17 +959,40 @@ def _flushes_keccak() -> Flushes:
     return flushes
 
 
+def _flushes_dot2() -> Flushes:
+    pc, fp, o_a, o_p, o_w, o_acc, o_c, ptr, a_0, a_1 = _cols(DOT2_COLUMNS, "pc", "fp", "o_a", "o_p", "o_w", "o_acc", "o_c", "ptr", "a_0", "a_1")
+    cnt_a, cnt_p, cnt_w0, cnt_w1, cnt_acc, cnt_c, cnt_bc = _cols(DOT2_COLUMNS, "cnt_a", "cnt_p", "cnt_w0", "cnt_w1", "cnt_acc", "cnt_c", "cnt_bc")
+    w0, w1, acc = (_cols(DOT2_COLUMNS, f"{name}_0", f"{name}_1", f"{name}_2") for name in ("w0", "w1", "acc"))
+    flushes = Flushes()
+    flushes.state_step(pc, fp)
+    flushes.bytecode(pc, cnt_bc, OP_DOT2, (_col(o_a), _col(o_p), _col(o_w), _col(o_acc), _col(o_c)))
+    # The lane cell is read with a zero top limb, so both lanes are in K.
+    flushes.memory_cols(_prod(fp, o_a), cnt_a, a_0, a_1)
+    flushes.memory_cols(_prod(fp, o_p), cnt_p, ptr)
+    flushes.memory_cols(_prod(ptr, o_w), cnt_w0, *w0)
+    flushes.memory_cols(_prod(ptr, o_w, 1), cnt_w1, *w1)
+    flushes.memory_cols(_prod(fp, o_acc), cnt_acc, *acc)
+    result = tuple(_col(acc[i]) + _prod(a_0, w0[i]) + _prod(a_1, w1[i]) for i in range(3))
+    flushes.memory(_prod(fp, o_c), cnt_c, result)
+    return flushes
+
+
 def _keccak_constraints(columns: Sequence[E]) -> tuple[E, ...]:
     fp, o_out, addr = (columns[index] for index in _cols(KECCAK_COLUMNS, "fp", "o_out", "addr"))
     return (addr + fp * o_out,)
 
 
-OP_XOR, OP_MUL, OP_SET, OP_DEREF, OP_JUMP, OP_KECCAK = range(6)
+OP_XOR, OP_MUL, OP_SET, OP_DEREF, OP_JUMP, OP_KECCAK, OP_DOT2 = range(7)
 
 ARITH_COLUMNS = ("pc", "fp", "o_a", "o_b", "o_c", "va_0", "va_1", "va_2", "vb_0", "vb_1", "vb_2", "cnt_a", "cnt_b", "cnt_c", "cnt_bc",)  # fmt: skip
 SET_COLUMNS = ("pc", "fp", "o", "k_0", "k_1", "k_2", "cnt", "cnt_bc")
 DEREF_COLUMNS = ("pc", "fp", "o1", "o2", "o3", "f_pc", "f_fp", "ptr", "v3_0", "v3_1", "v3_2",  "cnt_ptr", "cnt_target", "cnt_local", "cnt_bc",)  # fmt: skip
 JUMP_COLUMNS = ("pc", "fp", "o_c", "o_d", "o_f", "v_cond", "v_pc", "v_fp", "cnt_c", "cnt_d", "cnt_f", "cnt_bc", "w", "b",)  # fmt: skip
+DOT2_COLUMNS = (
+    "pc", "fp", "o_a", "o_p", "o_w", "o_acc", "o_c", "ptr", "a_0", "a_1",
+    "w0_0", "w0_1", "w0_2", "w1_0", "w1_1", "w1_2", "acc_0", "acc_1", "acc_2",
+    "cnt_a", "cnt_p", "cnt_w0", "cnt_w1", "cnt_acc", "cnt_c", "cnt_bc",
+)  # fmt: skip
 KECCAK_COLUMNS = (
     "pc", "fp", "o_m0", "o_m1", "o_m2", "o_m3", "o_tail", "o_b8", "o_cap", "o_out", "odd_in", "odd_out",
     # The read limb that holds no lane.
@@ -1006,6 +1029,7 @@ TABLES = (
     Table("deref", OP_DEREF, DEREF_COLUMNS, _flushes_deref()),
     Table("jump", OP_JUMP, JUMP_COLUMNS, _flushes_jump(), _jump_constraints),
     Table("keccak", OP_KECCAK, KECCAK_COLUMNS, _flushes_keccak(), _keccak_constraints),
+    Table("dot2", OP_DOT2, DOT2_COLUMNS, _flushes_dot2()),
 )
 
 
@@ -1013,7 +1037,7 @@ TABLE_WIDTHS = tuple(t.width for t in TABLES)
 GLOBAL_COLUMN_BASES = tuple(NUM_GLOBAL_COLUMNS + sum(TABLE_WIDTHS[:table]) for table in range(len(TABLES)))
 
 
-TABLE_LOG_FLOORS = (0, 0, 0, 0, 0, KECCAK_MIN_STEPS_LOG)  # each table's least log height: 0, but the Keccak reduction's block of steps for KECCAK
+TABLE_LOG_FLOORS = (0, 0, 0, 0, 0, KECCAK_MIN_STEPS_LOG, 0)  # each table's least log height: 0, but the Keccak reduction's block of steps for KECCAK
 
 
 def build_layout(bytecode: Sequence[K], log_memory: int, table_rows: Sequence[int]) -> Layout:
@@ -1528,7 +1552,7 @@ def verify_execution(bytecode: Sequence[K], public_input: Digest, proof: Proof) 
     # 3] Bus: one batched GKR over the push, pull and count trees, then the leaf decomposition, which leaves each table a degree-2 claim.
     bus = verify_bus_balance(layout, transcript)
 
-    # 4] One batched (back-loaded) "table sumcheck" over all six tables, at the bus point, proving the target the three
+    # 4] One batched (back-loaded) "table sumcheck" over all seven tables, at the bus point, proving the target the three
     # leaf claims derive and that constraints vanish. Every table takes a disjoint range of xi powers for its constraints
     xi = transcript.sample()
     n_constraints = sum(table.n_constraints for table in TABLES)

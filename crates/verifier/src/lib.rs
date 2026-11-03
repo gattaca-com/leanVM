@@ -253,7 +253,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     // 3] Bus: one batched GKR over the push, pull and count trees, then the leaf decomposition, which leaves each table a degree-2 claim.
     let bus = verify_bus_balance(&layout, &mut transcript)?;
 
-    // 4] One batched (back-loaded) "table sumcheck" over all six tables, at the bus point, proving the target the three
+    // 4] One batched (back-loaded) "table sumcheck" over all seven tables, at the bus point, proving the target the three
     // leaf claims derive and that constraints vanish. Every table takes a disjoint range of xi powers for its constraints
     let xi = transcript.sample();
     let n_constraints: usize = layout.tables.iter().map(|table| table.n_constraints()).sum();

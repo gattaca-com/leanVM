@@ -30,8 +30,12 @@ def main():
     digest = StackBuf(2)
     keccak_cells([5, 7, 5, 7, 5, 7, 5, 7, 5, 7], digest)
 
+    # A DOT2 folds the digest's first cell, two lanes, against weights behind a pointer.
+    weights = HeapBuf(2)
+    weights[GEN ** 0] = digest[1]
+    weights[GEN] = GEN
     chain = HeapBuf(LOOP_STEPS + 1)
-    chain[1] = digest[0]
+    chain[1] = dot2(digest[0], digest[0], weights[GEN ** 0])
     for index in mul_range(1, GEN ** LOOP_STEPS):
         chain[index * GEN] = mix(chain[index] + index, index) + index
 
@@ -102,9 +106,10 @@ fn public_input() -> [F192; 2] {
     let digest = primitives::hash::hash(&message);
     let word = |i: usize| u64::from_le_bytes(digest[8 * i..8 * i + 8].try_into().unwrap());
     let digest = [F192::new(word(0), word(1), 0), F192::new(word(2), word(3), 0)];
-    let mut value = digest[0];
-    let mut index = F192::ONE;
     let generator = F192::from(g_pow(1));
+    let lane = |limb: u64| F192::new(limb, 0, 0);
+    let mut value = digest[0] + lane(digest[0].c0) * digest[1] + lane(digest[0].c1) * generator;
+    let mut index = F192::ONE;
     for _ in 0..LOOP_STEPS {
         let candidate = value + index;
         let product = candidate * generator;

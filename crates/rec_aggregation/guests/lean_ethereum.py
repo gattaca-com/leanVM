@@ -173,7 +173,7 @@ N_TUPLE_SLOTS = 16
 BYTECODE_COLS = BYTECODE_COLS_PLACEHOLDER
 LOG2_BYTECODE_COLS = LOG2_BYTECODE_COLS_PLACEHOLDER
 
-# --------------------------------------------------------------- the six tables
+# --------------------------------------------------------------- the seven tables
 # The table sumcheck's batch carries EVERY committed column of a table, because its
 # bus forms read the flushed ones and its constraint the rest; TABLE_COLS_CAP caps
 # the evaluation frame. ETA_OFFSET[t] starts table t's disjoint range of zc_xi
@@ -283,7 +283,6 @@ LIG_YR_LEN = LIG_YR_LEN_PLACEHOLDER
 LIG_TOTAL_FOLDS = LIG_TOTAL_FOLDS_PLACEHOLDER
 LIG_MAX_QUERIES = LIG_MAX_QUERIES_PLACEHOLDER
 LIG_MAX_SQUEEZES = LIG_MAX_SQUEEZES_PLACEHOLDER
-LIG_MAX_INTERLEAVE = LIG_MAX_INTERLEAVE_PLACEHOLDER
 LIG_POSITIONS_LEN = LIG_POSITIONS_LEN_PLACEHOLDER
 LIG_CAP_DEPTH = LIG_CAP_DEPTH_PLACEHOLDER
 LIG_CAP_OFF = LIG_CAP_OFF_PLACEHOLDER
@@ -292,10 +291,8 @@ LIG_QUERY_GRIND_BITS = LIG_QUERY_GRIND_BITS_PLACEHOLDER
 LIG_OOD_SAMPLES = LIG_OOD_SAMPLES_PLACEHOLDER
 LIG_QUERIES = LIG_QUERIES_PLACEHOLDER
 LIG_FOLDS = LIG_FOLDS_PLACEHOLDER
-LIG_INTERLEAVE = LIG_INTERLEAVE_PLACEHOLDER
 LIG_LEAF_CELLS = LIG_LEAF_CELLS_PLACEHOLDER
 LIG_PACKED_ROW_CAP = LIG_PACKED_ROW_CAP_PLACEHOLDER
-LIG_ROW_CAP = LIG_ROW_CAP_PLACEHOLDER
 LIG_PATH_CAP = LIG_PATH_CAP_PLACEHOLDER
 LIG_TREE_DEPTH = LIG_TREE_DEPTH_PLACEHOLDER
 LIG_SQUEEZES = LIG_SQUEEZES_PLACEHOLDER
@@ -1173,70 +1170,54 @@ def opening_final_message(fs0, fs1, fs2, fs3, fs4, w0, w1, cursor, out, n: Const
     return sp[0], sp[8], sp[9], sp[10], sp[11], sp[12], cursor * GEN, nonce
 
 
-def opening_row_weights(point, out, folds: Const, reverse: Const):
-    # The row's eq weights as their two tensor factors: weight i is
-    # out[i % 2^lo] * out[2^lo + i // 2^lo], the low `lo` coordinates first. At
-    # level 0 lane i is interleaving index 2^folds - 1 - i, which reverses both.
+def opening_row_weights(point, out, folds: Const, reverse: Const, base: Const):
+    # The weight of each limb of a leaf row, in the row's order, for its DOT2 fold.
+    # Lane i weighs eq_lo[i % 2^lo] * eq_hi[i // 2^lo], the low `lo` coordinates
+    # first. At level 0 lane i is interleaving index 2^folds - 1 - i, which reverses
+    # both factors. Deeper rows hold three tower limbs a word, so limb j of word i
+    # weighs Y^j times word i's weight.
     if const(folds // 3 == 0):
         lo = folds
     else:
         lo = 3
     hi = folds - lo
+    factors = StackBuf(16)  # 2^lo + 2^hi for at most six folds
     for i in unroll(0, 2 ** lo):
         if reverse == 1:
             slot = 2 ** lo - 1 - i
         else:
             slot = i
-        out[GEN ** i] = eq_weight(point, lo, slot, 0)
+        factors[i] = eq_weight(point, lo, slot, 0)
     for i in unroll(0, 2 ** hi):
         if reverse == 1:
             slot = 2 ** hi - 1 - i
         else:
             slot = i
-        out[GEN ** (2 ** lo + i)] = eq_weight(point * GEN ** lo, hi, slot, 0)
+        factors[2 ** lo + i] = eq_weight(point * GEN ** lo, hi, slot, 0)
+    for h in unroll(0, 2 ** hi):
+        for l in unroll(0, 2 ** lo):
+            i = 2 ** lo * h + l
+            weight = factors[l] * factors[2 ** lo + h]
+            if base == 1:
+                out[GEN ** i] = weight
+            else:
+                out[GEN ** (3 * i)] = weight
+                out[GEN ** (3 * i + 1)] = weight * Y_TOWER
+                out[GEN ** (3 * i + 2)] = weight * (Y_TOWER * Y_TOWER)
     return
 
 
 @inline
-def opening_query(cap, flags, row_eq_weights, direction_bits, base: Const, interleave: Const, leaf_cells: Const, depth: Const, cap_depth: Const):
+def opening_query(cap, flags, row_weights, direction_bits, leaf_cells: Const, depth: Const, cap_depth: Const):
     # One query: hash the hinted row up its Merkle path into the shared cap, and
-    # return its dot product with the row's eq weights.
-    if base == 1:
-        row_len = interleave
-    else:
-        row_len = 3 * interleave
-    row = StackBuf(LIG_ROW_CAP)
-    hint_witness(row[0:row_len], "merkle_leaf_rows")
-    row_dot = 0
+    # return its dot product with the row's limb weights. The row is hinted as the
+    # packed cells the leaf hashes, two K limbs a cell: each DOT2 reads its cell
+    # with a zero top limb, which proves both limbs in K, and folds them.
     packed_row = StackBuf(LIG_PACKED_ROW_CAP)
-    if base == 1:
-        # Packing proves each hinted lane is in K before hashing or folding it.
-        for jb in unroll(0, interleave // 2):
-            packed_row[jb] = pack64x2(row[2 * jb], row[2 * jb + 1])
-    else:
-        # Pack the checked tower limbs into the leaf's contiguous byte image.
-        for jb in unroll(0, 3 * interleave // 2):
-            packed_row[jb] = pack64x2(row[2 * jb], row[2 * jb + 1])
-    # The weights' tensor factors (opening_row_weights): a run of lo_len row
-    # entries shares one hi factor.
-    if const(interleave // 8 == 0):
-        lo_len = interleave
-    else:
-        lo_len = 8
-    for h in unroll(0, interleave // lo_len):
-        part = 0
-        for l in unroll(0, lo_len):
-            jw = lo_len * h + l
-            if base == 1:
-                row_word = row[jw]
-            elif 3 * jw % 2 == 0:
-                # limbs (3w, 3w+1) are a pack; add Y^2 * limb(3w+2).
-                row_word = packed_row[3 * jw // 2] + Y_TOWER * Y_TOWER * row[3 * jw + 2]
-            else:
-                # limbs (3w+1, 3w+2) are a pack; shift it by Y and add limb(3w).
-                row_word = row[3 * jw] + Y_TOWER * packed_row[(3 * jw + 1) // 2]
-            part += row_word * row_eq_weights[GEN ** l]
-        row_dot += row_eq_weights[GEN ** (lo_len + h)] * part
+    hint_witness(packed_row[0:leaf_cells], "merkle_leaf_cells")
+    row_dot = 0
+    for jb in unroll(0, leaf_cells):
+        row_dot = dot2(row_dot, packed_row[jb], row_weights[GEN ** (2 * jb)])
     # Hash the packed row.
     leaf_hash_state = StackBuf(2)
     keccak_cells(packed_row[0:leaf_cells], leaf_hash_state)
@@ -1265,7 +1246,7 @@ def opening_query(cap, flags, row_eq_weights, direction_bits, base: Const, inter
     return row_dot
 
 
-def opening_queries(cap, flags, lam, lam_n, query_bit_ptrs, row_eq_weights, n_iters_g, odd: Const, base: Const, interleave: Const, leaf_cells: Const, depth: Const, cap_depth: Const):
+def opening_queries(cap, flags, lam, lam_n, query_bit_ptrs, row_weights, n_iters_g, odd: Const, base: Const, leaf_cells: Const, depth: Const, cap_depth: Const):
     # Specialize by row and path shape so opening configurations share query code.
     # Base-field rows (level 0) run two queries an iteration, sharing the loop
     # overhead and the weight reads; an odd count runs its first query alone,
@@ -1275,17 +1256,17 @@ def opening_queries(cap, flags, lam, lam_n, query_bit_ptrs, row_eq_weights, n_it
     mu = 1 / lam
     chain = HeapBuf(n_iters_g * GEN)
     if odd == 1:
-        chain[GEN ** 0] = opening_query(cap, flags, row_eq_weights, query_bit_ptrs[GEN ** 0], base, interleave, leaf_cells, depth, cap_depth) * mu
+        chain[GEN ** 0] = opening_query(cap, flags, row_weights, query_bit_ptrs[GEN ** 0], leaf_cells, depth, cap_depth) * mu
     else:
         chain[GEN ** 0] = 0
     for xi in mul_range(1, n_iters_g):
         if base == 1:
             bit_ptrs = query_bit_ptrs * xi * xi
-            d0 = opening_query(cap, flags, row_eq_weights, bit_ptrs[GEN ** odd], base, interleave, leaf_cells, depth, cap_depth)
-            d1 = opening_query(cap, flags, row_eq_weights, bit_ptrs[GEN ** (odd + 1)], base, interleave, leaf_cells, depth, cap_depth)
+            d0 = opening_query(cap, flags, row_weights, bit_ptrs[GEN ** odd], leaf_cells, depth, cap_depth)
+            d1 = opening_query(cap, flags, row_weights, bit_ptrs[GEN ** (odd + 1)], leaf_cells, depth, cap_depth)
             chain[xi * GEN] = ((chain[xi] + d0) * mu + d1) * mu
         else:
-            d = opening_query(cap, flags, row_eq_weights, query_bit_ptrs[xi], base, interleave, leaf_cells, depth, cap_depth)
+            d = opening_query(cap, flags, row_weights, query_bit_ptrs[xi], leaf_cells, depth, cap_depth)
             chain[xi * GEN] = (chain[xi] + d) * mu
     return chain[n_iters_g] * lam_n
 
@@ -1359,7 +1340,6 @@ def open_stacked(m_idx: Const, fs0, fs1, fs2, fs3, fs4, target, commit_root_0, c
         ml = m_idx * LIG_MAX_LEVELS + lvl
         n_queries = LIG_QUERIES[ml]
         depth = LIG_TREE_DEPTH[ml]
-        interleave = LIG_INTERLEAVE[ml]
         folds_off = LIG_FOLDS_OFF[ml]
         pos_off = LIG_POSITIONS_OFF[ml]
         for j in unroll(0, LIG_FOLDS[ml]):
@@ -1462,8 +1442,8 @@ def open_stacked(m_idx: Const, fs0, fs1, fs2, fs3, fs4, target, commit_root_0, c
         # leaves out are its LEADING words, whose whole blocks the committer hashes
         # once for all leaves. The flip is a compile-time index and the guest still
         # hashes the full image. Deeper levels commit every lane, ascending.
-        row_eq_weights = HeapBuf(GEN ** (LIG_MAX_INTERLEAVE[m_idx]))
-        opening_row_weights(fold_challenges * GEN ** folds_off, row_eq_weights, LIG_FOLDS[ml], 1 // (lvl + 1))
+        row_weights = HeapBuf(GEN ** (2 * LIG_LEAF_CELLS[ml]))
+        opening_row_weights(fold_challenges * GEN ** folds_off, row_weights, LIG_FOLDS[ml], 1 // (lvl + 1), 1 // (lvl + 1))
 
         cap_depth = LIG_CAP_DEPTH[ml]
         cap = merkle_caps * GEN ** (4 * LIG_CAP_OFF[ml])
@@ -1472,7 +1452,7 @@ def open_stacked(m_idx: Const, fs0, fs1, fs2, fs3, fs4, target, commit_root_0, c
         level_roots[GEN ** (2 * lvl)] = root_0
         level_roots[GEN ** (2 * lvl + 1)] = root_1
 
-        level_query_sum = opening_queries(cap, flags, lam, lam_pow, query_bit_ptrs * GEN ** pos_off, row_eq_weights, GEN ** (n_queries // (1 + 1 // (lvl + 1))), n_queries % 2 * (1 // (lvl + 1)), 1 // (lvl + 1), interleave, LIG_LEAF_CELLS[ml], depth, cap_depth)
+        level_query_sum = opening_queries(cap, flags, lam, lam_pow, query_bit_ptrs * GEN ** pos_off, row_weights, GEN ** (n_queries // (1 + 1 // (lvl + 1))), n_queries % 2 * (1 // (lvl + 1)), 1 // (lvl + 1), LIG_LEAF_CELLS[ml], depth, cap_depth)
 
         # Every level, including the last, ties its commitment in through an intro
         # message. The level's claims then enter the running one with powers of
@@ -1958,7 +1938,7 @@ def padding_weight(rows, zeta, tau: Const):
 
 
 def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, dims_g, table_rows, block_kappa, g_squares, fp_w, beta, claim_pool, claim_cplen_g, chi, claim_push, claim_pull, claim_count):
-    # Settle the bus against the six tables, in four steps: certify each side's
+    # Settle the bus against the seven tables, in four steps: certify each side's
     # leaf-cube tiling, decompose the three GKR leaf values over it, run the ONE
     # table sumcheck they all reduce to, and bind the public input. Pooled claims
     # land in claim_pool/claim_cplen_g and the reduced point in `chi`; the batch's
@@ -2193,7 +2173,7 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
         bus_table_total[s] = acc + gkr_claims[s]
     claim_idx = N_BUS_CLAIMS  # AIR/PI/pin claims pool after the deduped bus claims
 
-    # ---- ONE table sumcheck for all six tables ----
+    # ---- ONE table sumcheck for all seven tables ----
     # Mirrors leanvm_core::constraints::verify. zc_xi ONCE, each table folding its own
     # identities with a DISJOINT range of its powers (ETA_OFFSET[t]); one shared
     # point zeta (the bus GKR's); n = max_t tau_t rounds. Rounds bind the HIGHEST

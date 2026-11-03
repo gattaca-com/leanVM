@@ -44,6 +44,16 @@ pub(crate) struct Jrow {
     pub(crate) bytecode_read: u32,
 }
 
+/// `DOT2` row: the cell the pointer names, and the access counts of `a`, the pointer, the two
+/// weights, `acc` and `c`, in flush order.
+pub(crate) struct Dot2row {
+    pub(crate) pc: u32,
+    pub(crate) fp: u32,
+    pub(crate) base: u32,
+    pub(crate) r: [u32; 6],
+    pub(crate) bytecode_read: u32,
+}
+
 /// `KECCAK` row: the per-cell memory access counts, in the order the table flushes
 /// them (`tables::KeccakOp::cell`): the four `m` cells, the four `tail` cells, `b8`, the
 /// four `cap` cells, then the thirteen output cells. The fifty value lanes are those
@@ -128,6 +138,7 @@ pub(crate) struct Trace {
     pub(crate) keccak: Rows<Krow>,
     /// One past the last `KECCAK` row that writes output cell 1, and one past the last that writes cells `2..13`.
     pub(crate) keccak_live: [usize; 2],
+    pub(crate) dot2: Rows<Dot2row>,
     pub(crate) bytecode_count: Vec<u32>, // per-pc execution count; the column holds g^{A[pc]}
     /// One past the highest access count, of a cell or a pc: the `g`-powers a fill looks up.
     pub(crate) counts: usize,
@@ -143,6 +154,7 @@ impl Trace {
             self.deref.len(),
             self.jump.len(),
             self.keccak.len(),
+            self.dot2.len(),
         ]
     }
 }

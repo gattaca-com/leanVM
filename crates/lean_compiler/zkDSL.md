@@ -1,6 +1,6 @@
 # zkDSL Language Reference (leanVM)
 
-The zkDSL is a Python-syntax language that compiles to the leanVM ISA: six instructions (`XOR`, `MUL`, `SET`, `DEREF`, `JUMP`, `KECCAK`) over the binary field GF(2^192), with write-once memory and all indices carried "in the exponent" as powers of a fixed generator. For the underlying VM and proving system, see [`doc/leanvm/main.tex`](../../doc/leanvm/main.tex).
+The zkDSL is a Python-syntax language that compiles to the leanVM ISA: seven instructions (`XOR`, `MUL`, `SET`, `DEREF`, `JUMP`, `KECCAK`, `DOT2`) over the binary field GF(2^192), with write-once memory and all indices carried "in the exponent" as powers of a fixed generator. For the underlying VM and proving system, see [`doc/leanvm/main.tex`](../../doc/leanvm/main.tex).
 
 Source files use the `.py` extension and are **Python-shaped**: they import the [`snark_lib`](snark_lib.py) stub, which defines `GEN`, `log`, `mul_range`, `HeapBuf`, `StackBuf`, `assert_in_k`, `keccak` and `keccak_cells`, so editors and linters resolve the intrinsic names. The compiler skips the import. Ordinary helpers such as `pack64x2` are defined in the single-file guest. A program that uses placeholders is not a runnable Python file: its `*_PLACEHOLDER` identifiers are undefined until the host fills them in, so importing it raises `NameError`.
 
@@ -394,7 +394,7 @@ The two `DEREF` target cells are unconstrained touches, back-filled at the end o
 assert_in_k(lo, hi)
 ```
 
-`assert_in_k(a, b)` is the sole packing-related compiler intrinsic. It proves that both source memory words are in the base field GF(2^64) with one untaken `JUMP`: its condition is a known zero, while its destination and frame operands are `a` and `b`. Although neither value affects the successor state, both memory reads carry literal-zero upper limbs, so a source outside GF(2^64) cannot balance the memory permutation.
+`assert_in_k(a, b)` proves that both source memory words are in the base field GF(2^64) with one untaken `JUMP`: its condition is a known zero, while its destination and frame operands are `a` and `b`. Although neither value affects the successor state, both memory reads carry literal-zero upper limbs, so a source outside GF(2^64) cannot balance the memory permutation.
 
 Packing is ordinary zkDSL built on that assertion:
 
@@ -406,6 +406,14 @@ def pack64x2(a, b):
 ```
 
 The inline helper takes three cycles, one `JUMP`, one `MUL` and one `XOR`, and returns the canonical 128-bit packing `(a.c0, b.c0, 0)`. Assignment-target lowering writes its return directly into the destination, including an already-written cell whose second write is an equality assertion. A caller needing only membership uses `assert_in_k` directly and pays no packing arithmetic.
+
+A packed cell can also be folded without unpacking it:
+
+```python
+acc = dot2(acc, cell, weights[GEN ** k])
+```
+
+`dot2(acc, a, w[i])` is one `DOT2`: it returns `acc + a0·w[i] + a1·w[i+1]` for the packed cell `a = (a0, a1, 0)`. It reads `a` with a literal-zero top limb, so the same row proves both lanes in GF(2^64). The weights are two consecutive cells of a heap run, read through its pointer as a `DEREF` reads its target; `acc` and `a` are any scalars. The recursion guest folds each WHIR leaf row this way, the row hinted as the packed cells its leaf hash reads.
 
 The recursion transcript uses `challenge_from_state(state)` to reinterpret the first three 64-bit lanes of a canonical two-cell digest as one extension field challenge. For `state = [s0, s1]`, it lowers exactly as follows (the limb hints cost no cycles, but are not trusted):
 

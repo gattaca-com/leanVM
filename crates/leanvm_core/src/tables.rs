@@ -14,7 +14,7 @@
 //! so a relation on machine words is written out lane by lane. `eval_constraint`
 //! reads the columns as `E`-valued, which embeds `K`.
 
-use crate::cpu::{Drow, Jrow, Krow, Memory, Op, Rows, Srow, Trace};
+use crate::cpu::{Dot2row, Drow, Jrow, Krow, Memory, Op, Rows, Srow, Trace};
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
 use ::pcs::stack_open::EQUAL_BLOCK_LOG;
 use primitives::field::{F64, F192, mul_by_g};
@@ -91,6 +91,7 @@ pub(crate) const OP_SET: F64 = g_pow(2);
 pub(crate) const OP_DEREF: F64 = g_pow(3);
 pub(crate) const OP_JUMP: F64 = g_pow(4);
 pub(crate) const OP_KECCAK: F64 = g_pow(5);
+pub(crate) const OP_DOT2: F64 = g_pow(6);
 
 // ---- flush builder -----------------------------------------------------------
 
@@ -417,9 +418,9 @@ pub trait Table: Sync {
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]);
 }
 
-/// The tables in fixed order `[XOR, MUL, SET, DEREF, JUMP, KECCAK]`, the
+/// The tables in fixed order `[XOR, MUL, SET, DEREF, JUMP, KECCAK, DOT2]`, the
 /// order of `row_counts` / `taus` throughout `cpu`.
-pub const N_TABLES: usize = 6;
+pub const N_TABLES: usize = 7;
 
 pub fn tables() -> [&'static dyn Table; N_TABLES] {
     [
@@ -429,6 +430,7 @@ pub fn tables() -> [&'static dyn Table; N_TABLES] {
         &DerefTable,
         &JumpTable,
         &KeccakTable,
+        &Dot2Table,
     ]
 }
 
@@ -436,7 +438,7 @@ pub fn tables() -> [&'static dyn Table; N_TABLES] {
 pub(crate) const KECCAK_TABLE: usize = 5;
 
 /// Each table's least log height: 0, but the Keccak reduction's block of steps for `KECCAK`.
-pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, crate::keccak::MIN_STEPS.ilog2() as usize];
+pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, crate::keccak::MIN_STEPS.ilog2() as usize, 0];
 
 /// What each cell a `KECCAK` row touches is addressed by, in flush order (the four `m` cells, the
 /// four `tail` cells, `b8`, the four `cap` cells, then the thirteen output cells): the offset
@@ -899,6 +901,109 @@ impl Table for JumpTable {
                 ctx.g_at(r.bytecode_read),
                 w[i],
                 F64(!c[i].is_zero() as u64),
+            ]
+        });
+    }
+}
+
+// ---- DOT2 ---------------------------------------------------------------------
+
+/// `DOT2` (§sec:tab-dot2): `c = acc + a0·w0 + a1·w1` for a packed cell `a = (a0, a1, 0)` and two
+/// weights behind a pointer, `w0` at `p·o_w` and `w1` at `p·o_w·g`. The cell `a` is read with a
+/// literal zero top limb, so both lanes are in `K` by bus balance alone. The result is no column:
+/// its memory flush carries it as a degree-2 form over the lanes and the weights, as `MUL`'s does.
+struct Dot2Table;
+
+mod dot2 {
+    pub const PC: usize = 0;
+    pub const FP: usize = 1;
+    pub const OA: usize = 2;
+    pub const OP: usize = 3;
+    pub const OW: usize = 4;
+    pub const OACC: usize = 5;
+    pub const OC: usize = 6;
+    // The pointer, a single K lane like DEREF's.
+    pub const P: usize = 7;
+    // The packed cell's two lanes, then the two weights and the accumulator, three K limbs each.
+    pub const A0: usize = 8;
+    pub const A1: usize = 9;
+    pub const W0: usize = 10;
+    pub const W1: usize = 13;
+    pub const ACC: usize = 16;
+    pub const RA: usize = 19;
+    pub const RP: usize = 20;
+    pub const RW0: usize = 21;
+    pub const RW1: usize = 22;
+    pub const RACC: usize = 23;
+    pub const RC: usize = 24;
+    pub const RBC: usize = 25;
+    pub const N: usize = 26;
+}
+
+/// The result's three K lanes: `acc_i + a0·w0_i + a1·w1_i`.
+fn dot2_result() -> [Coord; 3] {
+    use dot2::*;
+    std::array::from_fn(|i| Coord::Sum(vec![Col(ACC + i), Prod(A0, W0 + i, 0), Prod(A1, W1 + i, 0)]))
+}
+
+impl Table for Dot2Table {
+    fn n_committed_columns(&self) -> usize {
+        dot2::N
+    }
+    fn count_columns(&self) -> &'static [usize] {
+        use dot2::*;
+        &[RA, RP, RW0, RW1, RACC, RC, RBC]
+    }
+    fn flushes(&self, f: &mut FlushBuilder) {
+        use dot2::*;
+        f.state_step(PC, FP);
+        f.bytecode(PC, RBC, OP_DOT2, &[Col(OA), Col(OP), Col(OW), Col(OACC), Col(OC)]);
+        f.memory_coords(Prod(FP, OA, 0), RA, [Col(A0), Col(A1), Const(F64::ZERO)]);
+        f.memory_k(Prod(FP, OP, 0), RP, P);
+        f.memory(Prod(P, OW, 0), RW0, W0, W0 + 1, W0 + 2);
+        f.memory(Prod(P, OW, 1), RW1, W1, W1 + 1, W1 + 2);
+        f.memory(Prod(FP, OACC, 0), RACC, ACC, ACC + 1, ACC + 2);
+        f.memory_coords(Prod(FP, OC, 0), RC, dot2_result());
+    }
+    fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]) {
+        let rows = &ctx.trace.dot2;
+        ctx.cols(out, rows, dot2::PC, |r: &Dot2row| {
+            let Op::Dot2 { a, ptr, w, acc, c } = ctx.prog[r.pc as usize] else {
+                unreachable!("a DOT2 row's pc {} holds {:?}", r.pc, ctx.prog[r.pc as usize])
+            };
+            let va = ctx.limbs(r.fp + a);
+            let (w0, w1, vacc) = (
+                ctx.limbs(r.base + w),
+                ctx.limbs(r.base + w + 1),
+                ctx.limbs(r.fp + acc),
+            );
+            [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
+                ctx.g_at(a),
+                ctx.g_at(ptr),
+                ctx.g_at(w),
+                ctx.g_at(acc),
+                ctx.g_at(c),
+                F64(ctx.mem.word((r.fp + ptr) as usize).c0),
+                va[0],
+                va[1],
+                w0[0],
+                w0[1],
+                w0[2],
+                w1[0],
+                w1[1],
+                w1[2],
+                vacc[0],
+                vacc[1],
+                vacc[2],
+                ctx.g_at(r.r[0]),
+                ctx.g_at(r.r[1]),
+                ctx.g_at(r.r[2]),
+                ctx.g_at(r.r[3]),
+                ctx.g_at(r.r[4]),
+                ctx.g_at(r.r[5]),
+                ctx.g_at(r.bytecode_read),
             ]
         });
     }

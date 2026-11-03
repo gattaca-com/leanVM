@@ -54,6 +54,17 @@ pub enum Op {
         out_odd: bool,
         out_cells: OutCells,
     },
+    /// `DOT2`: `mem[fp·c] = mem[fp·acc] + a0·w0 + a1·w1`, where `mem[fp·a] = a0 + y·a1` is read
+    /// canonical (top limb zero), so both lanes are in `K`. The two weights are the consecutive
+    /// cells `w0 = mem[p·w]` and `w1 = mem[p·w·g]` behind the pointer `p = mem[fp·ptr]`, as a
+    /// `DEREF` addresses its target.
+    Dot2 {
+        a: u32,
+        ptr: u32,
+        w: u32,
+        acc: u32,
+        c: u32,
+    },
 }
 
 /// How many of a `KECCAK`'s thirteen output cells it writes, from `out` on: the first one, the
@@ -90,6 +101,8 @@ impl Op {
             Self::Set { o, .. } => o,
             Self::Deref { o1, o2, o3, .. } => o1.max(o2).max(o3),
             Self::Jump { oc, od, of } => oc.max(od).max(of),
+            // `w + 1` is the second weight's offset from the pointer, bounded as a `DEREF`'s `o2`.
+            Self::Dot2 { a, ptr, w, acc, c } => a.max(ptr).max(w + 1).max(acc).max(c),
             Self::Keccak {
                 m,
                 tail,
