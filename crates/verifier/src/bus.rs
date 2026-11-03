@@ -3,7 +3,7 @@
 use crate::field::{E, ONE, ZERO};
 use crate::layout::{
     BUS_BITS, BYTECODE_FINAL_COUNTERS, BusBlock, Form, Layout, MEMORY_0, MEMORY_1, MEMORY_2, MEMORY_FINAL_COUNTERS,
-    SEP_BYTECODE, SEP_MEM, SEP_STATE, Table, constant, gpow,
+    SEP_BYTECODE, SEP_MEM, SEP_STATE, Table, col_form, constant, gpow,
 };
 use crate::multilinear::{
     CHUNK_LOG, Placement, dot, eq_kernel, index_mle, multilinear_eval, padding_weight, poly_eval, stack_offsets,
@@ -195,12 +195,21 @@ pub fn verify_bus_balance(layout: &Layout, transcript: &mut Transcript) -> Resul
         // A table's blocks stay symbolic: they accumulate into the form its sumcheck settles over its own columns.
         // That form is summed over the padding rows too, whose leaves hold 1 instead: the difference is public.
         let mut padding_rows = ZERO;
+        let mut gated = ZERO;
         for (&selector, block) in table_selectors.iter().zip(blocks) {
             let form = &mut forms[block.owner][side];
-            let mut block_form = constant(side_beta);
+            let mut block_form = Form::default();
             for (slot, coordinate) in block.coordinates.iter().enumerate() {
                 block_form.add_scaled(coordinate, side_weights[slot]); // the fingerprint, one tuple slot at a time
             }
+            // A gated leaf is 1 + gate·(β + 1) + Σ_i w_i c_i: its 1 sums to the selector, and its padding rows hold 1.
+            if let Some(gate) = block.gate {
+                block_form.add_scaled(&col_form(gate), side_beta + ONE);
+                form.add_scaled(&block_form, selector);
+                gated += selector;
+                continue;
+            }
+            block_form.add_scaled(&constant(ONE), side_beta);
             form.add_scaled(&block_form, selector);
             let padding = &layout.tables[block.owner].padding;
             let weight = padding_weight(&point[..block.log_rows], block.rows);
@@ -208,7 +217,7 @@ pub fn verify_bus_balance(layout: &Layout, transcript: &mut Transcript) -> Resul
         }
         // The leaves outside every block hold 1.
         let ones_padding = E::sum(framework_selectors.into_iter().chain(table_selectors)) + ONE;
-        totals.push(tree_values[side] + known + ones_padding + padding_rows); // what the forms owe: the GKR value, less framework and padding
+        totals.push(tree_values[side] + known + ones_padding + padding_rows + gated); // what the forms owe: the GKR value, less framework and padding
     }
 
     Ok(BusResult {

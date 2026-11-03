@@ -101,6 +101,10 @@ pub(crate) const OP_KECCAK: F64 = g_pow(5);
 pub struct FlushBuilder {
     pub(crate) push: Vec<Vec<Coord>>,
     pub(crate) pull: Vec<Vec<Coord>>,
+    /// Per pair, the column a gated pair flushes by ([`crate::leaf::Block::gate`]).
+    pub(crate) gates: Vec<Option<usize>>,
+    /// The count columns of the gated pairs' accesses, with their gates.
+    pub(crate) gated_counts: Vec<(usize, usize)>,
 }
 
 impl FlushBuilder {
@@ -108,12 +112,15 @@ impl FlushBuilder {
         Self {
             push: Vec::new(),
             pull: Vec::new(),
+            gates: Vec::new(),
+            gated_counts: Vec::new(),
         }
     }
 
     fn pair(&mut self, push: Vec<Coord>, pull: Vec<Coord>) {
         self.push.push(push);
         self.pull.push(pull);
+        self.gates.push(None);
     }
 
     /// Fall-through state step: the next pc is `g·pc`, fp unchanged.
@@ -157,16 +164,18 @@ impl FlushBuilder {
         self.pair(push, pull);
     }
 
-    /// [`Self::memory_coords`] when the column `flag` is 1. At 0 the push carries the count as the pull
-    /// does, so the pair cancels and touches no cell: the push's count coordinate is
-    /// `count·(1 + flag·(g + 1))`, which is `g·count` at 1 and `count` at 0.
-    pub(crate) fn memory_coords_if(&mut self, flag: usize, addr: Coord, count: usize, vals: [Coord; 3]) {
-        let counted = Coord::Sum(vec![Col(count), Prod(flag, count, 1), Prod(flag, count, 0)]);
-        let mut push = vec![Const(SEP_MEM), addr.clone(), counted];
-        let mut pull = vec![Const(SEP_MEM), addr, Col(count)];
+    /// [`Self::memory_coords`] where the column `gate` is 1, and no pair where it is 0. `addr` and `vals`
+    /// are already multiplied by the gate, as the separator and the counts are here: every
+    /// coordinate is then 0 where the gate is, and the leaf is 1 ([`crate::leaf::Block::gate`]).
+    pub(crate) fn memory_gated(&mut self, gate: usize, addr: Coord, count: usize, vals: [Coord; 3]) {
+        const _: () = assert!(SEP_MEM.0 == g_pow(1).0, "the separator is the gate's g-multiple");
+        let mut push = vec![GCol(gate, 1), addr.clone(), Prod(gate, count, 1)];
+        let mut pull = vec![GCol(gate, 1), addr, Prod(gate, count, 0)];
         push.extend_from_slice(&vals);
         pull.extend_from_slice(&vals);
         self.pair(push, pull);
+        *self.gates.last_mut().expect("a pair") = Some(gate);
+        self.gated_counts.push((count, gate));
     }
 
     /// Memory access: read the three-limb word at `addr`.
@@ -958,7 +967,7 @@ impl Table for JumpTable {
 /// and the output lanes' claims are the Keccak reduction's claim on the output.
 struct KeccakTable;
 
-pub(crate) mod keccakt {
+pub mod keccakt {
     use crate::keccak::ROW_CELLS;
     use primitives::hash::STATE_LANES;
 
@@ -974,7 +983,8 @@ pub(crate) mod keccakt {
     pub const RBC: usize = R0 + ROW_CELLS;
     pub const OUT_TWO: usize = RBC + 1; // whether output cell 1 is written …
     pub const OUT_ALL: usize = OUT_TWO + 1; // … and cells 2..13, both bound by the bytecode read
-    pub const N: usize = OUT_ALL + 1;
+    pub const ADDR: usize = OUT_ALL + 1; // `fp·o_O`, the output's address, for the gated cells
+    pub const N: usize = ADDR + 1;
 }
 
 /// A cell limb holding lane `even` in the even layout and `odd` in the odd one, as `flag`
@@ -993,9 +1003,32 @@ fn layout_limb(even: Option<usize>, odd: Option<usize>, values: usize, flag: usi
     )
 }
 
+/// [`layout_limb`] of an output cell written where `gate` is 1, times the gate: `gate·a + odd·(a + b)`,
+/// a missing lane being zero. The bytecode makes `odd` imply both gates, so `gate·odd` is `odd`.
+fn gated_limb(even: Option<usize>, odd: Option<usize>, values: usize, flag: usize, gate: usize) -> Coord {
+    let (a, b) = (even.map(|l| values + l), odd.map(|l| values + l));
+    if a == b {
+        return a.map_or(Const(F64::ZERO), |a| Prod(gate, a, 0));
+    }
+    Coord::Sum(
+        [a.map(|a| Prod(gate, a, 0)), a.map(|a| Prod(flag, a, 0)), b.map(|b| Prod(flag, b, 0))]
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
+}
+
 impl Table for KeccakTable {
     fn n_committed_columns(&self) -> usize {
         keccakt::N
+    }
+    fn n_constraints(&self) -> usize {
+        1 // the output's address, which the gated cells' flushes multiply by their gate
+    }
+    fn eval_constraint(&self, pows: &[F192], cols: &[F192], quadratic: bool) -> F192 {
+        use keccakt::*;
+        let product = cols[FP] * cols[O_M0 + 7];
+        pows[0] * if quadratic { product } else { cols[ADDR] + product }
     }
     fn count_columns(&self) -> &'static [usize] {
         const COUNTS: [usize; crate::keccak::ROW_CELLS + 1] = {
@@ -1027,24 +1060,31 @@ impl Table for KeccakTable {
         f.state_step(PC, FP);
         let operands: Vec<Coord> = (O_M0..=OUT_ODD).chain([OUT_TWO, OUT_ALL]).map(Col).collect();
         f.bytecode(PC, RBC, OP_KECCAK, &operands);
-        // Thirteen cells read, then up to thirteen written: output cell 0 always, cell 1 as
-        // `OUT_TWO` says, the rest as `OUT_ALL` says. A consecutive cell is a free ×g on the
-        // product's g-power.
+        // Thirteen cells read, then up to thirteen written: output cell 0 always, cell 1 where
+        // `OUT_TWO` is 1, the rest where `OUT_ALL` is. A consecutive cell is a free ×g on the
+        // product's g-power. A gated cell's address is `gate·ADDR·g^k`, which keeps it degree 2.
         let (even, odd) = (cell_lanes(false), cell_lanes(true));
         for (c, &(operand, step)) in KECCAK_CELLS.iter().enumerate() {
+            let gate = match c.checked_sub(STATE_CELLS) {
+                None | Some(0) => None,
+                Some(1) => Some(OUT_TWO),
+                Some(_) => Some(OUT_ALL),
+            };
             let (s, values, flag, free) = if c < STATE_CELLS {
                 (c, V_IN, IN_ODD, Some(FREE))
             } else {
                 (c - STATE_CELLS, V_OUT, OUT_ODD, None)
             };
-            let lo = layout_limb(even[s].0, odd[s].0, values, flag, free);
-            let hi = layout_limb(even[s].1, odd[s].1, values, flag, free);
-            let (addr, vals) = (Prod(FP, O_M0 + operand, step), [lo, hi, Const(F64::ZERO)]);
-            match c.checked_sub(STATE_CELLS) {
-                None | Some(0) => f.memory_coords(addr, R0 + c, vals),
-                Some(1) => f.memory_coords_if(OUT_TWO, addr, R0 + c, vals),
-                Some(_) => f.memory_coords_if(OUT_ALL, addr, R0 + c, vals),
-            }
+            let Some(gate) = gate else {
+                let lo = layout_limb(even[s].0, odd[s].0, values, flag, free);
+                let hi = layout_limb(even[s].1, odd[s].1, values, flag, free);
+                let vals = [lo, hi, Const(F64::ZERO)];
+                f.memory_coords(Prod(FP, O_M0 + operand, step), R0 + c, vals);
+                continue;
+            };
+            let lo = gated_limb(even[s].0, odd[s].0, values, flag, gate);
+            let hi = gated_limb(even[s].1, odd[s].1, values, flag, gate);
+            f.memory_gated(gate, Prod(gate, ADDR, step), R0 + c, [lo, hi, Const(F64::ZERO)]);
         }
     }
     /// Every column but the input lanes, which are `q_keccak`'s and have no window here. A row
@@ -1080,8 +1120,9 @@ impl Table for KeccakTable {
         ctx.cols(out, rows, R0, |r| r.r.map(|k| ctx.g_at(k)));
         ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
         ctx.cols(out, rows, OUT_TWO, |r| {
-            let (two, all) = op(r).out_cells.flags();
-            [flag(two), flag(all)]
+            let k = op(r);
+            let (two, all) = k.out_cells.flags();
+            [flag(two), flag(all), ctx.g_at(r.fp + k.offsets[7])]
         });
     }
 }

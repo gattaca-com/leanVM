@@ -57,12 +57,25 @@ pub enum Coord {
 /// A flushing rule: `2^kappa` rows, each a tuple of coordinates. The first `rows` flush;
 /// the rest are a table's padding rows (§sec:e2e-pad), whose leaves are `1`, and
 /// `padding` is the tuple at the table's padding row.
+///
+/// A gated block flushes where its column `gate` is 1. Its leaf is `1 + gate·(β + 1) + Σ_i w_i c_i`, which
+/// is `β + Σ_i w_i c_i` there and `1` where the gate is 0: every coordinate is a multiple of the gate. So
+/// a row it does not flush leaves no pair on the bus, and its padding rows need no correction.
 #[derive(Clone, Debug)]
 pub struct Block {
     pub kappa: usize,
     pub rows: usize,
     pub coords: Vec<Coord>,
     pub padding: Vec<F64>,
+    /// The column a gated block flushes by.
+    pub gate: Option<usize>,
+    /// The gate column whose rows bound this block's leaves that are not `1`, a gated block's own or the
+    /// one of the access a count column counts. The prover's alone: it sets [`Self::live`] from it.
+    pub follows: Option<usize>,
+    /// The prover's leaves at rows `live..` are `1`, so it neither computes nor folds them. Equal to
+    /// `rows` but for a block that [`Self::follows`] a gate, whose rows past the last one at 1 hold
+    /// the identity, the witness being sorted so ([`crate::keccak::ShapeSort`]).
+    pub live: usize,
 }
 
 impl Block {
@@ -73,6 +86,9 @@ impl Block {
             rows: 1 << kappa,
             coords,
             padding: Vec::new(),
+            gate: None,
+            follows: None,
+            live: 1 << kappa,
         }
     }
 }
@@ -448,7 +464,7 @@ fn twin_terms<'a>(
     cols: &[Column<'a>],
     gpow: &'a [F64],
 ) -> Option<(F192, Terms<'a>)> {
-    if (push.kappa, push.rows, push.coords.len()) != (pull.kappa, pull.rows, pull.coords.len()) {
+    if (push.kappa, push.live, push.gate, push.coords.len()) != (pull.kappa, pull.live, pull.gate, pull.coords.len()) {
         return None;
     }
     let mut differ = (0..push.coords.len()).filter(|&i| !same_coord(&push.coords[i], &pull.coords[i]));
@@ -518,8 +534,8 @@ impl Side<'_> {
     fn bulk(&self, b: usize) -> usize {
         let blk = &self.blocks[b];
         let aligned = self.lay.offsets[b].is_multiple_of(gkr::BLOCK_VALUES);
-        if blk.rows >= PAR_THRESHOLD && aligned {
-            blk.rows / gkr::BLOCK_VALUES
+        if blk.live >= PAR_THRESHOLD && aligned {
+            blk.live / gkr::BLOCK_VALUES
         } else {
             0
         }
@@ -666,8 +682,12 @@ pub fn build_leaves<'a>(
             let terms = blocks
                 .iter()
                 .map(|blk| {
-                    let mut const_part = beta;
+                    // A gated block's leaf is `1 + gate·(β + 1) + Σ_i w_i c_i`.
+                    let mut const_part = blk.gate.map_or(beta, |_| F192::ONE);
                     let mut terms = Terms::default();
+                    if let Some(gate) = blk.gate {
+                        terms.lins.push((cols[gate], beta + F192::ONE));
+                    }
                     for (i, c) in blk.coords.iter().enumerate() {
                         push_terms(c, w[i], cols, gpow, &mut terms, &mut const_part);
                     }
@@ -747,7 +767,7 @@ pub fn build_leaves<'a>(
     let mut jobs: Vec<(usize, usize, usize)> = (0..sides.len())
         .flat_map(|s| (0..sides[s].blocks.len()).map(move |b| (s, b)))
         .filter(|&(s, b)| sides[s].bulk(b) > 0)
-        .map(|(s, b)| (sides[s].blocks[b].rows, s, b))
+        .map(|(s, b)| (sides[s].blocks[b].live, s, b))
         .collect();
     jobs.sort_by_key(|&(rows, ..)| rows);
     for group in jobs.chunk_by(|x, y| x.0 == y.0) {
@@ -850,12 +870,12 @@ pub fn build_leaves<'a>(
                 let (blk, off) = (&blocks[b], lay.offsets[b]);
                 let bulk = side.bulk(b);
                 side.quads_done[b] = off + gkr::BLOCK_VALUES * bulk;
-                for z in gkr::BLOCK_VALUES * bulk..blk.rows {
+                for z in gkr::BLOCK_VALUES * bulk..blk.live {
                     gkr::set_leaf(&mut side.leaves, off + z, leaf_row(&side.terms[b], z));
                 }
                 // A padding row's leaf is the identity, so it leaves the product alone.
                 if tiled {
-                    fill_ones(&mut side.leaves, off + blk.rows, off + (1usize << blk.kappa), explicit);
+                    fill_ones(&mut side.leaves, off + blk.live, off + (1usize << blk.kappa), explicit);
                 }
             }
             if !runs[s].is_empty() {
@@ -876,7 +896,7 @@ pub fn build_leaves<'a>(
                 let mut runs: Vec<_> = blocks
                     .iter()
                     .enumerate()
-                    .map(|(b, blk)| lay.offsets[b] + blk.rows..lay.offsets[b] + (1usize << blk.kappa))
+                    .map(|(b, blk)| lay.offsets[b] + blk.live..lay.offsets[b] + (1usize << blk.kappa))
                     .filter(|run| !run.is_empty())
                     .collect();
                 runs.sort_unstable_by_key(|run| run.start);
@@ -963,7 +983,7 @@ fn finish_quads(leaves: &[gkr::Block], quads: &mut [F192], blocks: &[Block], lay
         if start >= end {
             continue;
         }
-        let ones_from = (lay.offsets[b] + blk.rows).div_ceil(4).clamp(start, end);
+        let ones_from = (lay.offsets[b] + blk.live).div_ceil(4).clamp(start, end);
         let computed = &mut quads[start..ones_from];
         if computed.len() >= PAR_THRESHOLD {
             parallel::fill(computed, |i| quad(start + i));
@@ -972,7 +992,7 @@ fn finish_quads(leaves: &[gkr::Block], quads: &mut [F192], blocks: &[Block], lay
                 *q = quad(start + i);
             }
         }
-        let run = lay.offsets[b] + blk.rows..lay.offsets[b] + (1usize << blk.kappa);
+        let run = lay.offsets[b] + blk.live..lay.offsets[b] + (1usize << blk.kappa);
         for k in outside(ones_from..end, unread(run, 2, quads.len())) {
             quads[k] = F192::ONE;
         }
@@ -1147,10 +1167,16 @@ fn decompose_formula<F: FnMut(usize, &[F192]) -> F192>(
         // framework blocks (boundary, memory, bytecode) still open columns at ζ.
         if let Some((t, base)) = owners[b] {
             let form = &mut forms[t];
-            form.constant += eq_hi * beta;
             for (i, c) in blk.coords.iter().enumerate() {
                 accumulate_form(c, eq_hi * w[i], base, form);
             }
+            // A gated leaf is `1 + gate·(β + 1) + Σ_i w_i c_i`: its `1` sums to `eq_hi`, and its padding rows hold 1.
+            if let Some(gate) = blk.gate {
+                form.coeffs[gate - base] += eq_hi * (beta + F192::ONE);
+                acc += eq_hi;
+                continue;
+            }
+            form.constant += eq_hi * beta;
             let phi_padding = blk
                 .padding
                 .iter()
@@ -1389,9 +1415,9 @@ fn build_count_leaves<'a>(blocks: &[Block], lay: &Layout, cols: &[Column<'a>]) -
             panic!("a count block is one column");
         };
         let column = cols[*i];
-        assert!(blk.rows <= column.stored() || column.pad() == F64::ONE, "a count pads with the identity");
-        for (first, piece) in column.pieces(0).take_while(|&(first, _)| first < blk.rows) {
-            segments.push((lay.offsets[b] + first, &piece[..piece.len().min(blk.rows - first)]));
+        assert!(blk.live <= column.stored() || column.pad() == F64::ONE, "a count pads with the identity");
+        for (first, piece) in column.pieces(0).take_while(|&(first, _)| first < blk.live) {
+            segments.push((lay.offsets[b] + first, &piece[..piece.len().min(blk.live - first)]));
         }
     }
     segments.sort_unstable_by_key(|segment| segment.0);
@@ -1956,6 +1982,9 @@ mod tests {
                     rows,
                     coords: vec![Coord::Col(i)],
                     padding: vec![F64::ONE],
+                    gate: None,
+                    follows: None,
+                    live: rows,
                 })
                 .collect();
             let lay = layout(&blocks);

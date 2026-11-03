@@ -376,6 +376,8 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
                 out_odd,
                 out_cells,
             } => {
+                // The gated output cells' flushes read `out_odd·gate` as `out_odd` ([`crate::tables`]).
+                assert!(!out_odd || out_cells == OutCells::All, "an odd output layout writes every cell");
                 let [m0, m1, m2, m3] = m.map(g_at);
                 let (out_two, out_all) = out_cells.flags();
                 put(&[
@@ -511,17 +513,32 @@ pub fn layout(
     for (t, table) in tables::tables().iter().enumerate() {
         let base = sch.base[t];
         let padding = table.padding();
-        let table_block = |coords: Vec<Coord>| Block {
+        let table_block = |coords: Vec<Coord>, gate: Option<usize>, follows: Option<usize>| Block {
             kappa: taus[t],
             rows: rows[t],
             padding: coords.iter().map(|c| crate::leaf::coord_at(c, &padding)).collect(),
             coords: offset_coords(base, coords),
+            gate: gate.map(|g| base + g),
+            follows: follows.map(|g| base + g),
+            live: rows[t],
         };
         let mut fb = FlushBuilder::new();
         table.flushes(&mut fb);
-        push.extend(fb.push.into_iter().map(table_block));
-        pull.extend(fb.pull.into_iter().map(table_block));
-        count_blocks.extend(table.count_columns().iter().map(|&c| table_block(vec![Col(c)])));
+        for (side, coords) in [(&mut push, fb.push), (&mut pull, fb.pull)] {
+            side.extend(coords.into_iter().zip(&fb.gates).map(|(coords, &gate)| {
+                let block = table_block(coords, gate, gate);
+                // A padding row's gated leaf is 1: its gate and every coordinate are 0 there.
+                assert!(
+                    gate.is_none_or(|g| padding[g] == F64::ZERO && block.padding.iter().all(|v| *v == F64::ZERO)),
+                    "a gated block's padding row does not flush"
+                );
+                block
+            }));
+        }
+        count_blocks.extend(table.count_columns().iter().map(|&c| {
+            let follows = fb.gated_counts.iter().find(|&&(count, _)| count == c).map(|&(_, gate)| gate);
+            table_block(vec![Col(c)], None, follows)
+        }));
     }
 
     let (placements, shape) = witness::placements_of(&col_kappas(log_mem, log_bytecode, taus));
@@ -537,6 +554,24 @@ pub fn layout(
         pi,
         taus,
         rows,
+    }
+}
+
+impl Layout {
+    /// Bound the prover's leaves of every block that follows a gate by the rows where the gate can be 1:
+    /// one past the last `KECCAK` row writing output cell 1, and cells `2..13` ([`Trace::keccak_live`]).
+    pub(crate) fn set_live(&mut self, keccak_live: [usize; 2]) {
+        let base = schema().base[tables::KECCAK_TABLE];
+        for blk in self.push.iter_mut().chain(&mut self.pull).chain(&mut self.count) {
+            if let Some(gate) = blk.follows {
+                blk.live = match gate - base {
+                    tables::keccakt::OUT_TWO => keccak_live[0],
+                    tables::keccakt::OUT_ALL => keccak_live[1],
+                    _ => unreachable!("a gate is a KECCAK output flag"),
+                };
+                debug_assert!(blk.live <= blk.rows);
+            }
+        }
     }
 }
 

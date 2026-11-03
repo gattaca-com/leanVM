@@ -48,6 +48,7 @@ pub(crate) struct Jrow {
 /// them (`tables::KeccakOp::cell`): the four `m` cells, the four `tail` cells, `b8`, the
 /// four `cap` cells, then the thirteen output cells. The fifty value lanes are those
 /// cells' lanes, read back from the final memory image.
+#[derive(Clone, Copy)]
 pub(crate) struct Krow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
@@ -60,27 +61,44 @@ pub(crate) struct Krow {
 pub(crate) struct Rows<T> {
     chunks: Vec<Vec<T>>,
     len: usize,
+    /// `log2` of a chunk's rows.
+    log: u32,
 }
 
-const CHUNK_LOG: usize = 14;
-const CHUNK: usize = 1 << CHUNK_LOG;
+const CHUNK_LOG: u32 = 14;
 
 impl<T> Rows<T> {
     pub(crate) fn new() -> Self {
         Self {
             chunks: Vec::new(),
             len: 0,
+            log: CHUNK_LOG,
+        }
+    }
+
+    /// The rows of `chunks`, each of `2^log` rows but the last.
+    pub(crate) fn from_chunks(chunks: Vec<Vec<T>>, log: u32) -> Self {
+        let n = chunks.len();
+        assert!(
+            chunks.iter().enumerate().all(|(i, c)| c.len() == 1 << log || (i + 1 == n && c.len() < 1 << log)),
+            "every chunk is full but the last"
+        );
+        Self {
+            len: chunks.iter().map(Vec::len).sum(),
+            chunks,
+            log,
         }
     }
 
     #[inline(always)]
     pub(crate) fn push(&mut self, row: T) {
+        let chunk = 1 << self.log;
         match self.chunks.last_mut() {
-            Some(chunk) if chunk.len() < CHUNK => chunk.push(row),
+            Some(last) if last.len() < chunk => last.push(row),
             _ => {
-                let mut chunk = Vec::with_capacity(CHUNK);
-                chunk.push(row);
-                self.chunks.push(chunk);
+                let mut last = Vec::with_capacity(chunk);
+                last.push(row);
+                self.chunks.push(last);
             }
         }
         self.len += 1;
@@ -92,7 +110,7 @@ impl<T> Rows<T> {
 
     #[inline(always)]
     pub(crate) fn get(&self, i: usize) -> &T {
-        &self.chunks[i >> CHUNK_LOG][i & (CHUNK - 1)]
+        &self.chunks[i >> self.log][i & ((1 << self.log) - 1)]
     }
 
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
@@ -106,7 +124,10 @@ pub(crate) struct Trace {
     pub(crate) set: Rows<Srow>,
     pub(crate) deref: Rows<Drow>,
     pub(crate) jump: Rows<Jrow>,
+    /// In the order of [`crate::keccak::ShapeSort`], so `keccak_live` bounds the rows of each output flag.
     pub(crate) keccak: Rows<Krow>,
+    /// One past the last `KECCAK` row that writes output cell 1, and one past the last that writes cells `2..13`.
+    pub(crate) keccak_live: [usize; 2],
     pub(crate) bytecode_count: Vec<u32>, // per-pc execution count; the column holds g^{A[pc]}
     /// One past the highest access count, of a cell or a pc: the `g`-powers a fill looks up.
     pub(crate) counts: usize,

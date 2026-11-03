@@ -21,6 +21,10 @@ use keccak_gkr::{Shape, Witness};
 use primitives::field::{F64, F192};
 use primitives::hash::STATE_LANES;
 
+/// Steps a block of the reduction's witness holds, and rows a block of [`ShapeSort`].
+#[cfg(test)]
+pub(crate) const BLOCK_ROWS: usize = BLOCK;
+
 /// Rounds between two committed states.
 pub const DEPTH: usize = 12;
 /// The reduction's shape at its fewest steps.
@@ -141,6 +145,89 @@ pub(crate) fn permute_cells(cells: &[F192; STATE_CELLS], in_odd: bool, out_odd: 
 /// the committed column until the reduction has run.
 pub(crate) type PreparedReductionWitness = Witness;
 
+/// The KECCAK rows in blocks of [`BLOCK`], grouped by how many output cells they write as they run:
+/// the table's rows that write every cell come first, then those that write two, so the bus leaves
+/// of the cells a row does not write are a run of identity past a prefix ([`crate::leaf::Block::live`]).
+///
+/// A block is dispatched once it is full, and holds one class. The rows left at the end, the classes
+/// sorted, fill the last blocks. Classes `Two` and `One` hold back their last full block, so the last
+/// block holds `One` rows alone when there is a full block of them, and else `Two` rows.
+/// The executing thread and the witness builder run one each over the same rows, so both see one order.
+pub(crate) struct ShapeSort<T> {
+    pending: [Vec<T>; 3],
+    held: [Option<Vec<T>>; 3],
+    /// The class of each block dispatched while running.
+    classes: Vec<u8>,
+}
+
+/// A row's class, in table order: every output cell, two, one.
+pub(crate) fn class(cells: crate::cpu::OutCells) -> usize {
+    match cells {
+        crate::cpu::OutCells::All => 0,
+        crate::cpu::OutCells::Two => 1,
+        crate::cpu::OutCells::One => 2,
+    }
+}
+
+impl<T: Copy> ShapeSort<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: std::array::from_fn(|_| Vec::with_capacity(BLOCK)),
+            held: [None, None, None],
+            classes: Vec::new(),
+        }
+    }
+
+    /// Add a row of class `class`. A block that fills goes to `dispatch`, and `fresh` replaces its buffer.
+    #[inline]
+    pub(crate) fn push(
+        &mut self,
+        class: usize,
+        row: T,
+        fresh: impl FnOnce() -> Vec<T>,
+        dispatch: impl FnOnce(Vec<T>),
+    ) {
+        let pending = &mut self.pending[class];
+        pending.push(row);
+        if pending.len() == BLOCK {
+            let full = std::mem::replace(pending, fresh());
+            let ready = if class == 0 { Some(full) } else { self.held[class].replace(full) };
+            if let Some(block) = ready {
+                self.classes.push(class as u8);
+                dispatch(block);
+            }
+        }
+    }
+
+    /// Dispatch the rows left, the last block with `last` set, and return the place of every block:
+    /// `order[g]` is the block dispatched `order[g]`-th, at place `g` of the table.
+    ///
+    /// Class by class, the full blocks come first, then the blocks of the rows left that begin with that class.
+    /// The last block, the only one that may be short, comes last. A run of one class keeps its order.
+    pub(crate) fn finish(self, mut dispatch: impl FnMut(Vec<T>, bool)) -> Vec<usize> {
+        let Self { pending, held, classes } = self;
+        let (mut rest, mut first) = (Vec::new(), Vec::new());
+        for (c, (held, pending)) in held.into_iter().zip(pending).enumerate() {
+            let rows = held.into_iter().flatten().chain(pending);
+            let at = rest.len();
+            rest.extend(rows);
+            first.extend((at..rest.len()).map(|_| c));
+        }
+        let dispatched = classes.len();
+        let blocks = rest.len().div_ceil(BLOCK);
+        for (i, block) in rest.chunks(BLOCK).enumerate() {
+            dispatch(block.to_vec(), i + 1 == blocks);
+        }
+        let mut order = Vec::with_capacity(dispatched + blocks);
+        for c in 0..3 {
+            order.extend((0..dispatched).filter(|&d| usize::from(classes[d]) == c));
+            order.extend((0..blocks.saturating_sub(1)).filter(|&i| first[i * BLOCK] == c).map(|i| dispatched + i));
+        }
+        order.extend((dispatched + blocks).checked_sub(1).filter(|_| blocks > 0));
+        order
+    }
+}
+
 /// The reduction's witness for the steps a program ran, built while it ran: every whole block
 /// of steps, its rounds in `extents` and its committed lanes in `lanes`, slot after slot.
 pub(crate) struct Blocks {
@@ -149,6 +236,10 @@ pub(crate) struct Blocks {
     /// thread's, the rest are the workers'.
     lanes: Vec<Vec<u64>>,
     steps: usize,
+    /// The place of each block ([`ShapeSort::finish`]).
+    order: Vec<usize>,
+    /// Whether the executing thread ran the last block dispatched.
+    inline_last: bool,
 }
 
 /// Append the committed lanes of one block of steps to `lanes`.
@@ -158,16 +249,18 @@ fn push_block(lanes: &mut Vec<u64>, steps: &[[u64; STATE_LANES]], slot: Slot) {
     block_lanes_into(DEPTH, steps, slot, &mut lanes[at..]);
 }
 
-/// Run `run`, which reports the lanes of each step it executes, and build the reduction's
-/// witness behind it: executing is one thread's work, so the others take each block of steps
-/// as it completes instead of waiting for the last.
-pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LANES])) -> R) -> (R, Blocks) {
+/// Run `run`, which reports the lanes each step reads and the output cells it writes, and build the
+/// reduction's witness behind it: executing is one thread's work, so the others take each block of
+/// steps as it completes instead of waiting for the last. The blocks are those of [`ShapeSort`].
+pub(crate) fn while_executing<R>(
+    run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LANES], crate::cpu::OutCells)) -> R,
+) -> (R, Blocks) {
     type Job = (Vec<[u64; STATE_LANES]>, Slot);
     // More workers than this slow the executing thread by more than they finish early.
     let workers = parallel::num_threads() / 2;
     // The extents the workers write into: each slot keeps its words alive, so a panic leaves no dangling write.
     let mut extents: Vec<Extent> = Vec::new();
-    let (result, lanes, steps) = std::thread::scope(|scope| {
+    let (result, lanes, steps, order, inline_last) = std::thread::scope(|scope| {
         // The workers hand their emptied step buffers back for the next blocks.
         let (recycle, recycled) = std::sync::mpsc::channel::<Vec<[u64; STATE_LANES]>>();
         // Block `g` of the whole ones goes to worker `g % workers`, which owns its queue.
@@ -190,36 +283,31 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LA
         drop(recycle);
 
         let mut inline = Vec::new();
-        let mut pending = Vec::with_capacity(BLOCK);
+        let mut sort = ShapeSort::new();
         let mut blocks = 0;
         let mut steps = 0;
-        let mut dispatch = |pending: &mut Vec<[u64; STATE_LANES]>, last: bool| {
+        let mut inline_last = false;
+        let mut dispatch = |block: Vec<[u64; STATE_LANES]>, last: bool| {
             if extents.last().is_none_or(|e| e.end() == blocks) {
                 extents.push(Extent::new(blocks, blocks.max(8), DEPTH));
             }
             let slot = extents.last().expect("an extent").slot(blocks);
             if workers == 0 || last {
-                push_block(&mut inline, pending, slot);
-                pending.clear();
+                push_block(&mut inline, &block, slot);
+                inline_last = last;
             } else {
-                let fresh = recycled.try_recv().unwrap_or_else(|_| Vec::with_capacity(BLOCK));
-                let block = std::mem::replace(pending, fresh);
                 jobs[blocks % workers]
                     .send((block, slot))
                     .expect("the workers outlive the run");
             }
             blocks += 1;
         };
-        let result = run(&mut |state| {
-            pending.push(*state);
+        let fresh = || recycled.try_recv().unwrap_or_else(|_| Vec::with_capacity(BLOCK));
+        let result = run(&mut |state, cells| {
             steps += 1;
-            if pending.len() == BLOCK {
-                dispatch(&mut pending, false);
-            }
+            sort.push(class(cells), *state, &fresh, |block| dispatch(block, false));
         });
-        if !pending.is_empty() {
-            dispatch(&mut pending, true);
-        }
+        let order = sort.finish(&mut dispatch);
         drop(jobs);
         let lanes = std::iter::once(inline)
             .chain(
@@ -228,9 +316,18 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LA
                     .map(|handle| handle.join().expect("a witness worker panicked")),
             )
             .collect();
-        (result, lanes, steps)
+        (result, lanes, steps, order, inline_last)
     });
-    (result, Blocks { extents, lanes, steps })
+    (
+        result,
+        Blocks {
+            extents,
+            lanes,
+            steps,
+            order,
+            inline_last,
+        },
+    )
 }
 
 impl Blocks {
@@ -248,21 +345,23 @@ impl Blocks {
             "a chunk per run of steps"
         );
         let blocks = self.steps.div_ceil(BLOCK);
+        assert_eq!(self.order.len(), blocks, "a place per block");
         let workers = self.lanes.len() - 1;
         let stride = lanes_len(DEPTH);
-        // Without workers every block is the executing thread's. With them, it ran only a last
-        // partial block, and whole block `g` is the `g / workers`-th of worker `g % workers`.
-        let lanes: Vec<&[u64]> = (0..blocks)
-            .map(|g| {
+        // Without workers every block is the executing thread's. With them, it ran only the last
+        // block dispatched, and block `d` before it is the `d / workers`-th of worker `d % workers`.
+        let ran: Vec<&[u64]> = (0..blocks)
+            .map(|d| {
                 let (owner, nth) = match workers {
-                    0 => (0, g),
-                    _ if g + 1 == blocks && !self.steps.is_multiple_of(BLOCK) => (0, 0),
-                    _ => (1 + g % workers, g / workers),
+                    0 => (0, d),
+                    _ if d + 1 == blocks && self.inline_last => (0, 0),
+                    _ => (1 + d % workers, d / workers),
                 };
                 &self.lanes[owner][nth * stride..][..stride]
             })
             .collect();
-        Witness::from_blocks_into(shape, self.extents, &lanes, crate::witness::CHUNK_LOG, chunks)
+        let lanes: Vec<&[u64]> = self.order.iter().map(|&d| ran[d]).collect();
+        Witness::from_ordered_blocks_into(shape, self.extents, self.order, &lanes, crate::witness::CHUNK_LOG, chunks)
     }
 }
 
@@ -303,7 +402,7 @@ mod tests {
             let (mut expected, reference) = build_qkeccak(&instances);
             let ((), blocks) = while_executing(|step| {
                 for state in &instances {
-                    step(state);
+                    step(state, crate::cpu::OutCells::One);
                 }
             });
             let steps = 1usize << n_steps_log(n);
