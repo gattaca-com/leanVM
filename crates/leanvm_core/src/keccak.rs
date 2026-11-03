@@ -305,7 +305,7 @@ pub(crate) fn while_executing<R>(
         let fresh = || recycled.try_recv().unwrap_or_else(|_| Vec::with_capacity(BLOCK));
         let result = run(&mut |state, cells| {
             steps += 1;
-            sort.push(class(cells), *state, &fresh, |block| dispatch(block, false));
+            sort.push(class(cells), *state, fresh, |block| dispatch(block, false));
         });
         let order = sort.finish(&mut dispatch);
         drop(jobs);
