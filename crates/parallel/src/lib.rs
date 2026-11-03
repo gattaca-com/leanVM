@@ -46,6 +46,22 @@ const CHUNK_FLOOR: usize = 64;
 thread_local! {
     static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static IN_TASK: Cell<bool> = const { Cell::new(false) };
+    static SERIAL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with every dispatch it makes on this thread run inline, on this thread.
+///
+/// For work on a thread of its own beside a running stage, which would otherwise wake every worker
+/// and take the cores the stage needs. Dispatches from other threads are unaffected.
+pub fn serial<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERIAL.set(self.0);
+        }
+    }
+    let _restore = Restore(SERIAL.replace(true));
+    f()
 }
 
 /// A type-erased work unit. The `&dyn Fn`'s lifetime is erased to `'static`; it
@@ -246,7 +262,7 @@ pub fn for_each_chunk<F: Fn(usize, usize) + Sync>(n_tasks: usize, f: F) {
     assert!(!IN_TASK.get(), "nested parallel dispatch from inside a pool task");
 
     let worker_count = num_threads();
-    if worker_count <= 1 || n_tasks <= 1 {
+    if worker_count <= 1 || n_tasks <= 1 || SERIAL.get() {
         if n_tasks > 0 {
             f(0, n_tasks);
         }

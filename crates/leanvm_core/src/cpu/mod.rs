@@ -560,6 +560,75 @@ pub fn prove_with(
     log_inv_rate: usize,
     gpow: &mut GPow,
 ) -> Result<(Proof, Stats), ProveError> {
+    prove_run(program, log_inv_rate, gpow, |gpow, step| {
+        program.execute_with(execute::Hints::Whole(witness, public_input), gpow, step)
+    })
+}
+
+/// A fragment of a fed run's witness streams ([`prove_fed`]): each stream goes on where the
+/// fragments before left it. The last fragment brings the public input.
+pub(crate) enum Fragment {
+    More(Witness),
+    Last(Witness, [F192; 2]),
+}
+
+/// What [`prove_fed`]'s producer sends the run through.
+pub struct Feed(std::sync::mpsc::Sender<Fragment>);
+
+impl Feed {
+    /// Send the next fragment of every stream. `false` once the run has stopped, so the producer can too.
+    pub fn send(&self, hints: Witness) -> bool {
+        self.0.send(Fragment::More(hints)).is_ok()
+    }
+
+    /// Send the last fragment and the public input.
+    pub fn finish(self, hints: Witness, public_input: [F192; 2]) {
+        self.0.send(Fragment::Last(hints, public_input)).ok();
+    }
+}
+
+/// [`prove_with`], the witness streams and the public input coming from `produce` while the program runs.
+///
+/// `produce` runs on its own thread, beside the executing one, and sends fragments in push order.
+/// The run waits whenever a stream it reads runs dry. Stream by stream, the fragments joined are
+/// the witness [`prove_with`] takes, so the proof is the same.
+/// The public input comes with the last fragment, so the program must not read `m[0]`, `m[1]` before
+/// it pops a value of that fragment. A run that does fails rather than read a wrong value.
+/// A producer that drops its [`Feed`] unfinished ends the run with an error.
+/// Returns what `produce` returned, joined before the witness is built, and the proof.
+#[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
+pub fn prove_fed<R: Send>(
+    program: &Program,
+    log_inv_rate: usize,
+    gpow: &mut GPow,
+    produce: impl FnOnce(Feed) -> R + Send,
+) -> (R, Result<(Proof, Stats), ProveError>) {
+    let mut produced = None;
+    let proof = prove_run(program, log_inv_rate, gpow, |gpow, step| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(move || produce(Feed(tx)));
+            let run = program.execute_with(execute::Hints::Fed(&rx), gpow, step);
+            // The producer stops at its next send once the receiver is gone.
+            drop(rx);
+            produced = Some(producer.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+            run
+        })
+    });
+    (produced.expect("the run joins the producer"), proof)
+}
+
+/// What a run reports of each `KECCAK` step: the lanes it reads and the output cells it writes.
+type KeccakStep<'a> = dyn FnMut(&[u64; primitives::hash::STATE_LANES], OutCells) + 'a;
+
+/// The prover behind [`prove_with`] and [`prove_fed`]: `run` executes the program from a g-power table,
+/// reporting each `KECCAK` step. The public input is what the run left in `m[0]`, `m[1]`.
+fn prove_run(
+    program: &Program,
+    log_inv_rate: usize,
+    gpow: &mut GPow,
+    run: impl FnOnce(GPow, &mut KeccakStep) -> Result<Execution, ExecError>,
+) -> Result<(Proof, Stats), ProveError> {
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
@@ -594,9 +663,7 @@ pub fn prove_with(
             });
         }
         crate::stage!("Execute program", || {
-            crate::keccak::while_executing(|step| {
-                program.execute_with(witness, public_input, std::mem::take(gpow), step)
-            })
+            crate::keccak::while_executing(|step| run(std::mem::take(gpow), step))
         })
     });
     drop(reserve);
@@ -608,6 +675,7 @@ pub fn prove_with(
         return Err(ProveError::UnconstrainedReads(exec.unconstrained_reads));
     }
     let cycles = exec.cycles;
+    let public_input = [exec.mem.word(0), exec.mem.word(1)];
     let mut w = crate::stage!("Build witness", || program.build(&exec, keccak_blocks));
     *gpow = std::mem::take(&mut exec.gpow);
     // Build witness was the last reader of the cells.
@@ -1284,7 +1352,7 @@ mod tests {
         let program = Program::from_bytecode(prog, 20_300);
         let pi = [w(3), w(5)];
         let (exec, blocks) = crate::keccak::while_executing(|step| {
-            program.execute_with(&program.witness, pi, GPow::new(), step)
+            program.execute_with(execute::Hints::Whole(&program.witness, pi), GPow::new(), step)
         });
         let witness = program.build(&exec.unwrap(), blocks);
         let real = ::pcs::stack_open::equal_blocks(&witness.q);

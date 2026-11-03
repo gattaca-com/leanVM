@@ -2,6 +2,7 @@
 //! the final memory image and the per-opcode [`Trace`].
 
 use flux_profiler::timed;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::hints::{GPow, MAX_CELLS, bounded_dlog};
@@ -283,35 +284,62 @@ fn in_k(what: &'static str, v: F192) -> Result<F64, Fault> {
 
 /// A named witness stream and the next entry `hint_witness` pops from it. Resolved
 /// once per run, so a pop indexes it rather than hashing its name.
+/// One witness stream as a run reads it: the streams of one name, from each fragment
+/// that carried one, in the order they came ([`Hints`]).
 struct Stream<'a> {
     name: &'a str,
-    entries: Option<&'a WitnessStream>,
+    parts: Vec<Cow<'a, WitnessStream>>,
+    /// The part the next entry comes from, and its index there.
+    part: usize,
     next: usize,
 }
 
-impl<'a> Stream<'a> {
-    fn pop(&mut self, len: u32) -> Result<&'a [F192], Fault> {
+impl Stream<'_> {
+    /// Whether an entry is left, so a fed run knows to wait for the next fragment.
+    fn has_next(&self) -> bool {
+        self.parts[self.part.min(self.parts.len())..]
+            .iter()
+            .enumerate()
+            .any(|(k, part)| part.ends.len() > if k == 0 { self.next } else { 0 })
+    }
+
+    fn pop(&mut self, len: u32) -> Result<&[F192], Fault> {
         let name = self.name;
-        let entries = self
-            .entries
-            .ok_or_else(|| Fault::Witness(format!("no witness stream `{name}` (Program::set_witness)")))?;
-        let entry = entries.entry(self.next).ok_or_else(|| {
+        if self.parts.is_empty() {
+            return Err(Fault::Witness(format!(
+                "no witness stream `{name}` (Program::set_witness)"
+            )));
+        }
+        while self.part + 1 < self.parts.len() && self.next == self.parts[self.part].ends.len() {
+            (self.part, self.next) = (self.part + 1, 0);
+        }
+        let popped: usize = self.parts[..self.part]
+            .iter()
+            .map(|part| part.ends.len())
+            .sum::<usize>()
+            + self.next;
+        let entry = self.parts[self.part].entry(self.next).ok_or_else(|| {
             Fault::Witness(format!(
-                "witness stream `{name}` exhausted (needs entry {}, has {})",
-                self.next + 1,
-                entries.ends.len()
+                "witness stream `{name}` exhausted (needs entry {}, has {popped})",
+                popped + 1,
             ))
         })?;
         if entry.len() != len as usize {
             return Err(Fault::Witness(format!(
-                "witness `{name}` entry {} holds {} values, the destination {len}",
-                self.next,
+                "witness `{name}` entry {popped} holds {} values, the destination {len}",
                 entry.len()
             )));
         }
         self.next += 1;
         Ok(entry)
     }
+}
+
+/// Where a run's advice comes from: a whole witness and the public input, or fragments
+/// that arrive while it runs, the last one with the public input ([`super::Feed`]).
+pub(crate) enum Hints<'a> {
+    Whole(&'a Witness, [F192; 2]),
+    Fed(&'a std::sync::mpsc::Receiver<super::Fragment>),
 }
 
 impl Program {
@@ -321,18 +349,21 @@ impl Program {
     /// Compilation yields the `Program`; executing it (here) and proving it are
     /// separate later phases.
     pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
-        self.execute_with(&self.witness, public_input, GPow::new(), &mut |_, _| {})
+        self.execute_with(Hints::Whole(&self.witness, public_input), GPow::new(), &mut |_, _| {})
     }
 
     /// [`Self::execute`] starting from `gpow`, a table an earlier run left. The table
     /// is a function of the exponent alone and announcing more only widens its index,
     /// so a run that starts from one skips growing and announcing it again.
     /// `keccak_step` gets the lanes each `KECCAK` row reads and the output cells it writes, as the row runs.
+    ///
+    /// A fed run waits for the next fragment whenever a stream runs dry. It seeds the public input when
+    /// the last fragment brings it. Until then `m[0]`, `m[1]` are unwritten: links and writes to them
+    /// end the same, and a read of one conflicts with the value that comes.
     #[timed]
     pub(crate) fn execute_with(
         &self,
-        witness: &Witness,
-        public_input: [F192; 2],
+        hints: Hints<'_>,
         gpow: GPow,
         keccak_step: &mut dyn FnMut(&[u64; primitives::hash::STATE_LANES], OutCells),
     ) -> Result<Execution, ExecError> {
@@ -370,11 +401,23 @@ impl Program {
             program: self,
             dbg_pc: 0,
             dbg_hint: None,
+            pi_pending: false,
+            pi_peeked: std::cell::Cell::new(false),
         };
         m.ensure(n0 - 1);
-        // Seed the public input into m[0], m[1] (addresses g^0, g^1, §sec:e2e-pi).
-        m.put(0, public_input[0])?;
-        m.put(1, public_input[1])?;
+        let (whole, fed) = match hints {
+            Hints::Whole(witness, public_input) => (Some(witness), Ok(public_input)),
+            Hints::Fed(fragments) => (None, Err(fragments)),
+        };
+        match fed {
+            // Seed the public input into m[0], m[1] (addresses g^0, g^1, §sec:e2e-pi).
+            Ok(public_input) => {
+                m.put(0, public_input[0])?;
+                m.put(1, public_input[1])?;
+            }
+            Err(_) => m.pi_pending = true,
+        }
+        let fed = fed.err();
 
         // Per-pc bytecode execution count, as an exponent of `g`.
         let mut bytecode_count: Vec<u32> = vec![0; self.prog.len()];
@@ -388,10 +431,20 @@ impl Program {
             .names()
             .map(|name| Stream {
                 name,
-                entries: witness.0.get(name),
+                parts: whole
+                    .and_then(|w| w.0.get(name))
+                    .map(Cow::Borrowed)
+                    .into_iter()
+                    .collect(),
+                part: 0,
                 next: 0,
             })
             .collect();
+        // A fed run files each fragment's streams by name.
+        let index: HashMap<&str, usize> = match fed {
+            Some(_) => plan.names().enumerate().map(|(i, name)| (name, i)).collect(),
+            None => HashMap::new(),
+        };
         // `DBG_PROF=1`: per-pc step counts, printed as a per-function cycle
         // profile after the run (needs `fn_ranges`, i.e. a compiled program).
         let mut prof: Option<Vec<u64>> = std::env::var("DBG_PROF").is_ok().then(|| vec![0u64; self.prog.len()]);
@@ -423,6 +476,9 @@ impl Program {
             unwritten_reads: Vec<u32>,
             /// To name where a conflict happened.
             program: &'a Program,
+            /// A fed run's public input has not come yet, and whether a hint has read a cell it may reach.
+            pi_pending: bool,
+            pi_peeked: std::cell::Cell<bool>,
             /// The pc of the currently executing instruction, and the name of the
             /// computed-advice hint if the write comes from one, so a write-once
             /// conflict can report where it happened. Plain fields rather than
@@ -458,7 +514,12 @@ impl Program {
             // instructions go on to check.
             #[inline(always)]
             fn get(&self, cell: u32) -> F192 {
-                self.covered(cell).map_or(F192::ZERO, |c| c.word)
+                let c = self.covered(cell);
+                // A fed run's public input may reach a linked cell once it comes.
+                if self.pi_pending && (cell < 2 || c.is_some_and(|c| c.state == State::Linked)) {
+                    self.pi_peeked.set(true);
+                }
+                c.map_or(F192::ZERO, |c| c.word)
             }
             // An instruction's read. An unwritten cell reads as ZERO, which is then written
             // there: the row is filled from the final image, which has to agree.
@@ -553,6 +614,38 @@ impl Program {
                 Ok(count)
             }
         }
+        // Take a fed run's next fragment: its streams join theirs, and the last one's public input
+        // goes into m[0], m[1]. `false` once no fragment is left.
+        fn feed<'a>(
+            fed: Option<&std::sync::mpsc::Receiver<super::Fragment>>,
+            index: &HashMap<&str, usize>,
+            streams: &mut [Stream<'a>],
+            m: &mut Mem<'_>,
+        ) -> Result<bool, ExecError> {
+            let Some(Ok(fragment)) = fed.map(std::sync::mpsc::Receiver::recv) else {
+                return Ok(false);
+            };
+            let (hints, public_input) = match fragment {
+                super::Fragment::More(hints) => (hints, None),
+                super::Fragment::Last(hints, public_input) => (hints, Some(public_input)),
+            };
+            for (name, stream) in hints.0 {
+                if let Some(&i) = index.get(name.as_str()) {
+                    streams[i].parts.push(Cow::Owned(stream));
+                }
+            }
+            if let Some(public_input) = public_input {
+                if m.pi_peeked.get() {
+                    let fault = Fault::Witness("a hint read the public input before the feed sent it".into());
+                    return Err(ExecError::new(m.program, m.dbg_pc, fault));
+                }
+                m.pi_pending = false;
+                m.put(0, public_input[0])?;
+                m.put(1, public_input[1])?;
+            }
+            Ok(true)
+        }
+
         // A runtime count (a loop's frame span, a `HeapBuf` size) as the exponent of
         // a g-power: the address table when it covers it, else a bounded discrete log.
         fn count(g: &mut GPow, x: F64) -> Option<u32> {
@@ -698,14 +791,18 @@ impl Program {
                             }
                         }
                         RHint::WitnessStack { base, len, .. } => {
-                            let values = streams[stream as usize].pop(*len).map_err(fail)?;
+                            let s = stream as usize;
+                            while !streams[s].has_next() && feed(fed, &index, &mut streams, &mut m)? {}
+                            let values = streams[s].pop(*len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
                                 m.put(fp + base + k as u32, value)?;
                             }
                         }
                         RHint::WitnessHeap { ptr, lo, len, .. } => {
                             let b = heap_base(&m, &mut g, fp + ptr, "hint_witness heap pointer").map_err(fail)?;
-                            let values = streams[stream as usize].pop(*len).map_err(fail)?;
+                            let s = stream as usize;
+                            while !streams[s].has_next() && feed(fed, &index, &mut streams, &mut m)? {}
+                            let values = streams[s].pop(*len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
                                 m.put(b + lo + k as u32, value)?;
                             }
@@ -1042,6 +1139,13 @@ impl Program {
             }
         }
 
+        // A fed run that halted before its last fragment still takes the public input from it.
+        while m.pi_pending {
+            if !feed(fed, &index, &mut streams, &mut m)? {
+                let fault = Fault::Witness("the hint feed ended without the public input".into());
+                return Err(ExecError::new(self, ending_pc, fault));
+            }
+        }
         let counts = bytecode_count.iter().copied().max().unwrap_or(0).max(m.counts) as usize + 1;
         let order = keccak.finish(|block, _| keccak_blocks.push(block));
         let mut ran: Vec<Option<Vec<Krow>>> = keccak_blocks.into_iter().map(Some).collect();
