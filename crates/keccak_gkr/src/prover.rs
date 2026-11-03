@@ -716,8 +716,15 @@ impl Layer<'_> {
     /// A point at infinity in some variable keeps only the product `u[j + 1] * u[j + 2]`, summed
     /// here. A binary one is a pack, whose sum `binary` already holds. The packs of the padding
     /// block are all equal, so their extension vanishes there.
-    fn skip_sums(&self, claim: &Claim, field: &PowerField, s: F192, binary: &[[F192; GROUP]; 2]) -> [Vec<F192>; 2] {
-        let weights = SkipWeights::new(claim.weights.iter().map(|&w| field.to_poly(w)).collect());
+    fn skip_sums(
+        &self,
+        claim: &Claim,
+        field: &PowerField,
+        weights: &[Element],
+        s: F192,
+        binary: &[[F192; GROUP]; 2],
+    ) -> [Vec<F192>; 2] {
+        let weights = SkipWeights::new(weights.to_vec());
         let groups: Vec<Element> = eq_table(&claim.point[SKIP + 1..])
             .iter()
             .map(|&e| field.to_poly(e))
@@ -1003,22 +1010,14 @@ struct Round<'a> {
 }
 
 impl<'a> Round<'a> {
-    fn new(field: &'a PowerField, claim: &Claim, s: F192, kappa: F192) -> Self {
+    /// `polys` are the claim's position weights, in the power basis.
+    fn new(field: &'a PowerField, claim: &Claim, polys: &[Element], s: F192, kappa: F192) -> Self {
+        let constants = parallel::map_collect(BITS, |j| field.to_poly(kappa * claim.weights[along(j, 2)]));
         let (mut weights, mut constant) = (vec![0u64; ROW], vec![0u64; ROW]);
         for j in 0..BITS {
             let at = FACTOR_ROW * (j / 64);
-            set(
-                &mut weights[at..][..FACTOR_ROW],
-                64,
-                j % 64,
-                &field.to_poly(claim.weights[j]),
-            );
-            set(
-                &mut constant[at..][..FACTOR_ROW],
-                64,
-                j % 64,
-                &field.to_poly(kappa * claim.weights[along(j, 2)]),
-            );
+            set(&mut weights[at..][..FACTOR_ROW], 64, j % 64, &polys[j]);
+            set(&mut constant[at..][..FACTOR_ROW], 64, j % 64, &constants[j]);
         }
         Self {
             field,
@@ -1280,11 +1279,37 @@ impl Rows {
     }
 }
 
+/// Pairs of positions one task of the local rounds takes. The rounds are serial work between
+/// two passes, so their larger ones are spread over the pool.
+const LOCAL_CHUNK: usize = 128;
+
+/// [`fold`] of one local table, its larger halves spread over the pool.
+fn local_fold(table: &[F192], challenge: F192) -> Vec<F192> {
+    if table.len() <= 2 * LOCAL_CHUNK {
+        return fold(table, 1, challenge);
+    }
+    parallel::map_collect(table.len() / 2, |i| table[2 * i] + challenge * (table[2 * i] + table[2 * i + 1]))
+}
+
 /// A round of the sumcheck over bit positions, on small tables in the standard basis: the
 /// coefficients of `sum_j w (kappa t0 + (kappa + t1) t2)` in the variable being bound.
 fn local_round(w: &[F192], t: &[Vec<F192>; 3], kappa: F192) -> [F192; 4] {
+    let pairs = w.len() / 2;
+    if pairs <= LOCAL_CHUNK {
+        return local_sums(w, t, kappa, 0..pairs);
+    }
+    parallel::map_reduce(
+        pairs.div_ceil(LOCAL_CHUNK),
+        || [F192::ZERO; 4],
+        |c| local_sums(w, t, kappa, c * LOCAL_CHUNK..((c + 1) * LOCAL_CHUNK).min(pairs)),
+        |a, b| std::array::from_fn(|k| a[k] + b[k]),
+    )
+}
+
+/// [`local_round`]'s sums over the pairs `pairs`.
+fn local_sums(w: &[F192], t: &[Vec<F192>; 3], kappa: F192, pairs: std::ops::Range<usize>) -> [F192; 4] {
     let mut h = [F192::ZERO; 4];
-    for i in 0..w.len() / 2 {
+    for i in pairs {
         let line = |v: &[F192]| (v[2 * i], v[2 * i] + v[2 * i + 1]);
         let (w, t0, t1, t2) = (line(w), line(&t[0]), line(&t[1]), line(&t[2]));
         let u = (kappa + t1.0, t1.1);
@@ -1354,7 +1379,9 @@ pub fn prove_layer(
             (F192::ONE + half) * poly_eval(&per_pack[q], s) + half * poly_eval(&per_pack[2 * GROUP + q], s)
         })
     });
-    let mut sums = tracing::info_span!("Skip").in_scope(|| layer.skip_sums(claim, &field, s, &binary));
+    // The position weights in the power basis, which Skip and the later rounds share.
+    let polys = parallel::map_collect(BITS, |j| field.to_poly(claim.weights[j]));
+    let mut sums = tracing::info_span!("Skip").in_scope(|| layer.skip_sums(claim, &field, &polys, s, &binary));
     let side_weights = [F192::ONE + claim.point[SKIP], claim.point[SKIP]];
     let mut scale = F192::ONE;
     let mut point = Vec::with_capacity(claim.point.len());
@@ -1378,7 +1405,7 @@ pub fn prove_layer(
         });
     }
 
-    let round = Round::new(&field, claim, s, kappa);
+    let round = Round::new(&field, claim, &polys, s, kappa);
     let blocks = eq_table(&claim.point[PACK_VARS..]);
     let infinity = tracing::info_span!("Groups").in_scope(|| layer.group_infinity(&round, &point, &claim.point));
     let coeffs = [
@@ -1447,7 +1474,7 @@ pub fn prove_layer(
     // The bit positions, in the standard basis.
     let cube = 1usize << LOCAL_VARS;
     let standard = |row: &[u64]| -> Vec<F192> {
-        let mut out: Vec<F192> = (0..BITS).map(|j| field.to_field(&get(row, BITS, j))).collect();
+        let mut out = parallel::map_collect(BITS, |j| field.to_field(&get(row, BITS, j)));
         out.resize(cube, F192::ZERO);
         out
     };
@@ -1467,8 +1494,8 @@ pub fn prove_layer(
         ps.add_round_poly(&coeffs, false);
         let challenge = ps.sample();
         local.push(challenge);
-        w = fold(&w, 1, challenge);
-        t = t.map(|v| fold(&v, 1, challenge));
+        w = local_fold(&w, challenge);
+        t = t.map(|v| local_fold(&v, challenge));
     }
     let t = [t[0][0], t[1][0], t[2][0]];
     ps.add_scalars(&t);
@@ -1525,7 +1552,8 @@ mod tests {
             point: Vec::new(),
             weights: rng.ext_vec(BITS),
         };
-        let round = Round::new(&field, &claim, s, rng.ext());
+        let polys: Vec<Element> = claim.weights.iter().map(|&w| field.to_poly(w)).collect();
+        let round = Round::new(&field, &claim, &polys, s, rng.ext());
         let rows: [Vec<u64>; 4] = std::array::from_fn(|_| (0..ROW).map(|_| rng.next_u64()).collect());
         let mut scratch = vec![0; 12 * FACTOR_ROW];
         for input in [
