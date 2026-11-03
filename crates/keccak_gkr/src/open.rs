@@ -9,7 +9,7 @@
 
 use fiat_shamir::transcript::ProverState;
 use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim};
-use primitives::field::{F64, F192};
+use primitives::field::{F64, F192, Weights8, dot_base};
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni")))]
 use primitives::field::F192Unreduced;
 use primitives::multilinear::{eq_table, mle_eval_many, poly_eval};
@@ -330,7 +330,14 @@ pub fn output_claim(shape: Shape, committed: &Committed, instance: &[F192], clai
     let jobs: Vec<(&[F64], &[F192])> = (0..1 << shape.slot_log())
         .flat_map(|slot| (0..runs).map(move |r| (committed.span(slot, r * run, run), low)))
         .collect();
-    let values = mle_eval_many(&jobs);
+    let values = if runs > 1 {
+        // Every run is at the same point: one packed `eq` table serves them all, where an
+        // evaluation per run would rebuild it.
+        let low: Vec<Weights8> = eq_table(low).as_chunks::<8>().0.iter().map(Weights8::new).collect();
+        parallel::map_collect(jobs.len(), |t| dot_base(&low, jobs[t].0).reduce())
+    } else {
+        mle_eval_many(&jobs)
+    };
     let mass = sum(&high[runs..]);
     let words = (committed.padding().into_iter().enumerate())
         .map(|(slot, pad)| dot(&values[slot * runs..][..runs], &high[..runs]) + mass.mul_base(F64(pad)))
