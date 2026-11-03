@@ -17,6 +17,23 @@ fn xor3(a: &mut [u64; 3], b: &[u64; 3]) {
     }
 }
 
+/// Transpose a 192 by 192 bit matrix, a row in three words: bit `c` of row `r` becomes bit `r`
+/// of row `c`. Nine 64 by 64 blocks.
+fn transpose192(a: &[[u64; 3]]) -> Vec<[u64; 3]> {
+    assert_eq!(a.len(), 192);
+    let mut out = vec![[0u64; 3]; 192];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut block: [u64; 64] = std::array::from_fn(|r| a[64 * i + r][j]);
+            crate::witness::transpose64(&mut block);
+            for (c, &word) in block.iter().enumerate() {
+                out[64 * j + c][i] = word;
+            }
+        }
+    }
+    out
+}
+
 /// The map from a field element to its coefficients on `1, s, ..., s^191`.
 pub struct PowerBasis {
     tables: Vec<[[u64; 3]; 256]>,
@@ -26,15 +43,15 @@ impl PowerBasis {
     /// `None` when `s` lies in a proper subfield, where its powers do not span the field.
     pub fn new(s: F192) -> Option<Self> {
         // Row `r` holds bit `r` of every power, beside the identity.
-        let mut rows = vec![([0u64; 3], [0u64; 3]); 192];
         let mut power = F192::ONE;
-        for b in 0..192 {
-            let p = bits(power);
-            for (r, row) in rows.iter_mut().enumerate() {
-                row.0[b / 64] |= (p[r / 64] >> (r % 64) & 1) << (b % 64);
-            }
-            power *= s;
-        }
+        let powers: Vec<[u64; 3]> = (0..192)
+            .map(|_| {
+                let p = bits(power);
+                power *= s;
+                p
+            })
+            .collect();
+        let mut rows: Vec<([u64; 3], [u64; 3])> = transpose192(&powers).into_iter().map(|r| (r, [0; 3])).collect();
         for (r, row) in rows.iter_mut().enumerate() {
             row.1[r / 64] = 1 << (r % 64);
         }
@@ -42,20 +59,17 @@ impl PowerBasis {
             let pivot = (b..192).find(|&r| rows[r].0[b / 64] >> (b % 64) & 1 == 1)?;
             rows.swap(b, pivot);
             let (pa, pi) = rows[b];
+            // Without a branch: whether a row has the bit is a coin toss.
             for (r, row) in rows.iter_mut().enumerate() {
-                if r != b && row.0[b / 64] >> (b % 64) & 1 == 1 {
-                    xor3(&mut row.0, &pa);
-                    xor3(&mut row.1, &pi);
+                let mask = 0u64.wrapping_sub(row.0[b / 64] >> (b % 64) & 1 & u64::from(r != b));
+                for k in 0..3 {
+                    row.0[k] ^= pa[k] & mask;
+                    row.1[k] ^= pi[k] & mask;
                 }
             }
         }
         // Row `b` of the inverse is coefficient `b` as a function of the element's bits.
-        let mut columns = [[0u64; 3]; 192];
-        for (b, row) in rows.iter().enumerate() {
-            for (r, column) in columns.iter_mut().enumerate() {
-                column[b / 64] |= (row.1[r / 64] >> (r % 64) & 1) << (b % 64);
-            }
-        }
+        let columns = transpose192(&rows.iter().map(|row| row.1).collect::<Vec<_>>());
         let tables = (0..24)
             .map(|k| {
                 let mut t = [[0u64; 3]; 256];
