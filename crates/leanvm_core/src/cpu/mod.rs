@@ -627,8 +627,21 @@ pub fn prove_with(
     let mut ps = ProverState::new(digest_words(&fs_seed(program)), digest_words(&public_input));
 
     #[cfg(any(test, feature = "tamper"))]
-    tamper::witness(tamper::take(), &mut w);
+    let tamper = tamper::take();
+    #[cfg(any(test, feature = "tamper"))]
+    tamper::witness(tamper, &mut w);
     // Announce the prover's sizes, then commit, before sampling any challenge.
+    // The rows past the last one a gate is 1 at hold the identity in its blocks, so their leaves are skipped.
+    // A forgery may set a gate the bytecode does not, so its leaves are all computed.
+    #[cfg(any(test, feature = "tamper"))]
+    let honest = tamper.is_none();
+    #[cfg(not(any(test, feature = "tamper")))]
+    let honest = true;
+    if honest {
+        w.layout.set_live(exec.trace.keccak_live);
+    }
+    #[cfg(any(test, feature = "tamper"))]
+    tamper::ungate(tamper, &mut w.layout);
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
     drop(pcs::reserve_level1(w.layout.shape.mu, log_inv_rate));
@@ -870,6 +883,8 @@ pub mod tamper {
     pub enum Tamper {
         /// Have every `KECCAK` write all thirteen output cells, whatever its bytecode requests.
         UnrequestedWrite,
+        /// [`Tamper::UnrequestedWrite`], and have the bus flush every cell written, as if no output cell were gated.
+        DroppedPush,
         /// Flip a bit of each `KECCAK`'s first output cell as it is written.
         WrongOutput,
         /// Flip the first `KECCAK` row's flag for output cells `2..13` in the witness, not in the bytecode.
@@ -908,6 +923,26 @@ pub mod tamper {
         if tamper == Some(Tamper::OutFlag) {
             let flag = w.layout.placements[schema().base[tables::KECCAK_TABLE] + tables::keccakt::OUT_ALL];
             w.q[flag.offset].0 ^= 1;
+        }
+    }
+
+    /// Flush the gated blocks' cells where their gates are 0 too: each coordinate divided by the gate.
+    pub(crate) fn ungate(tamper: Option<Tamper>, l: &mut Layout) {
+        fn divide(c: &Coord, gate: usize) -> Coord {
+            match *c {
+                Coord::GCol(i, k) if i == gate => Coord::Const(primitives::field::g_pow(k as usize)),
+                Coord::Prod(i, j, k) if i == gate || j == gate => Coord::GCol(if i == gate { j } else { i }, k),
+                Coord::Sum(ref cs) => Coord::Sum(cs.iter().map(|c| divide(c, gate)).collect()),
+                ref c => c.clone(),
+            }
+        }
+        if tamper != Some(Tamper::DroppedPush) {
+            return;
+        }
+        for blk in l.push.iter_mut().chain(&mut l.pull) {
+            if let Some(gate) = blk.gate.take() {
+                blk.coords = blk.coords.iter().map(|c| divide(c, gate)).collect();
+            }
         }
     }
 }
@@ -1027,8 +1062,9 @@ mod tests {
     }
 
     /// The forgeries of a KECCAK's output cells are rejected: a row that writes a cell its
-    /// bytecode does not request, which a later read uses; a requested cell holding a wrong
-    /// value; and the witness's flag for output cells `2..13` flipped against the bytecode.
+    /// bytecode does not request, which a later read uses; the same row flushing that cell on the
+    /// bus, as if it were not gated; a requested cell holding a wrong value; and the witness's flag
+    /// for output cells `2..13` flipped against the bytecode.
     #[test]
     fn keccak_output_forgeries_are_rejected() {
         use tamper::Tamper;
@@ -1044,12 +1080,17 @@ mod tests {
         // The bus fails where a memory push has no partner. A row writing all thirteen cells reads
         // its output lanes back from memory, so the wrong value balances the bus and the Keccak
         // reduction rejects it instead.
-        use verifier::VerifierError::{GkrLayer, KeccakProduct};
+        use verifier::VerifierError::{GkrLayer, KeccakProduct, TableSumcheckTerminal};
         let bus = |e: &verifier::VerifierError| matches!(e, GkrLayer(_));
         let reduction = |e: &verifier::VerifierError| *e == KeccakProduct;
         type Rejects<'a> = &'a dyn Fn(&verifier::VerifierError) -> bool;
-        let cases: [(Tamper, &Program, Rejects); 5] = [
+        // A prover that writes the cell and flushes it as before the gates balances its own bus, but its leaves are not
+        // the ones the verifier derives, which are 1 where a gate is 0.
+        let table = |e: &verifier::VerifierError| *e == TableSumcheckTerminal;
+        let cases: [(Tamper, &Program, Rejects); 7] = [
             (Tamper::UnrequestedWrite, &reading, &bus),
+            (Tamper::DroppedPush, &reading, &table),
+            (Tamper::DroppedPush, &partial, &table),
             (Tamper::WrongOutput, &partial, &bus),
             (Tamper::WrongOutput, &full, &reduction),
             (Tamper::OutFlag, &partial, &bus),
@@ -1059,6 +1100,7 @@ mod tests {
             tamper::set(forgery);
             let (proof, _) = prove(program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
             let verdict = verify(program, &pi, &proof).err();
+            eprintln!("{forgery:?}: {verdict:?}");
             assert!(
                 matches!(&verdict, Some(CpuError::Verifier(e)) if expected(e)),
                 "{forgery:?}: {verdict:?}"
@@ -1255,5 +1297,61 @@ mod tests {
         assert!(tagged >= 6, "the padding is found: {tagged} blocks tagged");
         let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &pi, &proof).expect("the proof verifies");
+    }
+
+    /// KECCAK rows of all three output shapes, interleaved, are sorted into blocks by shape. The rows writing
+    /// every cell come first, then those writing two, and each gate's leaves past its last row are skipped.
+    #[test]
+    fn mixed_output_shapes_sort_and_verify() {
+        let shapes = |k: u32| match k % 7 {
+            0 | 3 => OutCells::All,
+            5 => OutCells::Two,
+            _ => OutCells::One,
+        };
+        let n = 2900;
+        let mut prog = vec![Op::Set { o: 2, k: w(3) }, Op::Set { o: 3, k: w(4) }];
+        for i in 0..4 {
+            prog.push(Op::Set { o: 4 + i, k: w(5) });
+        }
+        prog.push(Op::Set { o: 8, k: w(6) });
+        for c in 0..4 {
+            prog.push(Op::Set { o: 9 + c, k: F192::ZERO });
+        }
+        let mut out = 13;
+        for k in 0..n {
+            let out_cells = shapes(k);
+            prog.push(Op::Keccak {
+                m: [2, 3, 2, 3],
+                tail: 4,
+                b8: 8,
+                cap: 9,
+                out,
+                in_odd: false,
+                out_odd: false,
+                out_cells,
+            });
+            out += out_cells.cells() as u32;
+        }
+        let len = (prog.len() + 1).next_power_of_two();
+        while prog.len() + 1 < len {
+            prog.push(Op::Xor { a: 2, b: 3, c: out });
+            out += 1;
+        }
+        prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
+        let program = Program::from_bytecode(prog, 64);
+        let pi = [w(7), w(11)];
+        let exec = program.execute(pi).expect("the run halts");
+        let rows = &exec.trace.keccak;
+        assert_eq!(rows.len(), n as usize);
+        let class = |i: usize| match program.prog[rows.get(i).pc as usize] {
+            Op::Keccak { out_cells, .. } => crate::keccak::class(out_cells),
+            _ => unreachable!(),
+        };
+        let count = |c: usize| (0..rows.len()).filter(|&i| class(i) == c).count();
+        let [live_two, live_all] = exec.trace.keccak_live;
+        assert_eq!(live_all, count(0), "the rows writing every cell lead");
+        assert!(live_two < count(0) + count(1) + crate::keccak::BLOCK_ROWS, "the rows writing two follow");
+        let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &proof).expect("sorted rows verify");
     }
 }

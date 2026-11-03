@@ -321,20 +321,20 @@ impl Program {
     /// Compilation yields the `Program`; executing it (here) and proving it are
     /// separate later phases.
     pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
-        self.execute_with(&self.witness, public_input, GPow::new(), &mut |_| {})
+        self.execute_with(&self.witness, public_input, GPow::new(), &mut |_, _| {})
     }
 
     /// [`Self::execute`] starting from `gpow`, a table an earlier run left. The table
     /// is a function of the exponent alone and announcing more only widens its index,
     /// so a run that starts from one skips growing and announcing it again.
-    /// `keccak_step` gets the lanes each `KECCAK` row reads, in row order and as the row runs.
+    /// `keccak_step` gets the lanes each `KECCAK` row reads and the output cells it writes, as the row runs.
     #[timed]
     pub(crate) fn execute_with(
         &self,
         witness: &Witness,
         public_input: [F192; 2],
         gpow: GPow,
-        keccak_step: &mut dyn FnMut(&[u64; primitives::hash::STATE_LANES]),
+        keccak_step: &mut dyn FnMut(&[u64; primitives::hash::STATE_LANES], OutCells),
     ) -> Result<Execution, ExecError> {
         use super::hints::{BitsDest, RHint};
 
@@ -403,7 +403,9 @@ impl Program {
         let mut set: Rows<Srow> = Rows::new();
         let mut deref: Rows<Drow> = Rows::new();
         let mut jump: Rows<Jrow> = Rows::new();
-        let mut keccak: Rows<Krow> = Rows::new();
+        // KECCAK rows go in blocks by output shape, in the order the witness builder's `ShapeSort` gives its steps.
+        let mut keccak: crate::keccak::ShapeSort<Krow> = crate::keccak::ShapeSort::new();
+        let mut keccak_blocks: Vec<Vec<Krow>> = Vec::new();
 
         // The memory's cells. Every method on the hot path is `#[inline(always)]`: they
         // sit in the interpreter's opcode loop. The instructions' accesses are unchecked:
@@ -940,7 +942,10 @@ impl Program {
                     #[cfg(any(test, feature = "tamper"))]
                     let tamper = super::tamper::peek();
                     #[cfg(any(test, feature = "tamper"))]
-                    if tamper == Some(super::tamper::Tamper::UnrequestedWrite) {
+                    if matches!(
+                        tamper,
+                        Some(super::tamper::Tamper::UnrequestedWrite | super::tamper::Tamper::DroppedPush)
+                    ) {
                         written = ROW_CELLS;
                     }
                     // The output cells are usually untouched and cold: fetch them while the permutation runs.
@@ -964,7 +969,7 @@ impl Program {
                     // by the Keccak reduction, §keccak); the interpreter still computes it so
                     // the output cells are consistent for any later read.
                     let mut lanes = crate::keccak::state_of_cells(&input, k.in_odd);
-                    keccak_step(&lanes);
+                    keccak_step(&lanes, out_cells);
                     primitives::hash::keccak_f(&mut lanes);
                     #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
                     let mut output = crate::keccak::cells_of_state(&lanes, k.out_odd);
@@ -981,12 +986,14 @@ impl Program {
                     for (count, &cell) in r.iter_mut().zip(&cells[..written]) {
                         *count = m.bump_access_count(cell);
                     }
-                    keccak.push(Krow {
+                    let row = Krow {
                         pc,
                         fp,
                         r,
                         bytecode_read,
-                    });
+                    };
+                    let fresh = || Vec::with_capacity(keccak_gkr::witness::BLOCK);
+                    keccak.push(crate::keccak::class(out_cells), row, fresh, |block| keccak_blocks.push(block));
                     pc += 1;
                 }
             }
@@ -1036,6 +1043,22 @@ impl Program {
         }
 
         let counts = bytecode_count.iter().copied().max().unwrap_or(0).max(m.counts) as usize + 1;
+        let order = keccak.finish(|block, _| keccak_blocks.push(block));
+        let mut ran: Vec<Option<Vec<Krow>>> = keccak_blocks.into_iter().map(Some).collect();
+        let placed = order.iter().map(|&d| ran[d].take().expect("a block has one place")).collect();
+        let keccak = Rows::from_chunks(placed, keccak_gkr::witness::BLOCK.ilog2());
+        let mut keccak_live = [0; 2];
+        for (i, row) in keccak.iter().enumerate() {
+            let Op::Keccak { out_cells, .. } = self.prog[row.pc as usize] else {
+                unreachable!("a KECCAK row's pc holds a KECCAK")
+            };
+            let (two, all) = out_cells.flags();
+            for (live, written) in keccak_live.iter_mut().zip([two, all]) {
+                if written {
+                    *live = i + 1;
+                }
+            }
+        }
         let trace = Trace {
             xor,
             mul,
@@ -1043,6 +1066,7 @@ impl Program {
             deref,
             jump,
             keccak,
+            keccak_live,
             bytecode_count,
             counts,
         };

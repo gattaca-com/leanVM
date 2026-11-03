@@ -59,6 +59,9 @@ pub struct BusBlock {
     pub rows: u64,              // ...of which the first `rows` flush, the rest being padding rows, whose leaves are 1
     pub coordinates: Vec<Form>, // the tuple flushed, over the owner's OWN local column indices; stays symbolic until its table sumcheck
     pub owner: usize,           // whose block it is, by opcode
+    // A gated block flushes where this column is 1. Its leaf is 1 + gate·(β + 1) + Σ_i w_i c_i, every coordinate a
+    // multiple of the gate, so a row it does not flush has leaf 1 and leaves no pair on the bus.
+    pub gate: Option<usize>,
 }
 
 pub const RELATION_LABEL: &[u8] =
@@ -117,6 +120,11 @@ pub fn constant(value: E) -> Form {
     Form::term(vec![], value)
 }
 
+/// The column `index` itself.
+pub fn col_form(index: usize) -> Form {
+    col(index, 0)
+}
+
 fn col(index: usize, exponent: u64) -> Form {
     Form::term(vec![index], gpow(exponent))
 }
@@ -133,12 +141,14 @@ pub const SEP_BYTECODE: E = E::new(4, 0, 0); // GEN^2
 pub struct Flushes {
     push: Vec<Vec<Form>>,
     pull: Vec<Vec<Form>>,
+    gates: Vec<Option<usize>>, // per pair, the column a gated pair flushes by
 }
 
 impl Flushes {
     fn pair(&mut self, push: Vec<Form>, pull: Vec<Form>) {
         self.push.push(push);
         self.pull.push(pull);
+        self.gates.push(None);
     }
 
     fn state_derived(&mut self, pc: usize, fp: usize, npc: Form, nfp: Form) {
@@ -166,12 +176,12 @@ impl Flushes {
         self.counted([constant(SEP_MEM), address], count, values.to_vec());
     }
 
-    /// `memory` when the column `flag` is 1. At 0 the push's counter is the pull's, `count·(1 + flag·(g + 1))`,
-    /// so the pair cancels and touches no cell.
-    fn memory_if(&mut self, flag: usize, address: Form, count: usize, values: [Form; 3]) {
-        let side = |counter: Form| [vec![constant(SEP_MEM), address.clone(), counter], values.to_vec()].concat();
-        let counter = col(count, 0) + prod(flag, count, 1) + prod(flag, count, 0);
-        self.pair(side(counter), side(col(count, 0)));
+    /// `memory` where the column `gate` is 1, and no pair where it is 0. The address and the values are already
+    /// multiplied by the gate, as the separator (GEN) and the counts are here.
+    fn memory_gated(&mut self, gate: usize, address: Form, count: usize, values: [Form; 3]) {
+        let side = |counter: Form| [vec![col(gate, 1), address.clone(), counter], values.to_vec()].concat();
+        self.pair(side(prod(gate, count, 1)), side(prod(gate, count, 0)));
+        *self.gates.last_mut().expect("a pair") = Some(gate);
     }
 
     /// The cell's limbs are the named columns, the missing top ones zero.
@@ -289,6 +299,11 @@ fn flushes_jump() -> Flushes {
     flushes
 }
 
+fn keccak_constraints(columns: &[E]) -> Vec<E> {
+    let [fp, o_out] = cols(KECCAK_HEAD, ["fp", "o_out"]).map(|index| columns[index]);
+    vec![columns[KECCAK_ADDR] + fp * o_out]
+}
+
 fn jump_constraints(columns: &[E]) -> Vec<E> {
     let [condition, inverse, flag] = cols(JUMP_COLUMNS, ["v_cond", "w", "b"]).map(|index| columns[index]);
     vec![flag + condition * inverse, condition * (flag + ONE)]
@@ -355,11 +370,31 @@ fn flushes_keccak() -> Flushes {
                 constant(ZERO),
             ];
             let count = KECCAK_CNT + KECCAK_CELLS * side + cell;
+            let gate = match cell {
+                1 => KECCAK_OUT_TWO,
+                _ => KECCAK_OUT_ALL,
+            };
+            // A gated cell's limb is `gate·a + odd·(a + b)`: the bytecode makes `out_odd` imply both gates.
+            let gated = |e: Option<usize>, o: Option<usize>| {
+                let (a, b) = (lane(e), lane(o));
+                if a == b {
+                    return a.map_or(constant(ZERO), |a| prod(gate, a, 0));
+                }
+                Form::sum(
+                    [a.map(|a| prod(gate, a, 0)), a.map(|a| prod(flag, a, 0)), b.map(|b| prod(flag, b, 0))]
+                        .into_iter()
+                        .flatten(),
+                )
+            };
             match (side, cell) {
                 (0, _) => flushes.memory(address(cell), count, values),
                 (_, 0) => flushes.memory(prod(fp, o_out, 0), count, values),
-                (_, 1) => flushes.memory_if(KECCAK_OUT_TWO, prod(fp, o_out, 1), count, values),
-                _ => flushes.memory_if(KECCAK_OUT_ALL, prod(fp, o_out, cell as u64), count, values),
+                _ => flushes.memory_gated(
+                    gate,
+                    prod(gate, KECCAK_ADDR, cell as u64),
+                    count,
+                    [gated(even[cell].0, odd[cell].0), gated(even[cell].1, odd[cell].1), constant(ZERO)],
+                ),
             }
         }
     }
@@ -393,6 +428,7 @@ const KECCAK_CNT: usize = KECCAK_OUT + STATE_LANES;
 const KECCAK_CNT_BC: usize = KECCAK_CNT + 2 * KECCAK_CELLS;
 const KECCAK_OUT_TWO: usize = KECCAK_CNT_BC + 1;
 const KECCAK_OUT_ALL: usize = KECCAK_OUT_TWO + 1;
+const KECCAK_ADDR: usize = KECCAK_OUT_ALL + 1; // fp·o_out, which a gated output cell's address multiplies by its gate
 
 /// The local KECCAK column riding spare slot `k` (`cpu::keccak_value` in the prover): its
 /// committed columns in local order, the ones before the value lanes then the read counts
@@ -436,7 +472,7 @@ fn keccak_columns() -> Vec<String> {
     head.chain(lanes("in"))
         .chain(lanes("out"))
         .chain(counts)
-        .chain(["cnt_bc", "out_two", "out_all"].map(String::from))
+        .chain(["cnt_bc", "out_two", "out_all", "addr"].map(String::from))
         .collect()
 }
 
@@ -449,7 +485,7 @@ pub fn tables() -> Vec<Table> {
         constraints,
     };
     let named = |columns: &[&str]| columns.iter().map(|name| name.to_string()).collect();
-    let mut keccak = table(OP_KECCAK, keccak_columns(), flushes_keccak(), |_| vec![]);
+    let mut keccak = table(OP_KECCAK, keccak_columns(), flushes_keccak(), keccak_constraints);
     // A padding row is zero, but for KECCAK's output lanes: a padding row permutes zeros.
     let mut output = [0; STATE_LANES];
     keccak_f(&mut output);
@@ -472,7 +508,7 @@ const TABLE_WIDTHS: [usize; N_TABLES] = [
     SET_COLUMNS.len(),
     DEREF_COLUMNS.len(),
     JUMP_COLUMNS.len(),
-    KECCAK_OUT_ALL + 1,
+    KECCAK_ADDR + 1,
 ];
 pub const GLOBAL_COLUMN_BASES: [usize; N_TABLES] = {
     let mut bases = [NUM_GLOBAL_COLUMNS; N_TABLES];
@@ -513,15 +549,16 @@ pub fn build_layout<'a>(
     let mut pull = Vec::new();
     let mut count = Vec::new();
     for ((table, &height), &rows) in tables.iter().zip(&table_log_heights).zip(table_rows) {
-        let block = |coordinates: &Vec<Form>| BusBlock {
+        let block = |coordinates: &Vec<Form>, gate: &Option<usize>| BusBlock {
             log_rows: height,
             rows,
             coordinates: coordinates.clone(),
             owner: table.opcode,
+            gate: *gate,
         };
-        push.extend(table.flushes.push.iter().map(block));
-        pull.extend(table.flushes.pull.iter().map(block));
-        count.extend(table.count_columns().map(|local| block(&vec![col(local, 0)])));
+        push.extend(table.flushes.push.iter().zip(&table.flushes.gates).map(|(c, g)| block(c, g)));
+        pull.extend(table.flushes.pull.iter().zip(&table.flushes.gates).map(|(c, g)| block(c, g)));
+        count.extend(table.count_columns().map(|local| block(&vec![col(local, 0)], &None)));
     }
 
     // Every column's log size, in global order: the framework's, q_keccak's, then each table's block.

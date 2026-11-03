@@ -126,6 +126,11 @@ BLOCK_KAPPA_SRC = BLOCK_KAPPA_SRC_PLACEHOLDER
 BLOCK_KAPPA_ADJ = BLOCK_KAPPA_ADJ_PLACEHOLDER
 BLOCK_TABLE = BLOCK_TABLE_PLACEHOLDER
 BLOCK_SIDE = BLOCK_SIDE_PLACEHOLDER
+# A gated block flushes where its table's local column BLOCK_GATE[b] is 1, NO_GATE marking one that is not
+# gated. Its leaf is 1 + gate·(β + 1) + Σ_i w_i coord_i, every coord a multiple of the gate, so a row it does
+# not flush, its padding rows included, has leaf 1.
+BLOCK_GATE = BLOCK_GATE_PLACEHOLDER
+NO_GATE = NO_GATE_PLACEHOLDER
 BLOCK_COORD_OFF = BLOCK_COORD_OFF_PLACEHOLDER
 BLOCK_COORD_COUNT = BLOCK_COORD_COUNT_PLACEHOLDER
 COORD_TYPE = COORD_TYPE_PLACEHOLDER
@@ -178,6 +183,10 @@ LOG2_BYTECODE_COLS = LOG2_BYTECODE_COLS_PLACEHOLDER
 # is sized for at least one block of 2^9 steps).
 TABLE_JUMP = 4
 TABLE_KECCAK = 5
+# KECCAK's local columns its one identity reads: addr = fp·o_out, the address its gated output cells multiply.
+KECCAK_FP = KECCAK_FP_PLACEHOLDER
+KECCAK_O_OUT = KECCAK_O_OUT_PLACEHOLDER
+KECCAK_ADDR = KECCAK_ADDR_PLACEHOLDER
 N_TABLES = N_TABLES_PLACEHOLDER
 FLOORS = FLOORS_PLACEHOLDER
 N_TABLE_COLS = N_TABLE_COLS_PLACEHOLDER
@@ -2076,6 +2085,8 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
                 assert goff == block_off_g[GEN ** b]  # bits == offset >> κ, κ-aligned
             selector_sum += eq_hi
             block_eq_hi[b] = eq_hi
+            if BLOCK_GATE[b] != NO_GATE:
+                acc += eq_hi  # a gated leaf's 1, summed over the block
             # A TABLE's block streams no value here: the table sumcheck settles its
             # fingerprint from that table's column evaluations. Only the framework
             # blocks (boundary, memory, bytecode) still decompose.
@@ -2144,18 +2155,19 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
                 table_sum = 0
                 for b in unroll(SIDE_BLOCK_START[s], SIDE_BLOCK_START[s + 1]):
                     if BLOCK_TABLE[b] == t:
-                        if s == COUNT_SIDE:
-                            coeff = 1
-                        else:
-                            coeff = beta_1
-                        for i in unroll(0, BLOCK_COORD_COUNT[b]):
-                            ci = BLOCK_COORD_OFF[b] + i
-                            if const(COORD_PADDING[ci] != 0):
-                                if s == COUNT_SIDE:
-                                    coeff += COORD_PADDING[ci]
-                                else:
-                                    coeff += fp_w[GEN ** i] * COORD_PADDING[ci]
-                        table_sum += block_eq_hi[b] * coeff
+                        if BLOCK_GATE[b] == NO_GATE:  # a gated block's padding rows hold 1 already
+                            if s == COUNT_SIDE:
+                                coeff = 1
+                            else:
+                                coeff = beta_1
+                            for i in unroll(0, BLOCK_COORD_COUNT[b]):
+                                ci = BLOCK_COORD_OFF[b] + i
+                                if const(COORD_PADDING[ci] != 0):
+                                    if s == COUNT_SIDE:
+                                        coeff += COORD_PADDING[ci]
+                                    else:
+                                        coeff += fp_w[GEN ** i] * COORD_PADDING[ci]
+                            table_sum += block_eq_hi[b] * coeff
                 padding_sum += pad_weight[t] * table_sum
             acc += padding_sum
             if s == PUSH_SIDE:
@@ -2258,6 +2270,9 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
             b = col_evals[13]
             constraint_eval = zc_xi_pows[ETA_OFFSET[t] + 0] * (b + c * col_evals[12])
             constraint_eval += zc_xi_pows[ETA_OFFSET[t] + 1] * (c * (b + 1))
+        if t == TABLE_KECCAK:
+            # `addr = fp·o_out`, the address a gated output cell's flush multiplies by its gate.
+            constraint_eval = zc_xi_pows[ETA_OFFSET[t]] * (col_evals[KECCAK_ADDR] + col_evals[KECCAK_FP] * col_evals[KECCAK_O_OUT])
         # The table's three bus forms, evaluated at the SAME column evaluations:
         # Σ_b eq_hi(b) · (γ + Σ_i α^i · coord_i), the coords read off col_evals at
         # their local index. This is what replaces opening those columns at ζ.
@@ -2290,6 +2305,8 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
                                 inner += fp_w[GEN ** i] * cv
                         if sd == COUNT_SIDE:
                             form += block_eq_hi[b] * inner
+                        elif BLOCK_GATE[b] != NO_GATE:
+                            form += block_eq_hi[b] * (beta_1 * col_evals[BLOCK_GATE[b]] + inner)
                         else:
                             form += block_eq_hi[b] * (beta + inner)
             constraint_eval += zc_xi_pows[ETA_FORM_BASE + sd] * form

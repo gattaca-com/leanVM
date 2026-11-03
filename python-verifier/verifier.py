@@ -529,6 +529,9 @@ class BusBlock:
     rows: int  # ...of which the first `rows` flush, the rest being padding rows, whose leaves are 1
     coordinates: tuple[Form, ...]  # the tuple flushed, over the owner's OWN local column indices; stays symbolic until its table sumcheck
     owner: int  # whose block it is, by opcode
+    # A gated block flushes where this column is 1. Its leaf is 1 + gate*(beta + 1) + sum_i w_i c_i, every
+    # coordinate a multiple of the gate, so a row it does not flush has leaf 1 and leaves no pair on the bus.
+    gate: int | None = None
 
 
 @dataclass(frozen=True)
@@ -629,16 +632,24 @@ def verify_bus_balance(layout: Layout, transcript: Transcript) -> BusResult:
         # A table's blocks stay symbolic: they accumulate into the form its sumcheck settles over its own columns.
         # That form is summed over the padding rows too, whose leaves hold 1 instead: the difference is public.
         padding_rows = ZERO
+        gated = ZERO
         for selector, block in zip(table_selectors, blocks, strict=True):
-            block_form = _const(side_beta)
+            block_form = Form()
             for slot, coordinate in enumerate(block.coordinates):
                 block_form.add_scaled(coordinate, side_weights[slot])  # the fingerprint, one tuple slot at a time
+            # A gated leaf is 1 + gate*(beta + 1) + sum_i w_i c_i: its 1 sums to the selector, and its padding rows hold 1.
+            if block.gate is not None:
+                block_form.add_scaled(_col(block.gate), side_beta + ONE)
+                forms[block.owner][side].add_scaled(block_form, selector)
+                gated += selector
+                continue
+            block_form.add_scaled(_const(ONE), side_beta)
             forms[block.owner][side].add_scaled(block_form, selector)
             padding = TABLES[block.owner].padding
             padding_rows += selector * padding_weight(point[: block.log_rows], block.rows) * (block_form.evaluate(padding.__getitem__) + ONE)
         # The leaves outside every block hold 1.
         ones_padding = E.sum(framework_selectors + table_selectors) + ONE
-        totals.append(tree_values[side] + known + ones_padding + padding_rows)  # what the forms owe: the GKR value, less framework and padding
+        totals.append(tree_values[side] + known + ones_padding + padding_rows + gated)  # what the forms owe: the GKR value, less framework and padding
 
     return BusResult(tuple(claims), point, forms, (totals[0], totals[1], totals[2]))
 
@@ -745,10 +756,12 @@ class Flushes:
     def __init__(self) -> None:
         self.push: list[tuple[Form, ...]] = []
         self.pull: list[tuple[Form, ...]] = []
+        self.gates: list[int | None] = []  # per pair, the column a gated pair flushes by
 
     def pair(self, push: Sequence[Form], pull: Sequence[Form]) -> None:
         self.push.append(tuple(push))
         self.pull.append(tuple(pull))
+        self.gates.append(None)
 
     def state_derived(self, pc: int, fp: int, npc: Form, nfp: Form) -> None:
         self.pair((_const(SEP_STATE), npc, nfp), (_const(SEP_STATE), _col(pc), _col(fp)))
@@ -765,11 +778,11 @@ class Flushes:
     def memory(self, address: Form, count: int, values: Sequence[Form]) -> None:
         self._counted((_const(SEP_MEM), address), count, values)
 
-    def memory_if(self, flag: int, address: Form, count: int, values: Sequence[Form]) -> None:
-        """`memory` when the column `flag` is 1. At 0 the push's counter is the pull's, count*(1 + flag*(g + 1)),
-        so the pair cancels and touches no cell."""
-        counter = Form.sum([_col(count), _prod(flag, count, 1), _prod(flag, count)])
-        self.pair((_const(SEP_MEM), address, counter, *values), (_const(SEP_MEM), address, _col(count), *values))
+    def memory_gated(self, gate: int, address: Form, count: int, values: Sequence[Form]) -> None:
+        """`memory` where the column `gate` is 1, and no pair where it is 0. The address and the values are already
+        multiplied by the gate, as the separator (GEN) and the counts are here."""
+        self.pair((_col(gate, 1), address, _prod(gate, count, 1), *values), (_col(gate, 1), address, _prod(gate, count), *values))
+        self.gates[-1] = gate
 
     def memory_cols(self, address: Form, count: int, *columns: int) -> None:
         self.memory(address, count, [_col(column) for column in columns] + [_const(ZERO)] * (3 - len(columns)))
@@ -902,7 +915,7 @@ def _flushes_keccak() -> Flushes:
     pc, fp, cnt_bc, free = _cols(KECCAK_COLUMNS, "pc", "fp", "cnt_bc", "free")
     o_m = _cols(KECCAK_COLUMNS, "o_m0", "o_m1", "o_m2", "o_m3")
     o_tail, o_b8, o_cap, o_out, odd_in, odd_out = _cols(KECCAK_COLUMNS, "o_tail", "o_b8", "o_cap", "o_out", "odd_in", "odd_out")
-    out_two, out_all = _cols(KECCAK_COLUMNS, "out_two", "out_all")
+    out_two, out_all, addr = _cols(KECCAK_COLUMNS, "out_two", "out_all", "addr")
     flushes = Flushes()
     flushes.state_step(pc, fp)
     operands = (*o_m, o_tail, o_b8, o_cap, o_out, odd_in, odd_out, out_two, out_all)
@@ -933,8 +946,22 @@ def _flushes_keccak() -> Flushes:
             elif cell == 0:
                 flushes.memory(_prod(fp, o_out, 0), count, values)
             else:
-                flushes.memory_if(out_two if cell == 1 else out_all, _prod(fp, o_out, cell), count, values)
+                # A gated cell's limb is gate*a + odd*(a + b): the bytecode makes `odd_out` imply both gates.
+                gate = out_two if cell == 1 else out_all
+
+                def gated(a: int | None, b: int | None, gate: int = gate) -> Form:
+                    if a == b:
+                        return _const(ZERO) if a is None else _prod(gate, a)
+                    return Form.sum([*([_prod(gate, a), _prod(flag, a)] if a is not None else []), *([_prod(flag, b)] if b is not None else [])])
+
+                limbs = [gated(lane(even[cell][h]), lane(odd[cell][h])) for h in (0, 1)] + [_const(ZERO)]
+                flushes.memory_gated(gate, _prod(gate, addr, cell), count, limbs)
     return flushes
+
+
+def _keccak_constraints(columns: Sequence[E]) -> tuple[E, ...]:
+    fp, o_out, addr = (columns[index] for index in _cols(KECCAK_COLUMNS, "fp", "o_out", "addr"))
+    return (addr + fp * o_out,)
 
 
 OP_XOR, OP_MUL, OP_SET, OP_DEREF, OP_JUMP, OP_KECCAK = range(6)
@@ -954,6 +981,8 @@ KECCAK_COLUMNS = (
     *(f"cnt_{cell}" for cell in range(2 * KECCAK_CELLS)), "cnt_bc",
     # The bytecode's flags for the output cells written: cell 1, and cells 2..13.
     "out_two", "out_all",
+    # fp*o_out, the output's address, which a gated output cell's address multiplies by its gate.
+    "addr",
 )  # fmt: skip
 KECCAK_IN, KECCAK_OUT, KECCAK_CNT = (KECCAK_COLUMNS.index(name) for name in ("in_0", "out_0", "cnt_0"))
 # Which slot of q_keccak each local KECCAK column is. The states take the first QKECCAK_SLOTS, the input
@@ -976,7 +1005,7 @@ TABLES = (
     Table("set", OP_SET, SET_COLUMNS, _flushes_set()),
     Table("deref", OP_DEREF, DEREF_COLUMNS, _flushes_deref()),
     Table("jump", OP_JUMP, JUMP_COLUMNS, _flushes_jump(), _jump_constraints),
-    Table("keccak", OP_KECCAK, KECCAK_COLUMNS, _flushes_keccak()),
+    Table("keccak", OP_KECCAK, KECCAK_COLUMNS, _flushes_keccak(), _keccak_constraints),
 )
 
 
@@ -998,10 +1027,10 @@ def build_layout(bytecode: Sequence[K], log_memory: int, table_rows: Sequence[in
     count: list[BusBlock] = []
     for table, height, rows in zip(TABLES, table_log_heights, table_rows, strict=True):
         flushes = table.flushes
-        for coordinates in flushes.push:
-            push.append(BusBlock(height, rows, coordinates, table.opcode))
-        for coordinates in flushes.pull:
-            pull.append(BusBlock(height, rows, coordinates, table.opcode))
+        for coordinates, gate in zip(flushes.push, flushes.gates, strict=True):
+            push.append(BusBlock(height, rows, coordinates, table.opcode, gate))
+        for coordinates, gate in zip(flushes.pull, flushes.gates, strict=True):
+            pull.append(BusBlock(height, rows, coordinates, table.opcode, gate))
         for local in table.count_columns:
             count.append(BusBlock(height, rows, (_col(local),), table.opcode))
 
