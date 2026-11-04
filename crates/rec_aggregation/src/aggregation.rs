@@ -1685,19 +1685,18 @@ pub fn aggregate_with_stats(
         .iter()
         .map(|child| verifier::da::digest(child.da_root))
         .collect();
-    let mut statements = Vec::with_capacity(children.len());
-    for (child, &da) in children.iter().zip(&child_da) {
+    for child in children {
         check_signer_set(&child.xmss_signers, &child.lean_sphincs_signers).map_err(AggregationError::InvalidChild)?;
-        statements.push(child.statement(da));
     }
-    // One single-threaded replay per worker: nothing inside dispatches.
+    // One statement hash and single-threaded replay per worker: nothing inside dispatches.
     let bytecode = scalar_bytecode();
     let summaries = parallel::map_collect(children.len(), |i| {
-        let public_input = public_input_bytes(&statements[i]);
-        verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof))
+        let pi = children[i].statement(child_da[i]);
+        let public_input = public_input_bytes(&pi);
+        (pi, verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof)))
     });
     let mut replayed = Vec::with_capacity(children.len());
-    for (pi, summary) in statements.into_iter().zip(summaries) {
+    for (pi, summary) in summaries {
         let summary =
             summary.map_err(|e| AggregationError::InvalidChild(AggregateVerifyError::Snark(SnarkVerifyError(e))))?;
         replayed.push((pi, summary));
@@ -1781,10 +1780,17 @@ pub fn aggregate_with_stats(
         })
         .collect();
     let sums = bytecode_sums(&claim_points);
+    // One single-threaded `gen_verify` per worker, like the replay: the children are independent.
+    let mut generated = parallel::map_collect(children.len(), |i| {
+        let (pi, summary) = &replayed[i];
+        let value = bytecode_value(&sums[2 * i], &claim_points[2 * i]);
+        gen_verify(guest, *pi, &children[i].proof.stream, summary, value)
+    })
+    .into_iter();
     let mut subs = Vec::with_capacity(children.len());
     let mut carried = Vec::with_capacity(children.len());
     let (mut xmss_slots, mut sphincs_slots) = (&cover.xmss.children[..], &cover.lean_sphincs.children[..]);
-    for (i, (child, (pi, summary))) in children.iter().zip(&replayed).enumerate() {
+    for (i, child) in children.iter().enumerate() {
         hints.push(
             "child_meta",
             &[count(child.xmss_signers.len()), count(child.lean_sphincs_signers.len())],
@@ -1814,8 +1820,7 @@ pub fn aggregate_with_stats(
         }
         hints.push_iter("child_defer", child.defer.cells());
         hints.push("child_da", &pack_hash_state(&child_da[i]));
-        let value = bytecode_value(&sums[2 * i], &claim_points[2 * i]);
-        let (sub_hints, defer) = gen_verify(guest, *pi, &child.proof.stream, summary, value)?;
+        let (sub_hints, defer) = generated.next().expect("one result per child")?;
         hints.append(sub_hints);
         subs.push(defer);
         carried.push(&child.defer);
