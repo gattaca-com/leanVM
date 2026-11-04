@@ -1420,8 +1420,8 @@ struct Region<K> {
     dups: Vec<K>,
     /// The slot of each raw signature, in the order given.
     raw: Vec<usize>,
-    /// Per child, the slot of each of its claims.
-    children: Vec<Vec<usize>>,
+    /// The slot of each claim of each child, in order, end to end.
+    children: Vec<usize>,
 }
 
 impl<K: Ord + Clone> Region<K> {
@@ -1450,18 +1450,27 @@ impl<K: Ord + Clone> Region<K> {
         }
         let mut claimed = vec![false; signers.len()];
         let mut dups = Vec::new();
-        let raw = raw
-            .iter()
-            .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
-            .collect();
-        let children = children
-            .map(|child| {
-                child
-                    .iter()
-                    .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
-                    .collect()
-            })
-            .collect();
+        // Each input list is sorted, so its position in the declared union only advances.
+        let mut slots = |input: &[K]| {
+            let mut pos = 0;
+            input
+                .iter()
+                .map(|claim| {
+                    while pos < signers.len() && signers[pos] < *claim {
+                        pos += 1;
+                    }
+                    if signers.get(pos) == Some(claim) && !claimed[pos] {
+                        claimed[pos] = true;
+                        pos
+                    } else {
+                        dups.push(claim.clone());
+                        signers.len() + dups.len() - 1
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let raw = slots(raw);
+        let children = children.flat_map(slots).collect();
         Ok(Self {
             signers,
             dups,
@@ -1478,21 +1487,6 @@ impl<K: Ord + Clone> Region<K> {
 impl Coverage {
     fn n_total(&self) -> usize {
         self.xmss.n_slots() + self.lean_sphincs.n_slots()
-    }
-}
-
-/// A claim takes its declared slot once; subsequent or omitted occurrences take
-/// fresh slots outside the hashed prefix.
-fn take_slot<K: Ord + Clone>(claims: &[K], claimed: &mut [bool], duplicates: &mut Vec<K>, claim: &K) -> usize {
-    match claims.binary_search(claim) {
-        Ok(pos) if !claimed[pos] => {
-            claimed[pos] = true;
-            pos
-        }
-        _ => {
-            duplicates.push(claim.clone());
-            claims.len() + duplicates.len() - 1
-        }
     }
 }
 
@@ -1831,12 +1825,18 @@ pub fn aggregate_with_stats(
     let sums = bytecode_sums(&claim_points);
     let mut subs = Vec::with_capacity(children.len());
     let mut carried = Vec::with_capacity(children.len());
+    let (mut xmss_slots, mut sphincs_slots) = (&cover.xmss.children[..], &cover.lean_sphincs.children[..]);
     for (i, (child, (pi, summary))) in children.iter().zip(replayed).enumerate() {
         hints.push(
             "child_meta",
             vec![count(child.xmss_signers.len()), count(child.lean_sphincs_signers.len())],
         );
-        for offsets in [&cover.xmss.children[i], &cover.lean_sphincs.children[i]] {
+        for (slots, len) in [
+            (&mut xmss_slots, child.xmss_signers.len()),
+            (&mut sphincs_slots, child.lean_sphincs_signers.len()),
+        ] {
+            let offsets;
+            (offsets, *slots) = slots.split_at(len);
             if offsets.is_empty() {
                 continue;
             }
@@ -2999,6 +2999,16 @@ mod tests {
             plan_coverage(short, &lean_sphincs, &[], None).err(),
             Some(AggregationError::TooLarge)
         );
+    }
+
+    #[test]
+    fn coverage_slots_preserve_omitted_and_overlapping_claims() {
+        let children: &[&[u8]] = &[&[1, 2, 4], &[2, 3, 5]];
+        let region = Region::plan(&[2, 4], children.iter().copied(), Some(&[1, 3, 4])).unwrap();
+        assert_eq!(region.signers, [1, 3, 4]);
+        assert_eq!(region.raw, [3, 2]);
+        assert_eq!(region.children, [0, 4, 5, 6, 1, 7]);
+        assert_eq!(region.dups, [2, 2, 4, 2, 5]);
     }
 
     fn prove_leaf(signers: &[(LeanXmssPublicKey, LeanXmssSignature)]) -> EthereumProof {
