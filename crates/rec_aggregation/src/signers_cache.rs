@@ -5,7 +5,6 @@
 //! parameters, hash construction, encoding predicate, and key derivation. Loaded
 //! signatures are also verified, so stale entries are regenerated from the first
 //! invalid one.
-
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -89,20 +88,31 @@ fn cache_path(message_id: u32) -> PathBuf {
 fn try_load_cache(path: &Path, message_id: u32) -> Option<Vec<CachedSignature>> {
     let bytes = fs::read(path).ok()?;
     let msg = message_for(message_id);
-    let mut signers = Vec::with_capacity(bytes.len() / LEAN_XMSS_RECORD);
-    for record in bytes.as_chunks::<LEAN_XMSS_RECORD>().0 {
-        let (pk, sig) = record.split_at(PUB_KEY_SIZE);
-        let pk = LeanXmssPublicKey::from_bytes(pk.try_into().unwrap());
-        let sig = LeanXmssSignature::from_bytes(sig.try_into().unwrap());
-        if sig.leaf_index() != leaf_index_of(signers.len(), message_id) || lean_xmss::verify(&pk, &msg, &sig).is_err() {
-            eprintln!(
-                "warning: signers cache {} is stale (signer {} no longer verifies); regenerating from there",
-                path.display(),
-                signers.len()
-            );
-            break;
-        }
-        signers.push((pk, sig));
+    let mut signers: Vec<CachedSignature> = bytes
+        .as_chunks::<LEAN_XMSS_RECORD>()
+        .0
+        .iter()
+        .map(|record| {
+            let (pk, sig) = record.split_at(PUB_KEY_SIZE);
+            (
+                LeanXmssPublicKey::from_bytes(pk.try_into().unwrap()),
+                LeanXmssSignature::from_bytes(sig.try_into().unwrap()),
+            )
+        })
+        .collect();
+    // One dispatch over all signers: the first one that fails ends the valid prefix.
+    let valid = parallel::find_first(signers.len(), |i| {
+        let (pk, sig) = &signers[i];
+        sig.leaf_index() != leaf_index_of(i, message_id) || lean_xmss::verify(pk, &msg, sig).is_err()
+    })
+    .unwrap_or(signers.len());
+    if valid < signers.len() {
+        eprintln!(
+            "warning: signers cache {} is stale (signer {valid} of {} no longer verifies); regenerating from there",
+            path.display(),
+            signers.len()
+        );
+        signers.truncate(valid);
     }
     Some(signers)
 }
