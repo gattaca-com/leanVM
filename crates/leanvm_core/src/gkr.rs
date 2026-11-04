@@ -1698,11 +1698,7 @@ pub fn prove_product_triple_from<C: TreeField>(
         // rounds come from one pass over its columns or its first table, and one double fold.
         let two_rounds = round_count >= 2
             && parallel::num_threads() >= 4
-            && cfg!(all(
-                target_arch = "x86_64",
-                target_feature = "vpclmulqdq",
-                target_feature = "avx512f"
-            ));
+            && cfg!(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2"));
         let pairs = two_rounds.then(|| Equality::new(&point[2..]));
         // A first table's double fold carries the third round's message, so it needs three rounds.
         for tree in &mut trees {
