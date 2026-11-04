@@ -212,8 +212,10 @@ impl Extent {
 
 pub struct Witness {
     pub shape: Shape,
-    /// The first `written` blocks of the batch, in order. The others are all `padding`.
+    /// The first `written` blocks of the batch, in the order they ran. The others are all `padding`.
     extents: Vec<Extent>,
+    /// Which block ran at each place of the batch, or empty when they ran in the batch's order.
+    order: Vec<usize>,
     written: usize,
     padding: Option<Extent>,
     /// Rounds between two stored states, as the extents store them.
@@ -448,10 +450,34 @@ impl Witness {
     /// If a block below `lanes.len()` was not run. A `lanes[g]` that block `g` did not leave gives
     /// the wrong witness.
     pub fn from_blocks(shape: Shape, extents: Vec<Extent>, lanes: &[&[u64]], committed: &mut [F64]) -> Self {
+        Self::from_ordered_blocks(shape, extents, Vec::new(), lanes, committed)
+    }
+
+    /// [`Witness::from_blocks`] for blocks that ran in another order: place `g` of the batch holds
+    /// the block that ran `order[g]`-th, and `lanes[g]` is what it left. An empty `order` is the batch's own.
+    ///
+    /// # Panics
+    /// If `order` is neither empty nor a permutation of the blocks.
+    pub fn from_ordered_blocks(
+        shape: Shape,
+        extents: Vec<Extent>,
+        order: Vec<usize>,
+        lanes: &[&[u64]],
+        committed: &mut [F64],
+    ) -> Self {
         let written = lanes.len();
+        if !order.is_empty() {
+            let mut seen = vec![false; written];
+            assert!(
+                order.len() == written && order.iter().all(|&g| g < written && !std::mem::replace(&mut seen[g], true)),
+                "the order is a permutation of the blocks"
+            );
+        }
         let padding = padding(shape, written);
         place(shape, lanes, padding.as_ref().map(|p| &p.1[..]), committed);
-        Self::from_extents(shape, extents, written, padding.map(|(extent, _)| extent))
+        let mut witness = Self::from_extents(shape, extents, written, padding.map(|(extent, _)| extent));
+        witness.order = order;
+        witness
     }
 
     /// The witness of extents whose first `written` blocks [`block`] ran: consecutive from
@@ -485,6 +511,7 @@ impl Witness {
         Self {
             shape,
             extents,
+            order: Vec::new(),
             written,
             padding,
             every,
@@ -534,6 +561,7 @@ impl Witness {
             let padding = self.padding.as_ref().expect("a block of the batch");
             return padding.round(round, padding.first);
         }
+        let g = self.order.get(g).copied().unwrap_or(g);
         let extent = self.extents.iter().find(|e| g < e.end()).expect("a written block");
         extent.round(round, g)
     }

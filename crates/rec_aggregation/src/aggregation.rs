@@ -2262,6 +2262,19 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
         block_side.extend(std::iter::repeat_n(s, blocks.len()));
     }
     ps("BLOCK_SIDE", literals(&block_side));
+    // A gated block's gate, as a local column of its table, or NO_GATE.
+    let no_gate = leanvm_core::tables::tables().iter().map(|t| t.n_committed_columns()).max().unwrap_or(0);
+    let gates = sides.iter().flat_map(|blocks| blocks.iter()).zip(&owner_pm).map(|(blk, owner)| {
+        blk.gate.map_or(no_gate, |gate| gate - sch_pm.base[owner.expect("a gated block is a table's")])
+    });
+    ps("BLOCK_GATE", literals(gates));
+    ps("NO_GATE", no_gate.to_string());
+    {
+        use leanvm_core::tables::keccakt::{ADDR, FP, O_M0};
+        ps("KECCAK_FP", FP.to_string());
+        ps("KECCAK_O_OUT", (O_M0 + 7).to_string());
+        ps("KECCAK_ADDR", ADDR.to_string());
+    }
     ps("BLOCK_COORD_OFF", literals(block_coords.iter().map(|r| r.start)));
     ps("BLOCK_COORD_COUNT", literals(block_coords.iter().map(|r| r.len())));
     ps("COORD_TYPE", literals(coordinates.iter().map(|c| c.kind)));

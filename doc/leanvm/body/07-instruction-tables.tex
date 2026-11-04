@@ -113,9 +113,9 @@ The store asserts that $v_2$ equals the source chosen by the mode $\dmode$ (\S\r
 
 \subsection{\texttt{KECCAK}}\label{sec:tab-keccak}
 
-One row is one permutation (\S\ref{sec:vm}), proved by the GKR of Annex~\ref{annex:keccak} rather than by constraints. A row has $117$ columns:
+One row is one permutation (\S\ref{sec:vm}), proved by the GKR of Annex~\ref{annex:keccak} rather than by constraints. A row has $118$ columns:
 \begin{itemize}
-\item $\pc$, $\fp$, the eight operand offsets, the two layout flags and $\mathit{free}$, $27$ read counts, one per cell read or written and one for the bytecode, and the two output flags $\mathit{out}_2$ and $\mathit{out}_{\mathit{all}}$.
+\item $\pc$, $\fp$, the eight operand offsets, the two layout flags and $\mathit{free}$, $27$ read counts, one per cell read or written and one for the bytecode, and the two output flags $\mathit{out}_2$ and $\mathit{out}_{\mathit{all}}$, and $\mathit{addr}=\fp\cdot o_{\mathit{out}}$.
 \item $\kin{\ell}$, the $25$ lanes of the state the row reads from memory.
 \item $\kmid{\ell}$, the $25$ lanes of the state after $12$ rounds. Committing it is an optimization and nothing more: it halves the depth of the reduction. No flush reads it.
 \item $\kout{\ell}$, the $25$ lanes the row writes back. These are \emph{virtual}: the flushes read them, but nothing commits them, and the claims the table sumcheck leaves on them are deferred to the GKR, which reduces them to claims on $\kin{\ell}$ and $\kmid{\ell}$.
@@ -123,7 +123,7 @@ One row is one permutation (\S\ref{sec:vm}), proved by the GKR of Annex~\ref{ann
 
 A limb holding lane $a$ in the even layout and $b$ in the odd one is the degree-$2$ form $a+\mathit{odd}\,(a+b)$, a limb holding no lane being the column $\mathit{free}$ when read and $0$ when written. The top limb is a literal $0$.
 \begin{itemize}
-\item \textbf{Constraints:} none. The permutation is proved by the GKR of Annex~\ref{annex:keccak}.
+\item \textbf{Constraints:} $\mathit{addr}+\fp\cdot o_{\mathit{out}}=0$, the address a gated write multiplies. The permutation is proved by the GKR of Annex~\ref{annex:keccak}.
 \item \textbf{Flushes:}
   \begin{itemize}
   \item \textbf{State:} \pull\ $\tup{\dsep{ST},\pc,\fp}$, \push\ $\tup{\dsep{ST},\gen\cdot\pc,\fp}$.
@@ -142,6 +142,6 @@ A limb holding lane $a$ in the even layout and $b$ in the odd one is the degree-
       &\rdf{\dsep{MEM},a_c,r_c,\kin{2c-1},\kin{2c},0} &&(9\le c<13),
     \end{align*}
     the writes the same with $\kout{\ell}$ and $r_{13+c}$. The rate cells take the forms $u_c,v_c$ above; the four capacity cells hold lanes $17$ to $24$ in either layout.
-  \item \textbf{Output selection:} write $0$ always happens; write $1$ happens when $\mathit{out}_2=1$, and writes $2$ to $12$ when $\mathit{out}_{\mathit{all}}=1$. The bytecode tuple binds both flags, so the program chooses the cells written, never the prover. A gated write pushes the counter $r\,(1+w\,(\gen+1))$ for its flag $w$ in place of $\gen\cdot r$. At $w=0$ its push equals its pull, so the pair cancels and no cell is touched. The honest prover then sets its read count to $1$. The claim on the $25$ output lanes is unchanged.
+  \item \textbf{Output selection:} write $0$ always happens; write $1$ happens when $\mathit{out}_2=1$, and writes $2$ to $12$ when $\mathit{out}_{\mathit{all}}=1$. The bytecode tuple binds both flags, so the program chooses the cells written, never the prover. A gated write's leaf is $1+w(\beta+1)+\sum_i\alpha^i c_i$ for its flag $w$, every coordinate $c_i$ a multiple of $w$. Its address is $w\cdot\mathit{addr}\cdot\gen^{c}$. At $w=1$ it is the access's leaf; at $w=0$ it is $1$, so no pair remains on the bus. The flags satisfy $\mathit{odd}_{\mathit{out}}\Rightarrow\mathit{out}_{\mathit{all}}\Rightarrow\mathit{out}_2$, which the bytecode builder asserts. The claim on the $25$ output lanes is unchanged.
   \end{itemize}
 \end{itemize}
