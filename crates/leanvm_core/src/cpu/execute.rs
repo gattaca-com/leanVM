@@ -982,7 +982,7 @@ impl Program {
                     // No table constraint covers the output (the relation is proven
                     // by the Keccak reduction, §keccak); the interpreter still computes it so
                     // the output cells are consistent for any later read.
-                    let mut lanes = crate::keccak::state_of_cells(k.in_odd, |c| input[c]);
+                    let mut lanes = crate::keccak::read_state(k.in_odd, |c| input[c]);
                     keccak_step(&lanes);
                     primitives::hash::keccak_f(&mut lanes);
                     let output = crate::keccak::cells_of_state(&lanes, k.out_odd);

@@ -120,6 +120,7 @@ impl PolyEval {
 
 /// The polynomial whose word `i` starts `acc[i]`.
 #[inline(always)]
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni"))))]
 pub fn carry<const N: usize, const M: usize>(acc: &[u128; N]) -> [u64; M] {
     let mut out = [0u64; M];
     for (i, &x) in acc.iter().enumerate() {

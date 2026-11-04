@@ -941,7 +941,7 @@ impl Table for KeccakTable {
     }
     /// Every column but the input lanes, which are `q_keccak`'s and have no window here.
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]) {
-        use crate::keccak::{STATE_CELLS, state_of_cells};
+        use crate::keccak::STATE_CELLS;
         use keccakt::*;
         let rows = &ctx.trace.keccak;
         let op = |r: &Krow| KeccakOp::of(&ctx.prog[r.pc as usize]);
@@ -959,7 +959,7 @@ impl Table for KeccakTable {
         ctx.cols(out, rows, V_OUT, |r| {
             let k = op(r);
             let base = k.cell(r.fp, STATE_CELLS) as usize;
-            state_of_cells(k.out_odd, |c| ctx.mem.word(base + c)).map(F64)
+            crate::keccak::read_state(k.out_odd, |c| ctx.mem.word(base + c)).map(F64)
         });
         ctx.cols(out, rows, R0, |r| r.r.map(|k| ctx.g_at(k)));
         ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
