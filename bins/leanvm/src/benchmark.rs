@@ -1,13 +1,13 @@
 //! The two benchmarks: one leaf of the aggregation tree (`aggregate`), and an
 //! n→1 recursion step over leaves of that size (`recursion`). Aggregation accepts
 //! signature counts and a blob count; recursion accepts these counts per leaf.
-
 use bench::{Plan, Timing};
 use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rec_aggregation::{EthereumProof, aggregate, aggregate_with_stats, signers_cache};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use signatures::{lean_sphincs, lean_xmss};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 fn blobs(n: usize, seed: u64) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -76,16 +76,21 @@ fn describe(n_lean_xmss: usize, n_lean_sphincs: usize) -> String {
 /// Proving runs one discarded warmup pass followed by `plan.repeat` measured
 /// passes; see [`bench`] for why the first pass is not
 /// representative and why the cooldown matters.
-pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize, log_inv_rate: usize, plan: Plan) {
+pub fn run_aggregation(
+    n_lean_xmss: usize,
+    n_lean_sphincs: usize,
+    n_blobs: usize,
+    log_inv_rate: usize,
+    setup_capacity: usize,
+    plan: Plan,
+) {
     assert!(
         n_lean_xmss > 0 || n_lean_sphincs > 0 || n_blobs > 0,
         "a leaf needs signatures or blobs"
     );
     assert!(n_blobs <= lean_da::DA_MAX_ROWS, "too many blobs in one commitment");
+    let mut gpow = rec_aggregation::setup(setup_capacity);
     let trace_span = tracing::info_span!("aggregation", n_lean_xmss, n_lean_sphincs, n_blobs, log_inv_rate).entered();
-    // Spawn the worker pool before any timed work, so no kernel pays the spawn cost.
-    leanvm_core::init_prover();
-    rec_aggregation::warm_up();
     let raw_lean_xmss = signers(0, n_lean_xmss);
     let raw_lean_sphincs = lean_sphincs_signers(0, n_lean_sphincs);
     let blobs = blobs(n_blobs, 0);
@@ -93,15 +98,22 @@ pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize
     // proof the reported timings are about, instead of repeating itself per pass.
     let ((sig, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
-        aggregate_with_stats(
+        let result = aggregate_with_stats(
             &[],
             raw_lean_xmss.clone(),
             raw_lean_sphincs.clone(),
             &blobs,
             None,
             log_inv_rate,
+            &mut gpow,
         )
-        .expect("leaf aggregates")
+        .expect("leaf aggregates");
+        assert_eq!(
+            gpow.capacity(),
+            setup_capacity,
+            "increase --setup-log-memory to cover this execution"
+        );
+        result
     });
     let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
@@ -142,6 +154,50 @@ pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize
     );
 }
 
+/// The recursion benchmark's children, from `target/children-cache` when a file made
+/// for these parameters and this guest still holds. Only the node step is measured,
+/// so re-proving the children (minutes on one core) is not worth repeating. The name
+/// binds the parameters and the guest's transcript seed (protocol and bytecode); a
+/// file that does not parse, or has a child that fails `verify`, is regenerated.
+fn cached_children(
+    n: usize,
+    per_leaf: usize,
+    lean_sphincs_per_leaf: usize,
+    blobs_per_leaf: usize,
+    log_inv_rate: usize,
+    prove: impl FnOnce() -> Vec<EthereumProof>,
+) -> Vec<EthereumProof> {
+    let seed = leanvm_core::cpu::fs_seed(rec_aggregation::aggregation::unified_guest());
+    let mut hasher = DefaultHasher::new();
+    (n, per_leaf, lean_sphincs_per_leaf, blobs_per_leaf, log_inv_rate).hash(&mut hasher);
+    seed.iter()
+        .for_each(|word| (word.c0, word.c1, word.c2).hash(&mut hasher));
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/children-cache")
+        .join(format!("recursion_children_{:016x}.bin", hasher.finish()));
+    let load = || -> Option<Vec<EthereumProof>> {
+        let files: Vec<Vec<u8>> = bincode::deserialize(&std::fs::read(&path).ok()?).ok()?;
+        let children: Vec<_> = files
+            .iter()
+            .map(|bytes| EthereumProof::from_bytes(bytes).ok())
+            .collect::<Option<_>>()?;
+        (children.len() == n && children.iter().all(|child| child.verify().is_ok())).then_some(children)
+    };
+    if let Some(children) = load() {
+        return children;
+    }
+    let children = prove();
+    let files: Vec<Vec<u8>> = children.iter().map(EthereumProof::to_bytes).collect();
+    let saved = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, bincode::serialize(&files).expect("serialize children cache")));
+    if let Err(error) = saved {
+        eprintln!("warning: could not write children cache to {}: {error}", path.display());
+    }
+    children
+}
+
 /// Prove `n` leaves with signatures and distinct blob payloads at `leaf_log_inv_rate`, then
 /// aggregate them in one recursion step at `log_inv_rate` and verify the result. The leaves are
 /// built once, in a process of their own; only the recursion step is measured.
@@ -153,6 +209,8 @@ pub fn run_recursion(
     leaf_log_inv_rate: usize,
     log_inv_rate: usize,
     enable_tracing: bool,
+    proof_out: Option<&std::path::Path>,
+    setup_capacity: usize,
     plan: Plan,
 ) {
     assert!(
@@ -182,15 +240,28 @@ pub fn run_recursion(
             out.as_ref(),
         );
     }
-    let children = leaves_from_subprocess(n);
+    let children = cached_children(n, per_leaf, lean_sphincs_per_leaf, blobs_per_leaf, leaf_log_inv_rate, || {
+        leaves_from_subprocess(n)
+    });
 
     if enable_tracing {
         bench::init_tracing();
     }
+    let mut gpow = rec_aggregation::setup(setup_capacity);
     let ((sig, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
-        aggregate_with_stats(&children, vec![], vec![], &[], None, log_inv_rate).expect("node aggregates")
+        let result = aggregate_with_stats(&children, vec![], vec![], &[], None, log_inv_rate, &mut gpow)
+            .expect("node aggregates");
+        assert_eq!(
+            gpow.capacity(),
+            setup_capacity,
+            "increase --setup-log-memory to cover this execution"
+        );
+        result
     });
+    if let Some(out) = proof_out {
+        std::fs::write(out, sig.to_bytes()).expect("write proof");
+    }
     let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
         sig.verify().expect("the recursive aggregate verifies");

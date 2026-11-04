@@ -46,8 +46,8 @@ use lean_da::{BLOB_SYMBOLS, CELL_SYMBOLS, CELLS_PER_ROW, CODEWORD_SYMBOLS};
 pub use lean_da::{DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS};
 use leanvm_core::constraints::xi_offsets;
 use leanvm_core::cpu::{
-    KeccakLane, Program, ProveError, Witness, from_scalar, keccak_value, prove, public_input_bytes, scalar_proof,
-    to_scalar,
+    GPow, KeccakLane, Program, ProveError, Witness, from_scalar, keccak_value, prove_with, public_input_bytes,
+    scalar_proof, to_scalar,
 };
 use leanvm_core::leaf::{Block, Coord};
 use leanvm_core::tables::N_TABLES;
@@ -1613,10 +1613,20 @@ pub fn aggregate(
     declare: Option<ClaimSelection<'_>>,
     log_inv_rate: usize,
 ) -> Result<EthereumProof, AggregationError> {
-    aggregate_with_stats(children, raw_lean_xmss, raw_lean_sphincs, blobs, declare, log_inv_rate).map(|(sig, _)| sig)
+    aggregate_with_stats(
+        children,
+        raw_lean_xmss,
+        raw_lean_sphincs,
+        blobs,
+        declare,
+        log_inv_rate,
+        &mut GPow::new(),
+    )
+    .map(|(sig, _)| sig)
 }
 
 /// [`aggregate`], under the same contract, also returning the prover's statistics (what the CLI's benchmarks report).
+/// A caller that aggregates repeatedly passes the same `gpow` each time, so the prover does not grow it again.
 pub fn aggregate_with_stats(
     children: &[EthereumProof],
     raw_lean_xmss: Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)>,
@@ -1624,6 +1634,7 @@ pub fn aggregate_with_stats(
     blobs: &[u64],
     declare: Option<ClaimSelection<'_>>,
     log_inv_rate: usize,
+    gpow: &mut GPow,
 ) -> Result<(EthereumProof, leanvm_core::cpu::Stats), AggregationError> {
     let declared_root = declare.map(|claims| claims.da_commitment);
     let declare = declare.map(|claims| claims.signatures);
@@ -1873,10 +1884,8 @@ pub fn aggregate_with_stats(
     if let Some(forge) = FORGE.with(|forge| forge.borrow_mut().take()) {
         forge(&mut hints);
     }
-    let mut program = guest.clone();
-    program.set_witnesses(hints);
-    let (proof, stats) =
-        prove(&program, public_input, log_inv_rate).map_err(|e| AggregationError::ProofError(SnarkProveError(e)))?;
+    let (proof, stats) = prove_with(guest, &hints, public_input, log_inv_rate, gpow)
+        .map_err(|e| AggregationError::ProofError(SnarkProveError(e)))?;
     Ok((
         EthereumProof {
             xmss_signers: cover.xmss.signers,
@@ -2791,6 +2800,17 @@ pub fn warm_up() {
     bytecode_rows();
 }
 
+/// Prepare reusable prover state for up to `capacity` VM cells, independently of proof inputs.
+///
+/// Initializes the worker pool, static prover and guest tables, address powers, and zeroed VM memory.
+/// Pass the returned state to [`aggregate_with_stats`] for each proof. Larger executions can grow it.
+#[tracing::instrument(name = "Setup")]
+pub fn setup(capacity: usize) -> GPow {
+    leanvm_core::init_prover();
+    warm_up();
+    GPow::setup(capacity)
+}
+
 /// The aggregation bytecode, compiled to a fixed point on its own size.
 ///
 /// The recursion placeholders are a function of the inner bytecode's log size,
@@ -3554,11 +3574,20 @@ def main():
             "bytecode: {} instructions, DA_MAX_ROWS = {DA_MAX_ROWS}",
             unified_guest().prog.len()
         );
-        let _ = aggregate_with_stats(&[], signing(&signers, 0), vec![], &da_rows(1, 7), None, LOG_INV_RATE);
+        let _ = aggregate_with_stats(
+            &[],
+            signing(&signers, 0),
+            vec![],
+            &da_rows(1, 7),
+            None,
+            LOG_INV_RATE,
+            &mut GPow::new(),
+        );
         for n_rows in [1usize, 6, 14, 32] {
             let rows = da_rows(n_rows, 300 + n_rows as u64);
             let started = std::time::Instant::now();
-            let (node, stats) = aggregate_with_stats(&[], signing(&signers, 0), vec![], &rows, None, LOG_INV_RATE)
+            let (node, stats) =
+                aggregate_with_stats(&[], signing(&signers, 0), vec![], &rows, None, LOG_INV_RATE, &mut GPow::new())
                 .expect("node aggregates");
             let elapsed = started.elapsed();
             let payload = n_rows * (1 << DA_LOG_K) * 8;

@@ -37,6 +37,19 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 2)]
     cooldown: u64,
 
+    /// VM cells to prepare before timing, as a base-2 logarithm.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 23,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=28)
+    )]
+    setup_log_memory: usize,
+
+    /// Skip the warmup pass, to time the first proof after setup.
+    #[arg(long, global = true)]
+    cold: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -84,6 +97,9 @@ enum Command {
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4)
         )]
         leaf_log_inv_rate: Option<usize>,
+        /// Write the serialized aggregate proof to this file.
+        #[arg(long)]
+        proof_out: Option<std::path::PathBuf>,
     },
     /// Prove and verify a batch of Keccak-f permutations with the VM's GKR, outside the VM.
     Hash {
@@ -110,13 +126,13 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     leanvm_core::init_prover();
-    let plan = bench::Plan::new(cli.repeat, cli.cooldown);
+    let plan = bench::Plan::new(cli.repeat, cli.cooldown).cold(cli.cold);
     if cli.tracing && !matches!(&cli.command, Command::Recursion { .. }) {
         bench::init_tracing();
     }
     match cli.command {
         Command::Aggregate { xmss, sphincs, blobs } => {
-            benchmark::run_aggregation(xmss, sphincs, blobs, cli.log_inv_rate, plan);
+            benchmark::run_aggregation(xmss, sphincs, blobs, cli.log_inv_rate, 1 << cli.setup_log_memory, plan);
         }
         Command::Recursion {
             n,
@@ -124,6 +140,7 @@ fn main() {
             sphincs_per_leaf,
             blobs_per_leaf,
             leaf_log_inv_rate,
+            proof_out,
         } => {
             benchmark::run_recursion(
                 n,
@@ -133,6 +150,8 @@ fn main() {
                 leaf_log_inv_rate.unwrap_or(cli.log_inv_rate),
                 cli.log_inv_rate,
                 cli.tracing,
+                proof_out.as_deref(),
+                1 << cli.setup_log_memory,
                 plan,
             );
         }
@@ -140,7 +159,7 @@ fn main() {
             keccak_gkr::batch_bench::run(1 << log_n, leanvm_core::keccak::DEPTH, cli.log_inv_rate, plan).print();
         }
         Command::Fibonacci { n } => {
-            fibonacci::run_fibonacci(n, cli.log_inv_rate, plan);
+            fibonacci::run_fibonacci(n, cli.log_inv_rate, 1 << cli.setup_log_memory, plan);
         }
     }
 }
