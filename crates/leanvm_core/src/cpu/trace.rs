@@ -75,11 +75,14 @@ impl<T> Rows<T> {
 
     #[inline(always)]
     pub(crate) fn push(&mut self, row: T) {
-        if self.len & (CHUNK - 1) == 0 {
-            self.chunks.push(Vec::with_capacity(CHUNK));
+        match self.chunks.last_mut() {
+            Some(chunk) if chunk.len() < CHUNK => chunk.push(row),
+            _ => {
+                let mut chunk = Vec::with_capacity(CHUNK);
+                chunk.push(row);
+                self.chunks.push(chunk);
+            }
         }
-        // SAFETY: a chunk was pushed whenever the last one filled, so there is one.
-        unsafe { self.chunks.last_mut().unwrap_unchecked() }.push(row);
         self.len += 1;
     }
 

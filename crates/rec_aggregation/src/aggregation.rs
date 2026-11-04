@@ -1145,7 +1145,7 @@ fn gen_verify(
     bytecode_value: F192,
 ) -> Result<(SubHints, DeferredSubproof), AggregationError> {
     let layout = leanvm_core::cpu::layout(
-        &program.prog,
+        program.bytecode_cols(),
         summary.log_memory,
         std::array::from_fn(|t| summary.table_rows[t] as usize),
         public_input,
@@ -2092,6 +2092,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     // Only block and coordinate structure is used here; dummy instructions and
     // table sizes let us derive it before the guest's bytecode exists.
     let stand_in = vec![leanvm_core::cpu::Op::Xor { a: 0, b: 0, c: 0 }; 1 << kbc];
+    let stand_in = leanvm_core::cpu::bytecode_columns(&stand_in);
     let layout = leanvm_core::cpu::layout(&stand_in, 20, [1 << 10; N_TABLES], [F192::ZERO, F192::ZERO]);
     let sides: [&[Block]; 3] = [&layout.push, &layout.pull, &layout.count];
 

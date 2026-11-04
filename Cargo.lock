@@ -336,6 +336,7 @@ dependencies = [
  "fiat_shamir",
  "keccak_gkr",
  "lean_compiler",
+ "libc",
  "parallel",
  "pcs",
  "primitives",

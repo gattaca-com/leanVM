@@ -156,6 +156,9 @@ pub struct Layout {
 /// announce it).
 pub(crate) struct Witness {
     pub(crate) q: Vec<F64>,
+    /// Which blocks of `q` equal their predecessor, as far as the fills know ([`::pcs::stack_open::equal_blocks`]
+    /// is the exact map): the padding of each column.
+    pub(crate) repeats: Vec<bool>,
     /// The KECCAK output lanes' values as `(global column index, values)`. They carry
     /// data for the bus but are not committed, so they are not in `q`.
     pub(crate) virt: Vec<(usize, Vec<F64>)>,
@@ -285,10 +288,13 @@ pub(crate) fn committed_log(log_mem: usize, log_bytecode: usize, taus: [usize; t
 /// Operand slots of a bytecode tuple, after the opcode.
 pub const BYTECODE_OPERANDS: usize = 10;
 
+/// The public bytecode columns, shared by the seed and finalize blocks.
+pub type BytecodeColumns = [std::sync::Arc<Vec<F64>>; 1 + BYTECODE_OPERANDS];
+
 /// The PUBLIC bytecode columns over the program cube, in bytecode-slot order: the opcode, then
 /// the operand slots. The program is not committed, so these ride the seed/finalize blocks as
 /// `Coord::Public` and stack into the polynomial [`bytecode_table`] returns.
-pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 1 + BYTECODE_OPERANDS] {
+pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
     let g_at = primitives::field::g_pow32_by_lookup;
 
     // The opcode, then the operand slots: offsets as g-powers, a `SET` immediate as its three
@@ -344,17 +350,17 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 1 + BYTECODE_OPERANDS] {
         row
     };
     // One pass writes all eleven columns.
-    // SAFETY: the pass below writes every slot of every column.
-    let mut columns: [Vec<F64>; 1 + BYTECODE_OPERANDS] =
-        std::array::from_fn(|_| unsafe { primitives::uninit_vec(prog.len()) });
-    let dst = columns.each_mut().map(|c| parallel::SendPtr(c.as_mut_ptr()));
-    parallel::for_each(prog.len(), |i| {
-        for (column, value) in dst.iter().zip(row(&prog[i])) {
-            // SAFETY: instruction `i` writes slot `i` of each column, in bounds and once.
-            unsafe { column.add(i).write(value) };
-        }
+    let chunk = parallel::recommended_chunk_size(prog.len());
+    let columns = primitives::filled_vecs([prog.len(); 1 + BYTECODE_OPERANDS], |columns| {
+        parallel::for_each_chunks_mut(columns, [chunk; 1 + BYTECODE_OPERANDS], |t, mut columns| {
+            for (i, op) in prog[t * chunk..].iter().take(chunk).enumerate() {
+                for (column, value) in columns.iter_mut().zip(row(op)) {
+                    column[i] = value;
+                }
+            }
+        });
     });
-    columns
+    columns.map(std::sync::Arc::new)
 }
 
 /// The stacked bytecode polynomial: the eleven columns at their bus tuple
@@ -364,10 +370,13 @@ pub fn bytecode_columns(prog: &[Op]) -> [Vec<F64>; 1 + BYTECODE_OPERANDS] {
 /// This is the multilinear an outermost verifier is handed in place of a
 /// structured program, and what the transcript seed binds ([`super::fs_seed`]).
 pub fn bytecode_table(prog: &[Op]) -> Vec<F64> {
-    let coords = bytecode_columns(prog)
-        .map(|c| Coord::Public(std::sync::Arc::new(c)))
-        .into();
-    let block = Block::full(crate::log2_strict_usize(prog.len()), coords);
+    stacked_columns(&bytecode_columns(prog))
+}
+
+/// [`bytecode_table`] over columns [`bytecode_columns`] already built.
+pub(crate) fn stacked_columns(cols: &BytecodeColumns) -> Vec<F64> {
+    let coords = cols.each_ref().map(|c| Coord::Public(c.clone())).into();
+    let block = Block::full(crate::log2_strict_usize(cols[0].len()), coords);
     crate::leaf::stacked_bytecode_table(std::slice::from_ref(&block))
 }
 
@@ -376,9 +385,9 @@ pub fn bytecode_table(prog: &[Op]) -> Vec<F64> {
 /// reference columns only by INDEX and the program only through its public columns, so
 /// this needs no committed witness: both prover and verifier reconstruct exactly the
 /// same structure.
-pub fn layout(prog: &[Op], log_mem: usize, rows: [usize; tables::N_TABLES], pi: [F192; 2]) -> Layout {
+pub fn layout(prog_cols: &BytecodeColumns, log_mem: usize, rows: [usize; tables::N_TABLES], pi: [F192; 2]) -> Layout {
     let taus = table_logs(rows);
-    let bytecode_size = prog.len();
+    let bytecode_size = prog_cols[0].len();
     let log_bytecode = crate::log2_strict_usize(bytecode_size);
 
     // Derived boundary: the run starts at (pc,fp) = (0,0) and, by convention, the
@@ -387,9 +396,6 @@ pub fn layout(prog: &[Op], log_mem: usize, rows: [usize; tables::N_TABLES], pi: 
     let final_pc = (bytecode_size - 1) as u32;
 
     let one = F64::ONE;
-    // Shared between the seed and finalize blocks: at kbc = 19 a copy is tens of
-    // megabytes per column.
-    let prog_cols: [std::sync::Arc<Vec<F64>>; 1 + BYTECODE_OPERANDS] = bytecode_columns(prog).map(std::sync::Arc::new);
 
     // ---- bus blocks ----
     use Coord::{Col, Const, Index, Public};
@@ -494,18 +500,12 @@ impl Program {
         // The trace was emitted in the same walk as the memory image (no re-walk).
         let tr = &exec.trace;
         let cells = exec.mem.len();
-        let bytecode_size = self.prog.len();
         let log_mem = crate::log2_strict_usize(cells);
 
         let sch = schema();
-        // g^0..g^{span-1}, so every pc/frame/operand/count fill is an O(1) lookup instead
-        // of an O(log) power: a frame base or an operand is below the cells the run used.
-        // The run's own table covers them unless a count outgrew it.
-        let span = exec.mem_used.max(bytecode_size).max(tr.counts);
-        let gpow = match exec.gpow.get(..span) {
-            Some(gpow) => std::borrow::Cow::Borrowed(gpow),
-            None => std::borrow::Cow::Owned(primitives::field::g_powers(span)),
-        };
+        // g^0.., so every pc/frame/operand/count fill is an O(1) lookup instead of an
+        // O(log) power: the run's own table covers every one.
+        let gpow = exec.gpow.powers();
 
         // The public layout (flush/count blocks, placements, boundary, taus) is a pure
         // function of the program + announced sizes + public input, with no committed
@@ -518,7 +518,7 @@ impl Program {
             "a table exceeds 2^{MAX_LOG_ROWS} rows"
         );
         let pi = [exec.mem.word(0), exec.mem.word(1)];
-        let l = layout(&self.prog, log_mem, row_counts, pi);
+        let l = layout(&self.bytecode_cols, log_mem, row_counts, pi);
 
         // The stacked witness is written exactly ONCE: allocate it, carve one window
         // per committed column, and have every fill write its column straight into
@@ -526,93 +526,119 @@ impl Program {
         // time, a gigabyte at this scale, for no gain: nothing folds the K-columns
         // in place, so the stack can be their only home.
         //
-        // SAFETY: the allocation is uninitialized. `split_stack` zeroes the pad tail
-        // and hands out windows tiling the rest; `fill_table` checks that each table
-        // wrote every window it was given, and the shared columns below write theirs.
-        let mut q = unsafe { witness::alloc_stack(l.shape) };
-        // An output lane is neither in the stack nor in `q_keccak`, so its values need
-        // storage of their own: it carries data for the bus. Every other column `q_keccak`
-        // carries ([`Witness::columns`]) is filled through the slot window handed out below.
-        let steps = 1 << l.taus[tables::KECCAK_TABLE];
-        let mut virt: Vec<(usize, Vec<F64>)> = (0..sch.n)
-            .filter(|&i| matches!(keccak_value(i), Some(KeccakLane::Output(_))))
-            // SAFETY: `FillCtx::cols_at` writes every row of every window it is given, and
-            // `fill_table` asserts each table wrote all of its windows.
-            .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
-            .collect();
-        let mut windows = witness::split_stack(&mut q, &l.placements);
-        for (i, buf) in virt.iter_mut() {
-            windows[*i] = buf;
-        }
-        // q_keccak's window is the committed states and then the spare slots, a slot per
-        // KECCAK column riding them: hand each its slot, so its fill writes it where it
-        // lives and the stack never holds it twice.
-        let (states, spare) = std::mem::take(&mut windows[QKECCAK]).split_at_mut(crate::keccak::SLOTS * steps);
-        windows[QKECCAK] = states;
-        for (k, window) in spare.chunks_exact_mut(steps).enumerate() {
-            windows[sch.base[tables::KECCAK_TABLE] + spare_local(k)] = window;
-        }
-
-        // Each table fills its own columns from the trace (local indices, offset
-        // into its global block).
-        crate::stage!("Fill columns", || {
-            for (t, table) in tables::tables().iter().enumerate() {
-                let (base, n) = (sch.base[t], table.n_committed_columns());
-                let ctx = FillCtx::new(tr, &exec.mem, &gpow, &self.prog, 1 << l.taus[t], table.padding());
-                tables::fill_table(*table, &ctx, &mut windows[base..base + n]);
+        // The fill below writes every slot: `split_stack` zeroes the pad tail and hands out windows tiling the
+        // rest; `fill_table` checks that each table wrote every window it was given, and the shared columns
+        // below write theirs.
+        let mut repeats = witness::alloc_repeats(l.shape);
+        let mut virt = Vec::new();
+        let mut keccak_reduction = None;
+        let q = primitives::filled_vec(l.shape.committed_len(), |q| {
+            // An output lane is neither in the stack nor in `q_keccak`, so its values need
+            // storage of their own: it carries data for the bus. Every other column `q_keccak`
+            // carries ([`Witness::columns`]) is filled through the slot window handed out below.
+            let steps = 1 << l.taus[tables::KECCAK_TABLE];
+            virt = (0..sch.n)
+                .filter(|&i| matches!(keccak_value(i), Some(KeccakLane::Output(_))))
+                // SAFETY: `FillCtx::cols_at` writes every row of every window it is given, and
+                // `fill_table` asserts each table wrote all of its windows.
+                .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
+                .collect();
+            let mut windows = witness::split_stack(q, &mut repeats, &l.placements);
+            for (i, buf) in virt.iter_mut() {
+                windows[*i] = tables::ColumnOut {
+                    words: buf,
+                    repeats: &mut [],
+                };
             }
-            // Shared columns. The 192-bit memory image splits into three K-limbs.
-            // These five plus `QKECCAK` below are every shared column, and each has to
-            // be written: the stack is uninitialized, so one left out would be read
-            // as indeterminate bytes rather than caught by a length mismatch.
-            const _: () = assert!(N_SHARED == 6, "a new shared column needs a fill here");
-            // One pass over the image fills all four of its columns, streamed out a
-            // cache line of each at a time: nothing reads them before the commitment.
-            const LINE: usize = 8;
-            const BLOCK: usize = 1 << 10;
-            let page_log = Memory::page_log();
-            let image = [MEM_LO, MEM_HI, MEM_TOP, MFCNT].map(|c| {
-                assert_eq!(windows[c].len(), cells, "a memory column spans the image");
-                parallel::SendPtr(windows[c].as_mut_ptr())
-            });
-            parallel::for_each_chunk(cells / BLOCK, |first, end| {
-                let stream = primitives::stream::Stream::new();
-                for b in first..end {
-                    let at = b * BLOCK;
-                    let page = exec.mem.page(at >> page_log);
-                    for line in (at..at + BLOCK).step_by(LINE) {
-                        let mut buf = [[F64::ZERO; LINE]; 4];
-                        for j in 0..LINE {
-                            let i = line + j;
-                            let cell = page.map_or(&Cell::UNWRITTEN, |p| &p[i & ((1 << page_log) - 1)]);
-                            // counts ended at g^{A[i]}
-                            let values = [cell.word.c0, cell.word.c1, cell.word.c2].map(F64);
-                            buf[0][j] = values[0];
-                            buf[1][j] = values[1];
-                            buf[2][j] = values[2];
-                            buf[3][j] = gpow[cell.count as usize];
+            // q_keccak's window is the committed states and then the spare slots, a slot per
+            // KECCAK column riding them: hand each its slot, so its fill writes it where it
+            // lives and the stack never holds it twice.
+            // The states stay untagged in the repeat map: a missing repeat is only a read. A spare slot
+            // takes its own tags, which line up whenever a slot spans whole blocks.
+            let tables::ColumnOut { words, repeats: tags } = std::mem::take(&mut windows[QKECCAK]);
+            let (states, spare) = words.split_at_mut(crate::keccak::SLOTS * steps);
+            let per_slot = steps >> ::pcs::stack_open::EQUAL_BLOCK_LOG;
+            let (state_tags, spare_tags) = tags.split_at_mut(crate::keccak::SLOTS * per_slot);
+            windows[QKECCAK] = tables::ColumnOut {
+                words: states,
+                repeats: state_tags,
+            };
+            let mut spare_tags = spare_tags.chunks_mut(per_slot.max(1));
+            for (k, words) in spare.chunks_exact_mut(steps).enumerate() {
+                let repeats = if per_slot > 0 {
+                    spare_tags.next().unwrap_or_default()
+                } else {
+                    &mut []
+                };
+                windows[sch.base[tables::KECCAK_TABLE] + spare_local(k)] = tables::ColumnOut { words, repeats };
+            }
+
+            // Each table fills its own columns from the trace (local indices, offset
+            // into its global block).
+            crate::stage!("Fill columns", || {
+                for (t, table) in tables::tables().iter().enumerate() {
+                    let (base, n) = (sch.base[t], table.n_committed_columns());
+                    let ctx = FillCtx::new(tr, &exec.mem, gpow, &self.prog, 1 << l.taus[t], table.padding());
+                    tables::fill_table(*table, &ctx, &mut windows[base..base + n]);
+                }
+                // Shared columns. The 192-bit memory image splits into three K-limbs.
+                // These five plus `QKECCAK` below are every shared column, and each has to
+                // be written: the stack is uninitialized, so one left out would be read
+                // as indeterminate bytes rather than caught by a length mismatch.
+                const _: () = assert!(N_SHARED == 6, "a new shared column needs a fill here");
+                // One pass over the image fills all four of its columns, streamed out a
+                // cache line of each at a time: nothing reads them before the commitment.
+                const LINE: usize = 8;
+                const BLOCK: usize = 1 << 10;
+                let written = exec.mem.cells(BLOCK);
+                let image = windows
+                    .get_disjoint_mut([MEM_LO, MEM_HI, MEM_TOP, MFCNT])
+                    .expect("the image columns are distinct")
+                    .map(|window| {
+                        assert_eq!(window.words.len(), cells, "a memory column spans the image");
+                        // Blocks past the written cells are all `unwritten`, so each repeats the block before it.
+                        for (b, repeat) in window.repeats.iter_mut().enumerate() {
+                            *repeat = b > 0 && (b - 1) * BLOCK >= written.len();
                         }
-                        for (column, values) in image.iter().zip(&buf) {
-                            // SAFETY: block `b` owns cells `b·BLOCK..(b+1)·BLOCK` of every
-                            // column, in bounds as `cells` is a whole number of blocks.
-                            unsafe { stream.copy_uninit(column.add(line), values) };
+                        &mut *window.words
+                    });
+                parallel::for_each_chunks_mut(image, [BLOCK; 4], |b, mut image| {
+                    let stream = primitives::stream::Stream::new();
+                    // Cells past the written ones are unwritten and never accessed.
+                    let unwritten = [F64::ZERO, F64::ZERO, F64::ZERO, gpow[0]].map(|v| [v; LINE]);
+                    let at = b * BLOCK;
+                    for line in (at..at + BLOCK).step_by(LINE) {
+                        let mut buf = unwritten;
+                        if let Some(cells) = written.get(line..line + LINE) {
+                            for (j, cell) in cells.iter().enumerate() {
+                                // counts ended at g^{A[i]}
+                                buf[0][j] = F64(cell.word.c0);
+                                buf[1][j] = F64(cell.word.c1);
+                                buf[2][j] = F64(cell.word.c2);
+                                buf[3][j] = gpow[cell.count as usize];
+                            }
+                        }
+                        for (column, values) in image.iter_mut().zip(&buf) {
+                            stream.copy(&mut column[line - at..][..LINE], values);
                         }
                     }
-                }
+                });
+                parallel::fill(windows[BFCNT].words, |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
             });
-            parallel::fill(windows[BFCNT], |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
-        });
-        // The committed Keccak states q_keccak, ALWAYS in this same stack: built from
-        // the executed KECCAK rows in order (row j = step j).
-        let keccak_reduction = crate::stage!("Build q_keccak", || {
-            keccak_blocks.place(tr.keccak.len(), windows[QKECCAK])
-        });
+            // The committed Keccak states q_keccak, ALWAYS in this same stack: built from
+            // the executed KECCAK rows in order (row j = step j).
+            keccak_reduction = Some(crate::stage!("Build q_keccak", || {
+                keccak_blocks.place(tr.keccak.len(), windows[QKECCAK].words)
+            }));
 
-        // (`execute` already asserts the run halts at the sentinel (pc, fp) =
-        // (g^{B-1}, 0), exactly the boundary the public layout derives.)
-        drop(windows); // release the borrow of `q` and of the output lanes' buffers
+            // (`execute` already asserts the run halts at the sentinel (pc, fp) =
+            // (g^{B-1}, 0), exactly the boundary the public layout derives.)
+            drop(windows); // release the borrow of `q`, its repeat map and the output lanes' buffers
+        });
+        let keccak_reduction = keccak_reduction.expect("the fill builds q_keccak");
         Witness {
             q,
+            repeats,
             virt,
             layout: l,
             log_mem,
