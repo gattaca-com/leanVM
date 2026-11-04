@@ -69,22 +69,16 @@ fn public_api_end_to_end() {
     let on = |message| received.xmss_signers().iter().filter(|(_, m)| *m == message).count();
     assert_eq!((on(MSG_0), on(MSG_1), on(MSG_2)), (3, 4, 1));
 
-    // 5. Removing some signatures from the aggregate: `declare` is what we keep. Here every claim on MSG_1 goes.
-    let (dropped_claims, xmss_signers): (Vec<_>, Vec<_>) =
-        received.xmss_signers().iter().cloned().partition(|(_, m)| *m == MSG_1);
-    let mut lean_sphincs_signers = received.lean_sphincs_signers().to_vec();
-    let dropped_signer = lean_sphincs_signers.remove(0);
-    let retained_signatures = SignatureClaims {
-        xmss: xmss_signers,
-        lean_sphincs: lean_sphincs_signers,
-    };
+    // 5. Selecting what to publish: a node publishes its children's claims whole, since its
+    //    commitment hashes each child's. `declare` selects the node's own raw signatures and
+    //    the DA root. Here every claim and the DA root stay.
     let narrowed = aggregate(
-        &[received],
+        std::slice::from_ref(&received),
         vec![],
         vec![],
         &[],
         Some(ClaimSelection {
-            signatures: &retained_signatures,
+            signatures: &SignatureClaims::default(),
             da_commitment: Some(commitment),
         }),
         2,
@@ -92,28 +86,29 @@ fn public_api_end_to_end() {
     .unwrap();
     narrowed.verify().unwrap();
     assert_eq!(narrowed.da_commitment(), Some(commitment));
-    assert_eq!(narrowed.num_signature_claims(), 11 - dropped_claims.len() - 1);
-    assert!(
-        dropped_claims
-            .iter()
-            .all(|claim| !narrowed.xmss_signers().contains(claim))
-    );
-    assert!(!narrowed.lean_sphincs_signers().contains(&dropped_signer));
-
-    let dropped = aggregate(
-        &[narrowed],
+    assert_eq!(narrowed.num_signature_claims(), 11);
+    assert_eq!(narrowed.xmss_signers(), received.xmss_signers());
+    // Naming a child's claim as the node's own is refused: nothing at this node covers it.
+    let kept: Vec<_> = received
+        .xmss_signers()
+        .iter()
+        .filter(|(_, m)| *m != MSG_1)
+        .cloned()
+        .collect();
+    let subset = SignatureClaims {
+        xmss: kept,
+        lean_sphincs: vec![],
+    };
+    let refused = aggregate(
+        &[received],
         vec![],
         vec![],
         &[],
         Some(ClaimSelection {
-            signatures: &retained_signatures,
+            signatures: &subset,
             da_commitment: None,
         }),
         2,
-    )
-    .unwrap();
-    dropped.verify().unwrap();
-    assert_eq!(dropped.da_commitment(), None);
-    assert_eq!(dropped.xmss_signers(), retained_signatures.xmss);
-    assert_eq!(dropped.lean_sphincs_signers(), retained_signatures.lean_sphincs);
+    );
+    assert!(matches!(refused, Err(AggregationError::NotCovered)));
 }
