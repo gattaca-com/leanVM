@@ -2449,8 +2449,8 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
             claim_idx += 1
         # The table's AIR constraint at the final point (col_evals is indexed by
         # local column index; the formulas mirror tables.rs Table::constraint). Every
-        # value relation now rides the bus as a degree-2 coordinate, so only JUMP's
-        # is-nonzero indicator is left with an identity of its own.
+        # value relation now rides the bus as a degree-2 coordinate. Only JUMP's
+        # is-nonzero indicator and KECCAK's `addr = fp·o_out` keep identities of their own.
         constraint_eval = 0
         if t == TABLE_JUMP:
             # `b = c*w` and `c*(b+1) = 0`. The condition is K-valued, its memory read

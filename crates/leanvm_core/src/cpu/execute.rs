@@ -993,7 +993,7 @@ impl Program {
                     use crate::keccak::{ROW_CELLS, STATE_CELLS};
                     let k = crate::tables::KeccakOp::of(op);
                     let cells: [u32; ROW_CELLS] = std::array::from_fn(|c| k.cell(fp, c));
-                    // The output cells written: the rest are left alone, and their flushes cancel.
+                    // The output cells written: the rest are left alone, and their gated flushes leave no pair.
                     #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
                     let mut written = STATE_CELLS + out_cells.cells();
                     #[cfg(any(test, feature = "tamper"))]

@@ -910,10 +910,10 @@ impl Table for JumpTable {
 /// permutation of a state in memory. The four `m` cells and `b8` are addressed *independently*
 /// at `fp·o_i` (`o_i = g^{m[i]}`), so a caller hashing e.g. `(tweak, pp)` need not copy them into
 /// adjacent cells; the four `tail` cells, the four `cap` cells and the thirteen output cells are
-/// consecutive runs based at `fp·o_T`, `fp·o_C` and `fp·o_O`. No address is committed: each rides
-/// the bus as the product `fp·o_X·g^k` (§sec:m3). The permutation relating output lanes to input
-/// lanes carries no table constraint either: it is proven by the Keccak reduction over
-/// `q_keccak` (§keccak), which leaves this table with no identity of its own.
+/// consecutive runs based at `fp·o_T`, `fp·o_C` and `fp·o_O`. Each address rides the bus as the
+/// product `fp·o_X·g^k` (§sec:m3). Only the gated output cells read a committed one: `ADDR`, which
+/// the table's one identity binds to `fp·o_O`. The permutation relating output lanes to input
+/// lanes carries no table constraint: it is proven by the Keccak reduction over `q_keccak` (§keccak).
 ///
 /// The cells read and written hold the lanes in the layout their flag names
 /// ([`crate::keccak::cell_lanes`]), the flags bound by the bytecode read, so a cell's limb is the
