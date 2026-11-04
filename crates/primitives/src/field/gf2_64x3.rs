@@ -828,7 +828,7 @@ pub mod x86_64 {
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "avx512f", enable = "avx512bw")]
-    pub fn reduce_halves512(even: __m512i, odd: __m512i) -> __m512i {
+    pub(crate) fn reduce_halves512(even: __m512i, odd: __m512i) -> __m512i {
         reduce_lanes512(_mm512_unpacklo_epi64(even, odd), _mm512_unpackhi_epi64(even, odd))
     }
 

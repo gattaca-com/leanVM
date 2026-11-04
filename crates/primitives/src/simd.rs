@@ -37,37 +37,6 @@ pub fn store<T: Plain>(dst: &mut [T], i: usize, v: __m512i) {
     unsafe { _mm512_storeu_si512(dst.as_mut_ptr().cast::<u8>().add(64 * i).cast(), v) }
 }
 
-/// The 8x8 transpose of qwords: qword `j` of `out[p]` is qword `p` of `r[j]`.
-#[inline(always)]
-pub fn transpose8(r: [__m512i; 8]) -> [__m512i; 8] {
-    // SAFETY: the module is compiled only with avx512f enabled, and these intrinsics touch only registers.
-    unsafe {
-        // Pairs of words, then 128-bit lane picks to finish.
-        let (a0, a1) = (_mm512_unpacklo_epi64(r[0], r[1]), _mm512_unpackhi_epi64(r[0], r[1]));
-        let (a2, a3) = (_mm512_unpacklo_epi64(r[2], r[3]), _mm512_unpackhi_epi64(r[2], r[3]));
-        let (a4, a5) = (_mm512_unpacklo_epi64(r[4], r[5]), _mm512_unpackhi_epi64(r[4], r[5]));
-        let (a6, a7) = (_mm512_unpacklo_epi64(r[6], r[7]), _mm512_unpackhi_epi64(r[6], r[7]));
-        let b0 = _mm512_shuffle_i64x2::<0x88>(a0, a2);
-        let b1 = _mm512_shuffle_i64x2::<0x88>(a1, a3);
-        let b2 = _mm512_shuffle_i64x2::<0xDD>(a0, a2);
-        let b3 = _mm512_shuffle_i64x2::<0xDD>(a1, a3);
-        let b4 = _mm512_shuffle_i64x2::<0x88>(a4, a6);
-        let b5 = _mm512_shuffle_i64x2::<0x88>(a5, a7);
-        let b6 = _mm512_shuffle_i64x2::<0xDD>(a4, a6);
-        let b7 = _mm512_shuffle_i64x2::<0xDD>(a5, a7);
-        [
-            _mm512_shuffle_i64x2::<0x88>(b0, b4),
-            _mm512_shuffle_i64x2::<0x88>(b1, b5),
-            _mm512_shuffle_i64x2::<0x88>(b2, b6),
-            _mm512_shuffle_i64x2::<0x88>(b3, b7),
-            _mm512_shuffle_i64x2::<0xDD>(b0, b4),
-            _mm512_shuffle_i64x2::<0xDD>(b1, b5),
-            _mm512_shuffle_i64x2::<0xDD>(b2, b6),
-            _mm512_shuffle_i64x2::<0xDD>(b3, b7),
-        ]
-    }
-}
-
 /// The bitwise XOR.
 #[inline(always)]
 pub fn xor(a: __m512i, b: __m512i) -> __m512i {
