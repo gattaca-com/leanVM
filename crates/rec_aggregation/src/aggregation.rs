@@ -1416,7 +1416,7 @@ thread_local! {
 pub(crate) type Hints = Witness;
 
 /// The coverage slot each write in the guest's coverage walk targets, in walk
-/// order: the raw signatures first, then each child's claim lists.
+/// order: the raw signatures. A child's claims take no slot.
 ///
 /// The table is one contiguous region per scheme, each its declared claims followed
 /// by its own duplicate slots:
@@ -1466,7 +1466,7 @@ impl<K: Ord + Clone> Region<K> {
         }
         let mut claimed = vec![false; signers.len()];
         let mut dups = Vec::new();
-        // Each input list is sorted, so its position in the declared union only advances.
+        // The raw list is sorted, so its position in the declared list only advances.
         let mut slots = |input: &[K]| {
             let mut pos = 0;
             input
@@ -3138,9 +3138,9 @@ mod tests {
         );
     }
 
-    /// A node over children of both schemes, overlapping in one signer of each:
-    /// the coverage table then needs a duplicate slot in both regions, and each
-    /// child's two claim lists have to land in their own.
+    /// A node over children of both schemes, overlapping in one signer of each.
+    /// The node hashes each child's commitment, and the outer verifier deduplicates
+    /// the flattened set.
     #[test]
     fn aggregate_mixed_two_to_one() {
         leanvm_core::init_prover();
@@ -3158,10 +3158,8 @@ mod tests {
         assert!(node.lean_sphincs_signers.windows(2).all(|w| w[0] < w[1]));
     }
 
-    /// A node whose children are each of one scheme only: every claim list it
-    /// rebuilds is empty on one side, which is the only way the guest's
-    /// claim-absorbing loops run over an empty range and its bound `log(x) <
-    /// log(g^0)` (unsatisfiable, so nothing may be written there) is reached.
+    /// A node whose children are each of one scheme only. Each leaf hashes one
+    /// empty raw list, and the node hashes two, with an empty coverage table.
     #[test]
     fn aggregate_one_scheme_per_child() {
         leanvm_core::init_prover();
@@ -3322,9 +3320,8 @@ def main():
     }
 
     /// The right leaf holds more claims than one loop frame of its list hashes
-    /// ([`CLAIM_GROUP`]), so both that leaf and the parent rebuilding it run the
-    /// list's group loop and then a partial last group, while the left leaf's list is
-    /// a partial group alone.
+    /// ([`CLAIM_GROUP`]), so that leaf runs the list's group loop and then a
+    /// partial last group, while the left leaf's list is a partial group alone.
     #[test]
     fn aggregate_two_to_one() {
         leanvm_core::init_prover();
@@ -3794,8 +3791,7 @@ def main():
 
     /// Two messages in one tree. Signer `i` holds the same pubkey under both, at
     /// different leaf indices, so its claims on B are distinct from those on A; the
-    /// left leaf holds one message, the right both, and the node needs a duplicate
-    /// slot for the claim both leaves cover.
+    /// left leaf holds one message, the right both, and both leaves cover one claim.
     #[test]
     fn aggregate_two_messages() {
         leanvm_core::init_prover();
@@ -3851,11 +3847,9 @@ def main():
         assert!(node.xmss_signers.windows(2).all(|w| w[0] < w[1]));
     }
 
-    /// Three levels, both schemes. The leanSPHINCS claims are rebuilt twice over, once
-    /// into each node and again into the root, and the two nodes share one claim,
-    /// so the root needs a leanSPHINCS duplicate slot for a claim it never saw
-    /// directly. The root also adds a raw signature of each scheme alongside its
-    /// children.
+    /// Three levels, both schemes. The two nodes share one leanSPHINCS claim, which
+    /// the flattened set holds once. The root also adds a raw signature of each
+    /// scheme alongside its children.
     #[test]
     #[ignore]
     fn aggregate_three_levels() {
