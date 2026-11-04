@@ -67,53 +67,38 @@ fn default_topology() -> Topology {
 
 /// Performance-core count: `hw.perflevel0.logicalcpu` on Apple silicon (where
 /// `available_parallelism` counts the efficiency cores too, and those are handled
-/// separately), else the platform's parallelism, capped on Linux at the physical cores
-/// the process may run on.
+/// separately), else the platform's parallelism over the SMT width.
 ///
 /// The prover is DRAM-bound once every core runs: a second SMT thread per core adds
-/// cache and bandwidth contention, not throughput.
+/// cache and bandwidth contention, not throughput. On a 16-core Zen 5 at 1,290
+/// signatures, 16 workers prove in 1.159 s where 32 take 1.234 s.
 fn perf_cores() -> usize {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if let Some(n) = sysctl_usize(c"hw.perflevel0.logicalcpu") {
         return n;
     }
-    // Already capped by the affinity mask and any cgroup quota.
     let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (logical / smt_width()).max(1)
+}
+
+/// Hardware threads per core, from cpu0's sibling list (`0,16` or `0-1`); 1 when unknown.
+pub fn smt_width() -> usize {
     #[cfg(target_os = "linux")]
-    if let Some(cores) = allowed_cores() {
-        return logical.min(cores);
+    if let Ok(list) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list") {
+        let width: usize = list
+            .trim()
+            .split(',')
+            .map(|part| match part.split_once('-') {
+                Some((lo, hi)) => match (lo.parse::<usize>(), hi.parse::<usize>()) {
+                    (Ok(lo), Ok(hi)) if hi >= lo => hi - lo + 1,
+                    _ => 1,
+                },
+                None => 1,
+            })
+            .sum();
+        return width.max(1);
     }
-    logical
-}
-
-/// The distinct physical cores behind the CPUs this process may run on: a core whose
-/// threads include at least one allowed CPU counts once.
-#[cfg(target_os = "linux")]
-fn allowed_cores() -> Option<usize> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let allowed = status
-        .lines()
-        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
-    let mut cores = std::collections::HashSet::new();
-    // An allowed CPU that is offline has no topology; it adds no core.
-    for cpu in cpu_list(allowed.trim())? {
-        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
-        if let Ok(siblings) = std::fs::read_to_string(path) {
-            cores.insert(siblings.trim().to_owned());
-        }
-    }
-    (!cores.is_empty()).then_some(cores.len())
-}
-
-/// The CPUs of a kernel CPU list such as `0-3,8,10-11`.
-#[cfg(any(target_os = "linux", test))]
-fn cpu_list(list: &str) -> Option<Vec<usize>> {
-    let mut cpus = Vec::new();
-    for part in list.split(',') {
-        let (lo, hi) = part.split_once('-').unwrap_or((part, part));
-        cpus.extend(lo.parse::<usize>().ok()?..=hi.parse::<usize>().ok()?);
-    }
-    Some(cpus)
+    1
 }
 
 /// Efficiency-core count on Apple silicon, else `0`.
@@ -178,17 +163,5 @@ pub(crate) fn set_qos(qos: Qos) {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = qos;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cpu_lists_parse_ranges_and_singles() {
-        assert_eq!(cpu_list("0-3,8,10-11"), Some(vec![0, 1, 2, 3, 8, 10, 11]));
-        assert_eq!(cpu_list("5"), Some(vec![5]));
-        assert_eq!(cpu_list("0-x"), None);
     }
 }

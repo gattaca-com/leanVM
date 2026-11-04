@@ -1,7 +1,7 @@
 //! Fixed-size thread pool for flat data-parallel kernels. Workers claim ranges from one shared counter, which also balances heterogeneous cores. Dispatches cannot nest. Task panics are resumed on the dispatcher after all workers stop.
-
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11,7 +11,7 @@ use std::thread::Thread;
 mod topology;
 
 use topology::{Qos, set_qos};
-pub use topology::{Topology, num_threads, topology};
+pub use topology::{Topology, num_threads, smt_width, topology};
 
 /// Idle spins before a worker parks: long enough to stay hot across back-to-back
 /// dispatches, short enough to yield the core during a sequential stretch.
@@ -334,9 +334,9 @@ impl<T> Copy for SendPtr<T> {}
 
 // SAFETY: `SendPtr` grants no access by itself; every dereference is inside an
 // `unsafe` block whose comment establishes that the range being touched belongs
-// to exactly one task, and the elements it reaches may move to that task's thread.
-unsafe impl<T: Send> Send for SendPtr<T> {}
-unsafe impl<T: Send> Sync for SendPtr<T> {}
+// to exactly one task.
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
     /// Offset the base by `n` elements.
@@ -387,20 +387,12 @@ where
 /// slice. Composes to any number of buffers, which the zip-based helpers do not:
 /// a kernel writing four tables at two different widths builds one of these per
 /// table and indexes them all by the same item.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Chunks<T> {
     base: SendPtr<T>,
     width: usize,
     len: usize,
 }
-
-// By hand: the derives would demand `T: Clone` and `T: Copy`.
-impl<T> Clone for Chunks<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for Chunks<T> {}
 
 impl<T> Chunks<T> {
     /// View `data` as `len.div_ceil(width)` chunks of `width` (the last shorter).
@@ -458,16 +450,10 @@ where
 {
     let views = chunk_views(bufs, widths);
     let n_tasks = views.iter().map(Chunks::count).max().unwrap_or(0);
-    map_reduce_with_state(
-        n_tasks,
-        init_state,
-        init_acc,
-        |state, acc, i| {
-            // SAFETY: the dispatch runs each task `i` once, and `bufs` stays borrowed until it returns.
-            fold(state, acc, i, unsafe { task_chunks(&views, i) });
-        },
-        combine,
-    )
+    map_reduce_with_state(n_tasks, init_state, init_acc, |state, acc, i| {
+        // SAFETY: the dispatch runs each task `i` once, and `bufs` stays borrowed until it returns.
+        fold(state, acc, i, unsafe { task_chunks(&views, i) });
+    }, combine)
 }
 
 /// [`map_reduce_chunks_mut`] without the reduction: `f(i, chunks)` for every task `i`, in parallel.
@@ -481,9 +467,29 @@ where
     for_each(n_tasks, |i| f(i, unsafe { task_chunks(&views, i) }));
 }
 
+/// [`for_each_chunks_mut`] over the chunks of buffers of two element types: task `i` gets chunk `i` of
+/// each of `a` and of each of `b`. A buffer with fewer chunks gives an empty slice past its end.
+pub fn for_each_chunks_mut2<A: Send, B: Send, const M: usize, const N: usize, F>(
+    a: [&mut [A]; M],
+    a_widths: [usize; M],
+    b: [&mut [B]; N],
+    b_widths: [usize; N],
+    f: F,
+) where
+    F: Fn(usize, [&mut [A]; M], [&mut [B]; N]) + Sync,
+{
+    let (a_views, b_views) = (chunk_views(a, a_widths), chunk_views(b, b_widths));
+    let n_tasks = a_views.iter().map(Chunks::count).chain(b_views.iter().map(Chunks::count)).max().unwrap_or(0);
+    // SAFETY: the dispatch runs each task `i` once, and the buffers stay borrowed until it returns.
+    for_each(n_tasks, |i| f(i, unsafe { task_chunks(&a_views, i) }, unsafe { task_chunks(&b_views, i) }));
+}
+
 fn chunk_views<T, const N: usize>(bufs: [&mut [T]; N], widths: [usize; N]) -> [Chunks<T>; N] {
-    let mut widths = widths.into_iter();
-    bufs.map(|buf| Chunks::new(buf, widths.next().expect("one width per buffer")))
+    let mut k = 0;
+    bufs.map(|buf| {
+        k += 1;
+        Chunks::new(buf, widths[k - 1])
+    })
 }
 
 /// Task `i`'s chunk of each view, or an empty slice for a view with fewer chunks.
@@ -493,14 +499,106 @@ fn chunk_views<T, const N: usize>(bufs: [&mut [T]; N], widths: [usize; N]) -> [C
 /// stay borrowed until it returns.
 unsafe fn task_chunks<'a, T, const N: usize>(views: &[Chunks<T>; N], i: usize) -> [&'a mut [T]; N] {
     // SAFETY: by the caller's contract, chunk `i` of each buffer is taken once, so the slices are disjoint.
-    views.each_ref().map(|view| {
-        if i < view.count() {
-            unsafe { view.get(i) }
-        } else {
-            &mut []
-        }
-    })
+    views.each_ref().map(|view| if i < view.count() { unsafe { view.get(i) } } else { &mut [] })
 }
+
+/// A buffer of rows that tasks share by residue: task `r < step` owns rows `r + i * step` of every block.
+///
+/// Blocks are `block_rows` rows of `row_len` words, and `step` divides `block_rows`. A residue owns the same
+/// number of rows in every block, so a task's rows are a plain iterator of `&mut [T]`, in block order.
+#[derive(Debug)]
+pub struct Strided<'a, T> {
+    data: &'a mut [T],
+    row_len: usize,
+    step: usize,
+    block_rows: usize,
+}
+
+impl<'a, T: Send> Strided<'a, T> {
+    /// View `data` as whole blocks of `block_rows` rows of `row_len`, the residues `step` rows apart.
+    #[must_use]
+    pub fn new(data: &'a mut [T], row_len: usize, step: usize, block_rows: usize) -> Self {
+        assert!(row_len > 0 && step > 0, "row length and step must be non-zero");
+        assert!(block_rows.is_multiple_of(step), "the step must divide the block");
+        let block_len = row_len * block_rows;
+        assert!(data.is_empty() || data.len().is_multiple_of(block_len), "data must hold whole blocks");
+        Self { data, row_len, step, block_rows }
+    }
+
+    /// Run `f(r, rows)` for every residue `r < step`, in parallel, over [`for_each_chunk`] ranges.
+    pub fn for_each<F: Fn(usize, Rows<'a, T>) + Sync>(self, f: F) {
+        let Self { data, row_len, step, block_rows } = self;
+        let (len, base) = (data.len(), SendPtr(data.as_mut_ptr()));
+        let per_block = block_rows / step;
+        let end = len.checked_div(row_len * block_rows).unwrap_or(0) * per_block;
+        for_each_chunk(step, |lo, hi| {
+            for r in lo..hi {
+                // SAFETY: `data` stays borrowed until the dispatch returns, and each residue runs once.
+                // Residue `r` owns rows `b * block_rows + r + i * step`, and no other residue owns one of those.
+                let rows = Rows { base, len, row_len, step, block_rows, per_block, r, next: 0, end, _data: PhantomData };
+                f(r, rows);
+            }
+        });
+    }
+}
+
+/// [`Strided::for_each`] with one block: `f(r, rows)` for every residue `r < step`, over rows `r, r + step, ...`.
+/// `step` must divide the row count.
+pub fn for_each_strided<T: Send, F: Fn(usize, Rows<'_, T>) + Sync>(data: &mut [T], row_len: usize, step: usize, f: F) {
+    let n_rows = data.len() / row_len.max(1);
+    Strided::new(data, row_len, step, n_rows).for_each(f);
+}
+
+/// The rows of one residue of a [`Strided`] view, in block order. Double-ended, so blocks can go last to first.
+#[derive(Debug)]
+pub struct Rows<'a, T> {
+    base: SendPtr<T>,
+    len: usize,
+    row_len: usize,
+    step: usize,
+    block_rows: usize,
+    per_block: usize,
+    r: usize,
+    next: usize,
+    end: usize,
+    _data: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> Rows<'a, T> {
+    /// Row `k` of this residue, for `k < self.end`.
+    fn row(&self, k: usize) -> &'a mut [T] {
+        let row = (k / self.per_block) * self.block_rows + self.r + (k % self.per_block) * self.step;
+        debug_assert!(self.r < self.step && (row + 1) * self.row_len <= self.len);
+        // SAFETY: the row is inside the buffer, and the iterator yields each `k` once, so no live slice overlaps this one.
+        unsafe { self.base.slice(row * self.row_len, self.row_len) }
+    }
+}
+
+impl<'a, T> Iterator for Rows<'a, T> {
+    type Item = &'a mut [T];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.next < self.end).then(|| {
+            self.next += 1;
+            self.row(self.next - 1)
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.end - self.next, Some(self.end - self.next))
+    }
+}
+
+impl<T> DoubleEndedIterator for Rows<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        (self.next < self.end).then(|| {
+            self.end -= 1;
+            self.row(self.end)
+        })
+    }
+}
+
+impl<T> ExactSizeIterator for Rows<'_, T> {}
 
 /// Parallel `dst.chunks_mut(chunk).zip(src.chunks(chunk))`, for a kernel that
 /// writes one table while reading another of the same length.
@@ -541,18 +639,17 @@ pub fn fill<T: Send, F: Fn(usize) -> T + Sync>(dst: &mut [T], build: F) {
 /// pool and writes each result straight into the output at its own index: one
 /// allocation, no `Option` slots, no per-worker intermediate vectors.
 pub fn map_collect<T: Send, F: Fn(usize) -> T + Sync>(n_tasks: usize, f: F) -> Vec<T> {
-    let mut out: Vec<T> = Vec::with_capacity(n_tasks);
-    let base = SendPtr(out.as_mut_ptr());
-    for_each(n_tasks, |i| {
-        // SAFETY: distinct `i` write disjoint in-bounds slots, each exactly once,
-        // and the dispatch blocks until every write is finished. A panic in `f`
-        // leaks the slots written so far, which is acceptable: a task panic is
-        // re-raised on the dispatcher and fails the proof.
-        unsafe { base.add(i).write(f(i)) };
+    let mut out: Vec<std::mem::MaybeUninit<T>> = Vec::with_capacity(n_tasks);
+    out.resize_with(n_tasks, std::mem::MaybeUninit::uninit);
+    // A panic in `f` leaks the slots written so far, which is acceptable: a task panic is re-raised on
+    // the dispatcher and fails the proof.
+    chunks_mut(&mut out, 1, |i, slot| {
+        slot[0].write(f(i));
     });
-    // SAFETY: every slot in `0..n_tasks` was initialized exactly once above.
-    unsafe { out.set_len(n_tasks) };
-    out
+    let mut out = std::mem::ManuallyDrop::new(out);
+    // SAFETY: every slot in `0..n_tasks` was written exactly once above, and `MaybeUninit<T>` has the
+    // layout of `T`, so the allocation, length and capacity carry over.
+    unsafe { Vec::from_raw_parts(out.as_mut_ptr().cast::<T>(), out.len(), out.capacity()) }
 }
 
 /// The smallest `i` in `0..n_tasks` with `pred(i)`, or `None`. Deterministic
