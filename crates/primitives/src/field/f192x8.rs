@@ -15,18 +15,49 @@
 use super::gf2_64::F64;
 use super::gf2_64x3::{F192, F192Unreduced};
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "vpclmulqdq",
+    target_feature = "avx2",
+    not(target_feature = "avx512f")
+))]
+pub use avx2::{Acc8, F64x8, F192x8};
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 pub use avx512::{Acc8, F64x8, F192x8};
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    )
+)))]
 pub use portable::{Acc8, F64x8, F192x8, Prod8};
 
 /// The unreduced products of eight elements, lane by lane: what [`F192x8::mul_unreduced`] returns.
 /// A sum of them is an XOR, and [`Prod8::reduce_lanes`] reduces each lane on its own.
-#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    )
+))]
 pub type Prod8 = Acc8;
 
 /// The eight-lane types on a target without the wide multiplier.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    )
+)))]
 mod portable {
     use super::{F64, F192, F192Unreduced};
     use crate::field::gf2_64x3::{mul_unreduced4, mul4};
@@ -254,13 +285,29 @@ pub fn fold_lones8_ext(x0: &[F192; 8], r: F192) -> [F192; 8] {
 /// `(sum x0*y0, sum (x0+x1)*(y0+y1))` over eight terms.
 #[inline(always)]
 pub fn msg_terms8_ext(x0: &[F192; 8], x1: &[F192; 8], y0: &[F192; 8], y1: &[F192; 8]) -> (Acc8, Acc8) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        )
+    ))]
     {
         let (a0, a1) = (F192x8::from_array(x0), F192x8::from_array(x1));
         let (b0, b1) = (F192x8::from_array(y0), F192x8::from_array(y1));
         (a0.mul_unreduced(b0), (a0 + a1).mul_unreduced(b0 + b1))
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        )
+    )))]
     {
         let xs: [F192; 8] = core::array::from_fn(|j| x0[j] + x1[j]);
         let ys: [F192; 8] = core::array::from_fn(|j| y0[j] + y1[j]);
@@ -271,9 +318,25 @@ pub fn msg_terms8_ext(x0: &[F192; 8], x1: &[F192; 8], y0: &[F192; 8], y1: &[F192
 /// `sum x0*y0` over eight terms.
 #[inline(always)]
 pub fn msg_lone8_ext(x0: &[F192; 8], y0: &[F192; 8]) -> Acc8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        )
+    ))]
     return F192x8::from_array(x0).mul_unreduced(F192x8::from_array(y0));
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        )
+    )))]
     portable::dot_ext(x0, y0)
 }
 
@@ -622,6 +685,425 @@ mod avx512 {
         let [d0e, d1e, d2e] = acc.even;
         let [d0o, d1o, d2o] = acc.odd;
         let red = |x, y| reduce_lanes512(_mm512_unpacklo_epi64(x, y), _mm512_unpackhi_epi64(x, y));
+        F192x8 {
+            lo: red(d0e, d1e),
+            hi: red(d0o, d1o),
+            c2: red(d2e, d2o),
+        }
+    }
+}
+
+/// The AVX-512 planes at half the width, for a machine with VPCLMULQDQ but no AVX-512: each 512-bit
+/// plane is two YMM halves, and every kernel runs once per half.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "vpclmulqdq",
+    target_feature = "avx2",
+    not(target_feature = "avx512f")
+))]
+mod avx2 {
+    use core::arch::x86_64::*;
+
+    use super::{F64, F192, F192Unreduced};
+    use crate::field::gf2_64x3::x86_64::{fold, pair, reduce_halves256};
+    use crate::{load_at, store_at};
+
+    /// One 512-bit plane as two halves.
+    type Plane = [__m256i; 2];
+
+    const fn words(w: [u64; 4]) -> __m256i {
+        // SAFETY: four words and a vector have one size, and every bit pattern is valid in each.
+        unsafe { core::mem::transmute::<[u64; 4], __m256i>(w) }
+    }
+
+    const fn plane(w: [u64; 8]) -> Plane {
+        [words([w[0], w[1], w[2], w[3]]), words([w[4], w[5], w[6], w[7]])]
+    }
+
+    const ZERO_PLANE: Plane = plane([0; 8]);
+
+    #[inline(always)]
+    fn xor(a: __m256i, b: __m256i) -> __m256i {
+        // SAFETY: the module is compiled only with avx2 enabled.
+        unsafe { _mm256_xor_si256(a, b) }
+    }
+
+    #[inline(always)]
+    fn xor2(a: Plane, b: Plane) -> Plane {
+        [xor(a[0], b[0]), xor(a[1], b[1])]
+    }
+
+    /// Eight elements in their three planes, as on AVX-512.
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C, align(64))]
+    pub struct F192x8 {
+        lo: Plane,
+        hi: Plane,
+        c2: Plane,
+    }
+
+    // SAFETY: `repr(C)` over six vectors that fill the alignment, so there is no padding and no invalid bit pattern.
+    unsafe impl crate::Plain for F192x8 {}
+
+    /// The unreduced products of eight elements, as on AVX-512: `even[i][h]` lane `j` is coefficient `i`
+    /// of element `4h + 2j`, and `odd` that of the element after it.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Acc8 {
+        even: [Plane; 3],
+        odd: [Plane; 3],
+    }
+
+    /// Eight base-field elements, one per qword.
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C, align(64))]
+    pub struct F64x8(Plane);
+
+    // SAFETY: `repr(C)` over two vectors that fill the alignment, which have no invalid bit pattern.
+    unsafe impl crate::Plain for F64x8 {}
+
+    impl F64x8 {
+        #[inline(always)]
+        pub fn from_array(k: &[F64; 8]) -> Self {
+            Self([load_at(k, 0), load_at(k, 4)])
+        }
+    }
+
+    impl core::ops::Add for F64x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn add(self, rhs: Self) -> Self {
+            Self(xor2(self.0, rhs.0))
+        }
+    }
+
+    impl F192x8 {
+        /// The eight mixed products `self_i * k_i`, unreduced: six carry-less multiplications per half.
+        #[inline(always)]
+        pub fn mul_base_unreduced(self, k: F64x8) -> Acc8 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { mul_base(self, k.0) }
+        }
+    }
+
+    /// The embedding of the base field.
+    impl From<F64x8> for F192x8 {
+        #[inline(always)]
+        fn from(k: F64x8) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe {
+                let zero = _mm256_setzero_si256();
+                // Each word is its element's `c0`.
+                Self {
+                    lo: k.0.map(|w| _mm256_unpacklo_epi64(w, zero)),
+                    hi: k.0.map(|w| _mm256_unpackhi_epi64(w, zero)),
+                    c2: ZERO_PLANE,
+                }
+            }
+        }
+    }
+
+    impl Acc8 {
+        pub const ZERO: Self = Self {
+            even: [ZERO_PLANE; 3],
+            odd: [ZERO_PLANE; 3],
+        };
+
+        /// The sum of the eight products, reduced.
+        #[inline]
+        pub fn reduce(self) -> F192 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { reduce_sum(self) }
+        }
+
+        /// Every lane reduced on its own.
+        #[inline(always)]
+        pub fn reduce_lanes(self) -> F192x8 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { reduce_planes(self) }
+        }
+    }
+
+    impl From<F192Unreduced> for Acc8 {
+        /// One scalar product, in the first even lane.
+        #[inline]
+        fn from(u: F192Unreduced) -> Self {
+            let [c0, c1, c2] = u.coeffs();
+            let lane = |[lo, hi]: [u64; 2]| plane([lo, hi, 0, 0, 0, 0, 0, 0]);
+            Self {
+                even: [lane(c0), lane(c1), lane(c2)],
+                odd: Self::ZERO.odd,
+            }
+        }
+    }
+
+    impl core::ops::BitXorAssign for Acc8 {
+        #[inline(always)]
+        fn bitxor_assign(&mut self, rhs: Self) {
+            for i in 0..3 {
+                self.even[i] = xor2(self.even[i], rhs.even[i]);
+                self.odd[i] = xor2(self.odd[i], rhs.odd[i]);
+            }
+        }
+    }
+
+    impl core::ops::BitXor for Acc8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn bitxor(mut self, rhs: Self) -> Self {
+            self ^= rhs;
+            self
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_sum(acc: Acc8) -> F192 {
+        let coeffs = core::array::from_fn(|i| {
+            let a = xor2(acc.even[i], acc.odd[i]);
+            let half = _mm256_xor_si256(a[0], a[1]);
+            let q = _mm_xor_si128(_mm256_castsi256_si128(half), _mm256_extracti128_si256::<1>(half));
+            [_mm_cvtsi128_si64(q) as u64, _mm_extract_epi64::<1>(q) as u64]
+        });
+        F192Unreduced::from_coeffs(coeffs).reduce()
+    }
+
+    /// Eight consecutive elements, 24 qwords, into their planes: unaligned loads and blends.
+    ///
+    /// Element `i` is qwords `3i..3i+3`, so a pair plane half is two loads that each hold one pair
+    /// in the right lane, and a `c2` half takes two such pairs of loads.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_planes(e: &[F192; 8]) -> F192x8 {
+        let q: &[u64] = crate::cast_slice(e);
+        let at = |i: usize| -> __m256i { load_at(q, i) };
+        let lanes = |a: usize, b: usize| _mm256_blend_epi32::<0xF0>(at(a), at(b));
+        let c2 = |s: usize| _mm256_blend_epi32::<0xCC>(lanes(s, s + 4), lanes(s + 2, s + 6));
+        F192x8 {
+            lo: [lanes(0, 4), lanes(12, 16)],
+            hi: [lanes(3, 7), lanes(15, 19)],
+            c2: [c2(2), c2(14)],
+        }
+    }
+
+    /// The inverse of [`load_planes`], as 128-bit pair stores and 64-bit `c2` stores.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store_planes(p: F192x8, out: &mut [F192; 8]) {
+        let q: &mut [u64] = crate::cast_slice_mut(out);
+        for h in 0..2 {
+            for (plane, parity) in [(p.lo[h], 0), (p.hi[h], 1)] {
+                let e = 4 * h + parity;
+                store_at(q, 3 * e, _mm256_castsi256_si128(plane));
+                store_at(q, 3 * (e + 2), _mm256_extracti128_si256::<1>(plane));
+            }
+            let c2 = p.c2[h];
+            let (low, high) = (_mm256_castsi256_si128(c2), _mm256_extracti128_si256::<1>(c2));
+            let e = 4 * h;
+            q[3 * e + 2] = _mm_cvtsi128_si64(low) as u64;
+            q[3 * e + 5] = _mm_extract_epi64::<1>(low) as u64;
+            q[3 * e + 8] = _mm_cvtsi128_si64(high) as u64;
+            q[3 * e + 11] = _mm_extract_epi64::<1>(high) as u64;
+        }
+    }
+
+    impl F192x8 {
+        /// One scalar in every element.
+        #[inline(always)]
+        pub fn splat(r: F192) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe {
+                let lo = _mm256_broadcastsi128_si256(pair(r.c0, r.c1));
+                let c2 = _mm256_set1_epi64x(r.c2 as i64);
+                Self {
+                    lo: [lo; 2],
+                    hi: [lo; 2],
+                    c2: [c2; 2],
+                }
+            }
+        }
+
+        #[inline(always)]
+        pub fn from_array(e: &[F192; 8]) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { load_planes(e) }
+        }
+
+        #[inline(always)]
+        pub fn to_array(self) -> [F192; 8] {
+            let mut out = [F192::ZERO; 8];
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { store_planes(self, &mut out) };
+            out
+        }
+
+        /// The eight lane-wise products, unreduced: twelve carry-less multiplications per half.
+        #[inline(always)]
+        pub fn mul_unreduced(self, rhs: Self) -> Acc8 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { mul(self, rhs) }
+        }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        ///
+        /// A pair plane half holds elements `4h + parity` and `4h + parity + 2`, so each output half is one
+        /// 128-bit lane shuffle of an input plane's halves.
+        #[inline(always)]
+        pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
+            #[inline]
+            #[target_feature(enable = "avx2")]
+            fn kernel(a: F192x8, b: F192x8) -> (F192x8, F192x8) {
+                let split = |x: Plane, y: Plane| {
+                    (
+                        [
+                            _mm256_permute2x128_si256::<0x20>(x[0], x[1]),
+                            _mm256_permute2x128_si256::<0x20>(y[0], y[1]),
+                        ],
+                        [
+                            _mm256_permute2x128_si256::<0x31>(x[0], x[1]),
+                            _mm256_permute2x128_si256::<0x31>(y[0], y[1]),
+                        ],
+                    )
+                };
+                let ((elo, ehi), (olo, ohi)) = (split(a.lo, b.lo), split(a.hi, b.hi));
+                // `[a0, a2, a4, a6, b0, b2, b4, b6]` and the odd ones, of qwords.
+                let pick = |x: Plane| {
+                    let (lo, hi) = (_mm256_unpacklo_epi64(x[0], x[1]), _mm256_unpackhi_epi64(x[0], x[1]));
+                    (
+                        _mm256_permute4x64_epi64::<0xD8>(lo),
+                        _mm256_permute4x64_epi64::<0xD8>(hi),
+                    )
+                };
+                let ((ae, ao), (be, bo)) = (pick(a.c2), pick(b.c2));
+                (
+                    F192x8 {
+                        lo: elo,
+                        hi: ehi,
+                        c2: [ae, be],
+                    },
+                    F192x8 {
+                        lo: olo,
+                        hi: ohi,
+                        c2: [ao, bo],
+                    },
+                )
+            }
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { kernel(a, b) }
+        }
+    }
+
+    impl core::ops::Add for F192x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn add(self, rhs: Self) -> Self {
+            Self {
+                lo: xor2(self.lo, rhs.lo),
+                hi: xor2(self.hi, rhs.hi),
+                c2: xor2(self.c2, rhs.c2),
+            }
+        }
+    }
+
+    /// The eight lane-wise products.
+    impl core::ops::Mul for F192x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn mul(self, rhs: Self) -> Self {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { reduce_planes(mul(self, rhs)) }
+        }
+    }
+
+    /// The Karatsuba operands of one parity: the pair half, `c0 + c1` in both qwords, and the pair half
+    /// with that parity's `c2` added to both qwords.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn karatsuba_operands(pairs: __m256i, c2_dup: __m256i) -> (__m256i, __m256i, __m256i) {
+        let swapped = _mm256_shuffle_epi32::<0x4E>(pairs);
+        (pairs, _mm256_xor_si256(pairs, swapped), _mm256_xor_si256(pairs, c2_dup))
+    }
+
+    /// The six Karatsuba products of one parity half, y-folded.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn karatsuba_lanes(
+        (ap, a_s, a_t): (__m256i, __m256i, __m256i),
+        a2: __m256i,
+        (bp, b_s, b_t): (__m256i, __m256i, __m256i),
+        b2: __m256i,
+    ) -> [__m256i; 3] {
+        let p0 = _mm256_clmulepi64_epi128::<0x00>(ap, bp);
+        let p1 = _mm256_clmulepi64_epi128::<0x11>(ap, bp);
+        let p2 = _mm256_clmulepi64_epi128::<0x00>(a2, b2);
+        let p01 = _mm256_clmulepi64_epi128::<0x00>(a_s, b_s);
+        let p02 = _mm256_clmulepi64_epi128::<0x00>(a_t, b_t);
+        let p12 = _mm256_clmulepi64_epi128::<0x11>(a_t, b_t);
+        fold(p0, p1, p2, p01, p02, p12, |x, y| _mm256_xor_si256(x, y))
+    }
+
+    /// The eight lane-wise products, unreduced: twelve carry-less multiplications per half.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn mul(a: F192x8, b: F192x8) -> Acc8 {
+        let mut acc = Acc8::ZERO;
+        for h in 0..2 {
+            // Each parity's c2 in both qwords of its lane.
+            let (a2e, a2o) = (
+                _mm256_shuffle_epi32::<0x44>(a.c2[h]),
+                _mm256_shuffle_epi32::<0xEE>(a.c2[h]),
+            );
+            let (b2e, b2o) = (
+                _mm256_shuffle_epi32::<0x44>(b.c2[h]),
+                _mm256_shuffle_epi32::<0xEE>(b.c2[h]),
+            );
+            let even = karatsuba_lanes(
+                karatsuba_operands(a.lo[h], a2e),
+                a2e,
+                karatsuba_operands(b.lo[h], b2e),
+                b2e,
+            );
+            let odd = karatsuba_lanes(
+                karatsuba_operands(a.hi[h], a2o),
+                a2o,
+                karatsuba_operands(b.hi[h], b2o),
+                b2o,
+            );
+            for i in 0..3 {
+                acc.even[i][h] = even[i];
+                acc.odd[i][h] = odd[i];
+            }
+        }
+        acc
+    }
+
+    /// The eight mixed products by the words of `k`, unreduced: six carry-less multiplications per half.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn mul_base(a: F192x8, k: Plane) -> Acc8 {
+        let mut acc = Acc8::ZERO;
+        for h in 0..2 {
+            // Immediate bit 0 picks the qword of the first operand, bit 4 that of the second.
+            acc.even[0][h] = _mm256_clmulepi64_epi128::<0x00>(a.lo[h], k[h]);
+            acc.even[1][h] = _mm256_clmulepi64_epi128::<0x01>(a.lo[h], k[h]);
+            acc.odd[0][h] = _mm256_clmulepi64_epi128::<0x10>(a.hi[h], k[h]);
+            acc.odd[1][h] = _mm256_clmulepi64_epi128::<0x11>(a.hi[h], k[h]);
+            acc.even[2][h] = _mm256_clmulepi64_epi128::<0x00>(a.c2[h], k[h]);
+            acc.odd[2][h] = _mm256_clmulepi64_epi128::<0x11>(a.c2[h], k[h]);
+        }
+        acc
+    }
+
+    /// Reduce every lane back to planes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_planes(acc: Acc8) -> F192x8 {
+        let [d0e, d1e, d2e] = acc.even;
+        let [d0o, d1o, d2o] = acc.odd;
+        let red = |x: Plane, y: Plane| [0, 1].map(|h| reduce_halves256(x[h], y[h]));
         F192x8 {
             lo: red(d0e, d1e),
             hi: red(d0o, d1o),
