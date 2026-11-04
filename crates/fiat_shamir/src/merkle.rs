@@ -42,6 +42,82 @@ fn sorted_unique(queries: &[usize]) -> Vec<usize> {
     unique
 }
 
+/// Rows of one width, back to back. On the wire it is exactly a `Vec<Vec<F64>>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rows {
+    words: Vec<F64>,
+    len: usize,
+}
+
+impl Rows {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> std::slice::ChunksExact<'_, F64> {
+        self.words.chunks_exact((self.words.len() / self.len.max(1)).max(1))
+    }
+}
+
+impl std::ops::Index<usize> for Rows {
+    type Output = [F64];
+
+    fn index(&self, i: usize) -> &[F64] {
+        self.iter().nth(i).expect("a row in range")
+    }
+}
+
+impl<'a> IntoIterator for &'a Rows {
+    type Item = &'a [F64];
+    type IntoIter = std::slice::ChunksExact<'a, F64>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> FromIterator<&'a [F64]> for Rows {
+    /// Copies each row once into one buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the rows have one width.
+    fn from_iter<I: IntoIterator<Item = &'a [F64]>>(rows: I) -> Self {
+        let rows = rows.into_iter();
+        let n = rows.size_hint().0.max(1);
+        let mut out = Self::default();
+        for row in rows {
+            if out.len == 0 {
+                out.words.reserve_exact(row.len() * n);
+            }
+            assert_eq!(out.words.len(), out.len * row.len(), "rows of one width");
+            out.words.extend_from_slice(row);
+            out.len += 1;
+        }
+        out
+    }
+}
+
+impl serde::Serialize for Rows {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Rows {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let rows = Vec::<Vec<F64>>::deserialize(deserializer)?;
+        if rows.windows(2).any(|w| w[0].len() != w[1].len()) {
+            return Err(serde::de::Error::custom("rows of one width"));
+        }
+        Ok(rows.iter().map(Vec::as_slice).collect())
+    }
+}
+
 /// One opening phase's Merkle data: the rows opened at each distinct queried
 /// position (sorted), and one octopus authenticating all of them.
 ///
@@ -54,19 +130,26 @@ fn sorted_unique(queries: &[usize]) -> Vec<usize> {
 /// proof.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrunedMerklePaths {
-    pub leaf_data: Vec<Vec<F64>>,
+    pub leaf_data: Rows,
     pub sibling_hashes: Vec<Hash>,
 }
 
 impl PrunedMerklePaths {
-    /// Prover side: open `positions` of a tree held in pieces, storing one row per distinct position plus a
-    /// single octopus over them. `node(level, i)` is node `i` of `level`, leaves at level 0, and `row(q)` is the
-    /// leaf at `q`.
+    /// Prover side: open `positions` of `tree`, storing one row per distinct
+    /// position plus a single octopus over them. `row(q)` is the leaf at `q`.
     ///
     /// For `q` queries in a tree of depth `d` the octopus is at most `q · d`
     /// hashes (what `q` independent paths would cost) and typically much
     /// smaller, since a sibling shared by several paths is emitted once.
-    pub fn prune<'a>(
+    pub fn prune<'a>(tree: &[Hash], num_leaves: usize, positions: &[usize], row: impl Fn(usize) -> &'a [F64]) -> Self {
+        assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+        assert_eq!(tree.len(), 2 * num_leaves - 1);
+        let level_start = |level: usize| 2 * num_leaves - ((2 * num_leaves) >> level);
+        Self::prune_with(num_leaves, positions, |level, i| tree[level_start(level) + i], row)
+    }
+
+    /// Like [`Self::prune`], for a tree held in pieces: `node(level, i)` is node `i` of `level`, leaves at level 0.
+    pub fn prune_with<'a>(
         num_leaves: usize,
         positions: &[usize],
         node: impl Fn(usize, usize) -> Hash,
@@ -102,8 +185,24 @@ impl PrunedMerklePaths {
         }
 
         Self {
-            leaf_data: sorted.iter().map(|&q| row(q).to_vec()).collect(),
+            leaf_data: sorted.iter().map(|&q| row(q)).collect(),
             sibling_hashes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_serialize_as_nested_vecs() {
+        let nested: Vec<Vec<F64>> = (0..3u64).map(|r| (0..5).map(|w| F64(10 * r + w)).collect()).collect();
+        let rows: Rows = nested.iter().map(Vec::as_slice).collect();
+        let bytes = bincode::serialize(&nested).unwrap();
+        assert_eq!(bincode::serialize(&rows).unwrap(), bytes);
+        assert_eq!(bincode::deserialize::<Rows>(&bytes).unwrap(), rows);
+        let empty: Vec<Vec<F64>> = Vec::new();
+        assert_eq!(bincode::serialize(&Rows::default()).unwrap(), bincode::serialize(&empty).unwrap());
     }
 }

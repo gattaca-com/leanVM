@@ -11,3 +11,6 @@ workspace = true
 parallel.workspace = true
 primitives.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true

@@ -6,10 +6,9 @@
 //! LCH novel-basis induction of the per-level sumcheck basis polynomial: the
 //! dense per-query expansion, its succinct residual evaluator, and the sparse
 //! transposed-NTT fast path with the dispatch between them.
-
 use crate::ntt::{AdditiveNttF64, transpose_butterfly_lanes};
-use crate::whir::build_eq_table_ext;
 use crate::whir_ntt_ext::words_mut;
+use crate::whir::build_eq_table_ext;
 use primitives::field::{F64, F192, Weights8, dot_base};
 
 // ===================================================================
@@ -25,7 +24,8 @@ fn next_s(s: F64, s_at_root: F64) -> F64 {
     s * s + s_at_root * s
 }
 
-/// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`, over K. Public for the recursion harness, which dumps
+/// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`, over K. Mirror of
+/// `whir::eval_sk_at_vks`. Public for the recursion harness, which dumps
 /// these vanishing-polynomial values as guest hints (base-field, embedded into
 /// the tower with both extension limbs zero).
 pub fn eval_sk_at_vks(log_n: usize) -> Vec<F64> {
@@ -113,14 +113,15 @@ pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     queries: &[usize],
     weights: &[F192],
 ) -> (Vec<F192>, F192) {
-    let enforced_sum = induce_sumcheck_enforced_sum(opened_rows, v_challenges, queries, weights);
-    (induce_basis(log_msg_cols, sks_vks, queries, weights), enforced_sum)
-}
-
-/// The basis half of [`induce_sumcheck_poly`]: `basis_poly[j] = Σ_i w_i · W-hat_j(q_i)`.
-fn induce_basis(log_msg_cols: usize, sks_vks: &[F64], queries: &[usize], weights: &[F192]) -> Vec<F192> {
     let n_queries = queries.len();
     assert_eq!(weights.len(), n_queries);
+    let eq = build_eq_table_ext(v_challenges);
+    assert_eq!(opened_rows.len(), n_queries * eq.len());
+    let enforced_sum = opened_rows
+        .chunks_exact(eq.len())
+        .zip(weights)
+        .fold(F192::ZERO, |sum, (row, &w)| sum + T::dot(row, &eq) * w);
+
     let inv_sks_vks = invert_sks(sks_vks);
     let lo = log_msg_cols / 2;
     let padded = n_queries.next_multiple_of(8);
@@ -140,7 +141,6 @@ fn induce_basis(log_msg_cols: usize, sks_vks: &[F64], queries: &[usize], weights
     }
     // `packed[j * (padded / 8) + g]` holds the weights `w_i · high_i(j)` of the queries `8g..8g + 8`.
     let groups = padded / 8;
-    // SAFETY: the fill writes every element before it reads any.
     let packed = primitives::filled_vec(groups << (log_msg_cols - lo), |packed| {
         parallel::chunks_mut(packed, groups, |j, row| {
             let scaled = |i: usize| match weights.get(i) {
@@ -152,14 +152,14 @@ fn induce_basis(log_msg_cols: usize, sks_vks: &[F64], queries: &[usize], weights
             }
         });
     });
-    // SAFETY: the fill writes every element before it reads any.
-    primitives::filled_vec(1 << log_msg_cols, |basis| {
+    let basis = primitives::filled_vec(1 << log_msg_cols, |basis| {
         parallel::chunks_mut(basis, 1 << lo, |j, out: &mut [F192]| {
             for (out, low) in out.iter_mut().zip(low.chunks_exact(padded)) {
                 *out = dot_base(&packed[j * groups..][..groups], low).reduce();
             }
         });
-    })
+    });
+    (basis, enforced_sum)
 }
 
 /// Appends `t[j] = Π_k s[k]^(bit k of j)`, over K, to `out`.
@@ -173,9 +173,11 @@ fn extend_tensor_k(out: &mut Vec<F64>, s: &[F64]) {
     }
 }
 
-/// The `enforced_sum` half of [`induce_sumcheck_poly`]:
+/// Just the `enforced_sum` half of [`induce_sumcheck_poly`]:
 ///   `enforced_sum = Σ_i w_i · <opened_rows[i], eq(v_challenges, ·)>`
-fn induce_sumcheck_enforced_sum<T: RowElem>(
+/// Cheap: O(num_queries x num_interleaved). The prover needs it for its last
+/// level, whose induced basis it never materializes.
+pub(crate) fn induce_sumcheck_enforced_sum<T: RowElem>(
     opened_rows: &[T],
     v_challenges: &[F192],
     queries: &[usize],
@@ -189,6 +191,80 @@ fn induce_sumcheck_enforced_sum<T: RowElem>(
         sum += w * T::dot(row, &eq);
     }
     sum
+}
+
+/// SUCCINCT evaluator for the induced basis poly's MLE at residual points,
+/// in place of the dense basis, via the closed form:
+///   `MLE(basis_poly)(p) = Σ_i w_i · Π_k (1 + p[k] · (1 + W-hat_k(q_i)))`
+/// where `q_i = F64(queries[i])` and the K-valued `W-hat_k(q_i)` lifts into E
+/// through the char-2 factor. `ris_for_basis` is the fixed residual prefix
+/// (length `log_msg_cols - yr_log_n`); returns evaluations at the `2^yr_log_n`
+/// points `ris_for_basis ++ y_bits`.
+pub(crate) fn induce_sumcheck_evaluate_at_residual(
+    log_msg_cols: usize,
+    sks_vks: &[F64],
+    queries: &[usize],
+    weights: &[F192],
+    ris_for_basis: &[F192],
+    yr_log_n: usize,
+) -> Vec<F192> {
+    assert_eq!(ris_for_basis.len() + yr_log_n, log_msg_cols);
+    let n_queries = queries.len();
+    let yr_len = 1usize << yr_log_n;
+
+    debug_assert_eq!(weights.len(), n_queries);
+    let inv_sks_vks = invert_sks(sks_vks);
+    let prefix_len = ris_for_basis.len();
+
+    // Per-query precomputation: W-hat_k(q) for all k over K, split into a
+    // fixed prefix product (E scalar) and the suffix W-hat values varied per y.
+    struct PerQuery {
+        prefix_prod: F192,
+        suffix_w: Vec<F64>, // length = yr_log_n
+    }
+    let compute_query = |&q: &usize| -> PerQuery {
+        let mut sks_at_x = vec![F64::ZERO; log_msg_cols];
+        normalized_sks_at(F64(q as u64), sks_vks, &inv_sks_vks, &mut sks_at_x);
+        // Prefix product: Π_{k<prefix_len} (1 + ris[k] · (1 + W-hat_k(q)))
+        let mut prefix_prod = F192::ONE;
+        for k in 0..prefix_len {
+            prefix_prod *= F192::ONE + ris_for_basis[k] * (F192::ONE + F192::from(sks_at_x[k]));
+        }
+        let suffix_w = if log_msg_cols > prefix_len {
+            sks_at_x[prefix_len..].to_vec()
+        } else {
+            Vec::new()
+        };
+        PerQuery { prefix_prod, suffix_w }
+    };
+    // Once per opening over query-count-sized inputs; stay serial below
+    // the dispatch crossover.
+    const PAR_FLOOR: usize = 1024;
+    let per_query: Vec<PerQuery> = if n_queries > PAR_FLOOR {
+        parallel::map_collect(n_queries, |i| compute_query(&queries[i]))
+    } else {
+        queries.iter().map(compute_query).collect()
+    };
+
+    // For each residual position y, accumulate the suffix product per query.
+    let compute_y = |y: usize| -> F192 {
+        let mut sum = F192::ZERO;
+        for i in 0..n_queries {
+            let pq = &per_query[i];
+            let mut suffix_prod = F192::ONE;
+            for j in 0..yr_log_n {
+                let p_j = if (y >> j) & 1 == 1 { F192::ONE } else { F192::ZERO };
+                suffix_prod *= F192::ONE + p_j * (F192::ONE + F192::from(pq.suffix_w[j]));
+            }
+            sum += weights[i] * pq.prefix_prod * suffix_prod;
+        }
+        sum
+    };
+    if yr_len > PAR_FLOOR {
+        primitives::par_collect(yr_len, compute_y)
+    } else {
+        (0..yr_len).map(compute_y).collect()
+    }
 }
 
 /// The transposed forward butterfly, applied to each pair of E elements as K words. The forward
@@ -224,6 +300,8 @@ const STRIP: usize = 16;
 ///   the rows (windows) of each replica, and sums the replicas. A layer skips the
 ///   blocks of rows that are still zero, as pass 1 does, and the sum is the only
 ///   thing written to the output.
+///
+/// Mirror of `whir::transpose_forward_ntt_sparse`.
 fn transpose_forward_ntt_sparse_ext(
     ntt: &AdditiveNttF64,
     positions: &[usize],
@@ -371,7 +449,8 @@ fn transpose_rows<'a>(tile: &mut [F192], k: usize, plan: impl Iterator<Item = &'
 /// `F^T`-based fast path for [`induce_sumcheck_poly`]: scatter per-query
 /// E-weights into the codeword domain, apply `F^T` with K-twiddles, keep the
 /// low `2^log_msg_cols` outputs. Byte-identical output to the dense path
-/// (pinned by `induce_via_ntt_matches_dense`).
+/// (pinned by `induce_via_ntt_matches_dense`). Mirror of
+/// `whir::induce_sumcheck_poly_via_ntt` with the L0 mixed row dot.
 pub(crate) fn induce_sumcheck_poly_via_ntt_base(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -381,10 +460,29 @@ pub(crate) fn induce_sumcheck_poly_via_ntt_base(
     weights: &[F192],
 ) -> (Vec<F192>, F192) {
     let log_block = log_msg_cols + log_inv_rate;
-    let enforced_sum = induce_sumcheck_enforced_sum(opened_rows, v_challenges, queries, weights);
+    let block_len = 1usize << log_block;
+    let n_queries = queries.len();
 
-    let ntt = AdditiveNttF64::standard(log_block);
-    let coeffs = transpose_forward_ntt_sparse_ext(&ntt, queries, weights, log_block, log_inv_rate);
+    let eq = build_eq_table_ext(v_challenges);
+    assert_eq!(opened_rows.len(), n_queries * eq.len());
+    debug_assert_eq!(weights.len(), n_queries);
+
+    let mut enforced_sum = F192::ZERO;
+    for (row, &w) in opened_rows.chunks_exact(eq.len()).zip(weights) {
+        enforced_sum += F64::dot(row, &eq) * w;
+    }
+
+    let coeffs = if log_block == 0 {
+        // SAFETY: zero is a valid F192, and the loop below reads these slots.
+        let mut c = vec![F192::ZERO; block_len];
+        for i in 0..n_queries {
+            c[queries[i]] += weights[i];
+        }
+        c
+    } else {
+        let ntt = AdditiveNttF64::standard(log_block);
+        transpose_forward_ntt_sparse_ext(&ntt, queries, weights, log_block, log_inv_rate)
+    };
     (coeffs, enforced_sum)
 }
 
@@ -399,7 +497,8 @@ pub(crate) fn induce_use_ntt_heuristic(log_msg_cols: usize, log_inv_rate: usize,
 }
 
 /// Dispatch between the dense [`induce_sumcheck_poly`] and the sparse
-/// [`induce_sumcheck_poly_via_ntt_base`] for L0 (base-field rows): in the recursive PCS this fires
+/// [`induce_sumcheck_poly_via_ntt_base`] for L0 (base-field rows). Mirror of
+/// `whir::induce_sumcheck_poly_auto`: in the recursive PCS this fires
 /// only at the top level (large message domain, many queries); deeper levels
 /// stay dense. Both paths produce identical output, so a mis-dispatch only
 /// costs time.

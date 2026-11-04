@@ -62,14 +62,13 @@ fn main() {
         let _quiet = (!last).then(bench::suppress_tracing);
 
         let t = Instant::now();
-        let (cm, pd) = tracing::info_span!("Commit").in_scope(|| commit(&witness, log_n, pc.initial_k, log_inv_rate));
+        let (cm, pd) = tracing::info_span!("Commit").in_scope(|| commit(&witness, &[], log_n, pc.initial_k, log_inv_rate));
         commit_t.push(t.elapsed().as_secs_f64());
 
         let mut ch = fiat_shamir::transcript::ProverState::from_label(b"pcs-throughput");
-        let stack = witness.clone();
         let t = Instant::now();
         tracing::info_span!("PCS open").in_scope(|| {
-            open_batch_mixed_whir_stacked(&mut ch, log_n, stack, pd, &pc, &claims, &ring);
+            open_batch_mixed_whir_stacked(&mut ch, log_n, witness.clone(), Vec::new(), pd, &pc, &claims, &ring);
         });
         open_t.push(t.elapsed().as_secs_f64());
         black_box((cm, ch.into_proof()));

@@ -107,7 +107,7 @@ pub fn commit(
         shape.committed_len(),
         "witness must be the committed lanes"
     );
-    let (commitment, prover_data) = whir_commit(witness, mu, LOG_BATCH, log_inv_rate);
+    let (commitment, prover_data) = whir_commit(witness, &[], mu, LOG_BATCH, log_inv_rate);
     ps.add_root(&commitment.root);
     Committed {
         prover_data,
@@ -141,7 +141,7 @@ pub fn open(ps: &mut ProverState, c: Committed, q: Vec<F64>, points: &[SlotClaim
     assert_eq!(q.len() % lane_block, 0, "witness must be whole committed lanes");
     assert!(q.len() <= 1usize << c.mu, "witness must fit the announced size");
     let cfg = whir_config(c.mu, c.log_inv_rate);
-    open_batch_mixed_whir_stacked(ps, c.mu, q, c.prover_data, &cfg, points, ring)
+    open_batch_mixed_whir_stacked(ps, c.mu, q, Vec::new(), c.prover_data, &cfg, points, ring)
 }
 
 #[cfg(test)]
