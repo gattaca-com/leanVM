@@ -141,29 +141,25 @@ fn induce_basis(log_msg_cols: usize, sks_vks: &[F64], queries: &[usize], weights
     // `packed[j * (padded / 8) + g]` holds the weights `w_i · high_i(j)` of the queries `8g..8g + 8`.
     let groups = padded / 8;
     // SAFETY: the fill writes every element before it reads any.
-    let packed = unsafe {
-        primitives::filled_vec(groups << (log_msg_cols - lo), |packed| {
-            parallel::chunks_mut(packed, groups, |j, row| {
-                let scaled = |i: usize| match weights.get(i) {
-                    Some(w) => w.mul_base(high[(i << (log_msg_cols - lo)) | j]),
-                    None => F192::ZERO,
-                };
-                for (g, slot) in row.iter_mut().enumerate() {
-                    *slot = Weights8::new(&std::array::from_fn(|t| scaled(8 * g + t)));
-                }
-            });
-        })
-    };
+    let packed = primitives::filled_vec(groups << (log_msg_cols - lo), |packed| {
+        parallel::chunks_mut(packed, groups, |j, row| {
+            let scaled = |i: usize| match weights.get(i) {
+                Some(w) => w.mul_base(high[(i << (log_msg_cols - lo)) | j]),
+                None => F192::ZERO,
+            };
+            for (g, slot) in row.iter_mut().enumerate() {
+                *slot = Weights8::new(&std::array::from_fn(|t| scaled(8 * g + t)));
+            }
+        });
+    });
     // SAFETY: the fill writes every element before it reads any.
-    unsafe {
-        primitives::filled_vec(1 << log_msg_cols, |basis| {
-            parallel::chunks_mut(basis, 1 << lo, |j, out: &mut [F192]| {
-                for (out, low) in out.iter_mut().zip(low.chunks_exact(padded)) {
-                    *out = dot_base(&packed[j * groups..][..groups], low).reduce();
-                }
-            });
-        })
-    }
+    primitives::filled_vec(1 << log_msg_cols, |basis| {
+        parallel::chunks_mut(basis, 1 << lo, |j, out: &mut [F192]| {
+            for (out, low) in out.iter_mut().zip(low.chunks_exact(padded)) {
+                *out = dot_base(&packed[j * groups..][..groups], low).reduce();
+            }
+        });
+    })
 }
 
 /// Appends `t[j] = Π_k s[k]^(bit k of j)`, over K, to `out`.

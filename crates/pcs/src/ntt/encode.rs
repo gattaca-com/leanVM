@@ -103,15 +103,13 @@ impl AdditiveNttF64 {
         let held = (1usize << log_inv_rate) >> usize::from(by_halves);
         let mut done = None;
         // SAFETY: the fill writes every element before it reads any.
-        let data = unsafe {
-            primitives::filled_vec((held * msg_rows) * num_ntts, |data| {
-                for first in (0..1usize << log_inv_rate).step_by(held).rev() {
-                    let src = Source::Lanes(Lanes { words: msg, n_lanes });
-                    let mut win = Window::new(data, num_ntts, first * msg_rows);
-                    done = Some(self.transform(&mut win, log_inv_rate, src, Some(on_rows), defer_deep));
-                }
-            })
-        };
+        let data = primitives::filled_vec((held * msg_rows) * num_ntts, |data| {
+            for first in (0..1usize << log_inv_rate).step_by(held).rev() {
+                let src = Source::Lanes(Lanes { words: msg, n_lanes });
+                let mut win = Window::new(data, num_ntts, first * msg_rows);
+                done = Some(self.transform(&mut win, log_inv_rate, src, Some(on_rows), defer_deep));
+            }
+        });
         match done.expect("the encode runs") {
             (plan, true) if by_halves => Codeword::Nothing(plan, n_lanes),
             (plan, true) => Codeword::BeforeDeep(data, plan),
@@ -134,12 +132,10 @@ impl AdditiveNttF64 {
     ) -> Codeword {
         let mut done = None;
         // SAFETY: the fill writes every element before it reads any.
-        let data = unsafe {
-            primitives::filled_vec(msg.len() << log_inv_rate, |data| {
-                let mut win = Window::new(data, num_ntts, 0);
-                done = Some(self.transform(&mut win, log_inv_rate, Source::Rows(msg), Some(on_rows), defer_deep));
-            })
-        };
+        let data = primitives::filled_vec(msg.len() << log_inv_rate, |data| {
+            let mut win = Window::new(data, num_ntts, 0);
+            done = Some(self.transform(&mut win, log_inv_rate, Source::Rows(msg), Some(on_rows), defer_deep));
+        });
         match done.expect("the encode runs") {
             (plan, true) => Codeword::BeforeDeep(data, plan),
             (plan, false) => Codeword::Whole(data, plan),

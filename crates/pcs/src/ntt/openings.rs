@@ -32,31 +32,29 @@ pub(super) fn built_rows(
     debug_assert!(positions.is_sorted());
     let places: Vec<usize> = positions.iter().map(|q| q & ((1 << log_block) - 1)).collect();
     // SAFETY: the fill writes every element before it reads any.
-    unsafe {
-        primitives::filled_vec(positions.len() * n, |out| {
-            let mut rest = out;
-            let mut at = 0;
-            let mut parts = positions
-                .chunk_by(|a, b| a >> log_block == b >> log_block)
-                .map(|run| {
-                    let (head, tail) = std::mem::take(&mut rest).split_at_mut(run.len() * n);
-                    rest = tail;
-                    at += run.len();
-                    (head, run, &places[at - run.len()..at])
-                })
-                .collect::<Vec<_>>();
-            parallel::chunks_mut(&mut parts, 1, |i, part| {
-                let (dst, run, live) = &mut part[0];
-                let block = run[0] >> log_block;
-                with_scratch(n << log_block, |scratch| {
-                    build(i, block, live, scratch);
-                    for (dst, &p) in dst.chunks_exact_mut(n).zip(live.iter()) {
-                        dst.copy_from_slice(&scratch[p * n..][..n]);
-                    }
-                });
+    primitives::filled_vec(positions.len() * n, |out| {
+        let mut rest = out;
+        let mut at = 0;
+        let mut parts = positions
+            .chunk_by(|a, b| a >> log_block == b >> log_block)
+            .map(|run| {
+                let (head, tail) = std::mem::take(&mut rest).split_at_mut(run.len() * n);
+                rest = tail;
+                at += run.len();
+                (head, run, &places[at - run.len()..at])
+            })
+            .collect::<Vec<_>>();
+        parallel::chunks_mut(&mut parts, 1, |i, part| {
+            let (dst, run, live) = &mut part[0];
+            let block = run[0] >> log_block;
+            with_scratch(n << log_block, |scratch| {
+                build(i, block, live, scratch);
+                for (dst, &p) in dst.chunks_exact_mut(n).zip(live.iter()) {
+                    dst.copy_from_slice(&scratch[p * n..][..n]);
+                }
             });
-        })
-    }
+        });
+    })
 }
 
 /// The reads of codeword rows, from what an encode kept of its codeword.

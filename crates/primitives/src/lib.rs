@@ -15,6 +15,18 @@ use std::mem::{MaybeUninit, needs_drop};
 #[cfg(feature = "test-util")]
 pub mod test_rng;
 
+/// Initialize the field lookup and SIMD shuffle tables before proving.
+pub fn setup() {
+    field::g_pow32_by_lookup(0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    bit_fold::gfni::setup();
+}
+
 /// Format an integer with comma-separated groups of three decimal digits.
 ///
 /// This accepts every standard signed and unsigned integer type through its
@@ -122,7 +134,7 @@ pub fn log2_ceil_usize(n: usize) -> usize {
 /// Implement it only for such types.
 pub unsafe trait Plain: Copy {}
 
-// SAFETY: integers.
+// SAFETY: integers, and `repr(transparent)` and `repr(C)` structs of them.
 unsafe impl Plain for u8 {}
 unsafe impl Plain for u64 {}
 unsafe impl Plain for u32 {}
@@ -157,10 +169,7 @@ unsafe impl Plain for core::arch::aarch64::uint64x2_t {}
 /// If the slice is misaligned for `B`, or its byte length is not a multiple of `size_of::<B>()`.
 pub fn cast_slice<A: Plain, B: Plain>(a: &[A]) -> &[B] {
     let (ptr, bytes) = (a.as_ptr().cast::<B>(), core::mem::size_of_val(a));
-    assert!(
-        ptr.is_aligned() && bytes % core::mem::size_of::<B>() == 0,
-        "slice does not cast"
-    );
+    assert!(ptr.is_aligned() && bytes % core::mem::size_of::<B>() == 0, "slice does not cast");
     // SAFETY: both types are plain, so every byte is initialized and any pattern is valid; the checks above
     // cover alignment and length, and the lifetime is the borrow's.
     unsafe { core::slice::from_raw_parts(ptr, bytes / core::mem::size_of::<B>()) }
@@ -169,10 +178,7 @@ pub fn cast_slice<A: Plain, B: Plain>(a: &[A]) -> &[B] {
 /// [`cast_slice`] of a mutable slice.
 pub fn cast_slice_mut<A: Plain, B: Plain>(a: &mut [A]) -> &mut [B] {
     let (ptr, bytes) = (a.as_mut_ptr().cast::<B>(), core::mem::size_of_val(a));
-    assert!(
-        ptr.is_aligned() && bytes % core::mem::size_of::<B>() == 0,
-        "slice does not cast"
-    );
+    assert!(ptr.is_aligned() && bytes % core::mem::size_of::<B>() == 0, "slice does not cast");
     // SAFETY: as `cast_slice`, and the borrow is unique.
     unsafe { core::slice::from_raw_parts_mut(ptr, bytes / core::mem::size_of::<B>()) }
 }
@@ -180,53 +186,54 @@ pub fn cast_slice_mut<A: Plain, B: Plain>(a: &mut [A]) -> &mut [B] {
 /// The `A` whose bytes start at element `i` of `src`, read unaligned.
 #[inline(always)]
 pub fn load_at<T: Plain, A: Plain>(src: &[T], i: usize) -> A {
-    let rest = &src[i..];
-    assert!(size_of::<A>() <= size_of_val(rest));
+    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(src));
     // SAFETY: the assert keeps the bytes inside `src`, and any bytes of a `Plain` type are
     // readable and a valid `A`.
-    unsafe { rest.as_ptr().cast::<A>().read_unaligned() }
+    unsafe { src.as_ptr().wrapping_add(i).cast::<A>().read_unaligned() }
 }
 
 /// Write `v` over the bytes from element `i` of `dst` on, unaligned.
 #[inline(always)]
 pub fn store_at<T: Plain, A: Plain>(dst: &mut [T], i: usize, v: A) {
-    let rest = &mut dst[i..];
-    assert!(size_of::<A>() <= size_of_val(rest));
+    assert!(i * size_of::<T>() + size_of::<A>() <= size_of_val(dst));
     // SAFETY: the assert keeps the bytes inside `dst`, and any bytes are a valid `Plain` value.
-    unsafe { rest.as_mut_ptr().cast::<A>().write_unaligned(v) }
+    unsafe { dst.as_mut_ptr().add(i).cast::<A>().write_unaligned(v) }
 }
 
 /// `N` vectors of the given lengths, filled in place by `fill`.
 ///
-/// It skips the zero-fill, which would cost one more pass over memory. Only plain data is allowed, so
-/// dropping an element runs no code:
+/// It skips the zero-fill, which would cost one more pass over memory. `fill` receives one slice per
+/// vector and must write every element before it reads it. Only plain data is allowed, so an unwritten
+/// element holds no invalid value and dropping it runs no code:
 ///
 /// ```compile_fail
-/// unsafe { primitives::filled_vecs([1], |_: [&mut [String]; 1]| {}) };
+/// primitives::filled_vecs([1], |_: [&mut [String]; 1]| {});
 /// ```
-///
-/// # Safety
-///
-/// `fill` receives one slice per vector of uninitialized elements, and must write every element
-/// before it reads it.
 #[must_use]
-pub unsafe fn filled_vecs<T: Plain, const N: usize>(lens: [usize; N], fill: impl FnOnce([&mut [T]; N])) -> [Vec<T>; N] {
-    // SAFETY: `fill` writes each element before reading it, by the caller's contract.
+pub fn filled_vecs<T: Plain, const N: usize>(lens: [usize; N], fill: impl FnOnce([&mut [T]; N])) -> [Vec<T>; N] {
+    // SAFETY: `fill` writes each element before reading it, by its contract.
     let mut vs = lens.map(|len| unsafe { uninit_vec(len) });
     fill(vs.each_mut().map(|v| &mut v[..]));
     vs
 }
 
 /// One vector of `len` elements, filled in place by `fill`: [`filled_vecs`] with `N = 1`.
-///
-/// # Safety
-///
-/// As [`filled_vecs`]: `fill` must write every element before it reads it.
 #[must_use]
-pub unsafe fn filled_vec<T: Plain>(len: usize, fill: impl FnOnce(&mut [T])) -> Vec<T> {
-    // SAFETY: forwarded to the caller's contract.
-    let [v] = unsafe { filled_vecs([len], |[s]| fill(s)) };
+pub fn filled_vec<T: Plain>(len: usize, fill: impl FnOnce(&mut [T])) -> Vec<T> {
+    let [v] = filled_vecs([len], |[s]| fill(s));
     v
+}
+
+/// One vector per length in `lens`, filled in place by `fill`: [`filled_vecs`] for a count known at run time.
+///
+/// `fill` receives one slice per vector and must write every element before it reads it.
+#[must_use]
+pub fn filled_cols<T: Plain>(lens: impl IntoIterator<Item = usize>, fill: impl FnOnce(&mut [&mut [T]])) -> Vec<Vec<T>> {
+    // SAFETY: `fill` writes each element before reading it, by its contract.
+    let mut vs: Vec<Vec<T>> = lens.into_iter().map(|len| unsafe { uninit_vec(len) }).collect();
+    let mut slices: Vec<&mut [T]> = vs.iter_mut().map(|v| &mut v[..]).collect();
+    fill(&mut slices);
+    vs
 }
 
 /// A vector of `len` uninitialized elements, for a fill that outlives one scope.
@@ -244,6 +251,18 @@ pub unsafe fn uninit_vec<T: Plain>(len: usize) -> Vec<T> {
 
     // SAFETY: the capacity holds `len` elements, and the caller writes each one before reading it.
     unsafe { v.set_len(len) };
+    v
+}
+
+/// Allocate `bytes` without touching them; the caller decides when to free the extent.
+///
+/// An allocator that keeps freed extents (jemalloc with `dirty_decay_ms:-1`) is left holding one
+/// extent of that size. Buffers carved from it coalesce back when freed. A later buffer of that
+/// size then reuses their pages instead of mapping fresh ones. An allocator that unmaps on free
+/// (glibc) just maps and unmaps. A failed allocation is ignored.
+pub fn reserve_extent(bytes: usize) -> Vec<u8> {
+    let mut v = Vec::<u8>::new();
+    let _ = v.try_reserve_exact(bytes);
     v
 }
 

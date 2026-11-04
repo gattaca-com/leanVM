@@ -484,11 +484,9 @@ fn fold_and_msg_lsb(f: &[F192], b: &[F192], r: F192) -> (Vec<F192>, Vec<F192>, S
     // One output per input pair, so the tasks write every slot of `nf` and `nb`.
     let mut msg = (Acc8::ZERO, Acc8::ZERO);
     // SAFETY: the fill writes every element before it reads any.
-    let [nf, nb] = unsafe {
-        primitives::filled_vecs([half; 2], |[nf, nb]| {
-            msg = accumulate_msg_chunks(nf, nb, ROUND_CHUNK, task)
-        })
-    };
+    let [nf, nb] = primitives::filled_vecs([half; 2], |[nf, nb]| {
+        msg = accumulate_msg_chunks(nf, nb, ROUND_CHUNK, task)
+    });
     let (u_0, u_2) = msg;
     (
         nf,
@@ -736,38 +734,36 @@ fn fold_all_lanes(
     let mut sums = (Acc8::ZERO, Acc8::ZERO);
     // Every task streams each of its output blocks below.
     // SAFETY: the fill writes every element before it reads any.
-    let [f, b] = unsafe {
-        primitives::filled_vecs([lane_block; 2], |[f, b]| {
-            sums = accumulate_msg_chunks(f, b, TASK * lift_len, |c, f_out, b_out| {
-                let out_blocks = f_out.len() / lift_len;
-                // The witness block and the weight block stay in L1 and L2; the outputs take only streaming stores,
-                // so they are never fetched.
-                let mut acc = vec![F192::ZERO; lift_len];
-                let mut weight = vec![F192::ZERO; lift_len];
-                let (mut u_0, mut u_2) = (Acc8::ZERO, Acc8::ZERO);
-                let stream = primitives::stream::Stream::new();
-                for i in 0..out_blocks {
-                    let h = c * TASK + i;
-                    let lanes = base.chunks_exact(lane_block).enumerate().map(|(l, lane)| {
-                        // The lane's next block, when this task reads it.
-                        let next = if i + 1 < out_blocks {
-                            &lane[(h + 1) * lift_len..(h + 2) * lift_len]
-                        } else {
-                            &[][..]
-                        };
-                        (weights[l], &lane[h * lift_len..(h + 1) * lift_len], next)
-                    });
-                    lane_sums(&mut acc, lanes);
-                    let (t_0, t_2) = lift(h, &acc, &mut weight);
-                    u_0 ^= t_0;
-                    u_2 ^= t_2;
-                    stream.copy(&mut f_out[i * lift_len..][..lift_len], &acc);
-                    stream.copy(&mut b_out[i * lift_len..][..lift_len], &weight);
-                }
-                (u_0, u_2)
-            });
-        })
-    };
+    let [f, b] = primitives::filled_vecs([lane_block; 2], |[f, b]| {
+        sums = accumulate_msg_chunks(f, b, TASK * lift_len, |c, f_out, b_out| {
+            let out_blocks = f_out.len() / lift_len;
+            // The witness block and the weight block stay in L1 and L2; the outputs take only streaming stores,
+            // so they are never fetched.
+            let mut acc = vec![F192::ZERO; lift_len];
+            let mut weight = vec![F192::ZERO; lift_len];
+            let (mut u_0, mut u_2) = (Acc8::ZERO, Acc8::ZERO);
+            let stream = primitives::stream::Stream::new();
+            for i in 0..out_blocks {
+                let h = c * TASK + i;
+                let lanes = base.chunks_exact(lane_block).enumerate().map(|(l, lane)| {
+                    // The lane's next block, when this task reads it.
+                    let next = if i + 1 < out_blocks {
+                        &lane[(h + 1) * lift_len..(h + 2) * lift_len]
+                    } else {
+                        &[][..]
+                    };
+                    (weights[l], &lane[h * lift_len..(h + 1) * lift_len], next)
+                });
+                lane_sums(&mut acc, lanes);
+                let (t_0, t_2) = lift(h, &acc, &mut weight);
+                u_0 ^= t_0;
+                u_2 ^= t_2;
+                stream.copy(&mut f_out[i * lift_len..][..lift_len], &acc);
+                stream.copy(&mut b_out[i * lift_len..][..lift_len], &weight);
+            }
+            (u_0, u_2)
+        });
+    });
     let (u_0, u_2) = sums;
     let msg = SumcheckMessage {
         u_0: u_0.reduce(),
@@ -1285,11 +1281,9 @@ mod tests {
             );
             let g = rng.ext();
             // SAFETY: the fill writes every element before it reads any.
-            let seeded = unsafe {
-                primitives::filled_vec(1 << n, |seeded| {
-                    primitives::multilinear::fill_eq_table(&point, g, seeded)
-                })
-            };
+            let seeded = primitives::filled_vec(1 << n, |seeded| {
+                primitives::multilinear::fill_eq_table(&point, g, seeded)
+            });
             let scaled: Vec<F192> = serial.iter().map(|&e| g * e).collect();
             assert_eq!(&*seeded, &scaled, "seeded mismatch at n={n}");
         }

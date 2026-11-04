@@ -11,16 +11,28 @@
 //! - Portable: a 256-entry subset-sum table per byte, one lookup per byte.
 //! - GFNI: an 8x8 bit matrix per (input byte, output byte), applied to 64 rows by one instruction.
 
-use crate::field::F192;
+use crate::field::{F192, F192x8};
+
+use crate::multilinear::eq_table as build_eq;
 
 /// Rows folded per call.
 pub const BLOCK: usize = 64;
+
+/// Whether the fold runs on GFNI rather than the byte tables.
+pub const GFNI: bool = cfg!(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+));
 
 /// The weights of every bit of a row, prepared for folding.
 #[derive(Clone, Debug)]
 pub struct BitFold {
     /// Bytes per row.
     n_chunks: usize,
+    /// The weight of every bit of a row.
+    weights: Vec<F192>,
     /// The target's fold kernel data.
     imp: Imp,
 }
@@ -39,11 +51,45 @@ impl BitFold {
         );
         Self {
             n_chunks,
+            weights: weights.to_vec(),
             imp: Imp::new(weights),
         }
     }
 
-    /// Fold up to 64 rows split in two runs of bytes: `self` weighs the `A` bytes of `head_rows`, `tail` the `B` of `tail_rows`.
+    /// The fold of a position at multilinear level `t`, once `rho_1..rho_t` are bound.
+    ///
+    /// Position `q` covers the `2^t` consecutive rows `q * 2^t + u`, so its weights are a tensor:
+    ///
+    /// ```text
+    ///     w[64 u + s] = eq(rho, u) * L_s(z)        u in 0..2^t, s in 0..64
+    /// ```
+    pub fn at_level(lagrange: &[F192], rho: &[F192]) -> Self {
+        let weights: Vec<F192> = build_eq(rho)
+            .iter()
+            .flat_map(|&e| lagrange.iter().map(move |&l| e * l))
+            .collect();
+        Self::new(&weights)
+    }
+
+    /// Bytes per row.
+    pub fn n_chunks(&self) -> usize {
+        self.n_chunks
+    }
+
+    /// The weight of every bit of a row.
+    pub fn weights(&self) -> &[F192] {
+        &self.weights
+    }
+
+    /// Fold up to 64 consecutive rows into `out[..rows.len()]`.
+    #[inline]
+    pub fn fold_block<const CHUNKS: usize>(&self, rows: &[[u8; CHUNKS]], out: &mut [F192; BLOCK]) {
+        debug_assert_eq!(CHUNKS, self.n_chunks);
+        assert!(rows.len() <= BLOCK);
+        self.imp.fold_block(rows, out);
+    }
+
+    /// Fold up to 64 rows split in two runs of bytes: `self` weighs the `A` bytes of `head`, `tail` the `B` of `tail_rows`.
     ///
     /// The sums are added before the output transpose, so a row of 24 bytes costs 24 input bytes, not 32.
     #[inline]
@@ -57,6 +103,24 @@ impl BitFold {
         debug_assert!(A == self.n_chunks && B == tail.n_chunks);
         assert!(head_rows.len() <= BLOCK && head_rows.len() == tail_rows.len());
         self.imp.fold_block_pair(&tail.imp, head_rows, tail_rows, out);
+    }
+
+    /// Fold up to 64 consecutive rows into eight vectors, eight values each, in the order `GROUP_LOG` picks.
+    ///
+    /// Value `p` is the fold of row `p`, and a short block is zero-padded. Lane `l` of vector `r` holds the value
+    ///
+    /// ```text
+    ///     p = (r mod G) + G * l + 8 G * (r div G)        G = 2^GROUP_LOG
+    /// ```
+    ///
+    /// So values group in runs of `G`, with run member `r mod G` in register `r mod G`, and eight consecutive runs
+    /// fill the lanes of one vector. The operands of a lane-wise product over such a group are then whole vectors.
+    #[inline]
+    pub fn fold_block_x8<const CHUNKS: usize, const GROUP_LOG: usize>(&self, rows: &[[u8; CHUNKS]]) -> [F192x8; 8] {
+        const { assert!(GROUP_LOG <= 2) };
+        debug_assert_eq!(CHUNKS, self.n_chunks);
+        assert!(rows.len() <= BLOCK);
+        self.imp.fold_block_x8::<CHUNKS, GROUP_LOG>(rows)
     }
 
     /// Fold 64 rows given as byte columns: `cols[j][p]` is byte `j` of row `p`.
@@ -115,6 +179,26 @@ fn fold_row_lookup<const CHUNKS: usize>(tables: &[[F192; 256]], row: &[u8; CHUNK
         .fold(F192::ZERO, |acc, (&v, sums)| acc + sums[usize::from(v)])
 }
 
+/// The value in lane `l` of vector `r` of [`BitFold::fold_block_x8`], for groups of `2^g`.
+const fn lane_value(g: usize, r: usize, l: usize) -> usize {
+    (r & ((1 << g) - 1)) | (l << g) | ((r >> g) << (g + 3))
+}
+
+#[cfg(any(
+    test,
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))
+))]
+/// The vectors of [`BitFold::fold_block_x8`], from the 64 values in natural order.
+fn x8_from_values<const G: usize>(values: &[F192; BLOCK]) -> [F192x8; 8] {
+    std::array::from_fn(|r| F192x8::from_array(&std::array::from_fn(|l| values[lane_value(G, r, l)])))
+}
+
 #[cfg(not(all(
     target_arch = "x86_64",
     target_feature = "gfni",
@@ -138,7 +222,7 @@ use gfni::Imp;
     target_feature = "avx512vbmi"
 )))]
 mod portable {
-    use super::{BLOCK, F192, fold_row_lookup, lookup_tables};
+    use super::{BLOCK, F192, F192x8, fold_row_lookup, lookup_tables, x8_from_values};
 
     /// The byte tables.
     #[derive(Clone, Debug)]
@@ -160,6 +244,13 @@ mod portable {
         }
 
         #[inline]
+        pub(super) fn fold_block<const CHUNKS: usize>(&self, rows: &[[u8; CHUNKS]], out: &mut [F192; BLOCK]) {
+            for (o, row) in out.iter_mut().zip(rows) {
+                *o = fold_row_lookup(&self.tables, row);
+            }
+        }
+
+        #[inline]
         pub(super) fn fold_block_pair<const A: usize, const B: usize>(
             &self,
             tail: &Self,
@@ -170,6 +261,13 @@ mod portable {
             for ((o, head), tail_row) in out.iter_mut().zip(head_rows).zip(tail_rows) {
                 *o = fold_row_lookup(&self.tables, head) + fold_row_lookup(&tail.tables, tail_row);
             }
+        }
+
+        #[inline]
+        pub(super) fn fold_block_x8<const CHUNKS: usize, const G: usize>(&self, rows: &[[u8; CHUNKS]]) -> [F192x8; 8] {
+            let mut values = [F192::ZERO; BLOCK];
+            self.fold_block(rows, &mut values);
+            x8_from_values::<G>(&values)
         }
 
         #[inline]
@@ -290,7 +388,7 @@ mod avx2 {
     target_feature = "avx512bw",
     target_feature = "avx512vbmi"
 ))]
-mod gfni {
+pub mod gfni {
     //! The GFNI fold of 64 rows at a time.
     //!
     //! ```text
@@ -307,7 +405,9 @@ mod gfni {
     use std::mem::MaybeUninit;
     use std::sync::LazyLock;
 
-    use super::{BLOCK, F192};
+    #[cfg(not(target_feature = "vpclmulqdq"))]
+    use super::x8_from_values;
+    use super::{BLOCK, F192, F192x8, lane_value};
     use crate::simd::{self, from_words, xor};
 
     /// Bytes of an F192.
@@ -350,39 +450,33 @@ mod gfni {
         }
     }
 
-    /// The input byte that register `r` holds after the input stages, for rows of `2^c` bytes: its bits are the
-    /// register's bits from `c - 6` on, then those below.
-    const fn byte_of_reg(c: usize, r: usize) -> usize {
-        let skew = c.saturating_sub(6);
-        (r >> skew) | ((r & ((1 << skew) - 1)) << (c - skew))
-    }
-
-    /// The value in qword `l` of output register `r`.
-    const fn lane_value(r: usize, l: usize) -> usize {
-        l | (r << 3)
-    }
-
     /// Stages taking eight registers of one output coefficient, register = byte `o` and offset = value `p`, to qwords.
     ///
     /// Stage `s` swaps register bit `s` with the value bit that [`lane_value`] gives register bit `s`.
     /// The last stage then orders each register's offsets as qword = lane, byte = `o`.
     ///
-    /// So register `r`, qword `l` is the coefficient of value `lane_value(r, l)`.
-    static OUTPUT_STAGES: LazyLock<[Stage; 3]> = LazyLock::new(|| {
-        [0, 1, 2].map(|s| {
-            Stage::swap(lane_value(1 << s, 0), |f| {
-                if s == 2 { lane_value(f & 7, f >> 3) } else { f }
+    /// So register `r`, qword `l` is the coefficient of value `lane_value(g, r, l)`.
+    static OUTPUT_STAGES: LazyLock<[[Stage; 3]; 3]> = LazyLock::new(|| {
+        [0, 1, 2].map(|g| {
+            [0, 1, 2].map(|s| {
+                Stage::swap(lane_value(g, 1 << s, 0), |f| {
+                    if s == 2 { lane_value(g, f & 7, f >> 3) } else { f }
+                })
             })
         })
     });
 
+    pub(crate) fn setup() {
+        LazyLock::force(&OUTPUT_STAGES);
+    }
+
     /// The coefficient registers of 24 registers of output bytes, register `o` holding byte `o` of 64 values.
     ///
-    /// Per coefficient, register `r` and qword `l` hold the coefficient of value `lane_value(r, l)`.
+    /// Per coefficient, register `r` and qword `l` hold the coefficient of value `lane_value(G, r, l)`.
     #[inline(always)]
-    fn coefficients(acc: &[__m512i; OUT_BYTES]) -> [[__m512i; 8]; 3] {
+    fn coefficients<const G: usize>(acc: &[__m512i; OUT_BYTES]) -> [[__m512i; 8]; 3] {
         let mut c: [[__m512i; 8]; 3] = std::array::from_fn(|i| std::array::from_fn(|o| acc[8 * i + o]));
-        for (s, stage) in OUTPUT_STAGES.iter().enumerate() {
+        for (s, stage) in OUTPUT_STAGES[G].iter().enumerate() {
             // SAFETY: the module is compiled only with these target features enabled.
             c.iter_mut().for_each(|c| unsafe { stage.apply(1 << s, c) });
         }
@@ -397,7 +491,7 @@ mod gfni {
     #[inline]
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
     pub fn store_f192(acc: &[__m512i; OUT_BYTES], out: &mut [F192; BLOCK]) {
-        let [c0, c1, c2] = coefficients(acc);
+        let [c0, c1, c2] = coefficients::<0>(acc);
 
         // Interleave the three coefficients of values 8k..8k+8 into 24 consecutive qwords.
         //
@@ -522,13 +616,7 @@ mod gfni {
         matrices: &[[u64; OUT_BYTES]; N],
         next: *const u8,
     ) {
-        for (i, (pair, m)) in regs
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(matrices.as_chunks::<2>().0)
-            .enumerate()
-        {
+        for (i, (pair, m)) in regs.as_chunks::<2>().0.iter().zip(matrices.as_chunks::<2>().0).enumerate() {
             if PREFETCH {
                 // A prefetch past the end of the data is harmless.
                 _mm_prefetch::<_MM_HINT_T0>(next.wrapping_add(128 * i).cast());
@@ -567,6 +655,166 @@ mod gfni {
             .collect()
     }
 
+    /// The eight vectors of 24 registers of output bytes, in the order of [`BitFold::fold_block_x8`] for group size `2^G`.
+    #[cfg(target_feature = "vpclmulqdq")]
+    #[inline(always)]
+    fn x8_from_acc<const G: usize>(acc: &[__m512i; OUT_BYTES]) -> [F192x8; 8] {
+        let [c0, c1, c2] = coefficients::<G>(acc);
+        std::array::from_fn(|r| F192x8::from_coeffs(c0[r], c1[r], c2[r]))
+    }
+
+    /// The matrices of every byte of a row's weights, as [`weight_matrices`] gives them.
+    pub fn byte_matrices(weights: &[F192]) -> Vec<[u64; OUT_BYTES]> {
+        // SAFETY: the module is compiled only with these target features enabled.
+        weights.as_chunks().0.iter().map(|w| unsafe { weight_matrices(w) }).collect()
+    }
+
+    /// 64 lines of 64 bytes, transposed: register `j` holds byte `j` of every line, one line per byte of the register.
+    ///
+    /// The lines of a block of instances sit one block apart, so folding with lines as lanes puts an instance in
+    /// each lane.
+    pub struct LineRegs([__m512i; 64]);
+
+    impl Default for LineRegs {
+        /// Registers to be [`load`](LineRegs::load)ed.
+        fn default() -> Self {
+            Self([from_words([0; 8]); 64])
+        }
+    }
+
+    impl LineRegs {
+        #[cfg(test)]
+        pub(super) fn registers(&self) -> &[__m512i; 64] {
+            &self.0
+        }
+
+        /// Replace the registers with the transpose of `lines`.
+        ///
+        /// Four stages of unpacks inside the 128-bit lanes, then two of lane shuffles. On a Zen 5 the unpacks issue
+        /// on more ports than a byte permute does. Both groups work in place: the first writes each register where
+        /// the second leaves it, so the transpose needs no scratch to stay in the L1.
+        #[inline(always)]
+        pub fn load(&mut self, lines: [&[u8; 64]; 64]) {
+            #[inline]
+            #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+            fn transpose(regs: &mut [__m512i; 64], lines: [&[u8; 64]; 64]) {
+                // Register bit `s` against the offset bits inside a 128-bit lane, 16 registers at a time.
+                for t in 0..4 {
+                    let mut x: [__m512i; 16] = std::array::from_fn(|k| simd::load(lines[16 * t + k], 0));
+                    unpack_stage::<1, 16>(&mut x, |u, w| (_mm512_unpacklo_epi8(u, w), _mm512_unpackhi_epi8(u, w)));
+                    unpack_stage::<2, 16>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi16(u, w), _mm512_unpackhi_epi16(u, w))
+                    });
+                    unpack_stage::<4, 16>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi32(u, w), _mm512_unpackhi_epi32(u, w))
+                    });
+                    unpack_stage::<8, 16>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi64(u, w), _mm512_unpackhi_epi64(u, w))
+                    });
+                    for (k, r) in x.into_iter().enumerate() {
+                        regs[BYTE_OF_REG[16 * t + k] as usize] = r;
+                    }
+                }
+                // Register bits 4 and 5 against the lane index, four registers at a time.
+                for k in 0..16 {
+                    let at = [0, 16, 32, 48].map(|o| BYTE_OF_REG[o + k] as usize);
+                    let [a, b, c, d] = at.map(|p| regs[p]);
+                    let (a, b) = (_mm512_shuffle_i64x2::<0x44>(a, b), _mm512_shuffle_i64x2::<0xEE>(a, b));
+                    let (c, d) = (_mm512_shuffle_i64x2::<0x44>(c, d), _mm512_shuffle_i64x2::<0xEE>(c, d));
+                    let (a, c) = (_mm512_shuffle_i64x2::<0x88>(a, c), _mm512_shuffle_i64x2::<0xDD>(a, c));
+                    let (b, d) = (_mm512_shuffle_i64x2::<0x88>(b, d), _mm512_shuffle_i64x2::<0xDD>(b, d));
+                    for (p, r) in at.into_iter().zip([a, b, c, d]) {
+                        regs[p] = r;
+                    }
+                }
+            }
+            // SAFETY: the module is compiled only with these target features enabled.
+            unsafe { transpose(&mut self.0, lines) }
+        }
+    }
+
+    /// The byte of the lines that register `z` holds when the stages are done: the four low bits of `z` reversed, and
+    /// the two high bits swapped.
+    const BYTE_OF_REG: [u8; 64] = {
+        let mut f = [0u8; 64];
+        let mut z = 0;
+        while z < 64 {
+            f[z] = ((z as u8 & 15).reverse_bits() >> 4) | (z as u8 >> 4 & 1) << 5 | (z as u8 >> 5) << 4;
+            z += 1;
+        }
+        f
+    };
+
+    /// One stage of the lane unpacks: registers `z` and `z | BIT` become the low and the high halves of their interleave.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+    fn unpack_stage<const BIT: usize, const N: usize>(
+        x: &mut [__m512i; N],
+        interleave: impl Fn(__m512i, __m512i) -> (__m512i, __m512i),
+    ) {
+        for i in 0..N / 2 {
+            let z = i / BIT * 2 * BIT + i % BIT;
+            (x[z], x[z | BIT]) = interleave(x[z], x[z | BIT]);
+        }
+    }
+
+    /// 24 registers of output bytes, register `o` holding byte `o` of 64 sums of weights, one per lane.
+    #[derive(Clone, Copy)]
+    pub struct ByteAcc([__m512i; OUT_BYTES]);
+
+    impl ByteAcc {
+        pub fn zero() -> Self {
+            Self([from_words([0; 8]); OUT_BYTES])
+        }
+
+        /// Add, per lane, the sum of the weights of the set bits of registers `first..first + N`.
+        ///
+        /// `matrices[j]` weighs the bits of register `first + j`, as [`byte_matrices`] builds them.
+        #[inline(always)]
+        pub fn add_fold<const N: usize>(&mut self, regs: &LineRegs, first: usize, matrices: &[[u64; OUT_BYTES]; N]) {
+            // SAFETY: the module is compiled only with these target features enabled.
+            unsafe {
+                accumulate_into::<N, false>(
+                    &mut self.0,
+                    regs.0[first..first + N].try_into().expect("N registers"),
+                    matrices,
+                    std::ptr::null(),
+                );
+            }
+        }
+
+        /// The 64 sums as eight vectors of eight, lane `l` of vector `v` being sum [`x8_lane`](Self::x8_lane)`(v, l)`.
+        #[cfg(target_feature = "vpclmulqdq")]
+        #[inline(always)]
+        pub fn to_x8(&self) -> [F192x8; 8] {
+            #[inline]
+            #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+            fn unpack(acc: &[__m512i; OUT_BYTES]) -> [[__m512i; 8]; 3] {
+                std::array::from_fn(|i| {
+                    let mut x: [__m512i; 8] = std::array::from_fn(|o| acc[8 * i + o]);
+                    unpack_stage::<1, 8>(&mut x, |u, w| (_mm512_unpacklo_epi8(u, w), _mm512_unpackhi_epi8(u, w)));
+                    unpack_stage::<2, 8>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi16(u, w), _mm512_unpackhi_epi16(u, w))
+                    });
+                    unpack_stage::<4, 8>(&mut x, |u, w| {
+                        (_mm512_unpacklo_epi32(u, w), _mm512_unpackhi_epi32(u, w))
+                    });
+                    x
+                })
+            }
+            // SAFETY: the module is compiled only with these target features enabled.
+            let c = unsafe { unpack(&self.0) };
+            std::array::from_fn(|r| F192x8::from_coeffs(c[0][r], c[1][r], c[2][r]))
+        }
+
+        /// The lane of the 64 sums that lane `l` of vector `v` of [`to_x8`](Self::to_x8) holds.
+        ///
+        /// The byte unpacks inside the 128-bit lanes leave the sums in this order, which costs no cross-lane shuffle.
+        pub const fn x8_lane(v: usize, l: usize) -> usize {
+            2 * ((v as u8).reverse_bits() >> 5) as usize + (l & 1) + 16 * (l >> 1)
+        }
+    }
+
     /// The GFNI matrices and the input transpose.
     #[derive(Clone, Debug)]
     pub(super) struct Imp {
@@ -581,15 +829,26 @@ mod gfni {
             let n_chunks = weights.len() / 8;
             let c = n_chunks.trailing_zeros() as usize;
 
+            let skew = c.saturating_sub(6);
+
+            // Register `r` then holds input byte `j(r)`: its bits are register bits skew.. then 0..skew.
+            let byte_of_reg = |r: usize| (r >> skew) | ((r & ((1 << skew) - 1)) << (c - skew));
             let bytes: &[[F192; 8]] = weights.as_chunks().0;
             // SAFETY: the module is compiled only with these target features enabled.
             let matrices = (0..n_chunks)
-                .flat_map(|r| unsafe { weight_matrices(&bytes[byte_of_reg(c, r)]) })
+                .flat_map(|r| unsafe { weight_matrices(&bytes[byte_of_reg(r)]) })
                 .collect();
             Self {
                 matrices,
                 input: input_stages(c),
             }
+        }
+
+        #[inline]
+        pub(super) fn fold_block<const CHUNKS: usize>(&self, rows: &[[u8; CHUNKS]], out: &mut [F192; BLOCK]) {
+            let acc = self.accumulate_rows(rows);
+            // SAFETY: the module is compiled only with these target features enabled.
+            unsafe { store_f192(&acc, out) };
         }
 
         #[inline]
@@ -604,6 +863,21 @@ mod gfni {
             acc.iter_mut().zip(&tail_acc).for_each(|(a, t)| *a = xor(*a, *t));
             // SAFETY: the module is compiled only with these target features enabled.
             unsafe { store_f192(&acc, out) };
+        }
+
+        /// The block as eight vectors, straight from the accumulators.
+        #[cfg(target_feature = "vpclmulqdq")]
+        #[inline]
+        pub(super) fn fold_block_x8<const CHUNKS: usize, const G: usize>(&self, rows: &[[u8; CHUNKS]]) -> [F192x8; 8] {
+            x8_from_acc::<G>(&self.accumulate_rows(rows))
+        }
+
+        #[cfg(not(target_feature = "vpclmulqdq"))]
+        #[inline]
+        pub(super) fn fold_block_x8<const CHUNKS: usize, const G: usize>(&self, rows: &[[u8; CHUNKS]]) -> [F192x8; 8] {
+            let mut values = [F192::ZERO; BLOCK];
+            self.fold_block(rows, &mut values);
+            x8_from_values::<G>(&values)
         }
 
         /// Phases 1 and 2 of up to 64 rows: 24 registers of output bytes.
@@ -626,8 +900,6 @@ mod gfni {
             rows: &[[u8; CHUNKS]; BLOCK],
             next: *const u8,
         ) -> [__m512i; OUT_BYTES] {
-            // Every register is written below only when at least one stage runs.
-            const { assert!(CHUNKS.is_power_of_two() && CHUNKS >= 8, "a row is 8 to 128 bytes") };
             // Phase 1: CHUNKS registers of 64 bytes, row-major, then one register per input byte.
             let mut regs = MaybeUninit::<[__m512i; CHUNKS]>::uninit();
             let dst = regs.as_mut_ptr().cast::<__m512i>();
@@ -658,8 +930,11 @@ mod gfni {
         #[inline]
         #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
         fn fold_columns_full<const CHUNKS: usize>(&self, cols: &[[u8; BLOCK]; CHUNKS]) -> [__m512i; OUT_BYTES] {
+            // The register order the input stages leave: register `r` holds input byte `j(r)`.
             let c = CHUNKS.trailing_zeros() as usize;
-            let regs: [__m512i; CHUNKS] = std::array::from_fn(|r| simd::load(&cols[byte_of_reg(c, r)], 0));
+            let skew = c.saturating_sub(6);
+            let byte_of_reg = |r: usize| (r >> skew) | ((r & ((1 << skew) - 1)) << (c - skew));
+            let regs: [__m512i; CHUNKS] = std::array::from_fn(|r| simd::load(&cols[byte_of_reg(r)], 0));
             self.accumulate::<CHUNKS, false>(&regs, std::ptr::null())
         }
 
@@ -676,12 +951,7 @@ mod gfni {
             let matrices = self.matrices.as_chunks::<OUT_BYTES>().0;
             // SAFETY: the module is compiled only with these target features enabled.
             unsafe {
-                accumulate_into::<CHUNKS, PREFETCH>(
-                    &mut acc,
-                    regs,
-                    matrices.try_into().expect("a matrix per register"),
-                    next,
-                );
+                accumulate_into::<CHUNKS, PREFETCH>(&mut acc, regs, matrices.try_into().expect("a matrix per register"), next);
             }
             acc
         }
@@ -693,20 +963,72 @@ mod tests {
     use super::*;
     use crate::test_rng::Rng;
 
-    /// Every row width against the byte-table fold, the rows given as byte columns.
+    /// Register `j` holds byte `j` of the 64 lines, line `p` in byte `p`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
     #[test]
-    fn fold_columns_matches_lookup() {
+    fn line_regs_transpose_the_lines() {
+        let mut rng = Rng::new(0x71_4E);
+        let lines: Vec<[u8; 64]> = (0..64).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
+        let mut regs = gfni::LineRegs::default();
+        regs.load(std::array::from_fn(|p| &lines[p]));
+        for j in 0..64 {
+            let mut got = [0u8; 64];
+            crate::simd::store(&mut got, 0, regs.registers()[j]);
+            assert_eq!(got, std::array::from_fn(|p| lines[p][j]), "register {j}");
+        }
+    }
+
+    /// Every row width, full and short blocks, against the byte-table fold.
+    #[test]
+    fn fold_block_matches_lookup() {
         fn check<const CHUNKS: usize>(rng: &mut Rng) {
+            // Random weights, one per bit of a CHUNKS-byte row.
             let weights: Vec<F192> = (0..8 * CHUNKS).map(|_| rng.ext()).collect();
-            let (fold, tables) = (BitFold::new(&weights), lookup_tables(&weights));
-            let rows: Vec<[u8; CHUNKS]> = (0..BLOCK)
-                .map(|_| std::array::from_fn(|_| rng.next_u64() as u8))
-                .collect();
-            let cols: [[u8; BLOCK]; CHUNKS] = std::array::from_fn(|j| std::array::from_fn(|p| rows[p][j]));
-            let mut out = [F192::ZERO; BLOCK];
-            fold.fold_columns(&cols, &mut out);
-            for (p, row) in rows.iter().enumerate() {
-                assert_eq!(out[p], fold_row_lookup(&tables, row), "CHUNKS={CHUNKS}, row {p}");
+            let fold = BitFold::new(&weights);
+            let tables = lookup_tables(&weights);
+
+            // Full blocks of random rows, then a short block that exercises the zero padding.
+            for len in [BLOCK, BLOCK, 5] {
+                let rows: Vec<[u8; CHUNKS]> = (0..len)
+                    .map(|_| std::array::from_fn(|_| rng.next_u64() as u8))
+                    .collect();
+                let mut out = [F192::ZERO; BLOCK];
+                fold.fold_block(&rows, &mut out);
+                for (p, row) in rows.iter().enumerate() {
+                    assert_eq!(
+                        out[p],
+                        fold_row_lookup(&tables, row),
+                        "CHUNKS={CHUNKS}, len={len}, row {p}"
+                    );
+                }
+                // The vector orders, against the same values in natural order.
+                let x8 = |vectors: [F192x8; 8]| vectors.map(F192x8::to_array);
+                assert_eq!(
+                    x8(fold.fold_block_x8::<CHUNKS, 0>(&rows)),
+                    x8(x8_from_values::<0>(&out)),
+                    "CHUNKS={CHUNKS}, len={len}, g=0"
+                );
+                assert_eq!(
+                    x8(fold.fold_block_x8::<CHUNKS, 1>(&rows)),
+                    x8(x8_from_values::<1>(&out)),
+                    "CHUNKS={CHUNKS}, len={len}, g=1"
+                );
+                assert_eq!(
+                    x8(fold.fold_block_x8::<CHUNKS, 2>(&rows)),
+                    x8(x8_from_values::<2>(&out)),
+                    "CHUNKS={CHUNKS}, len={len}, g=2"
+                );
+                if len == BLOCK {
+                    let cols: [[u8; BLOCK]; CHUNKS] = std::array::from_fn(|j| std::array::from_fn(|p| rows[p][j]));
+                    let mut by_columns = [F192::ZERO; BLOCK];
+                    fold.fold_columns(&cols, &mut by_columns);
+                    assert_eq!(by_columns, out, "CHUNKS={CHUNKS}, columns");
+                }
             }
         }
         let mut rng = Rng::new(0xB17_F01D);
@@ -717,25 +1039,22 @@ mod tests {
         check::<128>(&mut rng);
     }
 
-    /// Two runs of bytes against the byte-table folds of each, full and short blocks.
+    /// Two runs of bytes against the sum of their folds, full and short blocks.
     #[test]
-    fn fold_block_pair_matches_lookup() {
+    fn fold_block_pair_adds_both_runs() {
         let mut rng = Rng::new(0x0009_A12B);
         let weights: Vec<F192> = (0..192).map(|_| rng.ext()).collect();
         let (head, tail) = (BitFold::new(&weights[..128]), BitFold::new(&weights[128..]));
-        let (head_tables, tail_tables) = (lookup_tables(&weights[..128]), lookup_tables(&weights[128..]));
         for len in [BLOCK, 5] {
-            let head_rows: Vec<[u8; 16]> = (0..len)
-                .map(|_| std::array::from_fn(|_| rng.next_u64() as u8))
-                .collect();
-            let tail_rows: Vec<[u8; 8]> = (0..len)
-                .map(|_| std::array::from_fn(|_| rng.next_u64() as u8))
-                .collect();
+            let head_rows: Vec<[u8; 16]> = (0..len).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
+            let tail_rows: Vec<[u8; 8]> = (0..len).map(|_| std::array::from_fn(|_| rng.next_u64() as u8)).collect();
             let mut out = [F192::ZERO; BLOCK];
             head.fold_block_pair(&tail, &head_rows, &tail_rows, &mut out);
+            let (mut by_head, mut by_tail) = ([F192::ZERO; BLOCK], [F192::ZERO; BLOCK]);
+            head.fold_block(&head_rows, &mut by_head);
+            tail.fold_block(&tail_rows, &mut by_tail);
             for p in 0..len {
-                let want = fold_row_lookup(&head_tables, &head_rows[p]) + fold_row_lookup(&tail_tables, &tail_rows[p]);
-                assert_eq!(out[p], want, "len={len}, row {p}");
+                assert_eq!(out[p], by_head[p] + by_tail[p], "len={len}, row {p}");
             }
         }
     }

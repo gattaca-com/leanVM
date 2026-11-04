@@ -6,7 +6,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::Plain;
+pub use crate::Plain;
 
 /// The vector of eight words, the first in the low qword.
 pub const fn from_words(w: [u64; 8]) -> __m512i {
@@ -14,10 +14,17 @@ pub const fn from_words(w: [u64; 8]) -> __m512i {
     unsafe { core::mem::transmute::<[u64; 8], __m512i>(w) }
 }
 
+/// The eight words of a vector, the low qword first.
+#[inline(always)]
+pub fn to_words(v: __m512i) -> [u64; 8] {
+    // SAFETY: both types are 64 bytes and every bit pattern is a valid array.
+    unsafe { core::mem::transmute::<__m512i, [u64; 8]>(v) }
+}
+
 /// Register `i` of `src`: bytes `64 * i..64 * i + 64`, read unaligned.
 #[inline(always)]
 pub fn load<T: Plain>(src: &[T], i: usize) -> __m512i {
-    assert!(i < size_of_val(src) / 64);
+    assert!(64 * (i + 1) <= size_of_val(src));
     // SAFETY: the assert keeps the 64 bytes inside `src`, and any bytes of a `Plain` type are readable.
     unsafe { _mm512_loadu_si512(src.as_ptr().cast::<u8>().wrapping_add(64 * i).cast()) }
 }
@@ -25,7 +32,7 @@ pub fn load<T: Plain>(src: &[T], i: usize) -> __m512i {
 /// Write `v` over register `i` of `dst`: bytes `64 * i..64 * i + 64`, unaligned.
 #[inline(always)]
 pub fn store<T: Plain>(dst: &mut [T], i: usize, v: __m512i) {
-    assert!(i < size_of_val(dst) / 64);
+    assert!(64 * (i + 1) <= size_of_val(dst));
     // SAFETY: the assert keeps the 64 bytes inside `dst`, and any bytes are a valid `Plain` value.
     unsafe { _mm512_storeu_si512(dst.as_mut_ptr().cast::<u8>().add(64 * i).cast(), v) }
 }
@@ -73,16 +80,10 @@ pub fn xor(a: __m512i, b: __m512i) -> __m512i {
 /// Only those words must lie inside `src`: a register may hang over its end, or start past it with `n == 0`.
 #[inline(always)]
 pub fn load_prefix<T: Plain>(src: &[T], i: usize, n: usize) -> __m512i {
-    let words = size_of_val(src) / 8;
-    assert!(n <= 8 && (n == 0 || (n <= words && i <= (words - n) / 8)));
+    assert!(n <= 8 && (n == 0 || 8 * i + n <= size_of_val(src) / 8));
     // SAFETY: the assert keeps the first `n` words inside `src`, which is readable for any `Plain` bytes.
     // The masked-out words are not accessed.
-    unsafe {
-        _mm512_maskz_loadu_epi64(
-            ((1u16 << n) - 1) as u8,
-            src.as_ptr().cast::<u8>().wrapping_add(64 * i).cast(),
-        )
-    }
+    unsafe { _mm512_maskz_loadu_epi64(((1u16 << n) - 1) as u8, src.as_ptr().cast::<u8>().wrapping_add(64 * i).cast()) }
 }
 
 /// Write the first `n <= 8` words of `v` over register `i` of `dst`, and leave the others as they are.
@@ -90,14 +91,7 @@ pub fn load_prefix<T: Plain>(src: &[T], i: usize, n: usize) -> __m512i {
 /// Only those words must lie inside `dst`.
 #[inline(always)]
 pub fn store_prefix<T: Plain>(dst: &mut [T], i: usize, n: usize, v: __m512i) {
-    let words = size_of_val(dst) / 8;
-    assert!(n <= 8 && (n == 0 || (n <= words && i <= (words - n) / 8)));
+    assert!(n <= 8 && (n == 0 || 8 * i + n <= size_of_val(dst) / 8));
     // SAFETY: the assert keeps the first `n` words inside `dst`, and any bytes are a valid `Plain` value.
-    unsafe {
-        _mm512_mask_storeu_epi64(
-            dst.as_mut_ptr().cast::<u8>().wrapping_add(64 * i).cast(),
-            ((1u16 << n) - 1) as u8,
-            v,
-        )
-    }
+    unsafe { _mm512_mask_storeu_epi64(dst.as_mut_ptr().cast::<u8>().wrapping_add(64 * i).cast(), ((1u16 << n) - 1) as u8, v) }
 }

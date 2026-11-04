@@ -320,30 +320,28 @@ fn join(form: &Form, cols: &[&[F64]], r: F192, half: usize) -> State {
     let rights: Vec<_> = form.groups.iter().map(|(_, right)| pair(right)).collect();
     let r8 = F192x8::splat(r);
     // SAFETY: every task writes all `width` entries of each of its blocks.
-    unsafe {
-        primitives::filled_vec(blocks * width, |state| {
-            parallel::chunks_mut(state, TASK_BLOCKS * width, |t, out| {
-                let mut rows = rows_scratch(cols.len());
-                for (b, out) in task_blocks(t, blocks).zip(out.chunks_exact_mut(width)) {
-                    load_rows(cols, &form.used, 8 * b, half, false, &mut rows);
-                    let (lo, sum) = &rows;
-                    let dot = |terms: &[(usize, F192x8, F192x8)]| {
-                        terms
-                            .iter()
-                            .fold(Prod8::ZERO, |acc, &(c, w, wr)| {
-                                acc ^ w.mul_base_unreduced(lo[c]) ^ wr.mul_base_unreduced(sum[c])
-                            })
-                            .reduce_lanes()
-                    };
-                    out[0] = dot(&lin);
-                    for (g, ((left, _), right)) in form.groups.iter().zip(&rights).enumerate() {
-                        out[1 + 2 * g] = F192x8::from(lo[*left]) + r8.mul_base_unreduced(sum[*left]).reduce_lanes();
-                        out[2 + 2 * g] = dot(right);
-                    }
+    primitives::filled_vec(blocks * width, |state| {
+        parallel::chunks_mut(state, TASK_BLOCKS * width, |t, out| {
+            let mut rows = rows_scratch(cols.len());
+            for (b, out) in task_blocks(t, blocks).zip(out.chunks_exact_mut(width)) {
+                load_rows(cols, &form.used, 8 * b, half, false, &mut rows);
+                let (lo, sum) = &rows;
+                let dot = |terms: &[(usize, F192x8, F192x8)]| {
+                    terms
+                        .iter()
+                        .fold(Prod8::ZERO, |acc, &(c, w, wr)| {
+                            acc ^ w.mul_base_unreduced(lo[c]) ^ wr.mul_base_unreduced(sum[c])
+                        })
+                        .reduce_lanes()
+                };
+                out[0] = dot(&lin);
+                for (g, ((left, _), right)) in form.groups.iter().zip(&rights).enumerate() {
+                    out[1 + 2 * g] = F192x8::from(lo[*left]) + r8.mul_base_unreduced(sum[*left]).reduce_lanes();
+                    out[2 + 2 * g] = dot(right);
                 }
-            });
-        })
-    }
+            }
+        });
+    })
 }
 
 /// The state folded by `r`, `v[i] = v[i] + r·(v[i] + v[i + half])` in every column, the upper half dropped.

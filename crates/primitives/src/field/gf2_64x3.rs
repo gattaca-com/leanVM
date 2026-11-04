@@ -265,6 +265,26 @@ pub fn mul_unreduced4(a: [F192; 4], b: [F192; 4]) -> [F192Unreduced; 4] {
     std::array::from_fn(|i| a[i].mul_unreduced(b[i]))
 }
 
+/// Eight mixed products `t * k[i]` by one shared `E` scalar.
+///
+/// On AVX-512 this is six CLMULs for all eight, against twenty-four one at a time.
+#[inline(always)]
+pub fn mul_base8(t: F192, k: [F64; 8]) -> [F192; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    // SAFETY: both features are enabled at compile time, and `f192x8` fails the build without avx512bw.
+    return unsafe { x86_64::mul_base8(t, k) };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    ))]
+    // SAFETY: both features are enabled at compile time.
+    return unsafe { x86_64::mul_base8_ymm(t, k) };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2")))]
+    k.map(|k| t.mul_base(k))
+}
+
 /// Eight `E` weights, laid out once for [`dot_base`].
 ///
 /// Pairs share a 128-bit lane, so the kernel loads them with no shuffle:
@@ -350,14 +370,12 @@ impl F192Unreduced {
     pub const ZERO: Self = Self { coeffs: [[0; 2]; 3] };
 
     /// The three 128-bit coefficients as `[low, high]` words.
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2"))]
     #[inline]
     pub(crate) const fn coeffs(self) -> [[u64; 2]; 3] {
         self.coeffs
     }
 
     /// Build from three 128-bit coefficients given as `[low, high]` words.
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2"))]
     #[inline]
     pub(crate) const fn from_coeffs(coeffs: [[u64; 2]; 3]) -> Self {
         Self { coeffs }
@@ -730,13 +748,13 @@ pub mod x86_64 {
             _mm256_xor_si256(_mm256_srli_epi64::<63>(hi), _mm256_srli_epi64::<61>(hi)),
             _mm256_srli_epi64::<60>(hi),
         );
-        // lo ^ g(hi ^ spill), with g(v) = v ^ v<<1 ^ v<<3 ^ v<<4.
+        // lo ^ f(hi ^ spill), with f(v) = v ^ v<<1 ^ v<<3 ^ v<<4.
         let v = _mm256_xor_si256(hi, spill);
-        let g = _mm256_xor_si256(
+        let f = _mm256_xor_si256(
             _mm256_xor_si256(v, _mm256_slli_epi64::<1>(v)),
             _mm256_xor_si256(_mm256_slli_epi64::<3>(v), _mm256_slli_epi64::<4>(v)),
         );
-        _mm256_xor_si256(lo, g)
+        _mm256_xor_si256(lo, f)
     }
 
     /// Qword `i` is the reduction of lane `i`'s 128-bit product, `even` holding those of the even
@@ -756,25 +774,40 @@ pub mod x86_64 {
     /// `g(hi) = hi * (x^4 + x^3 + x + 1)` pushes past x^63, and `g(spill)` fits a byte.
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     const G_SPILL: __m512i = {
-        let mut words = [0u64; 8];
+        let mut table = [0u8; 64];
         let mut n = 0;
         while n < 16 {
             let spill = n ^ (n >> 1) ^ (n >> 3);
-            let g = (spill ^ (spill << 1) ^ (spill << 3) ^ (spill << 4)) as u8 as u64;
             // The table fills each 128-bit lane, as the in-lane byte shuffle reads it.
-            let mut lane = 0;
-            while lane < 4 {
-                words[2 * lane + n / 8] |= g << (8 * (n % 8));
-                lane += 1;
-            }
+            table[n] = (spill ^ (spill << 1) ^ (spill << 3) ^ (spill << 4)) as u8;
+            table[16 + n] = table[n];
+            table[32 + n] = table[n];
+            table[48 + n] = table[n];
             n += 1;
+        }
+        let mut words = [0u64; 8];
+        let mut w = 0;
+        while w < 8 {
+            words[w] = u64::from_le_bytes([
+                table[8 * w],
+                table[8 * w + 1],
+                table[8 * w + 2],
+                table[8 * w + 3],
+                table[8 * w + 4],
+                table[8 * w + 5],
+                table[8 * w + 6],
+                table[8 * w + 7],
+            ]);
+            w += 1;
         }
         crate::simd::from_words(words)
     };
 
-    /// Lane-wise base reduction on eight qwords:
+    /// Lane-wise base reduction on eight qwords; see the four-qword version.
+    ///
     /// `lo ^ g(hi) ^ g(spill)`, with `g(y) = y ^ y<<1 ^ y<<3 ^ y<<4 = z ^ z<<3` for `z = y ^ y<<1`, and
     /// `g(spill)` one in-lane byte lookup on the top nibble of `hi`.
+    ///
     #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
     #[inline]
     #[target_feature(enable = "avx512f", enable = "avx512bw")]
@@ -931,6 +964,30 @@ pub mod x86_64 {
         ]
     }
 
+    /// Eight mixed products by one scalar.
+    ///
+    /// # Safety
+    ///
+    /// Callable only where vpclmulqdq, avx512f and avx512bw are enabled.
+    #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[inline]
+    #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
+    pub fn mul_base8(t: F192, k: [F64; 8]) -> [F192; 8] {
+        // `t` in every lane: [c0, c1] for both pair registers, [c2, c2] for the last.
+        let t01 = _mm512_broadcast_i32x4(pair(t.c0, t.c1));
+        let t2 = _mm512_set1_epi64(t.c2 as i64);
+        let kv = crate::simd::load(&k, 0);
+        let [e0, e1, o0, o1, e2, o2] = mul_by_pairs(t01, t01, t2, kv);
+        // Gather each product's low and high halves into qword-wise vectors, then reduce.
+        let even = bits::<__m512i, [u64; 8]>(reduce_halves512(e0, e1));
+        let odd = bits::<__m512i, [u64; 8]>(reduce_halves512(o0, o1));
+        let c2 = bits::<__m512i, [u64; 8]>(reduce_halves512(e2, o2));
+        std::array::from_fn(|i| {
+            let (j, w) = (i / 2, if i % 2 == 0 { &even } else { &odd });
+            F192::new(w[2 * j], w[2 * j + 1], c2[i])
+        })
+    }
+
     /// The mixed inner product over packed weights.
     ///
     /// # Safety
@@ -984,11 +1041,41 @@ pub mod x86_64 {
         ]
     }
 
-    /// [`super::dot_base`] in two YMM halves.
+    /// [`super::mul_base8`] in two YMM halves.
     ///
     /// # Safety
     ///
     /// Callable only where vpclmulqdq and avx2 are enabled.
+    #[cfg(all(
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    ))]
+    #[inline]
+    #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
+    pub fn mul_base8_ymm(t: F192, k: [F64; 8]) -> [F192; 8] {
+        let t01 = _mm256_broadcastsi128_si256(pair(t.c0, t.c1));
+        let t2 = _mm256_set1_epi64x(t.c2 as i64);
+        let mut out = [F192::ZERO; 8];
+        for (out, k) in out.as_chunks_mut::<4>().0.iter_mut().zip(k.as_chunks::<4>().0) {
+            let kv = bits::<[F64; 4], __m256i>(*k);
+            let [e0, e1, o0, o1, e2, o2] = mul_by_pairs_ymm(t01, t01, t2, kv);
+            let even = bits::<__m256i, [u64; 4]>(reduce_halves256(e0, e1));
+            let odd = bits::<__m256i, [u64; 4]>(reduce_halves256(o0, o1));
+            let c2 = bits::<__m256i, [u64; 4]>(reduce_halves256(e2, o2));
+            for (i, slot) in out.iter_mut().enumerate() {
+                let (j, w) = (i / 2, if i % 2 == 0 { &even } else { &odd });
+                *slot = F192::new(w[2 * j], w[2 * j + 1], c2[i]);
+            }
+        }
+        out
+    }
+
+    /// [`super::dot_base`] in two YMM halves.
+    ///
+    /// # Safety
+    ///
+    /// Callable only where vpclmulqdq and avx2 are enabled; `k.len()` must be `8 * w.len()`.
     #[cfg(all(
         target_feature = "vpclmulqdq",
         target_feature = "avx2",
@@ -1166,6 +1253,13 @@ mod tests {
     fn batched_mixed_products_match_scalar() {
         let mut rng = Rng::new(9);
         for _ in 0..200 {
+            let t = rng.ext();
+            // Edge scalars sit next to random ones, so every lane sees a zero and an all-ones word.
+            let mut k: [F64; 8] = std::array::from_fn(|_| F64(rng.ext().c0));
+            k[1] = F64(0);
+            k[6] = F64(u64::MAX);
+            assert_eq!(mul_base8(t, k), k.map(|k| t.mul_base(k)));
+
             let w: [F192; 16] = std::array::from_fn(|_| rng.ext());
             let packed = [
                 Weights8::new(w[..8].try_into().unwrap()),
