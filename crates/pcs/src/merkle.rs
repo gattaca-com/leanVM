@@ -19,6 +19,8 @@
 //! The encoder hands blocks over as it finishes them, so leaves are hashed while the rows are in L2.
 //!
 //! Above the blocks, the last block to finish a unit of nodes climbs it, so no pass waits on a barrier.
+
+use flux_profiler::timed;
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -85,6 +87,7 @@ impl MerkleBuilder {
     /// # Panics
     ///
     /// Panics unless the block is aligned, sized like every other, and new.
+    #[timed]
     pub fn absorb(&self, first_leaf: usize, rows: &[F64]) {
         self.absorb_bytes(first_leaf, cast_slice(rows));
     }
@@ -169,6 +172,7 @@ impl MerkleBuilder {
     /// # Panics
     ///
     /// Panics unless every leaf was absorbed.
+    #[timed]
     pub fn finish(self) -> CutTree {
         assert!(self.progress.all_claimed(), "every leaf absorbed");
         let (cut, num_leaves) = (self.cut, self.nodes.num_leaves);

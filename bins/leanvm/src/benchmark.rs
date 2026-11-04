@@ -1,6 +1,8 @@
 //! The two benchmarks: one leaf of the aggregation tree (`aggregate`), and an
 //! n→1 recursion step over leaves of that size (`recursion`). Aggregation accepts
 //! signature counts and a blob count; recursion accepts these counts per leaf.
+
+use flux_profiler::timed;
 use bench::{Plan, Timing};
 use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -9,6 +11,7 @@ use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use signatures::{lean_sphincs, lean_xmss};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+#[timed]
 fn blobs(n: usize, seed: u64) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(seed);
     (0..n * lean_da::BLOB_SYMBOLS).map(|_| rng.random()).collect()
@@ -16,6 +19,7 @@ fn blobs(n: usize, seed: u64) -> Vec<u64> {
 
 /// Cached signers `[from, to)`, as the aggregation API takes them: one message for
 /// all, each signature at its own signer's leaf index.
+#[timed]
 fn signers(from: usize, to: usize) -> Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)> {
     if to == 0 {
         return Vec::new();
@@ -27,6 +31,7 @@ fn signers(from: usize, to: usize) -> Vec<(LeanXmssPublicKey, lean_xmss::Message
 }
 
 /// Each leanSPHINCS signer comes with the message it signed, as the leanXMSS ones do.
+#[timed]
 fn lean_sphincs_signers(
     from: usize,
     to: usize,
@@ -159,6 +164,7 @@ pub fn run_aggregation(
 /// so re-proving the children (minutes on one core) is not worth repeating. The name
 /// binds the parameters and the guest's transcript seed (protocol and bytecode); a
 /// file that does not parse, or has a child that fails `verify`, is regenerated.
+#[timed]
 fn cached_children(
     n: usize,
     per_leaf: usize,
@@ -201,6 +207,7 @@ fn cached_children(
 /// Prove `n` leaves with signatures and distinct blob payloads at `leaf_log_inv_rate`, then
 /// aggregate them in one recursion step at `log_inv_rate` and verify the result. The leaves are
 /// built once, in a process of their own; only the recursion step is measured.
+#[timed]
 pub fn run_recursion(
     n: usize,
     per_leaf: usize,

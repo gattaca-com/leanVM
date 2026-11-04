@@ -7,6 +7,8 @@
 //! memory/state/bytecode plumbing for one Keccak-f sponge step whose relation
 //! is discharged by the Keccak reduction (see [`crate::keccak`]). All
 //! challenges and transcript scalars live in the same tower E.
+
+use flux_profiler::timed;
 use std::collections::HashMap;
 
 use crate::constraints;
@@ -540,6 +542,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
 /// the same table back and skips growing it. On an error `gpow` is left as a fresh table.
 /// [`GPow::setup`] prepares the tables and VM memory before the first proof.
 #[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
+#[timed]
 pub fn prove_with(
     program: &Program,
     witness: &Witness,
@@ -718,6 +721,7 @@ pub fn prove_with(
 /// `KECCAK` output lanes', which go to the reduction), then the three public-input limb
 /// claims, each located in its committed slot. Every verifier assembles the same list in
 /// the same order.
+#[timed]
 fn finish_claims(
     l: &Layout,
     bus_claims: Vec<ColumnClaim>,

@@ -1,4 +1,6 @@
 //! The points of the domain: the table of normalized subspace polynomials and its twiddles.
+
+use flux_profiler::timed;
 use primitives::field::F64;
 use primitives::log2_strict_usize;
 
@@ -129,6 +131,7 @@ impl Twiddles {
     }
 
     /// Recover novel-basis coefficients from evaluations with a scalar inverse NTT.
+    #[timed]
     pub(super) fn inverse_transform(&self, data: &mut [F64]) {
         let log_d = log2_strict_usize(data.len());
         assert!(log_d <= self.log_domain_size());

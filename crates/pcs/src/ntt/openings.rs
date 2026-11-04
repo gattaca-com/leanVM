@@ -1,4 +1,6 @@
 //! Codeword rows read back from an encode that did not write its whole codeword.
+
+use flux_profiler::timed;
 use primitives::field::F64;
 
 use super::cosets::CosetEncoder;
@@ -164,6 +166,7 @@ impl<'a> Rebuild<'a> {
     }
 
     /// The sub-blocks back to back, before their deep layers.
+    #[timed]
     fn run(&self, layers: Layers) -> Vec<F64> {
         let Plan { log_d, num_ntts, start, deep_start, .. } = self.plan;
         let (rows, log_step) = (1usize << (deep_start - start), log_d - deep_start);

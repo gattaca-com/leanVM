@@ -26,6 +26,7 @@ use crate::ntt::{AdditiveNttF64, Encoded, Keep, Kept, Plan, gather_rows};
 use crate::stack_open::EQUAL_BLOCK_LOG;
 use fiat_shamir::merkle::PrunedMerklePaths;
 use fiat_shamir::transcript::ProverState;
+use flux_profiler::timed;
 use primitives::field::{
     Acc8, F64, F192, F192Unreduced, F192x8, fold_lones8_ext, fold_pairs8_ext, msg_lone8_ext, msg_terms8_ext, powers,
 };
@@ -46,6 +47,7 @@ use crate::whir_ntt_ext::*;
 // ===================================================================
 
 /// Build the eq-MLE table at `point`, LSB-first, without dispatching to the worker pool.
+#[timed]
 pub fn build_eq_table_ext(point: &[F192]) -> Vec<F192> {
     let d = point.len();
     let mut out: Vec<F192> = Vec::with_capacity(1usize << d);
@@ -223,6 +225,7 @@ const KEEP_CODEWORD_MAX_BYTES: usize = 1 << 30;
 /// `repeats` tags the message's blocks of `2^EQUAL_BLOCK_LOG` words that equal their predecessor, or is empty.
 /// A lane block that is all zero inside the message is left out of the encode too, see [`data_blocks`].
 /// Its codeword lane is zero, so the leaf images, the root and the opened rows are the same.
+#[timed]
 pub fn commit(
     message: &[F64],
     repeats: &[bool],
@@ -380,6 +383,7 @@ pub fn level1_bytes(config: &ProverConfig, log_n: usize) -> usize {
 ///
 /// - Each lane of the row-major message is RS-encoded with base-field twiddles.
 /// - The codeword is then Merkle-committed, one leaf per row.
+#[timed]
 pub(crate) fn ligero_commit_ext(
     poly: &[F192],
     log_msg_cols: usize,
@@ -651,6 +655,7 @@ const STREAM_FOLD_MIN: usize = 1 << 19;
 ///
 /// The basis folded is `b + sum s * v` over `glued`, summed per stage in L1: the glued sum is never stored.
 /// A window is at most `EQ_LOW_LEN` long and starts at a multiple of it, as a split `eq` basis needs.
+#[timed]
 fn fold_and_msg_lsb(
     f: &[F192],
     b: &[F192],
@@ -835,6 +840,7 @@ fn msg_terms_lone(f0: &[F192], b0: &[F192]) -> (Acc8, Acc8) {
 }
 
 /// Round message for a lane round, over `f.len() / block` blocks.
+#[timed]
 fn round_msg_blocks(f: &[F192], b: &[F192], block: usize) -> SumcheckMessage {
     // Real asserts, not debug ones: the crate is only ever built in release, and a
     // block count that truncates drops the trailing block from BOTH u_0 and u_2,
@@ -1067,6 +1073,7 @@ fn add_lane_deltas<'a>(out: &mut [F192], deltas: impl Iterator<Item = (F192, &'a
 ///
 /// `lift` turns each witness block into its weight block while the witness block is still in cache, and both
 /// stream out.
+#[timed]
 fn fold_all_lanes(
     base: &[F64],
     block: usize,
@@ -1211,6 +1218,7 @@ impl SumcheckProver {
     ///
     /// The last one lifts the tables to the witness and the weight over one lane block, and the
     /// message is the adjacent-pair one over them.
+    #[timed]
     pub(crate) fn fold_lane(&mut self, r: F192, last: bool) -> SumcheckMessage {
         self.t_r = self.quad.eval(r);
         self.round += 1;
@@ -1255,6 +1263,7 @@ impl SumcheckProver {
         }
     }
 
+    #[timed]
     fn fold(&mut self, r: F192) -> SumcheckMessage {
         self.t_r = self.quad.eval(r);
         self.round += 1;
@@ -1273,6 +1282,7 @@ impl SumcheckProver {
 
     /// Introduce a fresh basis poly with claimed sum `h_new`; sends the
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
+    #[timed]
     fn introduce_new(&mut self, b_new: Vec<F192>, h_new: F192) -> SumcheckMessage {
         assert_eq!(b_new.len(), self.f.len());
         let msg = round_msg_lsb(&self.f, &b_new);
@@ -1282,6 +1292,7 @@ impl SumcheckProver {
 
     /// Introduce the OOD basis `eq(z, ·)` and compute its claimed inner product in the same
     /// pass as the round message. The basis stays split in two small tables.
+    #[timed]
     fn introduce_ood(&mut self, z: &[F192]) -> (SumcheckMessage, F192) {
         assert_eq!(1 << z.len(), self.f.len());
         let b_new = Basis::eq(z);
@@ -1297,6 +1308,7 @@ impl SumcheckProver {
     /// h_new`. The running claim keeps `lambda^0 = 1`.
     ///
     /// Only the scalars move here. The vectors wait in `glued` for the next `fold`.
+    #[timed]
     fn glue_pending(&mut self, lambda: F192) {
         let pending = std::mem::take(&mut self.pending);
         assert!(!pending.is_empty(), "glue without introduce_new");
@@ -1361,6 +1373,7 @@ fn sample_queries_ordered(ch: &mut ProverState, block_len: usize, count: usize) 
 /// challenge is drawn only once its query positions are fixed too, and
 /// `glue_pending` then folds every claim of the level in with its own power.
 /// A verifier replays it operation for operation.
+#[timed]
 fn send_ood(sc: &mut SumcheckProver, ps: &mut ProverState, n_vars: usize, count: usize) {
     for _ in 0..count {
         let z = ps.sample_vec(n_vars);
@@ -1394,6 +1407,7 @@ fn fetched_row<'a>(group: &[usize], rows: &'a [F64], row_words: usize, q: usize)
 /// out of these rounds.
 ///
 /// Scalars enter the shared transcript as they are transmitted, and authenticated Merkle openings travel as one phase per level. The caller has already bound the initial commitment and target.
+#[timed]
 pub(crate) fn recursive_prover_with_prepared_basis(
     config: &ProverConfig,
     log_n: usize,

@@ -34,6 +34,7 @@
 
 use crate::gkr::prefetch_lines;
 use crate::transcript::ProverState;
+use flux_profiler::timed;
 use primitives::field::{F64, F64x8, F192, F192Unreduced, F192x8, Prod8, Weights8, dot_base, powers};
 use primitives::multilinear::{eq_table, interp, poly_eval, shrink_eq_high};
 
@@ -889,6 +890,7 @@ fn round_polynomial([endpoint, quadratic]: [F192; 2], zeta: F192, claim: F192, w
 /// over rows while it is taller than a block: its endpoint sums come from the dots. Once the challenges
 /// above a block are drawn, one pass leaves every column as `BLOCK` values, from which the linear part
 /// of the rest and the final claims follow.
+#[timed]
 pub fn prove(
     airs: &[Air<'_>],
     cols: &[&[F64]],

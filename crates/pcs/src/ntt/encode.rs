@@ -1,4 +1,6 @@
 //! The encoder: it composes the plan, the gathered passes and the deep pass into one transform.
+
+use flux_profiler::timed;
 use primitives::field::F64;
 
 #[cfg(doc)]
@@ -132,6 +134,7 @@ impl<'t> Encoder<'t> {
     /// # Panics
     ///
     /// Panics unless the codeword is exactly `2^r` messages long.
+    #[timed]
     pub(super) fn rows(
         self,
         data: &mut [F64],

@@ -5,6 +5,8 @@
 //! parameters, hash construction, encoding predicate, and key derivation. Loaded
 //! signatures are also verified, so stale entries are regenerated from the first
 //! invalid one.
+
+use flux_profiler::timed;
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -85,6 +87,7 @@ fn cache_path(message_id: u32) -> PathBuf {
     cache_dir().join(format!("lean_xmss_signers_{:016x}.bin", hasher.finish()))
 }
 
+#[timed]
 fn try_load_cache(path: &Path, message_id: u32) -> Option<Vec<CachedSignature>> {
     let bytes = fs::read(path).ok()?;
     let msg = message_for(message_id);
@@ -117,6 +120,7 @@ fn try_load_cache(path: &Path, message_id: u32) -> Option<Vec<CachedSignature>> 
     Some(signers)
 }
 
+#[timed]
 fn save_cache(path: &Path, signers: &[CachedSignature]) {
     let mut bytes = Vec::with_capacity(signers.len() * LEAN_XMSS_RECORD);
     for (pk, sig) in signers {
@@ -135,6 +139,7 @@ fn write_cache(path: &Path, bytes: &[u8]) {
     }
 }
 
+#[timed]
 fn generate_range(start: usize, end: usize, message_id: u32) -> Vec<CachedSignature> {
     let total = end - start;
     let started = Instant::now();
@@ -166,6 +171,7 @@ pub fn get_signers(n: usize) -> Vec<CachedSignature> {
 /// The first `n` cached signers, signing [`message_for`]`(message_id)`, signer `i` at
 /// `leaf_index_of(i, message_id)`: one cache file per message, the keys shared
 /// across them.
+#[timed]
 pub fn get_signers_for(n: usize, message_id: u32) -> Vec<CachedSignature> {
     let mut pools = POOLS.lock().unwrap();
     let pool = pools.entry(message_id).or_default();
@@ -249,6 +255,7 @@ fn lean_sphincs_cache_path() -> PathBuf {
     cache_dir().join(format!("lean_sphincs_signers_{:016x}.bin", lean_sphincs_footprint()))
 }
 
+#[timed]
 fn try_load_lean_sphincs_cache() -> Option<Vec<CachedSphincsSignature>> {
     let bytes = fs::read(lean_sphincs_cache_path()).ok()?;
     let mut signers = Vec::with_capacity(bytes.len() / LEAN_SPHINCS_RECORD);
@@ -283,6 +290,7 @@ fn save_lean_sphincs_cache(signers: &[CachedSphincsSignature]) {
 
 static LEAN_SPHINCS_POOL: Mutex<Vec<CachedSphincsSignature>> = Mutex::new(Vec::new());
 
+#[timed]
 pub fn get_lean_sphincs_signers(n: usize) -> Vec<CachedSphincsSignature> {
     let mut pool = LEAN_SPHINCS_POOL.lock().unwrap();
     if pool.len() < n {

@@ -24,6 +24,8 @@
 //! takes one explicit OOD sample. The base-field
 //! commitment only shrinks the level-0 symbols to 8 bytes; every random
 //! ingredient is sampled from `E` with the same error terms as before.
+
+use flux_profiler::timed;
 use crate::transcript::ProverState;
 use primitives::field::F64;
 
@@ -103,6 +105,7 @@ pub struct Committed {
 /// neither encoded nor hashed, and the resulting commitment is the same one the
 /// full `2^μ` witness would have produced. `repeats` tags its blocks that equal their predecessor
 /// ([`::pcs::whir::commit`]).
+#[timed]
 pub fn commit(
     ps: &mut ProverState,
     witness: &[F64],
@@ -158,6 +161,7 @@ pub fn reserve_level1(mu: usize, log_inv_rate: usize) -> Vec<u8> {
 /// `repeats` tags the blocks of `q` that equal their predecessor ([`::pcs::stack_open::open_batch_mixed_whir_stacked`]).
 ///
 /// The opening consumes the commitment: it frees the codeword and tree once the L0 queries are answered.
+#[timed]
 pub fn open(
     ps: &mut ProverState,
     c: Committed,

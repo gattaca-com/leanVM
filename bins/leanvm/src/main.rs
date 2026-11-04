@@ -1,11 +1,13 @@
 //! Benchmark CLI for signature and blob proofs, recursion, batched Keccak, and the Fibonacci demo.
 
 #[global_allocator]
-static ALLOCATOR: bench::Jemalloc = bench::Jemalloc;
+static ALLOCATOR: flux_profiler::allocator::CountingAllocator<bench::Jemalloc> =
+    flux_profiler::allocator::CountingAllocator(bench::Jemalloc);
 
 use clap::{Parser, Subcommand};
 
 mod benchmark;
+mod flux_bridge;
 mod fibonacci;
 mod report;
 
@@ -49,6 +51,10 @@ struct Cli {
     /// Skip the warmup pass, to time the first proof after setup.
     #[arg(long, global = true)]
     cold: bool,
+
+    /// Publish flux-profiler rings, for scripts/flux-trace.sh.
+    #[arg(long, global = true)]
+    flux: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -126,8 +132,9 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     leanvm_core::init_prover();
+    let flux = flux_bridge::init(cli.flux);
     let plan = bench::Plan::new(cli.repeat, cli.cooldown).cold(cli.cold);
-    if cli.tracing && !matches!(&cli.command, Command::Recursion { .. }) {
+    if !flux && cli.tracing && !matches!(&cli.command, Command::Recursion { .. }) {
         bench::init_tracing();
     }
     match cli.command {

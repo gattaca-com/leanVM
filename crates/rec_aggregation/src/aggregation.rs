@@ -37,6 +37,7 @@
 //! protocol to drift.
 
 use bincode::Options as _;
+use flux_profiler::timed;
 use pcs::whir::{MAX_LOG_INV_RATE, MIN_LOG_INV_RATE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -690,6 +691,7 @@ impl EthereumProof {
 }
 
 /// [`stacked_bytecode`] as the `verifier` crate takes it, hashed once: what [`EthereumProof::verify`] checks proofs against, and [`aggregate`] reads its children with.
+#[timed]
 fn scalar_bytecode() -> &'static verifier::Bytecode {
     static BYTECODE: std::sync::OnceLock<verifier::Bytecode> = std::sync::OnceLock::new();
     BYTECODE.get_or_init(|| {
@@ -701,6 +703,7 @@ fn scalar_bytecode() -> &'static verifier::Bytecode {
 /// The stacked bytecode polynomial of the aggregation guest: the one fixed
 /// table every node's bytecode claims are about. Cached, because verification
 /// evaluates it and building it walks the whole program.
+#[timed]
 fn stacked_bytecode() -> &'static [F64] {
     static TABLE: std::sync::OnceLock<Vec<F64>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| leanvm_core::cpu::layout::bytecode_table(&unified_guest().prog))
@@ -708,6 +711,7 @@ fn stacked_bytecode() -> &'static [F64] {
 
 /// The rows of [`BLOCK`] entries of the stacked bytecode that hold its populated slots: every other row is
 /// structurally zero.
+#[timed]
 fn bytecode_rows() -> Range<usize> {
     static ROWS: std::sync::OnceLock<Range<usize>> = std::sync::OnceLock::new();
     ROWS.get_or_init(|| {
@@ -843,6 +847,7 @@ fn absorb_round(
 ///
 /// Each child brings two claims, the fresh one its verification raised and the one it deferred; `sums` holds their
 /// [`bytecode_sums`] in that order. Returns the guest hints and the single claim they reduce to.
+#[timed]
 fn aggregate_deferred_claims(
     subproofs: &[DeferredSubproof],
     carried_claims: &[&DeferredClaim],
@@ -1150,6 +1155,7 @@ fn walk_claims(layout: &leanvm_core::cpu::Layout, kbc: usize, mut visit: impl Fn
 /// `verifier` crate read out of the child's proof, whose scalars are
 /// `proof_stream` (zero hand-mirroring drift). Nothing here says the child
 /// verifies: the guest's run does.
+#[timed]
 fn gen_verify(
     program: &Program,
     public_input: [F192; 2],
@@ -1615,6 +1621,7 @@ fn lean_sphincs_hints(
 /// - Raw signatures are assumed valid (otherwise `aggregate` will panic).
 /// - Children are assumed verified by the caller ([`EthereumProof::verify`]): any invalid child
 ///   proof ends up returning the error [`AggregationError::ProofError`] (TODO return the index of invalid proof).
+#[timed]
 pub fn aggregate(
     children: &[EthereumProof],
     raw_lean_xmss: Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)>,
@@ -1637,6 +1644,7 @@ pub fn aggregate(
 
 /// [`aggregate`], under the same contract, also returning the prover's statistics (what the CLI's benchmarks report).
 /// A caller that aggregates repeatedly passes the same `gpow` each time, so the prover does not grow it again.
+#[timed]
 pub fn aggregate_with_stats(
     children: &[EthereumProof],
     raw_lean_xmss: Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)>,
@@ -2052,6 +2060,7 @@ struct OpeningShape {
 
 /// The recursion program's placeholder map depends on table structure and bytecode
 /// size, so one compiled guest serves every proof layout.
+#[timed]
 fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     // Only block and coordinate structure is used here; dummy instructions and
     // table sizes let us derive it before the guest's bytecode exists.
@@ -2803,6 +2812,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
 
 /// Build the guest bytecode and the stacked table its claims are about. Both are
 /// cached, so this only moves the cost out of the first prove or verify.
+#[timed]
 pub fn warm_up() {
     unified_guest();
     stacked_bytecode();
@@ -2828,6 +2838,7 @@ pub fn setup(capacity: usize) -> GPow {
 /// itself. Its *digest* needs no such loop: it rides the statement rather than
 /// the code. The guess converges in one or two rounds because the map's only
 /// size-dependent part is a handful of unrolled sumcheck rounds.
+#[timed]
 pub fn unified_guest() -> &'static Program {
     static GUEST: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
     GUEST.get_or_init(|| {
@@ -2844,6 +2855,7 @@ pub fn unified_guest() -> &'static Program {
     })
 }
 
+#[timed]
 fn compile_guest(kbc: usize) -> Program {
     let replacements = placeholder_map(kbc);
     // `DBG_PLACEHOLDERS=path`: dump the baked guest constants, to read alongside

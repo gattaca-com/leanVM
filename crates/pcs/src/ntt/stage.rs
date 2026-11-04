@@ -1,4 +1,6 @@
 //! The lane-major message: its transpose, and the stage a gathered first pass fills from it.
+
+use flux_profiler::timed;
 use primitives::field::F64;
 use primitives::stream::Stream;
 
@@ -33,6 +35,7 @@ use crate::stack_open::EQUAL_BLOCK_LOG;
 /// - Each lane adds a contiguous burst of words to an L1-resident tile.
 /// - The finished tile goes out as one contiguous run.
 /// - That keeps an n-way gather at a `2^rows_log` stride near memory bandwidth.
+#[timed]
 pub(super) fn transpose_lane_major(out: &mut [F64], msg: &[F64], blocks: &[usize], row_words: usize, log_rows: usize) {
     let rows = 1usize << log_rows;
     assert!(!blocks.is_empty(), "a commitment needs at least one lane");

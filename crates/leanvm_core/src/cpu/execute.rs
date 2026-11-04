@@ -1,5 +1,7 @@
 //! The write-once execution interpreter: run the compiled program to produce
 //! the final memory image and the per-opcode [`Trace`].
+
+use flux_profiler::timed;
 use std::collections::HashMap;
 
 use super::hints::{GPow, MAX_CELLS, bounded_dlog};
@@ -326,6 +328,7 @@ impl Program {
     /// is a function of the exponent alone and announcing more only widens its index,
     /// so a run that starts from one skips growing and announcing it again.
     /// `keccak_step` gets the lanes each `KECCAK` row reads, in row order and as the row runs.
+    #[timed]
     pub(crate) fn execute_with(
         &self,
         witness: &Witness,

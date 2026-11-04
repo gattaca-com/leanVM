@@ -3,6 +3,7 @@
 //! sizes and public input. Plus the prover-side witness build.
 
 use super::*;
+use flux_profiler::timed;
 
 // ---- column schema -----------------------------------------------------------
 
@@ -369,6 +370,7 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
 ///
 /// This is the multilinear an outermost verifier is handed in place of a
 /// structured program, and what the transcript seed binds ([`super::fs_seed`]).
+#[timed]
 pub fn bytecode_table(prog: &[Op]) -> Vec<F64> {
     stacked_columns(&bytecode_columns(prog))
 }
@@ -385,6 +387,7 @@ pub(crate) fn stacked_columns(cols: &BytecodeColumns) -> Vec<F64> {
 /// reference columns only by INDEX and the program only through its public columns, so
 /// this needs no committed witness: both prover and verifier reconstruct exactly the
 /// same structure.
+#[timed]
 pub fn layout(prog_cols: &BytecodeColumns, log_mem: usize, rows: [usize; tables::N_TABLES], pi: [F192; 2]) -> Layout {
     let taus = table_logs(rows);
     let bytecode_size = prog_cols[0].len();
@@ -494,6 +497,7 @@ pub(crate) fn table_logs(rows: [usize; tables::N_TABLES]) -> [usize; tables::N_T
 
 impl Program {
     /// `keccak_blocks` is what [`crate::keccak::while_executing`] built behind `exec`'s run.
+    #[timed]
     pub(crate) fn build(&self, exec: &Execution, keccak_blocks: crate::keccak::Blocks) -> Witness {
         assert!(self.prog.len().is_power_of_two());
         assert!(exec.mem.len().is_power_of_two());

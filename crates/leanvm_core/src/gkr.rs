@@ -9,6 +9,7 @@
 
 use crate::PAR_THRESHOLD;
 use crate::transcript::ProverState;
+use flux_profiler::timed;
 use primitives::field::{F64, F64x8, F192, F192Unreduced, F192x8, Prod8, mul_unreduced4, mul2, mul4};
 use primitives::multilinear::{eq_table, interp};
 use primitives::stream::Stream;
@@ -359,6 +360,7 @@ impl<'a, F: TreeField> Tree<'a> for Levels<'a, F> {
     }
 }
 
+#[timed]
 fn build_layers<F: TreeField>(leaves: Leaves<'_, F>, mu: usize) -> Levels<'_, F> {
     let Leaves {
         leaves,
@@ -955,6 +957,7 @@ fn reduce_sides(columns: &dyn LeafColumns, task: impl Fn(usize) -> [[Prod8; 4]; 
 }
 
 /// The first message of both sides' blocks of the runs.
+#[timed]
 fn columns_message(columns: &dyn LeafColumns, equality: &Equality) -> [[F192; 4]; 2] {
     let task = |t: usize| {
         let mut sums = [[Prod8::ZERO; 4]; 2];
@@ -967,6 +970,7 @@ fn columns_message(columns: &dyn LeafColumns, equality: &Equality) -> [[F192; 4]
 }
 
 /// The first two round polynomials, accumulated before either challenge is sampled.
+#[timed]
 fn columns_polynomial(columns: &dyn LeafColumns, equality: &Equality) -> [[[F192; 5]; 5]; 2] {
     let task = |t| {
         let mut sums = [[[Prod8::ZERO; 5]; 5]; 2];
@@ -990,6 +994,7 @@ fn columns_polynomial(columns: &dyn LeafColumns, equality: &Equality) -> [[[F192
 
 /// Folds the blocks of the runs by `challenge` into the sides' `next_blocks`, and with an `equality`
 /// returns the message of the folded blocks.
+#[timed]
 fn columns_fold(
     columns: &dyn LeafColumns,
     next: [&mut [Block]; 2],
@@ -1291,6 +1296,7 @@ impl<'a> QuaternaryLayerState<'a> {
     }
 
     /// `(q(0)+q(1), [X²]q, [X³]q, [X⁴]q)`.
+    #[timed]
     fn round_message(&self, equality: &Equality) -> [F192; 4] {
         if let Some(first) = &self.first {
             return first.message(&self.ones, equality);
@@ -1394,6 +1400,7 @@ impl<'a> QuaternaryLayerState<'a> {
         message
     }
 
+    #[timed]
     fn fold(&mut self, challenge: F192) {
         if self.blocked() {
             self.fold_blocks(challenge, None, None, None, false);
@@ -1459,6 +1466,7 @@ impl<'a> QuaternaryLayerState<'a> {
         self.logical_rows /= 2;
     }
 
+    #[timed]
     fn fold_and_message(&mut self, challenge: F192, equality: &Equality) -> [F192; 4] {
         if self.blocked() {
             return self.fold_blocks(challenge, None, Some(equality), None, false);
@@ -1610,6 +1618,7 @@ pub fn prove_product_triple(leaves: [Vec<F192>; 3], ps: &mut ProverState, shape:
 /// tree's in `C`. The proof is the same whichever field holds the third tree's values.
 ///
 /// The `columns` are blocks of the first two trees' leaves that `push` and `pull` do not store.
+#[timed]
 pub fn prove_product_triple_from<C: TreeField>(
     push: Leaves,
     pull: Leaves,
@@ -1646,6 +1655,7 @@ pub fn prove_product_triple_from<C: TreeField>(
 
     let mut layer = mu;
     while layer > 0 {
+        let _layer_guard = flux_profiler::TimerGuard::new("gkr::layer");
         let lambda = ps.sample();
         let round_count = mu - layer;
         if layer % 2 == 1 {

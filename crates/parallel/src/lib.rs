@@ -1,4 +1,6 @@
 //! Fixed-size thread pool for flat data-parallel kernels. Workers claim ranges from one shared counter, which also balances heterogeneous cores. Dispatches cannot nest. Task panics are resumed on the dispatcher after all workers stop.
+
+use flux_profiler::timed;
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
@@ -194,6 +196,7 @@ fn wait_for_dispatch(pool: &Pool, id: usize, last_generation: usize) -> usize {
 /// `remaining / (2·workers)`, clamped to `1..=`[`MAX_CLAIM_BATCH`]: big early
 /// claims cut counter contention, and the proportional shrink keeps the tail
 /// balanced across cores of different speeds.
+#[timed]
 fn drain(pool: &Pool) {
     // SAFETY: the dispatcher published `Some(job)` before the generation bump
     // this worker observed, and overwrites it only on the next dispatch (gated on
@@ -253,6 +256,7 @@ impl Drop for InTask {
 /// If called from inside a pool task: that would deadlock on the dispatch lock, so
 /// it panics rather than silently serializing. Fan out over the outermost
 /// independent unit and keep the levels below it sequential.
+#[timed]
 pub fn for_each_chunk<F: Fn(usize, usize) + Sync>(n_tasks: usize, f: F) {
     assert!(!IN_TASK.get(), "nested parallel dispatch from inside a pool task");
     // The caller runs tasks too, inline or as worker 0, so nesting panics on every path.

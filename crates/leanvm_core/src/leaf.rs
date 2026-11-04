@@ -11,6 +11,7 @@ use crate::PAR_THRESHOLD;
 use crate::constraints::{self, TableBlocks};
 use crate::gkr;
 use crate::transcript::ProverState;
+use flux_profiler::timed;
 use primitives::field::{
     F64, F64x8, F192, F192Unreduced, F192x8, Prod8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
     mul_slices,
@@ -615,6 +616,7 @@ impl gkr::LeafColumns for ColumnLeaves<'_> {
 /// With `columns`, aligned groups of four bulk GKR blocks are left unstored; incomplete boundary groups remain stored.
 /// The returned [`ColumnLeaves`] recomputes them from the columns, reducing traffic compared with reading stored leaves.
 /// A side that does not tile its layout keeps all its leaves.
+#[timed]
 /// `memory_len` bounds the real prefix of columns `MEM_LO..=MFCNT`; their suffixes must each be constant.
 pub fn build_leaves<'a>(
     sides: &[(&'a [Block], &'a Layout); 2],
@@ -939,6 +941,7 @@ fn fill_ones(leaves: &mut [gkr::Block], start: usize, end: usize, len: usize) {
 
 /// Write every quad the staged groups did not: the rest of each block from its leaves, and
 /// whole-identity runs of its padding as the identity.
+#[timed]
 fn finish_quads(leaves: &[gkr::Block], quads: &mut [F192], blocks: &[Block], lay: &Layout, quads_done: &[usize]) {
     let quad = |k: usize| gkr::quad_at(leaves, k);
     // Blocks below four slots share quads with their neighbours, so the quads from the first
@@ -1347,6 +1350,7 @@ pub fn stacked_bytecode_table(blocks: &[Block]) -> Vec<F64> {
 
 /// The count side reads its base-field leaves directly from the columns. Only product levels
 /// are stored, with whole blocks of identity padding left implicit.
+#[timed]
 fn build_count_leaves<'a>(blocks: &[Block], lay: &Layout, cols: &[&'a [F64]]) -> gkr::Leaves<'a, F64> {
     // `(offset, end, column)` of each block, the column cut to its rows, by offset.
     let mut segments: Vec<(usize, usize, &[F64])> = blocks
@@ -1473,6 +1477,7 @@ pub struct BusProof {
 }
 
 /// The four memory columns must be constant from `memory_len` to their logical end.
+#[timed]
 pub fn prove_balance(
     push: &[Block],
     pull: &[Block],
@@ -1652,6 +1657,7 @@ pub fn prove_balance(
 /// `v` there and its dot is `v`, since `low` sums to one. Those blocks are not swept: each
 /// accumulator takes `v` times the sum of their `high` weights, and each dot is written as `v`.
 #[allow(clippy::type_complexity)]
+#[timed]
 fn tables_and_prods_at(
     cols: &[&[F64]],
     tables: &[(usize, usize)],

@@ -9,3 +9,7 @@ rustdocflags = ["-D", "warnings"]
 
 [target.'cfg(all())']
 rustflags = ["-C", "target-cpu=native"]
+
+[net]
+# flux-profiler is a git dependency on a private repo: fetch it with the git CLI and its credentials.
+git-fetch-with-cli = true

@@ -62,6 +62,8 @@
 //! weight. It never materializes a dense vector per claim. A verifier never
 //! builds the vector at all: it evaluates its MLE at the WHIR final point from
 //! `Phi`'s challenges.
+
+use flux_profiler::timed;
 use fiat_shamir::transcript::ProverState;
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512bw", target_feature = "avx512vbmi"))]
 use primitives::bit_fold::{BLOCK, BitFold};
@@ -167,6 +169,7 @@ pub fn sample_map_challenges(ch: &mut ProverState) -> [F192; COMPOSITION_SHIFTS.
 /// for `i in 0..64` (bit i = polynomial-basis coordinate of the u64).
 ///
 /// A caller whose reduction already produced these passes them in, so this is the reference for tests and the unprepared fallback.
+#[timed]
 pub fn fold_1b_rows(packed_witness: &[F64], suffix_tensor: &[F192]) -> Vec<F192> {
     assert_eq!(packed_witness.len(), suffix_tensor.len());
     parallel::fold_reduce(
@@ -202,6 +205,7 @@ fn xor_accs(mut a: Vec<F192>, b: Vec<F192>) -> Vec<F192> {
 /// Naive reference: a per-position bit-scan over the three 64-bit limbs.
 /// See [`fold_ext_elems`] for the bytewise-table production version.
 #[cfg(test)]
+#[timed]
 pub fn fold_ext_elems_naive(suffix_tensor: &[F192], coordinate_weights: &[F192]) -> Vec<F192> {
     assert_eq!(coordinate_weights.len(), DEGREE_E);
     parallel::map_collect(suffix_tensor.len(), |i| {
@@ -390,6 +394,7 @@ impl RingWeight {
 
 /// Finish a ring-switch claim without materializing its dense weight vector.
 /// The batching scalar is baked into both the target and the map.
+#[timed]
 pub(crate) fn prove_finish_deferred(
     state: RingSwitchProveState,
     coordinate_weights: &[F192],
@@ -494,6 +499,7 @@ pub struct RingSwitchProveState {
 /// reduction sends them itself), which is what lets this
 /// phase touch no transcript at all. `precomputed_s_hat_v` is `None` only for a
 /// caller that wants them folded out of the witness instead.
+#[timed]
 pub fn prove_prepare(
     packed_witness: &[F64],
     suffix_point: &[F192],

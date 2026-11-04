@@ -6,6 +6,8 @@
 //! LCH novel-basis induction of the per-level sumcheck basis polynomial: the
 //! dense per-query expansion, its succinct residual evaluator, and the sparse
 //! transposed-NTT fast path with the dispatch between them.
+
+use flux_profiler::timed;
 use crate::ntt::{AdditiveNttF64, transpose_butterfly_lanes};
 use crate::whir_ntt_ext::words_mut;
 use crate::whir::build_eq_table_ext;
@@ -105,6 +107,7 @@ fn invert_sks(sks_vks: &[F64]) -> Vec<F64> {
 /// `W-hat_j(q) = Π_k W-hat_k(q)^(bit k of j)` is a K value and a tensor over the
 /// bits of `j`. Split at `lo` bits, `basis_poly[j] = Σ_i (w_i · high_i(j >> lo)) ·
 /// low_i(j mod 2^lo)`: one packed mixed dot over the queries per output.
+#[timed]
 pub(crate) fn induce_sumcheck_poly<T: RowElem>(
     log_msg_cols: usize,
     sks_vks: &[F64],
@@ -177,6 +180,7 @@ fn extend_tensor_k(out: &mut Vec<F64>, s: &[F64]) {
 ///   `enforced_sum = Σ_i w_i · <opened_rows[i], eq(v_challenges, ·)>`
 /// Cheap: O(num_queries x num_interleaved). The prover needs it for its last
 /// level, whose induced basis it never materializes.
+#[timed]
 pub(crate) fn induce_sumcheck_enforced_sum<T: RowElem>(
     opened_rows: &[T],
     v_challenges: &[F192],
@@ -200,6 +204,7 @@ pub(crate) fn induce_sumcheck_enforced_sum<T: RowElem>(
 /// through the char-2 factor. `ris_for_basis` is the fixed residual prefix
 /// (length `log_msg_cols - yr_log_n`); returns evaluations at the `2^yr_log_n`
 /// points `ris_for_basis ++ y_bits`.
+#[timed]
 pub(crate) fn induce_sumcheck_evaluate_at_residual(
     log_msg_cols: usize,
     sks_vks: &[F64],

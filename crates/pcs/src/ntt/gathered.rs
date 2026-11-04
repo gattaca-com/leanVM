@@ -1,4 +1,6 @@
 //! The gathered pass: a few layers in one sweep of the buffer, one row group at a time.
+
+use flux_profiler::timed;
 use primitives::field::F64;
 
 use super::scratch::with_scratch;
@@ -133,6 +135,7 @@ impl<'a> GatheredPass<'a> {
     }
 
     /// Sweep the buffer once, one task per range of residues.
+    #[timed]
     pub(super) fn run(&self, layers: Layers, win: &mut Window) {
         let base = win.base();
         let win = &*win;
