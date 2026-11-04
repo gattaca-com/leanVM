@@ -14,29 +14,51 @@
 
 use super::gf2_64::F64;
 use super::gf2_64x3::{F192, F192Unreduced};
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 use super::gf2_64x3::{mul_unreduced4, mul4};
 
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
+pub use wide::{Acc8, F192x8, F64x8};
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-pub use avx512::{Acc8, F192x8, F64x8};
+use avx512 as wide;
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f")))]
+use avx2 as wide;
 
 /// The unreduced products of eight elements, lane by lane: what [`F192x8::mul_unreduced`] returns.
 /// A sum of them is an XOR, and [`Prod8::reduce_lanes`] reduces each lane on its own.
-#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
 pub type Prod8 = Acc8;
 
 /// Eight elements, on a target without the wide multiplier.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 #[derive(Clone, Copy, Debug)]
 // Line-aligned, as on AVX-512, so a block of them streams in whole lines.
 #[repr(C, align(64))]
 pub struct F192x8([F192; 8]);
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 // SAFETY: one field, an array of plain elements.
 unsafe impl crate::Plain for F192x8 {}
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl F192x8 {
     pub const ZERO: Self = Self([F192::ZERO; 8]);
     pub const ONE: Self = Self([F192::ONE; 8]);
@@ -101,7 +123,10 @@ impl F192x8 {
 }
 
 /// The eight lane-wise products.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl F192x8 {
     /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
     #[inline]
@@ -110,7 +135,10 @@ impl F192x8 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl core::ops::Mul for F192x8 {
     type Output = Self;
 
@@ -126,7 +154,10 @@ impl core::ops::Mul for F192x8 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl core::ops::Add for F192x8 {
     type Output = Self;
 
@@ -137,15 +168,24 @@ impl core::ops::Add for F192x8 {
 }
 
 /// Eight base-field elements, on a target without the wide multiplier.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 #[derive(Clone, Copy, Debug)]
 pub struct F64x8([F64; 8]);
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 // SAFETY: one field, an array of plain elements.
 unsafe impl crate::Plain for F64x8 {}
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl F64x8 {
     pub const ZERO: Self = Self([F64::ZERO; 8]);
     pub const ONE: Self = Self([F64::ONE; 8]);
@@ -194,7 +234,10 @@ impl F64x8 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl core::ops::Add for F64x8 {
     type Output = Self;
 
@@ -204,7 +247,10 @@ impl core::ops::Add for F64x8 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl core::ops::Mul for F64x8 {
     type Output = Self;
 
@@ -214,7 +260,10 @@ impl core::ops::Mul for F64x8 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl F192x8 {
     /// The eight mixed products `self_i * k_i`, unreduced.
     #[inline]
@@ -224,7 +273,10 @@ impl F192x8 {
 }
 
 /// The embedding of the base field.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl From<F64x8> for F192x8 {
     #[inline]
     fn from(k: F64x8) -> Self {
@@ -233,11 +285,17 @@ impl From<F64x8> for F192x8 {
 }
 
 /// The unreduced products of eight elements, lane by lane, on a target without the wide multiplier.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 #[derive(Clone, Copy, Debug)]
 pub struct Prod8([F192Unreduced; 8]);
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl Prod8 {
     pub const ZERO: Self = Self([F192Unreduced::ZERO; 8]);
 
@@ -263,7 +321,10 @@ impl Prod8 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl core::ops::BitXorAssign for Prod8 {
     #[inline]
     fn bitxor_assign(&mut self, rhs: Self) {
@@ -273,7 +334,10 @@ impl core::ops::BitXorAssign for Prod8 {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl core::ops::BitXor for Prod8 {
     type Output = Self;
 
@@ -285,10 +349,16 @@ impl core::ops::BitXor for Prod8 {
 }
 
 /// The unreduced sum of eight-element products, lane by lane, as on AVX-512.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 pub type Acc8 = Prod8;
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 impl From<F192Unreduced> for Prod8 {
     /// One sum in lane 0, the other lanes zero.
     #[inline]
@@ -302,10 +372,16 @@ impl From<F192Unreduced> for Prod8 {
 /// `x0 + r * (x0 + x1)`, elementwise.
 #[inline]
 pub fn fold_pairs8_ext(x0: &[F192; 8], x1: &[F192; 8], r: F192) -> [F192; 8] {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
     // SAFETY: the features are enabled at compile time.
-    return unsafe { avx512::fold_pairs_ext(x0, x1, r) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    return unsafe { wide::fold_pairs_ext(x0, x1, r) };
+    #[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
     {
         let s: [F192; 8] = core::array::from_fn(|j| x0[j] + x1[j]);
         let lo = mul4([s[0], s[1], s[2], s[3]], [r; 4]);
@@ -317,10 +393,16 @@ pub fn fold_pairs8_ext(x0: &[F192; 8], x1: &[F192; 8], r: F192) -> [F192; 8] {
 /// `x0 + r * x0`, elementwise.
 #[inline]
 pub fn fold_lones8_ext(x0: &[F192; 8], r: F192) -> [F192; 8] {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
     // SAFETY: the features are enabled at compile time.
-    return unsafe { avx512::fold_lones_ext(x0, r) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    return unsafe { wide::fold_lones_ext(x0, r) };
+    #[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
     {
         let lo = mul4([x0[0], x0[1], x0[2], x0[3]], [r; 4]);
         let hi = mul4([x0[4], x0[5], x0[6], x0[7]], [r; 4]);
@@ -331,10 +413,16 @@ pub fn fold_lones8_ext(x0: &[F192; 8], r: F192) -> [F192; 8] {
 /// `(sum x0*y0, sum (x0+x1)*(y0+y1))` over eight terms.
 #[inline]
 pub fn msg_terms8_ext(x0: &[F192; 8], x1: &[F192; 8], y0: &[F192; 8], y1: &[F192; 8]) -> (Acc8, Acc8) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
     // SAFETY: the features are enabled at compile time.
-    return unsafe { avx512::msg_terms_ext(x0, x1, y0, y1) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    return unsafe { wide::msg_terms_ext(x0, x1, y0, y1) };
+    #[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
     {
         let xs: [F192; 8] = core::array::from_fn(|j| x0[j] + x1[j]);
         let ys: [F192; 8] = core::array::from_fn(|j| y0[j] + y1[j]);
@@ -345,30 +433,48 @@ pub fn msg_terms8_ext(x0: &[F192; 8], x1: &[F192; 8], y0: &[F192; 8], y1: &[F192
 /// `sum x0*y0` over eight terms.
 #[inline]
 pub fn msg_lone8_ext(x0: &[F192; 8], y0: &[F192; 8]) -> Acc8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
     // SAFETY: the features are enabled at compile time.
-    return unsafe { avx512::dot_ext(x0, y0) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    return unsafe { wide::dot_ext(x0, y0) };
+    #[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
     dot_ext(x0, y0)
 }
 
 /// The eight mixed products `c * k_i`, unreduced.
 #[inline]
 pub fn mul_base_splat8(c: F192, k: &[F64; 8]) -> Acc8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
     // SAFETY: the features are enabled at compile time.
-    return unsafe { avx512::mul_base_splat(c, k) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    return unsafe { wide::mul_base_splat(c, k) };
+    #[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
     Prod8(k.map(|k| c.mul_base_unreduced(k)))
 }
 
 /// The eight products `a_i * b_i`.
 #[inline]
 pub fn mul_f64x8(a: &[F64; 8], b: &[F64; 8]) -> [F64; 8] {
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
     // SAFETY: the features are enabled at compile time.
-    return unsafe { avx512::mul_f64x8(a, b) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    return unsafe { wide::mul_f64x8(a, b) };
+    #[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
     core::array::from_fn(|i| a[i] * b[i])
 }
 
@@ -392,15 +498,24 @@ impl Acc8 {
     /// [`mul_base_splat8`]: element `i` of the result is the `i`-th product's sum.
     #[inline]
     pub fn reduce_each(self) -> [F192; 8] {
-        #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+        #[cfg(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+))]
         // SAFETY: the features are enabled at compile time.
-        return unsafe { avx512::reduce_each(self) };
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+        return unsafe { wide::reduce_each(self) };
+        #[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
         self.reduce_lanes().to_array()
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
+)))]
 #[inline]
 fn dot_ext(x: &[F192; 8], y: &[F192; 8]) -> Acc8 {
     F192x8::from_array(x).mul_unreduced(F192x8::from_array(y))
@@ -1016,6 +1131,685 @@ mod avx512 {
 
     #[inline]
     #[target_feature(enable = "avx512f,avx512bw")]
+    pub fn reduce_each(acc: Acc8) -> [F192; 8] {
+        let mut out = [F192::ZERO; 8];
+        store_planes(reduce_planes(acc), &mut out);
+        out
+    }
+}
+
+/// The AVX-512 kernels in two YMM halves, for a machine with VPCLMULQDQ but no AVX-512.
+///
+/// The planes keep the AVX-512 memory layout: each 512-bit plane is two 256-bit halves, low half first.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f")))]
+mod avx2 {
+    use core::arch::x86_64::*;
+
+    use super::{F64, F192, F192Unreduced};
+    use crate::field::gf2_64x3::x86_64::{fold, pair};
+    use crate::{load_at, store_at};
+
+    /// One 512-bit plane as two halves.
+    type Plane = [__m256i; 2];
+
+    const fn words(w: [u64; 4]) -> __m256i {
+        // SAFETY: four words and a vector have one size, and every bit pattern is valid in each.
+        unsafe { core::mem::transmute::<[u64; 4], __m256i>(w) }
+    }
+
+    const fn plane(w: [u64; 8]) -> Plane {
+        [words([w[0], w[1], w[2], w[3]]), words([w[4], w[5], w[6], w[7]])]
+    }
+
+    const ZERO_PLANE: Plane = plane([0; 8]);
+
+    #[inline(always)]
+    fn xor(a: __m256i, b: __m256i) -> __m256i {
+        // SAFETY: the module is compiled only with avx2 enabled.
+        unsafe { _mm256_xor_si256(a, b) }
+    }
+
+    #[inline(always)]
+    fn xor2(a: Plane, b: Plane) -> Plane {
+        [xor(a[0], b[0]), xor(a[1], b[1])]
+    }
+
+    /// Eight elements in their three planes, as on AVX-512.
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C, align(64))]
+    pub struct F192x8 {
+        lo: Plane,
+        hi: Plane,
+        c2: Plane,
+    }
+
+    // SAFETY: `repr(C)` over six vectors that fill the alignment, so there is no padding and no invalid bit pattern.
+    unsafe impl crate::Plain for F192x8 {}
+
+    /// The unreduced products of eight elements, as on AVX-512: `even[i][h]` lane `j` is coefficient `i`
+    /// of element `4h + 2j`, and `odd` that of the element after it.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Acc8 {
+        even: [Plane; 3],
+        odd: [Plane; 3],
+    }
+
+    /// `g(spill)` per top nibble of a high word, as the AVX-512 reduction's table, in both 128-bit lanes.
+    const G_SPILL: __m256i = {
+        let mut table = [0u8; 32];
+        let mut n = 0;
+        while n < 16 {
+            let spill = n ^ (n >> 1) ^ (n >> 3);
+            table[n] = (spill ^ (spill << 1) ^ (spill << 3) ^ (spill << 4)) as u8;
+            table[16 + n] = table[n];
+            n += 1;
+        }
+        // SAFETY: 32 bytes and a vector have one size, and every bit pattern is valid in each.
+        unsafe { core::mem::transmute::<[u8; 32], __m256i>(table) }
+    };
+
+    /// Lane-wise base reduction: qword `i` is the reduction of `hi[i] * x^64 + lo[i]`.
+    /// `lo ^ g(hi) ^ g(spill)`, with `g(y) = z ^ z<<3` for `z = y ^ y<<1`, and `g(spill)` one byte lookup.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_lanes(lo: __m256i, hi: __m256i) -> __m256i {
+        let g_spill = _mm256_shuffle_epi8(G_SPILL, _mm256_srli_epi64::<60>(hi));
+        let z = _mm256_xor_si256(hi, _mm256_slli_epi64::<1>(hi));
+        _mm256_xor_si256(_mm256_xor_si256(lo, g_spill), _mm256_xor_si256(z, _mm256_slli_epi64::<3>(z)))
+    }
+
+    /// Qword `i` of each lane pair: the reductions of the even and odd 128-bit products.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_halves(even: __m256i, odd: __m256i) -> __m256i {
+        reduce_lanes(_mm256_unpacklo_epi64(even, odd), _mm256_unpackhi_epi64(even, odd))
+    }
+
+    /// Every qword times `x`: a shift, and the carried-out bit folds back as `x^64 = 0x1B`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn words_mul_x(w: __m256i) -> __m256i {
+        let carry = _mm256_cmpgt_epi64(_mm256_setzero_si256(), w);
+        _mm256_xor_si256(_mm256_slli_epi64::<1>(w), _mm256_and_si256(carry, _mm256_set1_epi64x(0x1B)))
+    }
+
+    /// The 4x4 transpose of qwords.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn transpose4(r: [__m256i; 4]) -> [__m256i; 4] {
+        let t0 = _mm256_unpacklo_epi64(r[0], r[1]);
+        let t1 = _mm256_unpackhi_epi64(r[0], r[1]);
+        let t2 = _mm256_unpacklo_epi64(r[2], r[3]);
+        let t3 = _mm256_unpackhi_epi64(r[2], r[3]);
+        [
+            _mm256_permute2x128_si256::<0x20>(t0, t2),
+            _mm256_permute2x128_si256::<0x20>(t1, t3),
+            _mm256_permute2x128_si256::<0x31>(t0, t2),
+            _mm256_permute2x128_si256::<0x31>(t1, t3),
+        ]
+    }
+
+    /// The 8x8 transpose of qwords: qword `j` of `out[p]` is qword `p` of `r[j]`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn transpose_qwords(r: [Plane; 8]) -> [Plane; 8] {
+        let mut out = [ZERO_PLANE; 8];
+        for (hi, lo) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            // Rows 4 lo.., half hi of each, land in rows 4 hi.., half lo.
+            let block = transpose4(core::array::from_fn(|i| r[4 * lo + i][hi]));
+            for (i, v) in block.into_iter().enumerate() {
+                out[4 * hi + i][lo] = v;
+            }
+        }
+        out
+    }
+
+    /// `[a0, a2, a4, a6, b0, b2, b4, b6]` and the odd ones, of qwords.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn even_odd_qwords(a: Plane, b: Plane) -> (Plane, Plane) {
+        let pick = |x: Plane| {
+            let (lo, hi) = (_mm256_unpacklo_epi64(x[0], x[1]), _mm256_unpackhi_epi64(x[0], x[1]));
+            (_mm256_permute4x64_epi64::<0xD8>(lo), _mm256_permute4x64_epi64::<0xD8>(hi))
+        };
+        let ((ae, ao), (be, bo)) = (pick(a), pick(b));
+        ([ae, be], [ao, bo])
+    }
+
+    /// Eight base-field elements, one per qword.
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C, align(64))]
+    pub struct F64x8(Plane);
+
+    // SAFETY: `repr(C)` over two vectors that fill the alignment, which have no invalid bit pattern.
+    unsafe impl crate::Plain for F64x8 {}
+
+    impl F64x8 {
+        pub const ZERO: Self = Self(plane([0; 8]));
+        pub const ONE: Self = Self(plane([1; 8]));
+
+        #[inline(always)]
+        pub fn from_array(k: &[F64; 8]) -> Self {
+            Self([load_at(k, 0), load_at(k, 4)])
+        }
+
+        #[inline(always)]
+        pub fn to_array(self) -> [F64; 8] {
+            let mut out = [F64::ZERO; 8];
+            store_at(&mut out, 0, self.0[0]);
+            store_at(&mut out, 4, self.0[1]);
+            out
+        }
+
+        /// Every element times `x`.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            Self(self.0.map(|w| unsafe { words_mul_x(w) }))
+        }
+
+        #[inline]
+        pub fn lane(&self, i: usize) -> F64 {
+            self.to_array()[i]
+        }
+
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, k: F64) {
+            let mut lanes = self.to_array();
+            lanes[i] = k;
+            *self = Self::from_array(&lanes);
+        }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        #[inline(always)]
+        pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            let (even, odd) = unsafe { even_odd_qwords(a.0, b.0) };
+            (Self(even), Self(odd))
+        }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
+        #[inline(always)]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { transpose_qwords(g.map(|k| k.0)).map(Self) }
+        }
+    }
+
+    impl core::ops::Add for F64x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn add(self, rhs: Self) -> Self {
+            Self(xor2(self.0, rhs.0))
+        }
+    }
+
+    impl core::ops::Mul for F64x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn mul(self, rhs: Self) -> Self {
+            // SAFETY: the module is compiled only with the features enabled.
+            Self([0, 1].map(|h| unsafe { mul_words(self.0[h], rhs.0[h]) }))
+        }
+    }
+
+    impl F192x8 {
+        /// The eight mixed products `self_i * k_i`, unreduced: six carry-less multiplications per half.
+        #[inline(always)]
+        pub fn mul_base_unreduced(self, k: F64x8) -> Acc8 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { mul_base(self, k.0) }
+        }
+    }
+
+    /// The embedding of the base field.
+    impl From<F64x8> for F192x8 {
+        #[inline(always)]
+        fn from(k: F64x8) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe {
+                let zero = _mm256_setzero_si256();
+                Self {
+                    lo: k.0.map(|w| _mm256_unpacklo_epi64(w, zero)),
+                    hi: k.0.map(|w| _mm256_unpackhi_epi64(w, zero)),
+                    c2: ZERO_PLANE,
+                }
+            }
+        }
+    }
+
+    impl Acc8 {
+        pub const ZERO: Self = Self {
+            even: [ZERO_PLANE; 3],
+            odd: [ZERO_PLANE; 3],
+        };
+
+        /// The same sum with the odd elements' products moved onto the even ones.
+        #[inline(always)]
+        pub fn merge_parities(self) -> Self {
+            let even = core::array::from_fn(|i| xor2(self.even[i], self.odd[i]));
+            Self { even, ..Self::ZERO }
+        }
+
+        /// The sum of the sixteen products, reduced.
+        #[inline]
+        pub fn reduce(self) -> F192 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { reduce_sum(self) }
+        }
+
+        /// Every lane reduced on its own.
+        #[inline(always)]
+        pub fn reduce_lanes(self) -> F192x8 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { reduce_planes(self) }
+        }
+    }
+
+    impl From<F192Unreduced> for Acc8 {
+        /// One scalar product, in the first even lane.
+        #[inline]
+        fn from(u: F192Unreduced) -> Self {
+            let [c0, c1, c2] = u.coeffs();
+            let lane = |[lo, hi]: [u64; 2]| plane([lo, hi, 0, 0, 0, 0, 0, 0]);
+            Self {
+                even: [lane(c0), lane(c1), lane(c2)],
+                odd: Self::ZERO.odd,
+            }
+        }
+    }
+
+    impl core::ops::BitXorAssign for Acc8 {
+        #[inline(always)]
+        fn bitxor_assign(&mut self, rhs: Self) {
+            for i in 0..3 {
+                self.even[i] = xor2(self.even[i], rhs.even[i]);
+                self.odd[i] = xor2(self.odd[i], rhs.odd[i]);
+            }
+        }
+    }
+
+    impl core::ops::BitXor for Acc8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn bitxor(mut self, rhs: Self) -> Self {
+            self ^= rhs;
+            self
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_sum(acc: Acc8) -> F192 {
+        let coeffs = core::array::from_fn(|i| {
+            let a = xor2(acc.even[i], acc.odd[i]);
+            let half = _mm256_xor_si256(a[0], a[1]);
+            let q = _mm_xor_si128(_mm256_castsi256_si128(half), _mm256_extracti128_si256::<1>(half));
+            [_mm_cvtsi128_si64(q) as u64, _mm_extract_epi64::<1>(q) as u64]
+        });
+        F192Unreduced::from_coeffs(coeffs).reduce()
+    }
+
+    /// Eight consecutive elements, 24 qwords, into their planes: unaligned loads and blends.
+    ///
+    /// Element `i` is qwords `3i..3i+3`, so a pair plane half is two loads that each hold one pair
+    /// in the right lane, and a `c2` half takes two such pairs of loads.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_planes(e: &[F192; 8]) -> F192x8 {
+        let q: &[u64; 24] = crate::cast_slice::<F192, u64>(e).try_into().unwrap();
+        let at = |i: usize| -> __m256i { load_at(q, i) };
+        let lanes = |a: usize, b: usize| _mm256_blend_epi32::<0xF0>(at(a), at(b));
+        let c2 = |s: usize| _mm256_blend_epi32::<0xCC>(lanes(s, s + 4), lanes(s + 2, s + 6));
+        F192x8 {
+            lo: [lanes(0, 4), lanes(12, 16)],
+            hi: [lanes(3, 7), lanes(15, 19)],
+            c2: [c2(2), c2(14)],
+        }
+    }
+
+    /// The inverse of [`load_planes`], as 128-bit pair stores and 64-bit `c2` stores.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store_planes(p: F192x8, out: &mut [F192; 8]) {
+        let q: &mut [u64; 24] = crate::cast_slice_mut::<F192, u64>(out).try_into().unwrap();
+        for h in 0..2 {
+            for (plane, parity) in [(p.lo[h], 0), (p.hi[h], 1)] {
+                let e = 4 * h + parity;
+                store_at(q, 3 * e, _mm256_castsi256_si128(plane));
+                store_at(q, 3 * (e + 2), _mm256_extracti128_si256::<1>(plane));
+            }
+            let c2 = p.c2[h];
+            let (low, high) = (_mm256_castsi256_si128(c2), _mm256_extracti128_si256::<1>(c2));
+            let e = 4 * h;
+            q[3 * e + 2] = _mm_cvtsi128_si64(low) as u64;
+            q[3 * e + 5] = _mm_extract_epi64::<1>(low) as u64;
+            q[3 * e + 8] = _mm_cvtsi128_si64(high) as u64;
+            q[3 * e + 11] = _mm_extract_epi64::<1>(high) as u64;
+        }
+    }
+
+    impl F192x8 {
+        pub const ZERO: Self = Self {
+            lo: ZERO_PLANE,
+            hi: ZERO_PLANE,
+            c2: ZERO_PLANE,
+        };
+
+        /// Element `i` has `c0 = 1` and no other bit.
+        pub const ONE: Self = Self {
+            lo: plane([1, 0, 1, 0, 1, 0, 1, 0]),
+            hi: plane([1, 0, 1, 0, 1, 0, 1, 0]),
+            c2: ZERO_PLANE,
+        };
+
+        /// One scalar in every element.
+        #[inline(always)]
+        pub fn splat(r: F192) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe {
+                let lo = _mm256_broadcastsi128_si256(pair(r.c0, r.c1));
+                let c2 = _mm256_set1_epi64x(r.c2 as i64);
+                Self {
+                    lo: [lo; 2],
+                    hi: [lo; 2],
+                    c2: [c2; 2],
+                }
+            }
+        }
+
+        #[inline(always)]
+        pub fn from_array(e: &[F192; 8]) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { load_planes(e) }
+        }
+
+        /// Every element times `x`, the base field's generator: each coefficient on its own.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            // SAFETY: the module is compiled only with avx2 enabled.
+            let m = |p: Plane| p.map(|w| unsafe { words_mul_x(w) });
+            Self {
+                lo: m(self.lo),
+                hi: m(self.hi),
+                c2: m(self.c2),
+            }
+        }
+
+        #[inline(always)]
+        pub fn to_array(self) -> [F192; 8] {
+            let mut out = [F192::ZERO; 8];
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { store_planes(self, &mut out) };
+            out
+        }
+
+        /// Element `i`, read from memory with scalar loads.
+        #[inline]
+        pub fn lane(&self, i: usize) -> F192 {
+            assert!(i < 8);
+            let (qwords, at) = (core::ptr::from_ref(self).cast::<u64>(), 2 * (i / 2));
+            // SAFETY: the struct is three `repr(C)` planes of eight qwords, and `i < 8`.
+            unsafe {
+                let plane = qwords.add(8 * (i % 2));
+                F192::new(*plane.add(at), *plane.add(at + 1), *qwords.add(16 + i))
+            }
+        }
+
+        /// Overwrite element `i` with scalar stores.
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, e: F192) {
+            assert!(i < 8);
+            let (qwords, at) = (core::ptr::from_mut(self).cast::<u64>(), 2 * (i / 2));
+            // SAFETY: as in `lane`.
+            unsafe {
+                let plane = qwords.add(8 * (i % 2));
+                *plane.add(at) = e.c0;
+                *plane.add(at + 1) = e.c1;
+                *qwords.add(16 + i) = e.c2;
+            }
+        }
+
+        /// The eight lane-wise products, unreduced: twelve carry-less multiplications per half.
+        #[inline(always)]
+        pub fn mul_unreduced(self, rhs: Self) -> Acc8 {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { mul(self, rhs) }
+        }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        ///
+        /// A pair plane half holds elements `4h + parity` and `4h + parity + 2`, so each output half is one
+        /// 128-bit lane shuffle of an input plane's halves.
+        #[inline(always)]
+        pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
+            #[inline]
+            #[target_feature(enable = "avx2")]
+            fn kernel(a: F192x8, b: F192x8) -> (F192x8, F192x8) {
+                let split = |x: Plane, y: Plane| {
+                    (
+                        [
+                            _mm256_permute2x128_si256::<0x20>(x[0], x[1]),
+                            _mm256_permute2x128_si256::<0x20>(y[0], y[1]),
+                        ],
+                        [
+                            _mm256_permute2x128_si256::<0x31>(x[0], x[1]),
+                            _mm256_permute2x128_si256::<0x31>(y[0], y[1]),
+                        ],
+                    )
+                };
+                let ((elo, ehi), (olo, ohi)) = (split(a.lo, b.lo), split(a.hi, b.hi));
+                let (ec2, oc2) = even_odd_qwords(a.c2, b.c2);
+                (F192x8 { lo: elo, hi: ehi, c2: ec2 }, F192x8 { lo: olo, hi: ohi, c2: oc2 })
+            }
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { kernel(a, b) }
+        }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
+        ///
+        /// Pair `p` of `g[j]` is lane `(p / 2) % 2` of half `p / 4` of plane `p % 2`, so each output half
+        /// is one 128-bit lane shuffle of two inputs, and `c2` is an 8x8 transpose of qwords.
+        #[inline(always)]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            #[inline]
+            #[target_feature(enable = "avx2")]
+            fn kernel(g: [F192x8; 8]) -> [F192x8; 8] {
+                let pairs = |e: &F192x8, parity: usize| if parity == 0 { e.lo } else { e.hi };
+                let mut out = [F192x8::ZERO; 8];
+                for (p, o) in out.iter_mut().enumerate() {
+                    for parity in 0..2 {
+                        let half: Plane = core::array::from_fn(|h| {
+                            let (x, y) = (pairs(&g[4 * h + parity], p % 2)[p / 4], pairs(&g[4 * h + parity + 2], p % 2)[p / 4]);
+                            if (p / 2) % 2 == 0 {
+                                _mm256_permute2x128_si256::<0x20>(x, y)
+                            } else {
+                                _mm256_permute2x128_si256::<0x31>(x, y)
+                            }
+                        });
+                        if parity == 0 {
+                            o.lo = half;
+                        } else {
+                            o.hi = half;
+                        }
+                    }
+                }
+                let c2 = transpose_qwords(g.map(|e| e.c2));
+                for (o, c2) in out.iter_mut().zip(c2) {
+                    o.c2 = c2;
+                }
+                out
+            }
+            // SAFETY: the module is compiled only with avx2 enabled.
+            unsafe { kernel(g) }
+        }
+    }
+
+    impl core::ops::Add for F192x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn add(self, rhs: Self) -> Self {
+            Self {
+                lo: xor2(self.lo, rhs.lo),
+                hi: xor2(self.hi, rhs.hi),
+                c2: xor2(self.c2, rhs.c2),
+            }
+        }
+    }
+
+    /// The eight lane-wise products.
+    impl core::ops::Mul for F192x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn mul(self, rhs: Self) -> Self {
+            // SAFETY: the module is compiled only with the features enabled.
+            unsafe { reduce_planes(mul(self, rhs)) }
+        }
+    }
+
+    impl core::ops::AddAssign for F192x8 {
+        #[inline]
+        fn add_assign(&mut self, rhs: Self) {
+            *self = *self + rhs;
+        }
+    }
+
+    /// The Karatsuba operands of one parity: the pair half, `c0 + c1` in both qwords, and the pair half
+    /// with that parity's `c2` added to both qwords.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn karatsuba_operands(pairs: __m256i, c2_dup: __m256i) -> (__m256i, __m256i, __m256i) {
+        let swapped = _mm256_shuffle_epi32::<0x4E>(pairs);
+        (pairs, _mm256_xor_si256(pairs, swapped), _mm256_xor_si256(pairs, c2_dup))
+    }
+
+    /// The six Karatsuba products of one parity half, y-folded.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn karatsuba_lanes(
+        (ap, a_s, a_t): (__m256i, __m256i, __m256i),
+        a2: __m256i,
+        (bp, b_s, b_t): (__m256i, __m256i, __m256i),
+        b2: __m256i,
+    ) -> [__m256i; 3] {
+        let p0 = _mm256_clmulepi64_epi128::<0x00>(ap, bp);
+        let p1 = _mm256_clmulepi64_epi128::<0x11>(ap, bp);
+        let p2 = _mm256_clmulepi64_epi128::<0x00>(a2, b2);
+        let p01 = _mm256_clmulepi64_epi128::<0x00>(a_s, b_s);
+        let p02 = _mm256_clmulepi64_epi128::<0x00>(a_t, b_t);
+        let p12 = _mm256_clmulepi64_epi128::<0x11>(a_t, b_t);
+        fold(p0, p1, p2, p01, p02, p12, |x, y| _mm256_xor_si256(x, y))
+    }
+
+    /// The eight lane-wise products, unreduced: twelve carry-less multiplications per half.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn mul(a: F192x8, b: F192x8) -> Acc8 {
+        let mut acc = Acc8::ZERO;
+        for h in 0..2 {
+            // Each parity's c2 in both qwords of its lane.
+            let (a2e, a2o) = (_mm256_shuffle_epi32::<0x44>(a.c2[h]), _mm256_shuffle_epi32::<0xEE>(a.c2[h]));
+            let (b2e, b2o) = (_mm256_shuffle_epi32::<0x44>(b.c2[h]), _mm256_shuffle_epi32::<0xEE>(b.c2[h]));
+            let even = karatsuba_lanes(karatsuba_operands(a.lo[h], a2e), a2e, karatsuba_operands(b.lo[h], b2e), b2e);
+            let odd = karatsuba_lanes(karatsuba_operands(a.hi[h], a2o), a2o, karatsuba_operands(b.hi[h], b2o), b2o);
+            for i in 0..3 {
+                acc.even[i][h] = even[i];
+                acc.odd[i][h] = odd[i];
+            }
+        }
+        acc
+    }
+
+    /// The eight mixed products by the words of `k`, unreduced: six carry-less multiplications per half.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn mul_base(a: F192x8, k: Plane) -> Acc8 {
+        let mut acc = Acc8::ZERO;
+        for h in 0..2 {
+            // Immediate bit 0 picks the qword of the first operand, bit 4 that of the second.
+            acc.even[0][h] = _mm256_clmulepi64_epi128::<0x00>(a.lo[h], k[h]);
+            acc.even[1][h] = _mm256_clmulepi64_epi128::<0x01>(a.lo[h], k[h]);
+            acc.odd[0][h] = _mm256_clmulepi64_epi128::<0x10>(a.hi[h], k[h]);
+            acc.odd[1][h] = _mm256_clmulepi64_epi128::<0x11>(a.hi[h], k[h]);
+            acc.even[2][h] = _mm256_clmulepi64_epi128::<0x00>(a.c2[h], k[h]);
+            acc.odd[2][h] = _mm256_clmulepi64_epi128::<0x11>(a.c2[h], k[h]);
+        }
+        acc
+    }
+
+    /// Reduce every lane back to planes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_planes(acc: Acc8) -> F192x8 {
+        let [d0e, d1e, d2e] = acc.even;
+        let [d0o, d1o, d2o] = acc.odd;
+        let red = |x: Plane, y: Plane| [0, 1].map(|h| reduce_halves(x[h], y[h]));
+        F192x8 {
+            lo: red(d0e, d1e),
+            hi: red(d0o, d1o),
+            c2: red(d2e, d2o),
+        }
+    }
+
+    /// Four base-field products: one carry-less multiplication per parity of word, then the reduction.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn mul_words(a: __m256i, b: __m256i) -> __m256i {
+        reduce_halves(_mm256_clmulepi64_epi128::<0x00>(a, b), _mm256_clmulepi64_epi128::<0x11>(a, b))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    pub fn mul_f64x8(a: &[F64; 8], b: &[F64; 8]) -> [F64; 8] {
+        (F64x8::from_array(a) * F64x8::from_array(b)).to_array()
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    pub fn fold_pairs_ext(x0: &[F192; 8], x1: &[F192; 8], r: F192) -> [F192; 8] {
+        let (a, b) = (load_planes(x0), load_planes(x1));
+        let p = reduce_planes(mul(a + b, F192x8::splat(r)));
+        let mut out = [F192::ZERO; 8];
+        store_planes(a + p, &mut out);
+        out
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    pub fn fold_lones_ext(x0: &[F192; 8], r: F192) -> [F192; 8] {
+        let a = load_planes(x0);
+        let p = reduce_planes(mul(a, F192x8::splat(r)));
+        let mut out = [F192::ZERO; 8];
+        store_planes(a + p, &mut out);
+        out
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    pub fn msg_terms_ext(x0: &[F192; 8], x1: &[F192; 8], y0: &[F192; 8], y1: &[F192; 8]) -> (Acc8, Acc8) {
+        let (a0, a1, b0, b1) = (load_planes(x0), load_planes(x1), load_planes(y0), load_planes(y1));
+        (mul(a0, b0), mul(a0 + a1, b0 + b1))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    pub fn dot_ext(x0: &[F192; 8], y0: &[F192; 8]) -> Acc8 {
+        mul(load_planes(x0), load_planes(y0))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    pub fn mul_base_splat(c: F192, k: &[F64; 8]) -> Acc8 {
+        mul_base(F192x8::splat(c), F64x8::from_array(k).0)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
     pub fn reduce_each(acc: Acc8) -> [F192; 8] {
         let mut out = [F192::ZERO; 8];
         store_planes(reduce_planes(acc), &mut out);
