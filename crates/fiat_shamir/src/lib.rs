@@ -162,18 +162,17 @@ impl FiatShamirState {
                 .expect("a nonce exists")
         } else {
             // Many candidates at once through the batched permutation: each one's input is the
-            // state with a zero nonce absorbed, its nonce written into that scalar's first lane.
+            // state with a zero nonce absorbed, its nonce written into lane `lane` of every copy.
             let mut base = self.clone();
             base.absorb(F192::ZERO, DS_POW_NONCE);
             let lane = 4 * (base.n_pending - 1);
             const BATCH: usize = 2 * primitives::hash::LANES;
+            let mask = (1u64 << bits) - 1;
             let batch = |first: u64| {
-                let mut states = [base.state; BATCH];
-                for (i, state) in states.iter_mut().enumerate() {
-                    state[lane] = first + i as u64;
-                }
-                primitives::hash::keccak_f_many(&mut states);
-                states.iter().position(|s| s[0] & ((1u64 << bits) - 1) == 0)
+                (0..BATCH / primitives::hash::LANES).find_map(|h| {
+                    let at = h * primitives::hash::LANES;
+                    primitives::hash::grind_lane(&base.state, lane, first + at as u64, mask).map(|i| at + i)
+                })
             };
             // The smallest matching batch and its first match give the smallest nonce.
             let block: u64 = 1 << (bits.min(24) + 1);
