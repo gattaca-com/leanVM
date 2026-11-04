@@ -375,12 +375,20 @@ impl F192Unreduced {
     pub const ZERO: Self = Self { coeffs: [[0; 2]; 3] };
 
     /// The three 128-bit coefficients as `[low, high]` words.
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")),
+        allow(dead_code)
+    )]
     #[inline]
     pub(crate) const fn coeffs(self) -> [[u64; 2]; 3] {
         self.coeffs
     }
 
     /// Build from three 128-bit coefficients given as `[low, high]` words.
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")),
+        allow(dead_code)
+    )]
     #[inline]
     pub(crate) const fn from_coeffs(coeffs: [[u64; 2]; 3]) -> Self {
         Self { coeffs }

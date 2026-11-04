@@ -15,7 +15,7 @@
 use super::gf2_64::F64;
 use super::gf2_64x3::{F192, F192Unreduced};
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-use super::gf2_64x3::{Weights8, dot_base, mul_base8, mul_unreduced4, mul4};
+use super::gf2_64x3::{mul_unreduced4, mul4};
 
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 pub use avx512::{Acc8, F192x8, F64x8};
@@ -28,6 +28,8 @@ pub type Prod8 = Acc8;
 /// Eight elements, on a target without the wide multiplier.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[derive(Clone, Copy, Debug)]
+// Line-aligned, as on AVX-512, so a block of them streams in whole lines.
+#[repr(C, align(64))]
 pub struct F192x8([F192; 8]);
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
@@ -282,40 +284,18 @@ impl core::ops::BitXor for Prod8 {
     }
 }
 
-/// The unreduced sum of eight-element products, on a target without the wide multiplier.
+/// The unreduced sum of eight-element products, lane by lane, as on AVX-512.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-#[derive(Clone, Copy, Debug)]
-pub struct Acc8(F192Unreduced);
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-impl Acc8 {
-    pub const ZERO: Self = Self(F192Unreduced::ZERO);
-
-    #[inline]
-    pub fn reduce(self) -> F192 {
-        self.0.reduce()
-    }
-
-    /// Every lane reduced on its own, as [`Acc8::reduce_each`].
-    #[inline]
-    pub fn reduce_lanes(self) -> F192x8 {
-        unreachable!("the portable accumulator holds one sum, not eight");
-    }
-}
+pub type Acc8 = Prod8;
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-impl From<F192Unreduced> for Acc8 {
+impl From<F192Unreduced> for Prod8 {
+    /// One sum in lane 0, the other lanes zero.
     #[inline]
     fn from(u: F192Unreduced) -> Self {
-        Self(u)
-    }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-impl core::ops::BitXorAssign for Acc8 {
-    #[inline]
-    fn bitxor_assign(&mut self, rhs: Self) {
-        self.0 ^= rhs.0;
+        let mut lanes = [F192Unreduced::ZERO; 8];
+        lanes[0] = u;
+        Self(lanes)
     }
 }
 
@@ -379,7 +359,7 @@ pub fn mul_base_splat8(c: F192, k: &[F64; 8]) -> Acc8 {
     // SAFETY: the features are enabled at compile time.
     return unsafe { avx512::mul_base_splat(c, k) };
     #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-    Acc8(k.iter().fold(F192Unreduced::ZERO, |acc, &k| acc ^ c.mul_base_unreduced(k)))
+    Prod8(k.map(|k| c.mul_base_unreduced(k)))
 }
 
 /// The eight products `a_i * b_i`.
@@ -416,20 +396,14 @@ impl Acc8 {
         // SAFETY: the features are enabled at compile time.
         return unsafe { avx512::reduce_each(self) };
         #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
-        unreachable!("the portable accumulator holds one sum, not eight");
+        self.reduce_lanes().to_array()
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
 #[inline]
 fn dot_ext(x: &[F192; 8], y: &[F192; 8]) -> Acc8 {
-    let mut acc = F192Unreduced::ZERO;
-    for h in [0, 4] {
-        for p in mul_unreduced4([x[h], x[h + 1], x[h + 2], x[h + 3]], [y[h], y[h + 1], y[h + 2], y[h + 3]]) {
-            acc ^= p;
-        }
-    }
-    Acc8(acc)
+    F192x8::from_array(x).mul_unreduced(F192x8::from_array(y))
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
