@@ -741,37 +741,47 @@ const GROUP: usize = 8;
 fn bytecode_sums(points: &[Vec<F192>]) -> Vec<Vec<F192>> {
     let _span = tracing::info_span!("Bytecode sums").entered();
     let (rows, live) = (stacked_bytecode().as_chunks::<BLOCK>().0, bytecode_rows());
-    points
-        .iter()
-        .map(|point| {
-            // A leaf's claim weighs the first row alone.
-            if point.iter().all(|&x| x == F192::ZERO) {
-                return rows[0].iter().map(|&w| F192::from(w)).collect();
+    let mut sums: Vec<Vec<F192>> = Vec::with_capacity(points.len());
+    for (t, point) in points.iter().enumerate() {
+        // A point met before, as children that are copies of one proof bring, reuses its sums.
+        let same = points[..t].iter().position(|earlier| earlier == point);
+        let next = match same {
+            Some(earlier) => sums[earlier].clone(),
+            None => sums_at(rows, live.clone(), point),
+        };
+        sums.push(next);
+    }
+    sums
+}
+
+/// [`bytecode_sums`] of one point.
+fn sums_at(rows: &[[F64; BLOCK]], live: Range<usize>, point: &[F192]) -> Vec<F192> {
+    // A leaf's claim weighs the first row alone.
+    if point.iter().all(|&x| x == F192::ZERO) {
+        return rows[0].iter().map(|&w| F192::from(w)).collect();
+    }
+    let eq = eq_table(&point[BLOCK_VARS..]);
+    let (groups, weights) = (
+        rows[live.clone()].as_chunks::<GROUP>().0,
+        eq[live.clone()].as_chunks::<GROUP>().0,
+    );
+    let partial = parallel::fold_reduce(
+        groups.len(),
+        || vec![Prod8::ZERO; BLOCK / 8],
+        |acc: &mut Vec<Prod8>, g| {
+            let splats = weights[g].map(F192x8::splat);
+            for (x, acc) in acc.iter_mut().enumerate() {
+                for (splat, row) in splats.iter().zip(&groups[g]) {
+                    *acc ^= splat.mul_base_unreduced(F64x8::from_array(&row.as_chunks::<8>().0[x]));
+                }
             }
-            let eq = eq_table(&point[BLOCK_VARS..]);
-            let (groups, weights) = (
-                rows[live.clone()].as_chunks::<GROUP>().0,
-                eq[live.clone()].as_chunks::<GROUP>().0,
-            );
-            let partial = parallel::fold_reduce(
-                groups.len(),
-                || vec![Prod8::ZERO; BLOCK / 8],
-                |acc: &mut Vec<Prod8>, g| {
-                    let splats = weights[g].map(F192x8::splat);
-                    for (x, acc) in acc.iter_mut().enumerate() {
-                        for (splat, row) in splats.iter().zip(&groups[g]) {
-                            *acc ^= splat.mul_base_unreduced(F64x8::from_array(&row.as_chunks::<8>().0[x]));
-                        }
-                    }
-                },
-                |mut a, b| {
-                    a.iter_mut().zip(b).for_each(|(a, b)| *a ^= b);
-                    a
-                },
-            );
-            partial.into_iter().flat_map(|p| p.reduce_lanes().to_array()).collect()
-        })
-        .collect()
+        },
+        |mut a, b| {
+            a.iter_mut().zip(b).for_each(|(a, b)| *a ^= b);
+            a
+        },
+    );
+    partial.into_iter().flat_map(|p| p.reduce_lanes().to_array()).collect()
 }
 
 /// The stacked bytecode at `point`, from its [`bytecode_sums`]: what [`mle_eval_par`] gives over the whole table.
