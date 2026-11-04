@@ -301,6 +301,14 @@ cfg_select! {
     ) => {
         pub use x86::{SkipBlock, SkipWeights};
     }
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "vpclmulqdq",
+        not(target_feature = "avx512f")
+    ) => {
+        pub use avx2::{SkipBlock, SkipWeights};
+    }
     _ => {
         pub struct SkipWeights(Vec<[u64; 3]>);
 
@@ -836,6 +844,220 @@ mod avx2 {
                 }
                 acc.map(|v| v.sum())
             })
+        }
+    }
+
+    /// The AVX-512 `SkipBlock` at half the width: four slices at a time, the embedding by nibble lookups.
+    #[cfg(target_feature = "vpclmulqdq")]
+    pub use skip::{SkipBlock, SkipWeights};
+
+    #[cfg(target_feature = "vpclmulqdq")]
+    mod skip {
+        use core::arch::x86_64::*;
+
+        use super::super::*;
+        use crate::keccak::BITS;
+        use primitives::{load_at, store_at};
+
+        /// The layer's position weights, by word for vector loads.
+        pub struct SkipWeights(Vec<u64>);
+
+        impl SkipWeights {
+            pub fn new(weights: Vec<[u64; 3]>) -> Self {
+                assert_eq!(weights.len(), BITS);
+                let mut words = vec![0; 3 * BITS];
+                for (j, w) in weights.iter().enumerate() {
+                    for (k, &w) in w.iter().enumerate() {
+                        words[k * BITS + j] = w;
+                    }
+                }
+                Self(words)
+            }
+        }
+
+        /// [`skip_row`] over every row and slice of a block, four slices at a time: each register
+        /// holds one value of four positions, as the AVX-512 kernel holds eight.
+        pub struct SkipBlock {
+            /// Per slot, the low and high polynomial halves, each split into even and odd positions.
+            acc: Vec<[__m256i; 4]>,
+            packs: [[__m256i; HALF]; 5],
+            tile: [[__m256i; 4]; 5],
+        }
+
+        /// The nibble tables of the embedding, in both 128-bit lanes.
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn nibble_tables() -> [__m256i; 12] {
+            std::array::from_fn(|i| _mm256_broadcastsi128_si256(load_at::<u8, __m128i>(&NIBBLES[i], 0)))
+        }
+
+        /// The embedding of each pack of `v`: its low 16 bits, and its third byte in the low byte of a pack.
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn embedding(t: &[__m256i; 12], v: __m256i) -> (__m256i, __m256i) {
+            let mask = _mm256_set1_epi8(0x0f);
+            let (low_byte, high_byte) = (_mm256_set1_epi16(0x00ff), _mm256_set1_epi16(0xff00u16 as i16));
+            let nibbles = [_mm256_and_si256(v, mask), _mm256_and_si256(_mm256_srli_epi16::<4>(v), mask)];
+            let look = |k: usize, high: usize| {
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t[4 * k + 2 * high], nibbles[0]),
+                    _mm256_shuffle_epi8(t[4 * k + 2 * high + 1], nibbles[1]),
+                )
+            };
+            let low = _mm256_or_si256(
+                _mm256_and_si256(_mm256_xor_si256(look(0, 0), _mm256_srli_epi16::<8>(look(0, 1))), low_byte),
+                _mm256_and_si256(_mm256_xor_si256(_mm256_slli_epi16::<8>(look(1, 0)), look(1, 1)), high_byte),
+            );
+            let high = _mm256_and_si256(_mm256_xor_si256(look(2, 0), _mm256_srli_epi16::<8>(look(2, 1))), low_byte);
+            (low, high)
+        }
+
+        /// One half's packs of four consecutive positions, embedded: `out[q]` holds the half's pack
+        /// `q` of position `i` in word `i`.
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn embed4(t: &[__m256i; 12], positions: &[u64], half: usize, out: &mut [__m256i; HALF]) {
+            // Word `w` of the half, of each of the four positions.
+            let r: [__m256i; 4] = std::array::from_fn(|i| load_at(positions, BLOCK_WORDS * i + 4 * half));
+            let (a0, a1) = (_mm256_unpacklo_epi64(r[0], r[1]), _mm256_unpackhi_epi64(r[0], r[1]));
+            let (a2, a3) = (_mm256_unpacklo_epi64(r[2], r[3]), _mm256_unpackhi_epi64(r[2], r[3]));
+            let words = [
+                _mm256_permute2x128_si256::<0x20>(a0, a2),
+                _mm256_permute2x128_si256::<0x20>(a1, a3),
+                _mm256_permute2x128_si256::<0x31>(a0, a2),
+                _mm256_permute2x128_si256::<0x31>(a1, a3),
+            ];
+            let zero = _mm256_setzero_si256();
+            for (w, &v) in words.iter().enumerate() {
+                let (low, high) = embedding(t, v);
+                // Per lane, the four packs of its even word, then of its odd one.
+                let (even, odd) = (_mm256_unpacklo_epi16(low, high), _mm256_unpackhi_epi16(low, high));
+                let (first, second) = (_mm256_unpacklo_epi32(even, odd), _mm256_unpackhi_epi32(even, odd));
+                out[4 * w] = _mm256_unpacklo_epi32(first, zero);
+                out[4 * w + 1] = _mm256_unpackhi_epi32(first, zero);
+                out[4 * w + 2] = _mm256_unpacklo_epi32(second, zero);
+                out[4 * w + 3] = _mm256_unpackhi_epi32(second, zero);
+            }
+        }
+
+        /// One high-variable pair of [`extend_group`], leaving the low pair binary.
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        fn extend4_high(v: &[__m256i], high: usize) -> [__m256i; 4] {
+            let x = |a: [__m256i; 4], b: [__m256i; 4]| -> [__m256i; 4] {
+                std::array::from_fn(|l| _mm256_xor_si256(a[l], b[l]))
+            };
+            let q = |k: usize| -> [__m256i; 4] { std::array::from_fn(|l| v[4 * k + l]) };
+            match high {
+                0..=3 => q(high),
+                4 => x(q(0), q(1)),
+                5 => x(q(2), q(3)),
+                6 => x(q(0), q(2)),
+                7 => x(q(1), q(3)),
+                8 => x(x(q(0), q(1)), x(q(2), q(3))),
+                _ => unreachable!(),
+            }
+        }
+
+        impl SkipBlock {
+            pub fn new() -> Box<Self> {
+                // SAFETY: AVX2 is enabled at compile time.
+                let zero = unsafe { _mm256_setzero_si256() };
+                Box::new(Self {
+                    acc: vec![[zero; 4]; 2 * MIXED],
+                    packs: [[zero; HALF]; 5],
+                    tile: [[zero; 4]; 5],
+                })
+            }
+
+            /// Sum a block, the position weights as elements.
+            pub fn run(&mut self, block: &[u64], weights: &SkipWeights) {
+                assert!(block.len() >= BITS * BLOCK_WORDS);
+                // SAFETY: the features are enabled at compile time.
+                unsafe { self.sum(block, weights) }
+            }
+
+            /// The sums over a block, whose positions [`run`](Self::run) has checked.
+            #[target_feature(enable = "avx2,vpclmulqdq")]
+            #[inline]
+            fn sum(&mut self, block: &[u64], weights: &SkipWeights) {
+                let t = nibble_tables();
+                self.acc.fill([_mm256_setzero_si256(); 4]);
+                for half in 0..2 {
+                    for r in 0..5 {
+                        for z in (0..64).step_by(4) {
+                            let js = row_positions(r, z);
+                            for (packs, &j) in self.packs.iter_mut().zip(&js) {
+                                embed4(&t, &block[BLOCK_WORDS * j..][..4 * BLOCK_WORDS], half, packs);
+                            }
+                            let w: [[__m256i; 3]; 5] =
+                                std::array::from_fn(|x| std::array::from_fn(|k| load_at(&weights.0, k * BITS + js[x])));
+                            // `HIGH[6..]` have the group at infinity, which the rounds do not use.
+                            for high in 0..6 {
+                                for (tile, packs) in self.tile.iter_mut().zip(&self.packs) {
+                                    *tile = extend4_high(packs, high);
+                                }
+                                for i in 0..if high < 4 { 5 } else { 9 } {
+                                    let e: [__m256i; 5] = std::array::from_fn(|x| {
+                                        let v = &self.tile[x];
+                                        match i {
+                                            0 => _mm256_xor_si256(v[0], v[1]),
+                                            1 => _mm256_xor_si256(v[2], v[3]),
+                                            2 => _mm256_xor_si256(v[0], v[2]),
+                                            3 => _mm256_xor_si256(v[1], v[3]),
+                                            4 => _mm256_xor_si256(_mm256_xor_si256(v[0], v[1]), _mm256_xor_si256(v[2], v[3])),
+                                            _ => v[i - 5],
+                                        }
+                                    });
+                                    let mut sums = [_mm256_setzero_si256(); 6];
+                                    for x in 0..5 {
+                                        let (b, c) = (e[(x + 1) % 5], e[(x + 2) % 5]);
+                                        let even = _mm256_clmulepi64_epi128::<0x00>(b, c);
+                                        let odd = _mm256_clmulepi64_epi128::<0x11>(b, c);
+                                        for k in 0..3 {
+                                            let (s, w) = (&mut sums[2 * k..], w[x][k]);
+                                            s[0] = _mm256_xor_si256(s[0], _mm256_clmulepi64_epi128::<0x00>(even, w));
+                                            s[1] = _mm256_xor_si256(s[1], _mm256_clmulepi64_epi128::<0x10>(odd, w));
+                                        }
+                                    }
+                                    let point = match i {
+                                        0..=3 => 20 + 4 * high + i,
+                                        4 => 56 + high,
+                                        _ => 4 * (high - 4) + i - 5,
+                                    };
+                                    // The products start at bits 0, 64 and 128; combine their overlaps before storing.
+                                    let sums = [
+                                        _mm256_xor_si256(sums[0], _mm256_bslli_epi128::<8>(sums[2])),
+                                        _mm256_xor_si256(sums[1], _mm256_bslli_epi128::<8>(sums[3])),
+                                        _mm256_xor_si256(sums[4], _mm256_bsrli_epi128::<8>(sums[2])),
+                                        _mm256_xor_si256(sums[5], _mm256_bsrli_epi128::<8>(sums[3])),
+                                    ];
+                                    let acc = &mut self.acc[slot(half, point)];
+                                    for (acc, sum) in acc.iter_mut().zip(sums) {
+                                        *acc = _mm256_xor_si256(*acc, sum);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            /// The sum for slot `i`, as four polynomial words.
+            pub fn get(&self, i: usize) -> [u64; 4] {
+                let halves: [u128; 2] = std::array::from_fn(|k| {
+                    let mut lanes = [0u128; 2];
+                    // SAFETY: AVX2 is enabled at compile time.
+                    store_at(&mut lanes, 0, unsafe { _mm256_xor_si256(self.acc[i][2 * k], self.acc[i][2 * k + 1]) });
+                    lanes[0] ^ lanes[1]
+                });
+                [
+                    halves[0] as u64,
+                    (halves[0] >> 64) as u64,
+                    halves[1] as u64,
+                    (halves[1] >> 64) as u64,
+                ]
+            }
         }
     }
 }
