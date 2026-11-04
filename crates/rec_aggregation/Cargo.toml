@@ -29,3 +29,4 @@ signers-cache = ["signatures/mock"]
 
 [dev-dependencies]
 signatures = { workspace = true, features = ["mock"] }
+leanvm_core = { workspace = true, features = ["tamper"] }

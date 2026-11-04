@@ -28,7 +28,7 @@ pub mod layout;
 mod trace;
 pub use execute::{ExecError, Execution, Fault, Memory};
 pub use hints::GPow;
-pub use isa::{DerefMode, Op};
+pub use isa::{DerefMode, Op, OutCells};
 pub use layout::*;
 pub(crate) use trace::{Drow, Jrow, Krow, Rows, Srow, Trace, Xrow};
 
@@ -619,6 +619,8 @@ pub fn prove_with(
         digest_words(&public_input),
     );
 
+    #[cfg(any(test, feature = "tamper"))]
+    tamper::witness(tamper::take(), &mut w);
     // Announce the prover's sizes, then commit, before sampling any challenge.
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
@@ -852,6 +854,57 @@ fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::SlotClaim> {
         .collect()
 }
 
+/// Test-only forgeries of a `KECCAK`'s output cells: the prover is honest but for the one named here.
+#[cfg(any(test, feature = "tamper"))]
+pub mod tamper {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Tamper {
+        /// Have every `KECCAK` write all thirteen output cells, whatever its bytecode requests.
+        UnrequestedWrite,
+        /// Flip a bit of each `KECCAK`'s first output cell as it is written.
+        WrongOutput,
+        /// Flip the first `KECCAK` row's flag for output cells `2..13` in the witness, not in the bytecode.
+        OutFlag,
+    }
+
+    thread_local! {
+        static NEXT: std::cell::Cell<Option<Tamper>> = const { std::cell::Cell::new(None) };
+        static FORGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Have the next proof on this thread forged by `tamper`.
+    pub fn set(tamper: Tamper) {
+        NEXT.with(|next| next.set(Some(tamper)));
+    }
+
+    pub(crate) fn take() -> Option<Tamper> {
+        let tamper = NEXT.with(|next| next.take());
+        FORGING.with(|forging| forging.set(tamper.is_some()));
+        tamper
+    }
+
+    /// Whether the proof this thread is making is forged: then its bus may not balance, and the
+    /// prover sends the push side's product for both sides, as a cheating prover would.
+    pub(crate) fn forging() -> bool {
+        FORGING.with(|forging| forging.get())
+    }
+
+    /// The forgery the next proof will take, read by the run before [`take`] clears it.
+    pub(crate) fn peek() -> Option<Tamper> {
+        NEXT.with(|next| next.get())
+    }
+
+    /// The witness forged before its commitment, which the readers then share.
+    pub(crate) fn witness(tamper: Option<Tamper>, w: &mut layout::Witness) {
+        if tamper == Some(Tamper::OutFlag) {
+            let flag = w.layout.placements[schema().base[tables::KECCAK_TABLE] + tables::keccakt::OUT_ALL];
+            w.q[flag.offset].0 ^= 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +939,7 @@ mod tests {
             out: 13,
             in_odd: false,
             out_odd: true,
+            out_cells: OutCells::All,
         });
         prog.push(Op::Keccak {
             m: [13, 14, 15, 16],
@@ -895,6 +949,7 @@ mod tests {
             out: 26,
             in_odd: true,
             out_odd: false,
+            out_cells: OutCells::All,
         });
         for k in 0..2u32 {
             prog.push(Op::Set {
@@ -905,6 +960,103 @@ mod tests {
         prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
         assert_eq!(prog.len(), 16);
         Program::from_bytecode(prog, 64)
+    }
+
+    /// Two KECCAK rows over one input that write only part of their output: the first its cell 0
+    /// at 13, the second its cells 0 and 1 at 26. An XOR reads cell 13 and cell 27 into 40. With
+    /// `read_unrequested`, a second XOR reads cell 14 into 41, a cell the first row does not write.
+    fn partial_keccak_program(read_unrequested: bool) -> Program {
+        let mut prog = vec![Op::Set { o: 2, k: w(3) }, Op::Set { o: 3, k: w(4) }];
+        for c in 4..13u32 {
+            prog.push(Op::Set { o: c, k: w(u64::from(c)) });
+        }
+        for (out, out_cells) in [(13, OutCells::One), (26, OutCells::Two)] {
+            prog.push(Op::Keccak {
+                m: [2, 3, 2, 3],
+                tail: 4,
+                b8: 8,
+                cap: 9,
+                out,
+                in_odd: false,
+                out_odd: false,
+                out_cells,
+            });
+        }
+        prog.push(Op::Xor { a: 13, b: 27, c: 40 });
+        prog.push(if read_unrequested {
+            Op::Xor { a: 14, b: 13, c: 41 }
+        } else {
+            Op::Set { o: 41, k: F192::ONE }
+        });
+        prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
+        assert_eq!(prog.len(), 16);
+        Program::from_bytecode(prog, 64)
+    }
+
+    /// A KECCAK writes the output cells its bytecode requests and no other, and the proof verifies.
+    #[test]
+    fn keccak_writes_only_requested_cells() {
+        use crate::keccak::{STATE_CELLS, cells_of_state};
+        let program = partial_keccak_program(false);
+        let pi = [w(7), w(11)];
+        let exec = program.execute(pi).unwrap();
+        let input: [F192; STATE_CELLS] = std::array::from_fn(|c| match c {
+            0 | 2 => w(3),
+            1 | 3 => w(4),
+            _ => w(c as u64),
+        });
+        let mut state = crate::keccak::state_of_cells(&input, false);
+        primitives::hash::keccak_f(&mut state);
+        let out = cells_of_state(&state, false);
+        assert_eq!(exec.mem.word(13), out[0]);
+        assert_eq!([exec.mem.word(26), exec.mem.word(27)], [out[0], out[1]]);
+        assert_eq!(exec.mem.word(40), out[0] + out[1]);
+        assert!(
+            (14..26).chain(28..39).all(|c| exec.mem.word(c) == F192::ZERO),
+            "a cell not requested is not written"
+        );
+        let (proof, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &proof).expect("partial outputs verify");
+    }
+
+    /// The forgeries of a KECCAK's output cells are rejected: a row that writes a cell its
+    /// bytecode does not request, which a later read uses; a requested cell holding a wrong
+    /// value; and the witness's flag for output cells `2..13` flipped against the bytecode.
+    #[test]
+    fn keccak_output_forgeries_are_rejected() {
+        use tamper::Tamper;
+        let pi = [w(7), w(11)];
+        let reading = partial_keccak_program(true);
+        // Honestly, the read of the unrequested cell is the prover's choice, and refused.
+        assert!(matches!(
+            prove(&reading, pi, crate::pcs::TEST_LOG_INV_RATE),
+            Err(ProveError::UnconstrainedReads(cells)) if cells == [14]
+        ));
+        let full = keccak_program(w(3), w(4), [w(5); 4], w(6));
+        let partial = partial_keccak_program(false);
+        // The bus fails where a memory push has no partner. A row writing all thirteen cells reads
+        // its output lanes back from memory, so the wrong value balances the bus and the Keccak
+        // reduction rejects it instead.
+        use verifier::VerifierError::{GkrLayer, KeccakProduct};
+        let bus = |e: &verifier::VerifierError| matches!(e, GkrLayer(_));
+        let reduction = |e: &verifier::VerifierError| *e == KeccakProduct;
+        type Rejects<'a> = &'a dyn Fn(&verifier::VerifierError) -> bool;
+        let cases: [(Tamper, &Program, Rejects); 5] = [
+            (Tamper::UnrequestedWrite, &reading, &bus),
+            (Tamper::WrongOutput, &partial, &bus),
+            (Tamper::WrongOutput, &full, &reduction),
+            (Tamper::OutFlag, &partial, &bus),
+            (Tamper::OutFlag, &full, &bus),
+        ];
+        for (forgery, program, expected) in cases {
+            tamper::set(forgery);
+            let (proof, _) = prove(program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+            let verdict = verify(program, &pi, &proof).err();
+            assert!(
+                matches!(&verdict, Some(CpuError::Verifier(e)) if expected(e)),
+                "{forgery:?}: {verdict:?}"
+            );
+        }
     }
 
     /// The opcode's execution semantics: the output cells hold the permutation of the lanes the
@@ -1047,7 +1199,16 @@ mod tests {
         for j in 0..steps as u32 {
             let out = 20_000 + 13 * j;
             prog.push(if j == 0 {
-                Op::Keccak { m: [2, 3, 2, 3], tail: 4, b8: 8, cap: 9, out, in_odd: false, out_odd: true }
+                Op::Keccak {
+                    m: [2, 3, 2, 3],
+                    tail: 4,
+                    b8: 8,
+                    cap: 9,
+                    out,
+                    in_odd: false,
+                    out_odd: true,
+                    out_cells: OutCells::All,
+                }
             } else {
                 let inp = out - 13;
                 Op::Keccak {
@@ -1058,6 +1219,7 @@ mod tests {
                     out,
                     in_odd: j % 2 == 1,
                     out_odd: j % 2 == 0,
+                    out_cells: OutCells::All,
                 }
             });
         }

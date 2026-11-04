@@ -3342,6 +3342,23 @@ def main():
         assert_eq!(node.xmss_signers.len(), SMALL_LEAF_SIZE + big);
     }
 
+    /// A child whose first KECCAK row's flag for output cells `2..13` disagrees with the bytecode
+    /// fails the guest's run, in its bus GKR check (`verify_bus_gkr`).
+    #[test]
+    fn forged_keccak_flags_in_children_are_rejected() {
+        use leanvm_core::cpu::tamper::{self, Tamper};
+        leanvm_core::init_prover();
+        let signers = get_signers(2 * SMALL_LEAF_SIZE);
+        let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
+        tamper::set(Tamper::OutFlag);
+        let right = prove_leaf(&signers[SMALL_LEAF_SIZE..]);
+        let result = aggregate(&[left, right], vec![], vec![], &[], None, LOG_INV_RATE);
+        assert!(
+            matches!(result, Err(AggregationError::ProofError(_))),
+            "a child with a forged output flag is rejected"
+        );
+    }
+
     /// A claim changed anywhere in the tree changes the commitment, so the statement no
     /// longer matches the proof: the verifier rejects it, on the wire too. A forged child
     /// commitment hint fails in the guest, whose rebuilt child statement matches no proof.
