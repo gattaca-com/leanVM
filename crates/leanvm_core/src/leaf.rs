@@ -12,7 +12,7 @@ use crate::constraints::{self, TableBlocks};
 use crate::gkr;
 use crate::transcript::ProverState;
 use primitives::field::{
-    Acc8, F64, F64x8, F192, F192Unreduced, F192x8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
+    F64, F64x8, F192, F192Unreduced, F192x8, Prod8, Weights8, dot_base, g_pow, index_mle, mul_base_splat8, mul_f64x8,
     mul_slices,
 };
 use primitives::multilinear::{eq_eval_bits, eq_table, mle_eval_many};
@@ -414,7 +414,7 @@ fn leaf_rows8((constant, terms): &(F192, Terms), z: usize) -> F192x8 {
     fn eight(k: &[F64], z: usize) -> &[F64; 8] {
         k[z..z + 8].try_into().expect("eight words")
     }
-    let mut acc = Acc8::ZERO;
+    let mut acc = Prod8::ZERO;
     for (k, c) in &terms.lins {
         acc ^= mul_base_splat8(*c, eight(k, z));
     }
