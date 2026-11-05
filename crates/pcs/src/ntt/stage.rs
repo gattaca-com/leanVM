@@ -240,25 +240,14 @@ impl<'a> Stage<'a> {
         unsafe {
             fill_stage_tiles(stage, msg, t0, log_step, msg_rows, blocks, row_words, octet, copies, subs)
         }
-        #[cfg(not(any(
-            all(target_arch = "x86_64", target_feature = "avx512f"),
-            all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f"))
-        )))]
+        #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))))]
         fill_stage_tiles(stage, msg, t0, log_step, msg_rows, blocks, row_words, octet, copies, subs);
     }
 }
 
-/// [`Stage::fill`], a target-feature function where AVX-512 or AVX2 is enabled, so its tiles move through registers.
-#[cfg_attr(
-    all(target_arch = "x86_64", target_feature = "avx512f"),
-    target_feature(enable = "avx512f"),
-    inline
-)]
-#[cfg_attr(
-    all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
-    target_feature(enable = "avx2"),
-    inline
-)]
+/// [`Stage::fill`], a target-feature function where AVX-512 is enabled, so its tiles move through registers.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512f"), target_feature(enable = "avx512f"), inline)]
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")), target_feature(enable = "avx2"), inline)]
 fn fill_stage_tiles(
     stage: &mut [F64],
     msg: &[F64],
@@ -336,45 +325,8 @@ fn fill_tile(sub: &mut [F64], tile: usize, msg: &[F64], src: [usize; 8], zeros: 
     }
 }
 
-/// [`fill_tile`] as two 4x4 transposes of YMM halves per half of the lines.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
-#[inline]
-#[target_feature(enable = "avx2")]
-fn fill_tile(stage: &mut [F64], tile: usize, msg: &[F64], src: [usize; 8], zeros: u8) {
-    use core::arch::x86_64::*;
-    use primitives::{load_at, store_at};
-    // Line `k`, half `h`: words `4h..4h + 4` of the line's 8 residues.
-    let r: [[__m256i; 2]; 8] = std::array::from_fn(|k| {
-        if zeros >> k & 1 == 1 {
-            [_mm256_setzero_si256(); 2]
-        } else {
-            [load_at(msg, src[k]), load_at(msg, src[k] + 4)]
-        }
-    });
-    // Residue `s` is word `s` of every line: lines 0..4 in its first half, 4..8 in its second.
-    for h in 0..2 {
-        for q in 0..2 {
-            let t = |k: usize| r[4 * q + k][h];
-            let (a0, a1) = (_mm256_unpacklo_epi64(t(0), t(1)), _mm256_unpackhi_epi64(t(0), t(1)));
-            let (a2, a3) = (_mm256_unpacklo_epi64(t(2), t(3)), _mm256_unpackhi_epi64(t(2), t(3)));
-            let cols = [
-                _mm256_permute2x128_si256::<0x20>(a0, a2),
-                _mm256_permute2x128_si256::<0x20>(a1, a3),
-                _mm256_permute2x128_si256::<0x31>(a0, a2),
-                _mm256_permute2x128_si256::<0x31>(a1, a3),
-            ];
-            for (i, col) in cols.into_iter().enumerate() {
-                store_at(stage, (tile + 4 * h + i) * 8 + 4 * q, col);
-            }
-        }
-    }
-}
-
 /// [`fill_tile`] word by word.
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "avx512f"),
-    all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f"))
-)))]
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))))]
 #[inline(always)]
 fn fill_tile(sub: &mut [F64], tile: usize, msg: &[F64], src: [usize; 8], zeros: u8) {
     for s in 0..8 {
@@ -398,12 +350,66 @@ fn copy_tile(sub: &mut [F64], i: usize, from: usize, mask: u8) {
 }
 
 /// [`copy_tile`] word by word.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx512f"), all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))))]
 #[inline(always)]
 fn copy_tile(sub: &mut [F64], i: usize, from: usize, mask: u8) {
     for s in 0..BATCH {
         for k in (0..8).filter(|k| mask >> k & 1 == 1) {
             sub[(i * BATCH + s) * 8 + k] = sub[(from * BATCH + s) * 8 + k];
+        }
+    }
+}
+
+/// [`fill_tile`] in two 4x4 transposes of YMM halves per pair of lines.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn fill_tile(sub: &mut [F64], tile: usize, msg: &[F64], src: [usize; 8], zeros: u8) {
+    use core::arch::x86_64::*;
+    use primitives::{load_at, store_at};
+    // Line `k`, half `h`: words `4h..4h + 4` of the line's 8 residues.
+    let r: [[__m256i; 2]; 8] = std::array::from_fn(|k| {
+        if zeros >> k & 1 == 1 {
+            [_mm256_setzero_si256(); 2]
+        } else {
+            let line: &[F64; 8] = msg[src[k]..src[k] + 8].try_into().unwrap();
+            [load_at(line, 0), load_at(line, 4)]
+        }
+    });
+    // Residue `s` is word `s` of every line: lines 0..4 in its first half, 4..8 in its second.
+    for h in 0..2 {
+        for q in 0..2 {
+            let t = |k: usize| r[4 * q + k][h];
+            let (a0, a1) = (_mm256_unpacklo_epi64(t(0), t(1)), _mm256_unpackhi_epi64(t(0), t(1)));
+            let (a2, a3) = (_mm256_unpacklo_epi64(t(2), t(3)), _mm256_unpackhi_epi64(t(2), t(3)));
+            let cols = [
+                _mm256_permute2x128_si256::<0x20>(a0, a2),
+                _mm256_permute2x128_si256::<0x20>(a1, a3),
+                _mm256_permute2x128_si256::<0x31>(a0, a2),
+                _mm256_permute2x128_si256::<0x31>(a1, a3),
+            ];
+            for (i, col) in cols.into_iter().enumerate() {
+                store_at(sub, (tile + 4 * h + i) * 8 + 4 * q, col);
+            }
+        }
+    }
+}
+
+/// [`copy_tile`] with a blend per YMM half.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn copy_tile(sub: &mut [F64], i: usize, from: usize, mask: u8) {
+    use core::arch::x86_64::*;
+    use primitives::{load_at, store_at};
+    let bits = |h: i64| _mm256_setr_epi64x(1 << (4 * h), 2 << (4 * h), 4 << (4 * h), 8 << (4 * h));
+    let m = _mm256_set1_epi64x(i64::from(mask));
+    let lanes = [0, 1].map(|h| _mm256_cmpeq_epi64(_mm256_and_si256(m, bits(h)), bits(h)));
+    for s in 0..BATCH {
+        for (h, lanes) in lanes.into_iter().enumerate() {
+            let (kept, copied): (__m256i, __m256i) =
+                (load_at(sub, (i * BATCH + s) * 8 + 4 * h), load_at(sub, (from * BATCH + s) * 8 + 4 * h));
+            store_at(sub, (i * BATCH + s) * 8 + 4 * h, _mm256_blendv_epi8(kept, copied, lanes));
         }
     }
 }

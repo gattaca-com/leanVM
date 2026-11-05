@@ -176,12 +176,7 @@ fn fused_sweep_avx512<const N: usize, const T: usize>(
 /// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
 #[cfg(not(any(
     all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
 )))]
 #[inline(always)]
 fn radix8_butterflies(src: Option<[&[F64]; 8]>, rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
@@ -192,12 +187,7 @@ fn radix8_butterflies(src: Option<[&[F64]; 8]>, rows: &mut [&mut [F64]; 8], t: &
 /// [`butterfly_lanes`] on rows `top` and `bot` of a row group.
 #[cfg(not(any(
     all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
 )))]
 #[inline(always)]
 fn butterfly_rows<const N: usize>(rows: &mut [&mut [F64]; N], top: usize, bot: usize, twiddle: F64) {
@@ -208,12 +198,7 @@ fn butterfly_rows<const N: usize>(rows: &mut [&mut [F64]; N], top: usize, bot: u
 /// Copy the rows that are read from a source into the rows that are written, where the two differ.
 #[cfg(not(any(
     all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
 )))]
 #[inline(always)]
 fn copy_rows<const N: usize>(src: Option<[&[F64]; N]>, rows: &mut [&mut [F64]; N]) {
@@ -279,12 +264,7 @@ pub(super) fn butterfly_interleaved_fused_2layer(
 /// The four butterflies of one radix-4 row group.
 #[cfg(not(any(
     all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )
+    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f"))
 )))]
 #[inline(always)]
 fn radix4_butterflies(src: Option<[&[F64]; 4]>, rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
@@ -366,7 +346,7 @@ fn butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
 }
 
 /// The transpose of [`butterfly_lanes`]: `s = u + v; u' = s; v' = s * t + v` over a pair of rows.
-/// Only AVX-512 has a kernel; other targets take the scalar loop.
+/// AVX-512 and AVX2 with VPCLMULQDQ have kernels; other targets take the scalar loop.
 pub(crate) fn transpose_butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: F64) {
     debug_assert_eq!(top.len(), bot.len());
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
@@ -374,26 +354,12 @@ pub(crate) fn transpose_butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddl
     unsafe {
         transpose_butterfly_lanes_avx512(top, bot, twiddle.0)
     }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    ))]
-    // SAFETY: this code is compiled only where VPCLMULQDQ and AVX2 are enabled.
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f")))]
+    // SAFETY: as in `butterfly_lanes`.
     unsafe {
         avx2::transpose_butterfly_lanes(top, bot, twiddle.0)
     }
-    // One pass beats routing through the forward vector kernel, whose two extra XOR passes cost more here.
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-        all(
-            target_arch = "x86_64",
-            target_feature = "vpclmulqdq",
-            target_feature = "avx2",
-            not(target_feature = "avx512f")
-        )
-    )))]
+    #[cfg(not(any(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"), all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f")))))]
     for (u, v) in top.iter_mut().zip(bot.iter_mut()) {
         let s = *u + *v;
         *u = s;
@@ -772,22 +738,16 @@ fn butterfly_lane_pair_neon(top: &mut [F64], bot: &mut [F64], twiddle: u64) {
 }
 
 /// The AVX-512 register kernels at half the width, for a machine with VPCLMULQDQ but no AVX-512.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "vpclmulqdq",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f")))]
 mod avx2 {
     use core::arch::x86_64::*;
 
     use primitives::field::F64;
-    use primitives::field::gf2_64x3::x86_64::reduce_halves256;
     use primitives::{load_at, store_at};
 
     use super::fused_rows;
 
-    /// Four-lane vectors of every row that a register kernel keeps in flight, as on AVX-512.
+    /// Four-lane vectors of every row that a register kernel keeps in flight.
     const LANE_VECTORS: usize = 2;
 
     /// A broadcast twiddle, and whether it is zero: the butterfly is then `v' = v + u`, with no product.
@@ -796,13 +756,34 @@ mod avx2 {
     /// The vectors of `N` rows held in registers: `v[row][k]` is vector `k` of the row.
     pub(super) type RowVectors<const N: usize> = [[__m256i; LANE_VECTORS]; N];
 
-    /// `u ^ v * tw` in each of the four lanes, as `mul_xor_avx512`.
+    /// `g(spill)` per top nibble of a product's high word, as the AVX-512 table, in both 128-bit lanes.
+    const G_SPILL: __m256i = {
+        let mut table = [0u8; 32];
+        let mut n = 0;
+        while n < 16 {
+            let s = n ^ (n >> 1) ^ (n >> 3);
+            table[n] = (s ^ (s << 1) ^ (s << 3) ^ (s << 4)) as u8;
+            table[16 + n] = table[n];
+            n += 1;
+        }
+        // SAFETY: 32 bytes and a vector have one size, and every bit pattern is valid in each.
+        unsafe { core::mem::transmute::<[u8; 32], __m256i>(table) }
+    };
+
+    /// `u ^ v * tw` in each of the four lanes, reduced as in `mul_xor_avx512`.
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
     fn mul_xor(u: __m256i, v: __m256i, tw: __m256i) -> __m256i {
         let even = _mm256_clmulepi64_epi128::<0x00>(v, tw);
         let odd = _mm256_clmulepi64_epi128::<0x11>(v, tw);
-        _mm256_xor_si256(u, reduce_halves256(even, odd))
+        let lo = _mm256_unpacklo_epi64(even, odd);
+        let hi = _mm256_unpackhi_epi64(even, odd);
+        let g_spill = _mm256_shuffle_epi8(G_SPILL, _mm256_srli_epi64::<60>(hi));
+        let y = _mm256_xor_si256(hi, _mm256_slli_epi64::<1>(hi));
+        _mm256_xor_si256(
+            _mm256_xor_si256(_mm256_xor_si256(u, lo), g_spill),
+            _mm256_xor_si256(y, _mm256_slli_epi64::<3>(y)),
+        )
     }
 
     /// The mask of the first `n` of four qwords.
@@ -886,9 +867,8 @@ mod avx2 {
         let tw = twiddles.map(|t| (_mm256_set1_epi64x(t.0 as i64), t == F64::ZERO));
         let mut lane = 0;
         while lane + CHUNK <= len {
-            let chunks: [&mut [F64; CHUNK]; N] = rows
-                .each_mut()
-                .map(|row| (&mut row[lane..lane + CHUNK]).try_into().unwrap());
+            let chunks: [&mut [F64; CHUNK]; N] =
+                rows.each_mut().map(|row| (&mut row[lane..lane + CHUNK]).try_into().unwrap());
             let mut v: RowVectors<N> = match &src {
                 Some(src) => std::array::from_fn(|i| {
                     let from: &[F64; CHUNK] = src[i][lane..lane + CHUNK].try_into().unwrap();
@@ -928,6 +908,12 @@ mod avx2 {
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
     pub(super) fn transpose_butterfly_lanes(top: &mut [F64], bot: &mut [F64], twiddle: u64) {
         let tw = _mm256_set1_epi64x(twiddle as i64);
+        let step = |top: &mut [F64], bot: &mut [F64], i: usize, n: usize| {
+            let (u, v) = (load_prefix(top, i, n), load_prefix(bot, i, n));
+            let s = _mm256_xor_si256(u, v);
+            store_prefix(top, i, n, s);
+            store_prefix(bot, i, n, mul_xor(v, s, tw));
+        };
         let vectors = top.len() / 4;
         for i in 0..vectors {
             let (u, v): (__m256i, __m256i) = (load_at(top, 4 * i), load_at(bot, 4 * i));
@@ -937,10 +923,7 @@ mod avx2 {
         }
         let tail = top.len() - 4 * vectors;
         if tail > 0 {
-            let (u, v) = (load_prefix(top, vectors, tail), load_prefix(bot, vectors, tail));
-            let s = _mm256_xor_si256(u, v);
-            store_prefix(top, vectors, tail, s);
-            store_prefix(bot, vectors, tail, mul_xor(v, s, tw));
+            step(top, bot, vectors, tail);
         }
     }
 }
