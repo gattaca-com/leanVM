@@ -313,9 +313,7 @@ mod avx2 {
                 out.push(std::array::from_fn(|half| {
                     std::array::from_fn(|i| {
                         let n = i % 16;
-                        (0..4)
-                            .filter(|t| n >> t & 1 == 1)
-                            .fold(0, |acc, t| acc ^ byte(&w[4 * half + t], o))
+                        (0..4).filter(|t| n >> t & 1 == 1).fold(0, |acc, t| acc ^ byte(&w[4 * half + t], o))
                     })
                 }));
             }
@@ -340,10 +338,7 @@ mod avx2 {
                 let mut acc = [_mm256_setzero_si256(); 8];
                 for (j, col) in cols.iter().enumerate() {
                     let v: __m256i = load_at(col, 32 * h);
-                    let (lo, hi) = (
-                        _mm256_and_si256(v, mask),
-                        _mm256_and_si256(_mm256_srli_epi16::<4>(v), mask),
-                    );
+                    let (lo, hi) = (_mm256_and_si256(v, mask), _mm256_and_si256(_mm256_srli_epi16::<4>(v), mask));
                     for (i, acc) in acc.iter_mut().enumerate() {
                         let t = &tables[24 * j + 8 * k + i];
                         let (tl, th): (__m256i, __m256i) = (load_at(&t[0], 0), load_at(&t[1], 0));
@@ -364,10 +359,7 @@ mod avx2 {
                         (base + 4, _mm256_unpackhi_epi16(a, b), _mm256_unpackhi_epi16(c, d)),
                     ];
                     for (base, x, y) in quads {
-                        for (base, w) in [
-                            (base, _mm256_unpacklo_epi32(x, y)),
-                            (base + 2, _mm256_unpackhi_epi32(x, y)),
-                        ] {
+                        for (base, w) in [(base, _mm256_unpacklo_epi32(x, y)), (base + 2, _mm256_unpackhi_epi32(x, y))] {
                             let row = 32 * h + base;
                             store_at(words, row, _mm256_castsi256_si128(w));
                             store_at(words, row + 16, _mm256_extracti128_si256::<1>(w));
