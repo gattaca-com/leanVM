@@ -533,21 +533,30 @@ impl BusForm {
         out
     }
 
-    /// The form at one point, `evals` the columns' values there; only its degree-two terms when `quadratic`.
-    #[cfg(test)]
-    pub(crate) fn eval(&self, evals: &[F192], quadratic: bool) -> F192 {
-        let linear = if quadratic { F192::ZERO } else { self.linear(evals) };
+    /// The form at one point, unreduced: `evals` are the columns' values there.
+    /// This is what the zerocheck evaluates, per row while a table is unfolded and
+    /// at the sumcheck point after, so a table's several forms share one reduction
+    /// rather than paying one per term.
+    /// `quadratic` selects only degree-two terms, for a sumcheck round coefficient.
+    pub fn eval_unreduced(&self, evals: &[F192], quadratic: bool) -> F192Unreduced {
+        let linear = if quadratic {
+            F192Unreduced::ZERO
+        } else {
+            self.linear_unreduced(evals)
+        };
         self.prods
             .iter()
-            .fold(linear, |acc, &(a, b, c)| acc + evals[a] * evals[b] * c)
+            .fold(linear, |acc, &(a, b, c)| acc ^ (evals[a] * evals[b]).mul_unreduced(c))
     }
 
-    /// `constant + Σ coeffs[i]·evals[i]`.
-    fn linear(&self, evals: &[F192]) -> F192 {
+    /// `constant + Σ coeffs[i]·evals[i]`, unreduced.
+    fn linear_unreduced(&self, evals: &[F192]) -> F192Unreduced {
         self.coeffs
             .iter()
             .zip(evals)
-            .fold(self.constant, |acc, (&w, &v)| acc + w * v)
+            .fold(F192Unreduced::from(self.constant), |acc, (&w, &v)| {
+                acc ^ w.mul_unreduced(v)
+            })
     }
 
     /// What the form sums to over the table's rows against `eq(ζ, ·)`, the target the
@@ -555,13 +564,15 @@ impl BusForm {
     /// `ζ`, which is the whole point of a form; a product coordinate does NOT, so
     /// `prod_sums` supplies `Σ_z eq(ζ,z)·col_a(z)·col_b(z)` for each pair it uses.
     fn sum_at(&self, evals: &[F192], prod_sums: &[(usize, usize, F192)]) -> F192 {
-        self.prods.iter().fold(self.linear(evals), |acc, &(a, b, c)| {
-            let s = prod_sums
-                .iter()
-                .find(|p| (p.0, p.1) == (a, b))
-                .expect("every pair was summed");
-            acc + c * s.2
-        })
+        self.prods
+            .iter()
+            .fold(self.linear_unreduced(evals).reduce(), |acc, &(a, b, c)| {
+                let s = prod_sums
+                    .iter()
+                    .find(|p| (p.0, p.1) == (a, b))
+                    .expect("every pair was summed");
+                acc + c * s.2
+            })
     }
 }
 

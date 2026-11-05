@@ -880,6 +880,22 @@ pub(crate) fn prove_product_triple(leaves: [Leaves; 3], ps: &mut ProverState) ->
     ProductTriple { point, values }
 }
 
+/// Starts fetching the `bytes` at `base`. Nothing is read, so any address will do.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn prefetch_lines(base: *const u8, bytes: usize) {
+    for line in 0..bytes / 64 {
+        // SAFETY: a prefetch of any address is harmless.
+        unsafe {
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(base.wrapping_add(64 * line).cast())
+        };
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn prefetch_lines(_base: *const u8, _bytes: usize) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
