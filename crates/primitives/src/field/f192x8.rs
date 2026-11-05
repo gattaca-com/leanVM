@@ -1170,19 +1170,15 @@ mod avx512 {
     }
 }
 
-/// The AVX-512 planes at half the width, for a machine with VPCLMULQDQ but no AVX-512: each 512-bit
-/// plane is two YMM halves, and every kernel runs once per half.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "vpclmulqdq",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
+/// The AVX-512 kernels in two YMM halves, for a machine with VPCLMULQDQ but no AVX-512.
+///
+/// The planes keep the AVX-512 memory layout: each 512-bit plane is two 256-bit halves, low half first.
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx2", not(target_feature = "avx512f")))]
 mod avx2 {
     use core::arch::x86_64::*;
 
     use super::{F64, F192, F192Unreduced};
-    use crate::field::gf2_64x3::x86_64::{fold, pair, reduce_halves256};
+    use crate::field::gf2_64x3::x86_64::{fold, pair};
     use crate::{load_at, store_at};
 
     /// One 512-bit plane as two halves.
@@ -1228,6 +1224,37 @@ mod avx2 {
     pub struct Acc8 {
         even: [Plane; 3],
         odd: [Plane; 3],
+    }
+
+    /// `g(spill)` per top nibble of a high word, as the AVX-512 reduction's table, in both 128-bit lanes.
+    const G_SPILL: __m256i = {
+        let mut table = [0u8; 32];
+        let mut n = 0;
+        while n < 16 {
+            let spill = n ^ (n >> 1) ^ (n >> 3);
+            table[n] = (spill ^ (spill << 1) ^ (spill << 3) ^ (spill << 4)) as u8;
+            table[16 + n] = table[n];
+            n += 1;
+        }
+        // SAFETY: 32 bytes and a vector have one size, and every bit pattern is valid in each.
+        unsafe { core::mem::transmute::<[u8; 32], __m256i>(table) }
+    };
+
+    /// Lane-wise base reduction: qword `i` is the reduction of `hi[i] * x^64 + lo[i]`.
+    /// `lo ^ g(hi) ^ g(spill)`, with `g(y) = z ^ z<<3` for `z = y ^ y<<1`, and `g(spill)` one byte lookup.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_lanes(lo: __m256i, hi: __m256i) -> __m256i {
+        let g_spill = _mm256_shuffle_epi8(G_SPILL, _mm256_srli_epi64::<60>(hi));
+        let z = _mm256_xor_si256(hi, _mm256_slli_epi64::<1>(hi));
+        _mm256_xor_si256(_mm256_xor_si256(lo, g_spill), _mm256_xor_si256(z, _mm256_slli_epi64::<3>(z)))
+    }
+
+    /// Qword `i` of each lane pair: the reductions of the even and odd 128-bit products.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn reduce_halves(even: __m256i, odd: __m256i) -> __m256i {
+        reduce_lanes(_mm256_unpacklo_epi64(even, odd), _mm256_unpackhi_epi64(even, odd))
     }
 
     /// Every qword times `x`: a shift, and the carried-out bit folds back as `x^64 = 0x1B`.
@@ -1376,7 +1403,6 @@ mod avx2 {
             // SAFETY: the module is compiled only with avx2 enabled.
             unsafe {
                 let zero = _mm256_setzero_si256();
-                // Each word is its element's `c0`.
                 Self {
                     lo: k.0.map(|w| _mm256_unpacklo_epi64(w, zero)),
                     hi: k.0.map(|w| _mm256_unpackhi_epi64(w, zero)),
@@ -1466,7 +1492,7 @@ mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     fn load_planes(e: &[F192; 8]) -> F192x8 {
-        let q: &[u64] = crate::cast_slice(e);
+        let q: &[u64; 24] = crate::cast_slice::<F192, u64>(e).try_into().unwrap();
         let at = |i: usize| -> __m256i { load_at(q, i) };
         let lanes = |a: usize, b: usize| _mm256_blend_epi32::<0xF0>(at(a), at(b));
         let c2 = |s: usize| _mm256_blend_epi32::<0xCC>(lanes(s, s + 4), lanes(s + 2, s + 6));
@@ -1481,7 +1507,7 @@ mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     fn store_planes(p: F192x8, out: &mut [F192; 8]) {
-        let q: &mut [u64] = crate::cast_slice_mut(out);
+        let q: &mut [u64; 24] = crate::cast_slice_mut::<F192, u64>(out).try_into().unwrap();
         for h in 0..2 {
             for (plane, parity) in [(p.lo[h], 0), (p.hi[h], 1)] {
                 let e = 4 * h + parity;
@@ -1608,27 +1634,8 @@ mod avx2 {
                     )
                 };
                 let ((elo, ehi), (olo, ohi)) = (split(a.lo, b.lo), split(a.hi, b.hi));
-                // `[a0, a2, a4, a6, b0, b2, b4, b6]` and the odd ones, of qwords.
-                let pick = |x: Plane| {
-                    let (lo, hi) = (_mm256_unpacklo_epi64(x[0], x[1]), _mm256_unpackhi_epi64(x[0], x[1]));
-                    (
-                        _mm256_permute4x64_epi64::<0xD8>(lo),
-                        _mm256_permute4x64_epi64::<0xD8>(hi),
-                    )
-                };
-                let ((ae, ao), (be, bo)) = (pick(a.c2), pick(b.c2));
-                (
-                    F192x8 {
-                        lo: elo,
-                        hi: ehi,
-                        c2: [ae, be],
-                    },
-                    F192x8 {
-                        lo: olo,
-                        hi: ohi,
-                        c2: [ao, bo],
-                    },
-                )
+                let (ec2, oc2) = even_odd_qwords(a.c2, b.c2);
+                (F192x8 { lo: elo, hi: ehi, c2: ec2 }, F192x8 { lo: olo, hi: ohi, c2: oc2 })
             }
             // SAFETY: the module is compiled only with avx2 enabled.
             unsafe { kernel(a, b) }
@@ -1738,26 +1745,10 @@ mod avx2 {
         let mut acc = Acc8::ZERO;
         for h in 0..2 {
             // Each parity's c2 in both qwords of its lane.
-            let (a2e, a2o) = (
-                _mm256_shuffle_epi32::<0x44>(a.c2[h]),
-                _mm256_shuffle_epi32::<0xEE>(a.c2[h]),
-            );
-            let (b2e, b2o) = (
-                _mm256_shuffle_epi32::<0x44>(b.c2[h]),
-                _mm256_shuffle_epi32::<0xEE>(b.c2[h]),
-            );
-            let even = karatsuba_lanes(
-                karatsuba_operands(a.lo[h], a2e),
-                a2e,
-                karatsuba_operands(b.lo[h], b2e),
-                b2e,
-            );
-            let odd = karatsuba_lanes(
-                karatsuba_operands(a.hi[h], a2o),
-                a2o,
-                karatsuba_operands(b.hi[h], b2o),
-                b2o,
-            );
+            let (a2e, a2o) = (_mm256_shuffle_epi32::<0x44>(a.c2[h]), _mm256_shuffle_epi32::<0xEE>(a.c2[h]));
+            let (b2e, b2o) = (_mm256_shuffle_epi32::<0x44>(b.c2[h]), _mm256_shuffle_epi32::<0xEE>(b.c2[h]));
+            let even = karatsuba_lanes(karatsuba_operands(a.lo[h], a2e), a2e, karatsuba_operands(b.lo[h], b2e), b2e);
+            let odd = karatsuba_lanes(karatsuba_operands(a.hi[h], a2o), a2o, karatsuba_operands(b.hi[h], b2o), b2o);
             for i in 0..3 {
                 acc.even[i][h] = even[i];
                 acc.odd[i][h] = odd[i];
@@ -1789,7 +1780,7 @@ mod avx2 {
     fn reduce_planes(acc: Acc8) -> F192x8 {
         let [d0e, d1e, d2e] = acc.even;
         let [d0o, d1o, d2o] = acc.odd;
-        let red = |x: Plane, y: Plane| [0, 1].map(|h| reduce_halves256(x[h], y[h]));
+        let red = |x: Plane, y: Plane| [0, 1].map(|h| reduce_halves(x[h], y[h]));
         F192x8 {
             lo: red(d0e, d1e),
             hi: red(d0o, d1o),
@@ -1801,7 +1792,7 @@ mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2,vpclmulqdq")]
     fn mul_words(a: __m256i, b: __m256i) -> __m256i {
-        reduce_halves256(_mm256_clmulepi64_epi128::<0x00>(a, b), _mm256_clmulepi64_epi128::<0x11>(a, b))
+        reduce_halves(_mm256_clmulepi64_epi128::<0x00>(a, b), _mm256_clmulepi64_epi128::<0x11>(a, b))
     }
 
     #[inline]
