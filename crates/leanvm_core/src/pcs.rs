@@ -24,7 +24,6 @@
 //! takes one explicit OOD sample. The base-field
 //! commitment only shrinks the level-0 symbols to 8 bytes; every random
 //! ingredient is sampled from `E` with the same error terms as before.
-
 use crate::transcript::ProverState;
 use primitives::field::F64;
 
@@ -49,6 +48,18 @@ const _: () = assert!(::pcs::whir::SECURITY_BITS == crate::SECURITY_BITS as usiz
 pub const MIN_MU: usize = 15;
 /// Largest committed size accepted by all verifiers and compiled into the recursion guest.
 pub const MAX_MU: usize = 28;
+
+/// Prepare the configurations for every supported witness size and PCS rate.
+pub(crate) fn setup() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        for rate in MIN_LOG_INV_RATE..=MAX_LOG_INV_RATE {
+            for mu in MIN_MU..=MAX_MU {
+                whir_config(mu, rate);
+            }
+        }
+    });
+}
 
 /// The shared WHIR config for a `2^μ`-word witness, memoized per `(μ, log_inv_rate)`.
 fn whir_config(mu: usize, log_inv_rate: usize) -> std::sync::Arc<ProverConfig> {
@@ -90,10 +101,12 @@ pub struct Committed {
 /// `witness` is the stack truncated to the lane blocks that carry data
 /// ([`crate::witness::StackShape::committed_len`]); the zero tail past them is
 /// neither encoded nor hashed, and the resulting commitment is the same one the
-/// full `2^μ` witness would have produced.
+/// full `2^μ` witness would have produced. `repeats` tags its blocks that equal their predecessor
+/// ([`::pcs::whir::commit`]).
 pub fn commit(
     ps: &mut ProverState,
     witness: &[F64],
+    repeats: &[bool],
     shape: crate::witness::StackShape,
     log_inv_rate: usize,
 ) -> Committed {
@@ -107,13 +120,20 @@ pub fn commit(
         shape.committed_len(),
         "witness must be the committed lanes"
     );
-    let (commitment, prover_data) = whir_commit(witness, &[], mu, LOG_BATCH, log_inv_rate);
+    let (commitment, prover_data) = whir_commit(witness, repeats, mu, LOG_BATCH, log_inv_rate);
     ps.add_root(&commitment.root);
     Committed {
         prover_data,
         mu,
         log_inv_rate,
     }
+}
+
+/// Reserve one extent for the bus's transients and the level-1 commit's codeword.
+/// The transients are carved from it and coalesce back when freed. The codeword then reuses
+/// their pages instead of mapping fresh ones.
+pub fn reserve_level1(mu: usize, log_inv_rate: usize) -> Vec<u8> {
+    primitives::reserve_extent(::pcs::whir::level1_bytes(&whir_config(mu, log_inv_rate), mu))
 }
 
 // The batching challenges are just `sample()`d inside the stacked opener: every
@@ -135,13 +155,22 @@ pub fn commit(
 /// There is no plain (non-ring-switch) path: the witness ALWAYS carries a `q_keccak`
 /// sub-block (§cpu), so every opening is stacked.
 ///
+/// `repeats` tags the blocks of `q` that equal their predecessor ([`::pcs::stack_open::open_batch_mixed_whir_stacked`]).
+///
 /// The opening consumes the commitment: it frees the codeword and tree once the L0 queries are answered.
-pub fn open(ps: &mut ProverState, c: Committed, q: Vec<F64>, points: &[SlotClaim], ring: &RingSwitchOpen) {
+pub fn open(
+    ps: &mut ProverState,
+    c: Committed,
+    q: Vec<F64>,
+    repeats: Vec<bool>,
+    points: &[SlotClaim],
+    ring: &RingSwitchOpen,
+) {
     let lane_block = 1usize << (c.mu - LOG_BATCH);
     assert_eq!(q.len() % lane_block, 0, "witness must be whole committed lanes");
     assert!(q.len() <= 1usize << c.mu, "witness must fit the announced size");
     let cfg = whir_config(c.mu, c.log_inv_rate);
-    open_batch_mixed_whir_stacked(ps, c.mu, q, Vec::new(), c.prover_data, &cfg, points, ring)
+    open_batch_mixed_whir_stacked(ps, c.mu, q, repeats, c.prover_data, &cfg, points, ring)
 }
 
 #[cfg(test)]

@@ -472,7 +472,7 @@ where
 }
 
 /// [`map_reduce_chunks_mut`] without the reduction: `f(i, chunks)` for every task `i`, in parallel.
-pub(crate) fn for_each_chunks_mut<T: Send, const N: usize, F>(bufs: [&mut [T]; N], widths: [usize; N], f: F)
+pub fn for_each_chunks_mut<T: Send, const N: usize, F>(bufs: [&mut [T]; N], widths: [usize; N], f: F)
 where
     F: Fn(usize, [&mut [T]; N]) + Sync,
 {

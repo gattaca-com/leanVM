@@ -31,8 +31,8 @@ pub mod transcript;
 pub mod vmhash;
 pub mod witness;
 
-/// Prepare the process for proving: spawn the worker pool up front, so no kernel
-/// pays the spawn cost inside a timed region. Idempotent.
+/// Prepare the worker pool, field and hint tables, column schema, and PCS configurations.
+/// Idempotent; call before a timed region.
 ///
 /// Thread placement is the pool's own business: performance-core workers run at
 /// `USER_INTERACTIVE` and (on Apple silicon) efficiency-core workers at `UTILITY`,
@@ -40,6 +40,10 @@ pub mod witness;
 /// performance-worker count. See the `parallel` crate.
 pub fn init_prover() {
     parallel::init();
+    primitives::setup();
+    cpu::hints::setup();
+    cpu::layout::schema();
+    pcs::setup();
 }
 
 /// Target soundness of the whole proof, in bits. Every algebraic challenge is
