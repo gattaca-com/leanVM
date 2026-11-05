@@ -73,6 +73,9 @@ mod portable {
     unsafe impl crate::Plain for F192x8 {}
 
     impl F192x8 {
+        pub const ZERO: Self = Self([F192::ZERO; 8]);
+        pub const ONE: Self = Self([F192::ONE; 8]);
+
         #[inline]
         pub fn splat(r: F192) -> Self {
             Self([r; 8])
@@ -99,6 +102,29 @@ mod portable {
         pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
             let (even, odd) = even_odd(&a.0, &b.0);
             (Self(even), Self(odd))
+        }
+
+        #[inline]
+        pub fn lane(&self, i: usize) -> F192 {
+            self.0[i]
+        }
+
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, e: F192) {
+            self.0[i] = e;
+        }
+
+        /// Every element times `x`, the base field's generator: each coefficient on its own.
+        #[inline]
+        pub fn mul_x(self) -> Self {
+            let x = |c: u64| F64(c).mul_x().0;
+            Self(self.0.map(|e| F192::new(x(e.c0), x(e.c1), x(e.c2))))
+        }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
+        #[inline]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            core::array::from_fn(|p| Self(core::array::from_fn(|j| g[j].0[p])))
         }
     }
 
@@ -130,9 +156,55 @@ mod portable {
     unsafe impl crate::Plain for F64x8 {}
 
     impl F64x8 {
+        pub const ZERO: Self = Self([F64::ZERO; 8]);
+        pub const ONE: Self = Self([F64::ONE; 8]);
+
         #[inline]
         pub fn from_array(k: &[F64; 8]) -> Self {
             Self(*k)
+        }
+
+        #[inline]
+        pub fn to_array(self) -> [F64; 8] {
+            self.0
+        }
+
+        #[inline]
+        pub fn lane(&self, i: usize) -> F64 {
+            self.0[i]
+        }
+
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, k: F64) {
+            self.0[i] = k;
+        }
+
+        /// Every element times `x`.
+        #[inline]
+        pub fn mul_x(self) -> Self {
+            Self(self.0.map(F64::mul_x))
+        }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        #[inline]
+        pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
+            let (even, odd) = even_odd(&a.0, &b.0);
+            (Self(even), Self(odd))
+        }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
+        #[inline]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            core::array::from_fn(|p| Self(core::array::from_fn(|j| g[j].0[p])))
+        }
+    }
+
+    impl core::ops::Mul for F64x8 {
+        type Output = Self;
+
+        #[inline]
+        fn mul(self, rhs: Self) -> Self {
+            Self(core::array::from_fn(|i| self.0[i] * rhs.0[i]))
         }
     }
 
@@ -182,6 +254,20 @@ mod portable {
         pub fn reduce_lanes(self) -> F192x8 {
             F192x8(self.0.map(F192Unreduced::reduce))
         }
+
+        /// The same sum, held in as few vectors as the target allows: here it is already.
+        #[inline]
+        pub fn merge_parities(self) -> Self {
+            self
+        }
+    }
+
+    impl From<Prod8> for super::Acc8 {
+        /// The eight lanes summed into one.
+        #[inline]
+        fn from(p: Prod8) -> Self {
+            p.0.into_iter().fold(F192Unreduced::ZERO, |sum, lane| sum ^ lane).into()
+        }
     }
 
     impl core::ops::BitXorAssign for Prod8 {
@@ -230,6 +316,22 @@ mod sum {
         #[inline]
         pub fn reduce(self) -> F192 {
             self.0.reduce()
+        }
+
+        /// The same sum: it is already one.
+        #[inline]
+        pub fn merge_parities(self) -> Self {
+            self
+        }
+    }
+
+    impl core::ops::BitXor for Acc8 {
+        type Output = Self;
+
+        #[inline]
+        fn bitxor(mut self, rhs: Self) -> Self {
+            self ^= rhs;
+            self
         }
     }
 
@@ -319,6 +421,28 @@ pub fn xor_into8(out: &mut [F192; 8], add: &[F192; 8]) {
     }
 }
 
+/// The eight products `a_i * b_i`.
+#[inline]
+pub fn mul_f64x8(a: &[F64; 8], b: &[F64; 8]) -> [F64; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    // SAFETY: the features are enabled at compile time.
+    return unsafe { avx512::mul_f64x8(a, b) };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+    (F64x8::from_array(a) * F64x8::from_array(b)).to_array()
+}
+
+impl Prod8 {
+    /// Every lane reduced on its own, as an array: element `i` is lane `i`'s sum.
+    #[inline]
+    pub fn reduce_each(self) -> [F192; 8] {
+        #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+        // SAFETY: the features are enabled at compile time.
+        return unsafe { avx512::reduce_each(self) };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+        self.reduce_lanes().to_array()
+    }
+}
+
 /// The eight-lane types with VPCLMULQDQ but no AVX-512: two halves of four lanes, each the `x4` form, a
 /// YMM plane per coefficient, so a product is lane-wise, two lanes to an instruction.
 #[cfg(all(
@@ -354,6 +478,9 @@ mod avx2 {
     pub struct Prod8([Mixed4; 2]);
 
     impl F192x8 {
+        pub const ZERO: Self = Self([F192x4::ZERO; 2]);
+        pub const ONE: Self = Self([F192x4::ONE; 2]);
+
         #[inline(always)]
         pub fn splat(r: F192) -> Self {
             Self([F192x4::splat(r); 2])
@@ -410,6 +537,80 @@ mod avx2 {
             let ((ae, ao), (be, bo)) = (split(a), split(b));
             (Self([ae, be]), Self([ao, bo]))
         }
+
+        /// Element `i`, read from memory with scalar loads.
+        #[inline]
+        pub fn lane(&self, i: usize) -> F192 {
+            assert!(i < 8);
+            let qwords = core::ptr::from_ref(self).cast::<u64>();
+            // SAFETY: two `repr(C)` halves of three planes of four qwords, and `i < 8`.
+            unsafe {
+                let at = qwords.add(12 * (i / 4) + i % 4);
+                F192::new(*at, *at.add(4), *at.add(8))
+            }
+        }
+
+        /// Overwrite element `i` with scalar stores.
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, e: F192) {
+            assert!(i < 8);
+            let qwords = core::ptr::from_mut(self).cast::<u64>();
+            // SAFETY: as in `lane`.
+            unsafe {
+                let at = qwords.add(12 * (i / 4) + i % 4);
+                (*at, *at.add(4), *at.add(8)) = (e.c0, e.c1, e.c2);
+            }
+        }
+
+        /// Every element times `x`, the base field's generator: each coefficient on its own.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            Self(self.0.map(|h| F192x4(h.0.map(F64x4::mul_x_words))))
+        }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`, coefficient by coefficient.
+        #[inline]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            let planes: [[[__m256i; 2]; 8]; 3] =
+                core::array::from_fn(|k| transpose_qwords(g.map(|x| [x.0[0].0[k], x.0[1].0[k]])));
+            core::array::from_fn(|p| {
+                Self(core::array::from_fn(|h| {
+                    F192x4(core::array::from_fn(|k| planes[k][p][h]))
+                }))
+            })
+        }
+    }
+
+    /// The 4x4 transpose of qwords.
+    #[inline(always)]
+    fn transpose4(r: [__m256i; 4]) -> [__m256i; 4] {
+        // SAFETY: the module's cfg enables avx2.
+        unsafe {
+            let t0 = _mm256_unpacklo_epi64(r[0], r[1]);
+            let t1 = _mm256_unpackhi_epi64(r[0], r[1]);
+            let t2 = _mm256_unpacklo_epi64(r[2], r[3]);
+            let t3 = _mm256_unpackhi_epi64(r[2], r[3]);
+            [
+                _mm256_permute2x128_si256::<0x20>(t0, t2),
+                _mm256_permute2x128_si256::<0x20>(t1, t3),
+                _mm256_permute2x128_si256::<0x31>(t0, t2),
+                _mm256_permute2x128_si256::<0x31>(t1, t3),
+            ]
+        }
+    }
+
+    /// The 8x8 transpose of qwords, rows as two halves: qword `j` of `out[p]` is qword `p` of `r[j]`.
+    #[inline(always)]
+    fn transpose_qwords(r: [[__m256i; 2]; 8]) -> [[__m256i; 2]; 8] {
+        let mut out = r;
+        for (hi, lo) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            // Half `hi` of rows `4 lo ..`, transposed, is half `lo` of rows `4 hi ..`.
+            let block = transpose4(core::array::from_fn(|i| r[4 * lo + i][hi]));
+            for (i, v) in block.into_iter().enumerate() {
+                out[4 * hi + i][lo] = v;
+            }
+        }
+        out
     }
 
     impl core::ops::Add for F192x8 {
@@ -439,10 +640,74 @@ mod avx2 {
     }
 
     impl F64x8 {
+        pub const ZERO: Self = Self([F64x4::ZERO; 2]);
+        pub const ONE: Self = Self([F64x4::ONE; 2]);
+
         #[inline(always)]
         pub fn from_array(k: &[F64; 8]) -> Self {
             let (halves, _) = k.as_chunks::<4>();
             Self([F64x4::load(&halves[0]), F64x4::load(&halves[1])])
+        }
+
+        #[inline(always)]
+        pub fn to_array(self) -> [F64; 8] {
+            let [a, b] = self.0.map(F64x4::to_array);
+            [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]]
+        }
+
+        /// Element `i`, read from memory with a scalar load.
+        #[inline]
+        pub fn lane(&self, i: usize) -> F64 {
+            assert!(i < 8);
+            // SAFETY: two `repr(C)` halves of four qwords, and `i < 8`.
+            F64(unsafe { *core::ptr::from_ref(self).cast::<u64>().add(i) })
+        }
+
+        /// Overwrite element `i` with a scalar store.
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, k: F64) {
+            assert!(i < 8);
+            // SAFETY: as in `lane`.
+            unsafe { *core::ptr::from_mut(self).cast::<u64>().add(i) = k.0 };
+        }
+
+        /// Every element times `x`.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            Self(self.0.map(|h| F64x4(F64x4::mul_x_words(h.0))))
+        }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        #[inline(always)]
+        pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
+            // `[x0, x4, x2, x6]` reordered to `[x0, x2, x4, x6]`, and the same for the odd lanes.
+            let split = |x: Self| -> (F64x4, F64x4) {
+                let [lo, hi] = x.0.map(|h| h.0);
+                // SAFETY: the module's cfg enables avx2.
+                unsafe {
+                    (
+                        F64x4(_mm256_permute4x64_epi64::<0xD8>(_mm256_unpacklo_epi64(lo, hi))),
+                        F64x4(_mm256_permute4x64_epi64::<0xD8>(_mm256_unpackhi_epi64(lo, hi))),
+                    )
+                }
+            };
+            let ((ae, ao), (be, bo)) = (split(a), split(b));
+            (Self([ae, be]), Self([ao, bo]))
+        }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
+        #[inline]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            transpose_qwords(g.map(|x| x.0.map(|h| h.0))).map(|row| Self(row.map(F64x4)))
+        }
+    }
+
+    impl core::ops::Mul for F64x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn mul(self, rhs: Self) -> Self {
+            Self([self.0[0] * rhs.0[0], self.0[1] * rhs.0[1]])
         }
     }
 
@@ -471,6 +736,22 @@ mod avx2 {
         pub fn reduce_lanes(self) -> F192x8 {
             F192x8(self.0.map(Mixed4::reduce))
         }
+
+        /// The same sum, held in as few vectors as the target allows: here it is already.
+        #[inline(always)]
+        pub fn merge_parities(self) -> Self {
+            self
+        }
+    }
+
+    impl From<Prod8> for super::Acc8 {
+        /// The eight lanes summed into one.
+        #[inline]
+        fn from(p: Prod8) -> Self {
+            let [mut sum, other] = p.0;
+            sum ^= other;
+            sum.sum_unreduced().into()
+        }
     }
 
     impl core::ops::BitXorAssign for Prod8 {
@@ -498,7 +779,7 @@ mod avx512 {
 
     use super::{F64, F192, F192Unreduced};
     use crate::field::gf2_64x3::x86_64::{fold, mul_by_pairs, pair, reduce_lanes512};
-    use crate::simd::{from_words, load, store, xor};
+    use crate::simd::{from_words, load, store, to_words, xor};
 
     // The kernels enable avx512bw for `reduce_lanes512`, so the build must have it.
     #[cfg(not(target_feature = "avx512bw"))]
@@ -524,6 +805,35 @@ mod avx512 {
         odd: [__m512i; 3],
     }
 
+    /// The 8x8 transpose of qwords: qword `j` of `out[p]` is qword `p` of `r[j]`.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn transpose_qwords(r: [__m512i; 8]) -> [__m512i; 8] {
+        // Pair rows with `unpack`, then pair the pairs by 128-bit lane, twice.
+        let t = [0, 2, 4, 6].map(|i| {
+            [
+                _mm512_unpacklo_epi64(r[i], r[i + 1]),
+                _mm512_unpackhi_epi64(r[i], r[i + 1]),
+            ]
+        });
+        let u = |a: usize, b: usize| {
+            let (x, y) = (t[a], t[b]);
+            [
+                _mm512_shuffle_i64x2::<0x88>(x[0], y[0]),
+                _mm512_shuffle_i64x2::<0x88>(x[1], y[1]),
+                _mm512_shuffle_i64x2::<0xDD>(x[0], y[0]),
+                _mm512_shuffle_i64x2::<0xDD>(x[1], y[1]),
+            ]
+        };
+        let (low, high) = (u(0, 1), u(2, 3));
+        let mut out = [_mm512_setzero_si512(); 8];
+        for q in 0..4 {
+            out[q] = _mm512_shuffle_i64x2::<0x88>(low[q], high[q]);
+            out[q + 4] = _mm512_shuffle_i64x2::<0xDD>(low[q], high[q]);
+        }
+        out
+    }
+
     /// Eight base-field elements, one per qword.
     #[derive(Clone, Copy, Debug)]
     #[repr(transparent)]
@@ -533,9 +843,61 @@ mod avx512 {
     unsafe impl crate::Plain for F64x8 {}
 
     impl F64x8 {
+        pub const ZERO: Self = Self(from_words([0; 8]));
+        pub const ONE: Self = Self(from_words([1; 8]));
+
         #[inline(always)]
         pub fn from_array(k: &[F64; 8]) -> Self {
             Self(load(k, 0))
+        }
+
+        #[inline(always)]
+        pub fn to_array(self) -> [F64; 8] {
+            to_words(self.0).map(F64)
+        }
+
+        #[inline]
+        pub fn lane(&self, i: usize) -> F64 {
+            self.to_array()[i]
+        }
+
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, k: F64) {
+            let mut lanes = self.to_array();
+            lanes[i] = k;
+            *self = Self::from_array(&lanes);
+        }
+
+        /// Every element times `x`.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            // SAFETY: the module is compiled only with avx512f enabled.
+            Self(unsafe { words_mul_x(self.0) })
+        }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        #[inline(always)]
+        pub fn even_odd(a: Self, b: Self) -> (Self, Self) {
+            #[inline]
+            #[target_feature(enable = "avx512f")]
+            fn kernel(a: __m512i, b: __m512i) -> (__m512i, __m512i) {
+                let evens = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+                let odds = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+                (
+                    _mm512_permutex2var_epi64(a, evens, b),
+                    _mm512_permutex2var_epi64(a, odds, b),
+                )
+            }
+            // SAFETY: the module is compiled only with avx512f enabled.
+            let (even, odd) = unsafe { kernel(a.0, b.0) };
+            (Self(even), Self(odd))
+        }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
+        #[inline(always)]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe { transpose_qwords(g.map(|k| k.0)).map(Self) }
         }
     }
 
@@ -545,6 +907,18 @@ mod avx512 {
         #[inline(always)]
         fn add(self, rhs: Self) -> Self {
             Self(xor(self.0, rhs.0))
+        }
+    }
+
+    /// The eight lane-wise products: one carry-less multiplication per parity of word, then the
+    /// lane-wise reduction of both.
+    impl core::ops::Mul for F64x8 {
+        type Output = Self;
+
+        #[inline(always)]
+        fn mul(self, rhs: Self) -> Self {
+            // SAFETY: the module is compiled only with the features enabled.
+            Self(unsafe { mul_words(self.0, rhs.0) })
         }
     }
 
@@ -580,7 +954,15 @@ mod avx512 {
             odd: [from_words([0; 8]); 3],
         };
 
-        /// The sum of the eight products, reduced.
+        /// The same sum with the odd elements' products moved onto the even ones: a running sum then
+        /// keeps three vectors, not six.
+        #[inline(always)]
+        pub fn merge_parities(self) -> Self {
+            let even = core::array::from_fn(|i| xor(self.even[i], self.odd[i]));
+            Self { even, ..Self::ZERO }
+        }
+
+        /// The sum of the sixteen products, reduced.
         #[inline]
         pub fn reduce(self) -> F192 {
             // SAFETY: the module is compiled only with the features enabled.
@@ -640,6 +1022,15 @@ mod avx512 {
         F192Unreduced::from_coeffs(coeffs).reduce()
     }
 
+    /// Every qword times `x`: a shift, and the carried-out bit folds back as `x^64 = 0x1B`.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn words_mul_x(w: __m512i) -> __m512i {
+        let carry = _mm512_srai_epi64::<63>(w);
+        // 0x78 is `a ^ (b & c)`.
+        _mm512_ternarylogic_epi64::<0x78>(_mm512_slli_epi64::<1>(w), carry, _mm512_set1_epi64(0x1B))
+    }
+
     /// Eight consecutive elements, 24 qwords, into their planes: three loads, six permutes.
     #[inline]
     #[target_feature(enable = "avx512f")]
@@ -670,6 +1061,19 @@ mod avx512 {
     }
 
     impl F192x8 {
+        pub const ZERO: Self = Self {
+            lo: from_words([0; 8]),
+            hi: from_words([0; 8]),
+            c2: from_words([0; 8]),
+        };
+
+        /// Element `i` has `c0 = 1` and no other bit.
+        pub const ONE: Self = Self {
+            lo: from_words([1, 0, 1, 0, 1, 0, 1, 0]),
+            hi: from_words([1, 0, 1, 0, 1, 0, 1, 0]),
+            c2: from_words([0; 8]),
+        };
+
         /// One scalar in every element.
         #[inline(always)]
         pub fn splat(r: F192) -> Self {
@@ -690,12 +1094,51 @@ mod avx512 {
             unsafe { load_planes(e) }
         }
 
+        /// Every element times `x`, the base field's generator: each coefficient on its own.
+        #[inline(always)]
+        pub fn mul_x(self) -> Self {
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe {
+                Self {
+                    lo: words_mul_x(self.lo),
+                    hi: words_mul_x(self.hi),
+                    c2: words_mul_x(self.c2),
+                }
+            }
+        }
+
         #[inline(always)]
         pub fn to_array(self) -> [F192; 8] {
             let mut out = [F192::ZERO; 8];
             // SAFETY: the module is compiled only with the features enabled.
             unsafe { store_planes(self, &mut out) };
             out
+        }
+
+        /// Element `i`, read from memory with scalar loads.
+        #[inline]
+        pub fn lane(&self, i: usize) -> F192 {
+            assert!(i < 8);
+            let (qwords, at) = (core::ptr::from_ref(self).cast::<u64>(), 2 * (i / 2));
+            // SAFETY: the struct is three `repr(C)` planes of eight qwords, and `i < 8`.
+            unsafe {
+                let plane = qwords.add(8 * (i % 2));
+                F192::new(*plane.add(at), *plane.add(at + 1), *qwords.add(16 + i))
+            }
+        }
+
+        /// Overwrite element `i` with scalar stores.
+        #[inline]
+        pub fn set_lane(&mut self, i: usize, e: F192) {
+            assert!(i < 8);
+            let (qwords, at) = (core::ptr::from_mut(self).cast::<u64>(), 2 * (i / 2));
+            // SAFETY: as in `lane`.
+            unsafe {
+                let plane = qwords.add(8 * (i % 2));
+                *plane.add(at) = e.c0;
+                *plane.add(at + 1) = e.c1;
+                *qwords.add(16 + i) = e.c2;
+            }
         }
 
         /// The eight lane-wise products, unreduced: twelve carry-less multiplications.
@@ -732,6 +1175,50 @@ mod avx512 {
             // SAFETY: the module is compiled only with avx512f enabled.
             unsafe { kernel(a, b) }
         }
+
+        /// The 8x8 transpose: lane `j` of `out[p]` is lane `p` of `g[j]`.
+        ///
+        /// Even elements sit in `lo` and odd ones in `hi`, so each source plane splits by the parity
+        /// of `j` into a 4x4 transpose of 128-bit lanes, and `c2` is an 8x8 transpose of qwords.
+        #[inline(always)]
+        pub fn transpose(g: [Self; 8]) -> [Self; 8] {
+            #[inline]
+            #[target_feature(enable = "avx512f")]
+            fn kernel(g: [F192x8; 8]) -> [F192x8; 8] {
+                // The 128-bit lanes of four registers, out[m] lane i = r[i] lane m.
+                let lanes = |r: [__m512i; 4]| {
+                    let t0 = _mm512_shuffle_i64x2::<0x88>(r[0], r[1]);
+                    let t1 = _mm512_shuffle_i64x2::<0xDD>(r[0], r[1]);
+                    let t2 = _mm512_shuffle_i64x2::<0x88>(r[2], r[3]);
+                    let t3 = _mm512_shuffle_i64x2::<0xDD>(r[2], r[3]);
+                    [
+                        _mm512_shuffle_i64x2::<0x88>(t0, t2),
+                        _mm512_shuffle_i64x2::<0x88>(t1, t3),
+                        _mm512_shuffle_i64x2::<0xDD>(t0, t2),
+                        _mm512_shuffle_i64x2::<0xDD>(t1, t3),
+                    ]
+                };
+                let mut out = [F192x8::ZERO; 8];
+                // Source plane `lo` feeds the even outputs and `hi` the odd; even `j` feed `lo`.
+                let from_lo_even = lanes([g[0].lo, g[2].lo, g[4].lo, g[6].lo]);
+                let from_lo_odd = lanes([g[1].lo, g[3].lo, g[5].lo, g[7].lo]);
+                let from_hi_even = lanes([g[0].hi, g[2].hi, g[4].hi, g[6].hi]);
+                let from_hi_odd = lanes([g[1].hi, g[3].hi, g[5].hi, g[7].hi]);
+                for m in 0..4 {
+                    out[2 * m].lo = from_lo_even[m];
+                    out[2 * m].hi = from_lo_odd[m];
+                    out[2 * m + 1].lo = from_hi_even[m];
+                    out[2 * m + 1].hi = from_hi_odd[m];
+                }
+                let c2 = transpose_qwords(g.map(|e| e.c2));
+                for (o, c2) in out.iter_mut().zip(c2) {
+                    o.c2 = c2;
+                }
+                out
+            }
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe { kernel(g) }
+        }
     }
 
     impl core::ops::Add for F192x8 {
@@ -755,6 +1242,13 @@ mod avx512 {
         fn mul(self, rhs: Self) -> Self {
             // SAFETY: the module is compiled only with the features enabled.
             unsafe { reduce_planes(mul(self, rhs)) }
+        }
+    }
+
+    impl core::ops::AddAssign for F192x8 {
+        #[inline]
+        fn add_assign(&mut self, rhs: Self) {
+            *self = *self + rhs;
         }
     }
 
@@ -822,6 +1316,32 @@ mod avx512 {
             c2: red(d2e, d2o),
         }
     }
+
+    /// Eight base-field products: one carry-less multiplication per parity of word, then the lane-wise
+    /// reduction of both.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    fn mul_words(a: __m512i, b: __m512i) -> __m512i {
+        let (even, odd) = (
+            _mm512_clmulepi64_epi128::<0x00>(a, b),
+            _mm512_clmulepi64_epi128::<0x11>(a, b),
+        );
+        reduce_lanes512(_mm512_unpacklo_epi64(even, odd), _mm512_unpackhi_epi64(even, odd))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    pub fn mul_f64x8(a: &[F64; 8], b: &[F64; 8]) -> [F64; 8] {
+        to_words(mul_words(load(a, 0), load(b, 0))).map(F64)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub fn reduce_each(acc: Acc8) -> [F192; 8] {
+        let mut out = [F192::ZERO; 8];
+        store_planes(reduce_planes(acc), &mut out);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -843,10 +1363,16 @@ mod tests {
 
             assert_eq!(
                 fold_pairs8_ext(&x0, &x1, r),
-                core::array::from_fn(|j| crate::multilinear::interp(x0[j], x1[j], r))
+                core::array::from_fn(|j| x0[j] + r * (x0[j] + x1[j]))
             );
             assert_eq!(fold_lones8_ext(&x0, r), core::array::from_fn(|j| x0[j] + r * x0[j]));
 
+            assert_eq!(mul_f64x8(&k0, &k1), core::array::from_fn(|j| k0[j] * k1[j]));
+            assert_eq!(F64x8::from_array(&k0).mul_x().to_array(), k0.map(|k| k * F64::G));
+            assert_eq!(
+                F192x8::from_array(&x0).mul_x().to_array(),
+                x0.map(|e| e.mul_base(F64::G))
+            );
             let dot = |x: &[F192; 8], y: &[F192; 8]| (0..8).fold(F192::ZERO, |acc, j| acc + x[j] * y[j]);
             let (u0, u2) = msg_terms8_ext(&x0, &x1, &y0, &y1);
             assert_eq!(u0.reduce(), dot(&x0, &y0));
@@ -858,7 +1384,7 @@ mod tests {
             let mut per: Prod8 = mul_base_splat8(r, &k0);
             per ^= mul_base_splat8(x0[0], &k1);
             assert_eq!(
-                per.reduce_lanes().to_array(),
+                per.reduce_each(),
                 core::array::from_fn(|j| r.mul_base(k0[j]) + x0[0].mul_base(k1[j]))
             );
             let mut sum = x0;
@@ -872,11 +1398,22 @@ mod tests {
             );
             assert_eq!(xa.to_array(), x0);
             assert_eq!(F192x8::splat(r).to_array(), [r; 8]);
+            assert_eq!(F192x8::ONE.to_array(), [F192::ONE; 8]);
             assert_eq!((xa + xb).to_array(), core::array::from_fn(|j| x0[j] + x1[j]));
             assert_eq!((xa * xb).to_array(), core::array::from_fn(|j| x0[j] * x1[j]));
             let sum = (xa.mul_unreduced(xb) ^ xc.mul_unreduced(xa)).reduce_lanes();
             assert_eq!(sum.to_array(), core::array::from_fn(|j| x0[j] * x1[j] + y0[j] * x0[j]));
             assert_eq!(xa.mul_unreduced(xb).reduce(), dot(&x0, &x1));
+            let rows: [F192x8; 8] = core::array::from_fn(|j| {
+                let element = |p: usize| F192::new(x0[p].c0 ^ j as u64, x1[j].c1, y0[(j + p) % 8].c2);
+                F192x8::from_array(&core::array::from_fn(element))
+            });
+            let columns = F192x8::transpose(rows);
+            for (p, column) in columns.iter().enumerate() {
+                for j in 0..8 {
+                    assert_eq!(column.to_array()[j], rows[j].to_array()[p]);
+                }
+            }
             let (even, odd) = F192x8::even_odd(xa, xb);
             assert_eq!(
                 even.to_array(),
@@ -886,12 +1423,43 @@ mod tests {
                 odd.to_array(),
                 core::array::from_fn(|j| if j < 4 { x0[2 * j + 1] } else { x1[2 * (j - 4) + 1] })
             );
+            assert_eq!(F192x8::ZERO.to_array(), [F192::ZERO; 8]);
+            assert_eq!(xa.lane(5), x0[5]);
+            let mut moved = F192x8::ZERO;
+            for j in 0..8 {
+                moved.set_lane(j, y1[j]);
+            }
+            assert_eq!(moved.to_array(), y1);
 
             let (ka, kb) = (F64x8::from_array(&k0), F64x8::from_array(&k1));
+            assert_eq!(ka.to_array(), k0);
+            assert_eq!(F64x8::ONE.to_array(), [F64::ONE; 8]);
+            assert_eq!((ka + kb).to_array(), core::array::from_fn(|j| k0[j] + k1[j]));
+            assert_eq!((ka * kb).to_array(), core::array::from_fn(|j| k0[j] * k1[j]));
+            let (even, odd) = F64x8::even_odd(ka, kb);
             assert_eq!(
-                F192x8::from(ka + kb).to_array(),
-                core::array::from_fn(|j| F192::from(k0[j] + k1[j]))
+                even.to_array(),
+                core::array::from_fn(|j| if j < 4 { k0[2 * j] } else { k1[2 * (j - 4)] })
             );
+            assert_eq!(
+                odd.to_array(),
+                core::array::from_fn(|j| if j < 4 { k0[2 * j + 1] } else { k1[2 * (j - 4) + 1] })
+            );
+            let rows: [F64x8; 8] = core::array::from_fn(|j| {
+                F64x8::from_array(&core::array::from_fn(|p| {
+                    F64(k0[p].0 ^ k1[(j + p) % 8].0.rotate_left(j as u32))
+                }))
+            });
+            for (p, column) in F64x8::transpose(rows).into_iter().enumerate() {
+                for j in 0..8 {
+                    assert_eq!(column.to_array()[j], rows[j].to_array()[p]);
+                }
+            }
+            assert_eq!(F64x8::ZERO.to_array(), [F64::ZERO; 8]);
+            let mut moved = ka;
+            moved.set_lane(3, k1[0]);
+            assert_eq!(moved.lane(3), k1[0]);
+            assert_eq!(moved.lane(2), k0[2]);
             assert_eq!(F192x8::from(ka).to_array(), k0.map(F192::from));
             assert_eq!(
                 xa.mul_base_unreduced(ka).reduce_lanes().to_array(),
@@ -901,8 +1469,14 @@ mod tests {
             // Accumulation across calls sums before the one reduction.
             let mut acc = Acc8::ZERO;
             acc ^= msg_lone8_ext(&x0, &y0);
-            acc ^= msg_lone8_ext(&x1, &y1);
-            assert_eq!(acc.reduce(), dot(&x0, &y0) + dot(&x1, &y1));
+            // Off the wide targets the two sums differ in type; `into` is the lane sum there.
+            #[allow(clippy::useless_conversion)]
+            let splat: Acc8 = mul_base_splat8(y1[0], &k1).into();
+            acc ^= splat;
+            assert_eq!(
+                acc.reduce(),
+                dot(&x0, &y0) + (0..8).fold(F192::ZERO, |a, j| a + y1[0].mul_base(k1[j]))
+            );
         }
     }
 }

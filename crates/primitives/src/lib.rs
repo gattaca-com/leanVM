@@ -13,6 +13,13 @@ pub mod stream;
 #[cfg(feature = "test-util")]
 pub mod test_rng;
 
+use std::mem::{MaybeUninit, needs_drop};
+
+/// Initialize the field lookup tables before proving.
+pub fn setup() {
+    field::g_pow32_by_lookup(0);
+}
+
 /// Format an integer with comma-separated groups of three decimal digits.
 ///
 /// This accepts every standard signed and unsigned integer type through its
@@ -227,6 +234,23 @@ pub unsafe fn filled_vec<T: Plain>(len: usize, fill: impl FnOnce(&mut [T])) -> V
     v
 }
 
+/// One vector per length in `lens`, filled in place by `fill`: [`filled_vecs`] for a count known at run time.
+///
+/// # Safety
+///
+/// As [`filled_vecs`]: `fill` must write every element before it reads it.
+#[must_use]
+pub unsafe fn filled_cols<T: Plain>(
+    lens: impl IntoIterator<Item = usize>,
+    fill: impl FnOnce(&mut [&mut [T]]),
+) -> Vec<Vec<T>> {
+    // SAFETY: `fill` writes each element before reading it, by the caller's contract.
+    let mut vs: Vec<Vec<T>> = lens.into_iter().map(|len| unsafe { uninit_vec(len) }).collect();
+    let mut slices: Vec<&mut [T]> = vs.iter_mut().map(|v| &mut v[..]).collect();
+    fill(&mut slices);
+    vs
+}
+
 /// A vector of `len` uninitialized elements, for a fill that outlives one scope.
 ///
 /// Prefer [`filled_vec`], which keeps the fill next to the allocation.
@@ -243,6 +267,73 @@ pub unsafe fn uninit_vec<T: Plain>(len: usize) -> Vec<T> {
     // SAFETY: the capacity holds `len` elements, and the caller writes each one before reading it.
     unsafe { v.set_len(len) };
     v
+}
+
+/// Allocate `bytes` without touching them; the caller decides when to free the extent.
+///
+/// An allocator that keeps freed extents (jemalloc with `dirty_decay_ms:-1`) is left holding one
+/// extent of that size. Buffers carved from it coalesce back when freed. A later buffer of that
+/// size then reuses their pages instead of mapping fresh ones. An allocator that unmaps on free
+/// (glibc) just maps and unmaps. A failed allocation is ignored.
+pub fn reserve_extent(bytes: usize) -> Vec<u8> {
+    let mut v = Vec::<u8>::new();
+    let _ = v.try_reserve_exact(bytes);
+    v
+}
+
+/// Parallel `(0..n).map(build).collect()`.
+///
+/// - One allocation on the calling thread, filled in place by the workers.
+/// - No per-worker vector is allocated, then copied out.
+pub fn par_collect<T: Send>(n: usize, build: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    // The vector's spare capacity, written slot by slot before the length covers it.
+    let mut out = Vec::with_capacity(n);
+    let slots = &mut out.spare_capacity_mut()[..n];
+
+    // Track partial initialization only when values require destruction.
+    if needs_drop::<T>() {
+        let mut initialized = vec![false; n];
+        let mut guard = PartialInit {
+            slots,
+            initialized: &mut initialized,
+            armed: true,
+        };
+        let chunk_size = parallel::recommended_chunk_size(n);
+        parallel::chunks_mut2(guard.slots, guard.initialized, chunk_size, |chunk, slots, marks| {
+            let base = chunk * chunk_size;
+            for (offset, (slot, mark)) in slots.iter_mut().zip(marks).enumerate() {
+                slot.write(build(base + offset));
+                *mark = true;
+            }
+        });
+        guard.armed = false;
+    } else {
+        parallel::fill(slots, |i| MaybeUninit::new(build(i)));
+    }
+
+    // SAFETY: the dispatch joins and every slot is initialized before it returns successfully.
+    unsafe { out.set_len(n) };
+    out
+}
+
+struct PartialInit<'a, T> {
+    slots: &'a mut [MaybeUninit<T>],
+    initialized: &'a mut [bool],
+    armed: bool,
+}
+
+impl<T> Drop for PartialInit<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            // The pool stops all writers before resuming a task panic on this thread.
+            for (slot, initialized) in self.slots.iter_mut().zip(self.initialized.iter()) {
+                if *initialized {
+                    // SAFETY: the mark is set only after this slot has received a valid value.
+                    unsafe { slot.assume_init_drop() };
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
