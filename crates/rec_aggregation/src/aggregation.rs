@@ -1330,7 +1330,8 @@ fn gen_verify(
         let mut nodes = vec![[0u8; 32]; 2 * n];
         let mut active = vec![F192::ZERO; n];
         for opening in openings.by_ref().take(queries) {
-            hints.push_iter("merkle_leaf_rows", opening.leaf.iter().map(|x| F192::new(x.0, 0, 0)));
+            // The row as the packed cells its leaf hashes: two K limbs a cell, the top limb zero.
+            hints.push_iter("merkle_leaf_cells", opening.leaf.chunks(2).map(|x| F192::new(x[0].0, x[1].0, 0)));
             path_children.clear();
             leaf_bytes.clear();
             leaf_bytes.extend(opening.leaf.iter().flat_map(|x| x.to_bytes()));
@@ -2590,7 +2591,6 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
         ps("LIG_TOTAL_FOLDS", scal(&|c| c.folds.iter().sum()));
         ps("LIG_MAX_QUERIES", scal(&|c| *c.queries.iter().max().unwrap()));
         ps("LIG_MAX_SQUEEZES", scal(&|c| *c.squeezes.iter().max().unwrap()));
-        ps("LIG_MAX_INTERLEAVE", scal(&|c| *c.interleaving.iter().max().unwrap()));
         ps(
             "LIG_POSITIONS_LEN",
             scal(&|c| {
@@ -2609,7 +2609,6 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
             })
             .max()
             .unwrap();
-        ps("LIG_ROW_CAP", row_cap.to_string());
         ps("LIG_PACKED_ROW_CAP", (row_cap / 2).to_string());
         ps(
             "LIG_PATH_CAP",
@@ -2629,7 +2628,6 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
         ps("LIG_OOD_SAMPLES", flat(&|c| c.ood_samples.clone()));
         ps("LIG_QUERIES", flat(&|c| c.queries.clone()));
         ps("LIG_FOLDS", flat(&|c| c.folds.clone()));
-        ps("LIG_INTERLEAVE", flat(&|c| c.interleaving.clone()));
         // 128-bit cells per leaf row: level 0's committed rows are base-field
         // F64 (8 bytes/lane); deeper levels are native F192 (24 bytes/word,
         // received as three embedded K limbs each).

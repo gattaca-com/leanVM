@@ -353,6 +353,10 @@ pub fn bytecode_columns(prog: &[Op]) -> BytecodeColumns {
                 ]);
                 OP_KECCAK
             }
+            Op::Dot2 { a, ptr, w, acc, c } => {
+                put(&[g_at(a), g_at(ptr), g_at(w), g_at(acc), g_at(c)]);
+                OP_DOT2
+            }
         };
         row
     };

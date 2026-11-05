@@ -538,6 +538,26 @@ impl FnLower<'_> {
         true
     }
 
+    /// `dot2(acc, a, w[i])` into `c`: `acc + a0·w[i] + a1·w[i + 1]` for the packed cell `a = (a0, a1, 0)`,
+    /// the two weights consecutive cells of a heap run.
+    pub(super) fn lower_dot2(&mut self, args: &[Expr], c: Off) {
+        let [acc, a, weight] = args else {
+            self.fail(format!("dot2(acc, a, w[i]) takes three arguments, got {}", args.len()))
+        };
+        let Expr::Index(arr, idx) = weight else {
+            self.fail(format!("dot2's weights must be a heap index `w[GEN ** k]`, got `{weight:?}`"))
+        };
+        if self.stack_of(arr).is_some() {
+            self.fail("dot2 reads its weights through a pointer: pass a HeapBuf, not a StackBuf")
+        }
+        if let Some(GAddr { base: None, exp, .. }) = self.eval(idx).addr {
+            self.check_heap_bound(arr, exp, 2);
+        }
+        let (acc, a) = (self.expr(acc), self.expr(a));
+        let (ptr, w) = self.heap_addr(arr, idx);
+        self.emit(LOp::Dot2 { a, ptr, w, acc, c });
+    }
+
     /// The message cells `e` names: a list literal's words (a literal `0` known to be zero,
     /// which lets a constant window of the padding run stand in for it), or a run of cells, a
     /// heap run bridged through the stack since `KECCAK` addresses only frame cells.

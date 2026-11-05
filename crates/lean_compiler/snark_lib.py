@@ -202,8 +202,8 @@ def hint_witness(dest, name: Optional[str] = None) -> Any:
 
 
 def assert_in_k(a, b) -> None:
-    """Prove that both machine words are GF(2^64)-valued. This is the sole
-    packing-related intrinsic and lowers to one untaken JUMP."""
+    """Prove that both machine words are GF(2^64)-valued. It lowers to one
+    untaken JUMP."""
     _ = a, b
 
 
@@ -211,6 +211,13 @@ def assert_gpow(x) -> None:
     """Prove that `x = GEN ** e` with `e` below the memory size, by one DEREF
     through it: the lower half of `assert log x < k`, without an upper bound."""
     _ = x
+
+
+def dot2(acc, a, w) -> _Elt:
+    """`acc + a0*w0 + a1*w1`, one DOT2: the cell `a` holds two GF(2^64) lanes
+    `(a0, a1, 0)`, and `w` names the heap cell `w0`, `w1` being the next one."""
+    _ = acc, a, w
+    return _Elt()
 
 
 def hint_f192_limbs(dest, value) -> None:

@@ -251,6 +251,7 @@ const BUILTINS: &[&str] = &[
     "addr",
     "assert_in_k",
     "assert_gpow",
+    "dot2",
     "keccak",
     "keccak_cells",
     "const",

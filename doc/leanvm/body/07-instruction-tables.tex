@@ -111,6 +111,27 @@ The store asserts that $v_2$ equals the source chosen by the mode $\dmode$ (\S\r
   \end{itemize}
 \end{itemize}
 
+\subsection{\texttt{DOT2}}\label{sec:tab-dot2}
+
+\texttt{DOT2}\ $[o_A,o_p,o_W,o_{\mathit{acc}},o_C]$ folds a packed cell against two weights: it asserts $\loc{o_C}=\loc{o_{\mathit{acc}}}+a_0w_0+a_1w_1$, where $\loc{o_A}=a_0+a_1y$ and the weights $w_0,w_1$ sit at $p\cdot o_W$ and $\gen\cdot p\cdot o_W$ behind the pointer $p=\loc{o_p}$.
+\begin{itemize}
+\item \textbf{Columns:} $\pc,\fp$; operands $o_A,o_p,o_W,o_{\mathit{acc}},o_C$; pointer $p$ (a single $\K$-limb); lanes $a_0,a_1$; weights $(w_{0,i})_{i\in\{0,1,2\}}$, $(w_{1,i})_{i\in\{0,1,2\}}$; accumulator $(v_{\mathit{acc},i})_{i\in\{0,1,2\}}$; memory counts $r_A,r_p,r_{W_0},r_{W_1},r_{\mathit{acc}},r_C$; bytecode count $r_{\mathrm{bc}}$.
+\item \textbf{Constraints:} none.
+\item \textbf{Flushes:}
+  \begin{itemize}
+  \item \textbf{State:} \pull\ $\tup{\dsep{ST},\pc,\fp}$, \push\ $\tup{\dsep{ST},\gen\cdot\pc,\fp}$.
+  \item \textbf{Bytecode:} $\rdf{\dsep{BC},\pc,r_{\mathrm{bc}},\opc{DOT},o_A,o_p,o_W,o_{\mathit{acc}},o_C}$.
+  \item \textbf{Memory} (the destination carries a form of degree two, as \texttt{MUL\_NATIVE}'s does):
+    \begin{align*}
+      &\rdf{\dsep{MEM},\fp\cdot o_A,r_A,a_0,a_1,0},\qquad \rdf{\dsep{MEM},\fp\cdot o_p,r_p,p,0,0},\\
+      &\rdf{\dsep{MEM},\gen^{k}p\cdot o_W,r_{W_k},w_{k,0},w_{k,1},w_{k,2}}\quad(k\in\{0,1\}),\\
+      &\rdf{\dsep{MEM},\fp\cdot o_{\mathit{acc}},r_{\mathit{acc}},v_{\mathit{acc},0},v_{\mathit{acc},1},v_{\mathit{acc},2}},\\
+      &\rdf{\dsep{MEM},\fp\cdot o_C,r_C,(v_{\mathit{acc},i}+a_0w_{0,i}+a_1w_{1,i})_{i\in\{0,1,2\}}}.
+    \end{align*}
+  \end{itemize}
+\end{itemize}
+The lane cell's top limb is a literal $0$, so the bus balances only if the cell holds two $\K$ lanes: one row both proves them in $\K$ and folds them. The recursion guest reads each WHIR leaf row as the packed cells its leaf hash reads, and folds it with one \texttt{DOT2} a cell (\S\ref{sec:isa-programming}).
+
 \subsection{\texttt{KECCAK}}\label{sec:tab-keccak}
 
 One row is one permutation (\S\ref{sec:vm}), proved by the GKR of Annex~\ref{annex:keccak} rather than by constraints. A row has $118$ columns:

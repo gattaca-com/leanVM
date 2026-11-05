@@ -94,6 +94,14 @@ pub(crate) enum LOp {
         out_odd: bool,
         out_cells: OutCells,
     },
+    /// `DOT2`: `c = acc + a0·w0 + a1·w1`, the weights at `m[fp·ptr]·g^w` and the cell after it.
+    Dot2 {
+        a: Off,
+        ptr: Off,
+        w: u32,
+        acc: Off,
+        c: Off,
+    },
 }
 
 /// A prover hint attached to an instruction. Most are already the runtime's own

@@ -1047,6 +1047,11 @@ impl FnLower<'_> {
                 let ga = self.stack_addr(args);
                 self.materialize(ga)
             }
+            Expr::Call(f, args) if f == "dot2" => {
+                let c = self.fresh();
+                self.lower_dot2(args, c);
+                c
+            }
             Expr::Call(f, args) if f == "hint_log2_ceil" => {
                 // Computed advice: the prover fills g^log2_ceil (base-2 ceil-log) of the value in
                 // `bits` (a `nbits`-bit buffer), floored at `floor`. Returned
@@ -1190,6 +1195,7 @@ impl FnLower<'_> {
                     self.emit(LOp::Mul { a: la, b: lb, c: dst });
                 }
             }
+            Expr::Call(f, args) if f == "dot2" => self.lower_dot2(args, dst),
             // A call writes its single return value straight into `dst` (an
             // aliased inline return materializes, then copies into `dst`).
             Expr::Call(f, args) if self.defs.contains_key(f.as_str()) => {

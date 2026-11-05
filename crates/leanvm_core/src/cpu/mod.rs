@@ -15,7 +15,7 @@ use crate::constraints;
 use crate::leaf::{self, Block, ColumnClaim, Coord};
 use crate::pcs;
 use crate::tables::{
-    self, FillCtx, FlushBuilder, OP_DEREF, OP_JUMP, OP_KECCAK, OP_MUL, OP_SET, OP_XOR, SEP_BYTECODE, SEP_MEM, SEP_STATE,
+    self, FillCtx, FlushBuilder, OP_DEREF, OP_DOT2, OP_JUMP, OP_KECCAK, OP_MUL, OP_SET, OP_XOR, SEP_BYTECODE, SEP_MEM, SEP_STATE,
 };
 use crate::transcript::ProverState;
 use crate::witness;
@@ -30,7 +30,7 @@ pub use execute::{ExecError, Execution, Fault, Memory};
 pub use hints::GPow;
 pub use isa::{DerefMode, Op, OutCells};
 pub use layout::*;
-pub(crate) use trace::{Drow, Jrow, Krow, Rows, Srow, Trace, Xrow};
+pub(crate) use trace::{Dot2row, Drow, Jrow, Krow, Rows, Srow, Trace, Xrow};
 
 /// Data-memory size bounds (doc §Memory): memory is `2^h` cells with
 /// `MIN_LOG_MEM ≤ h ≤ MAX_LOG_MEM`. The prover pads up to the minimum; the
@@ -472,7 +472,7 @@ fn keccak_output_claim(table_claims: &[constraints::Claims]) -> keccak_gkr::Outp
 }
 
 /// Run statistics returned alongside the proof: the cycle count (total executed
-/// instructions), the per-opcode row counts `[XOR, MUL, SET, DEREF, JUMP, KECCAK]`,
+/// instructions), the per-opcode row counts `[XOR, MUL, SET, DEREF, JUMP, KECCAK, DOT2]`,
 /// and the committed witness size, the sum of the column lengths, i.e. the real data
 /// before the stacked witness is zero-padded to a power of two `2^m`.
 pub struct Stats {
@@ -491,7 +491,7 @@ pub struct Stats {
 
 impl Stats {
     /// Table names in `rows` order.
-    pub const TABLES: [&'static str; tables::N_TABLES] = ["XOR", "MUL", "SET", "DEREF", "JUMP", "KECCAK"];
+    pub const TABLES: [&'static str; tables::N_TABLES] = ["XOR", "MUL", "SET", "DEREF", "JUMP", "KECCAK", "DOT2"];
 
     /// One line of per-table instruction counts and shares, largest first, followed by memory, bytecode and committed-witness sizes.
     ///
@@ -670,7 +670,7 @@ pub fn prove_with(
             )
         });
         let table_claims = crate::stage!("Prove constraints", || {
-            // One sumcheck for all six tables (§constraints).
+            // One sumcheck for all seven tables (§constraints).
             // The eq point is the bus GKR's ζ, not a fresh one: that is what lets the
             // batch settle the bus forms alongside the constraints.
             let xi = ps.sample();
@@ -867,7 +867,7 @@ fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::SlotClaim> {
         .collect()
 }
 
-/// Test-only forgeries of a `KECCAK`'s output cells: the prover is honest but for the one named here.
+/// Test-only forgeries of a `KECCAK`'s output cells or a `DOT2`'s result: the prover is honest but for the one named here.
 #[cfg(any(test, feature = "tamper"))]
 pub mod tamper {
     use super::*;
@@ -882,6 +882,14 @@ pub mod tamper {
         WrongOutput,
         /// Flip the first `KECCAK` row's flag for output cells `2..13` in the witness, not in the bytecode.
         OutFlag,
+        /// Have every `DOT2` write its result plus one, as if its accumulator were another.
+        Dot2Acc,
+        /// Have every `DOT2` weigh each lane by the other lane's weight.
+        Dot2Lane,
+        /// Let a `DOT2` read a lane cell whose top limb is not zero, folding its two low lanes only.
+        Dot2OutsideK,
+        /// Have every `DOT2` write its result but leave no row in the table.
+        Dot2Dropped,
     }
 
     thread_local! {
@@ -1101,6 +1109,80 @@ mod tests {
         }
     }
 
+    /// Two chained `DOT2` rows over one packed cell `a` at 2 and the weights at cells 10 and 11,
+    /// read through the pointer at 4: `12 = 3 + a·w` and `13 = 12 + a·w`. An XOR reads 13 into 14.
+    fn dot2_program(a: F192) -> Program {
+        let e = |c0, c1, c2| F192::new(c0, c1, c2);
+        let mut prog = vec![
+            Op::Set { o: 2, k: a },
+            Op::Set { o: 3, k: e(5, 6, 7) },
+            Op::Set {
+                o: 4,
+                k: F192::from(primitives::field::g_pow(10)),
+            },
+            Op::Set { o: 10, k: e(11, 12, 13) },
+            Op::Set { o: 11, k: e(17, 0, 19) },
+        ];
+        for (acc, c) in [(3, 12), (12, 13)] {
+            prog.push(Op::Dot2 {
+                a: 2,
+                ptr: 4,
+                w: 0,
+                acc,
+                c,
+            });
+        }
+        prog.push(Op::Xor { a: 13, b: 3, c: 14 });
+        prog.resize(15, Op::Set { o: 15, k: F192::ONE });
+        prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
+        Program::from_bytecode(prog, 64)
+    }
+
+    /// A `DOT2` writes `acc + a0·w0 + a1·w1`, and its proof verifies.
+    #[test]
+    fn dot2_folds_two_lanes() {
+        let a = F192::new(0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321, 0);
+        let program = dot2_program(a);
+        let pi = [w(7), w(11)];
+        let exec = program.execute(pi).unwrap();
+        let (w0, w1) = (exec.mem.word(10), exec.mem.word(11));
+        let fold = |acc: F192| acc + w(a.c0) * w0 + w(a.c1) * w1;
+        assert_eq!(exec.mem.word(12), fold(exec.mem.word(3)));
+        assert_eq!(exec.mem.word(13), fold(exec.mem.word(12)));
+        let (proof, stats) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        assert_eq!(stats.rows[tables::N_TABLES - 1], 2);
+        verify(&program, &pi, &proof).expect("DOT2 rows verify");
+    }
+
+    /// The forgeries of a `DOT2` are rejected by the bus: a wrong result, as from another
+    /// accumulator; the two lanes weighed the other way round; a lane cell whose top limb is not
+    /// zero; and a row left out of the table while its result is still written.
+    #[test]
+    fn dot2_forgeries_are_rejected() {
+        use tamper::Tamper;
+        let pi = [w(7), w(11)];
+        let packed = dot2_program(F192::new(3, 4, 0));
+        let wide = dot2_program(F192::new(3, 4, 5));
+        // Honestly, a lane cell with a top limb is refused before any proof.
+        let err = wide.execute(pi).err().expect("a wide lane cell is refused");
+        assert!(matches!(err.fault, Fault::NotPacked { .. }), "{err}");
+        for (forgery, program) in [
+            (Tamper::Dot2Acc, &packed),
+            (Tamper::Dot2Lane, &packed),
+            (Tamper::Dot2OutsideK, &wide),
+            (Tamper::Dot2Dropped, &packed),
+        ] {
+            tamper::set(forgery);
+            let (proof, _) = prove(program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+            let verdict = verify(program, &pi, &proof).err();
+            eprintln!("{forgery:?}: {verdict:?}");
+            assert!(
+                matches!(&verdict, Some(CpuError::Verifier(verifier::VerifierError::GkrLayer(_)))),
+                "{forgery:?}: {verdict:?}"
+            );
+        }
+    }
+
     /// The opcode's execution semantics: the output cells hold the permutation of the lanes the
     /// input cells hold, each side in its layout, the two `m` pairs aliasing one another and
     /// `b8`'s free high limb ignored. With a zero `cap` and the padding in `tail` and `b8`, the
@@ -1196,7 +1278,7 @@ mod tests {
         let jumping = program(Op::Jump { oc: 1, od: 2, of: 1 });
         let exec = jumping.execute(pi).expect("the run halts in the final state");
         assert_eq!(exec.cycles, 5, "three SETs and both JUMPs, the last slot's included");
-        assert_eq!(exec.rows(), [0, 0, 3, 0, 2, 0], "XOR, MUL, SET, DEREF, JUMP, KECCAK");
+        assert_eq!(exec.rows(), [0, 0, 3, 0, 2, 0, 0], "XOR, MUL, SET, DEREF, JUMP, KECCAK, DOT2");
         let (proof, _) = prove(&jumping, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&jumping, &pi, &proof).expect("the verifier accepts the run");
 

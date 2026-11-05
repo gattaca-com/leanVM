@@ -193,6 +193,8 @@ pub enum Fault {
     NotAGPower { what: &'static str, value: F64 },
     /// A `KECCAK` input cell outside the 128-bit embedding.
     NotCanonical { cell: usize, value: F192 },
+    /// A `DOT2` lane cell outside the 128-bit embedding.
+    NotPacked { value: F192 },
     /// A `MUL` asked to solve `a·x = c` for `x` with `a = 0`.
     BackSolveThroughZero,
     /// The advice does not fit the program: a witness stream is missing or
@@ -261,6 +263,7 @@ impl std::fmt::Display for Fault {
                 "KECCAK input cell {cell} is not a canonical 128-bit embedding ({})",
                 word(*value)
             ),
+            Self::NotPacked { value } => write!(f, "DOT2 lane cell is not two packed K lanes ({})", word(*value)),
             Self::BackSolveThroughZero => write!(f, "cannot back-solve MUL through a zero operand"),
             Self::Witness(problem) => write!(f, "{problem}"),
             Self::OutOfMemory => write!(f, "the program allocates past 2^{} cells", MAX_CELLS.ilog2()),
@@ -403,6 +406,7 @@ impl Program {
         let mut set: Rows<Srow> = Rows::new();
         let mut deref: Rows<Drow> = Rows::new();
         let mut jump: Rows<Jrow> = Rows::new();
+        let mut dot2: Rows<Dot2row> = Rows::new();
         // KECCAK rows go in blocks by output shape, in the order the witness builder's `ShapeSort` gives its steps.
         let mut keccak: crate::keccak::ShapeSort<Krow> = crate::keccak::ShapeSort::new();
         let mut keccak_blocks: Vec<Vec<Krow>> = Vec::new();
@@ -989,6 +993,51 @@ impl Program {
                         pc += 1;
                     }
                 }
+                Op::Dot2 { a, ptr, w, acc, c } => {
+                    let p = m.read(fp + ptr);
+                    let base = as_addr(p)
+                        .and_then(|p| g.log(p))
+                        .ok_or_else(|| fail(Fault::WildPointer { value: p }))?;
+                    let cells = [fp + a, fp + ptr, base + w, base + w + 1, fp + acc, fp + c];
+                    let va = m.read(cells[0]);
+                    let (w0, w1, vacc) = (m.read(cells[2]), m.read(cells[3]), m.read(cells[4]));
+                    #[cfg(any(test, feature = "tamper"))]
+                    let tamper = super::tamper::peek();
+                    // The table reads `a` with a literal zero top limb, so anything else could not balance the bus.
+                    #[cfg(any(test, feature = "tamper"))]
+                    let canonical = va.c2 == 0 || tamper == Some(super::tamper::Tamper::Dot2OutsideK);
+                    #[cfg(not(any(test, feature = "tamper")))]
+                    let canonical = va.c2 == 0;
+                    if !canonical {
+                        return Err(fail(Fault::NotPacked { value: va }));
+                    }
+                    let (a0, a1) = (F192::new(va.c0, 0, 0), F192::new(va.c1, 0, 0));
+                    #[cfg_attr(not(any(test, feature = "tamper")), allow(unused_mut))]
+                    let mut vc = vacc + a0 * w0 + a1 * w1;
+                    #[cfg(any(test, feature = "tamper"))]
+                    match tamper {
+                        Some(super::tamper::Tamper::Dot2Acc) => vc += F192::ONE,
+                        Some(super::tamper::Tamper::Dot2Lane) => vc = vacc + a1 * w0 + a0 * w1,
+                        _ => {}
+                    }
+                    m.put(cells[5], vc)?;
+                    #[cfg(any(test, feature = "tamper"))]
+                    if tamper == Some(super::tamper::Tamper::Dot2Dropped) {
+                        pc += 1;
+                        steps += 1;
+                        continue;
+                    }
+                    // In flush order, so aliased cells pair each access with its own count.
+                    let r = cells.map(|cell| m.bump_access_count(cell));
+                    dot2.push(Dot2row {
+                        pc,
+                        fp,
+                        base,
+                        r,
+                        bytecode_read,
+                    });
+                    pc += 1;
+                }
                 Op::Keccak { out_cells, .. } => {
                     use crate::keccak::{ROW_CELLS, STATE_CELLS};
                     let k = crate::tables::KeccakOp::of(op);
@@ -1124,6 +1173,7 @@ impl Program {
             jump,
             keccak,
             keccak_live,
+            dot2,
             bytecode_count,
             counts,
         };
