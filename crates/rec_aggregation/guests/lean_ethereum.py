@@ -3635,7 +3635,7 @@ def lx_levels(cur, pp, powers, his, out, w: Const, k: Const):
         if const(r + 1 == LX_WINDOW):
             parent = out
         else:
-            parent = StackBuf(KECCAK_STATE)
+            parent = StackBuf(1)
         sibling = hint_witness("lx_path")
         if const((k // 2 ** r) % 2 == 0):
             keccak([pp, at], [cur, sibling], parent)
@@ -3725,7 +3725,7 @@ def verify_lean_xmss(signer, tags):
         cur = leaf[0]
         for v in unroll(0, LX_LAYER_WINDOWS):
             w = layer * LX_LAYER_WINDOWS + v
-            out = StackBuf(KECCAK_STATE)
+            out = StackBuf(1)
             assert log(windows[w]) < LX_WINDOW_ARMS
             if const(w + 1 == LX_WINDOWS):
                 his[w] = match(log(windows[w]), range(0, LX_WINDOW_ARMS), lambda k: lx_top_window(cur, pp, powers, his, out, w, k))
