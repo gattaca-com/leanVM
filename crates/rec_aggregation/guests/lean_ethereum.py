@@ -4166,15 +4166,13 @@ def da_verify_column(xb, n_blob_g, rowbase, zs, top_leaves, cell_factors, offset
 
 
 def da_verify_cell(lvals):
-    # Packing checks that each symbol used by both the hash and dot product is in K.
-    sym = StackBuf(DA_CELL)
-    hint_witness(sym, "da_symbols")
+    # The symbols are hinted two to a cell, as the hash reads them. Each DOT2 reads
+    # its cell with a zero top limb, which proves both symbols in K, and folds them.
     packed = StackBuf(DA_PACKED)
+    hint_witness(packed, "da_symbols")
     s = 0
     for e in unroll(0, DA_PACKED):
-        packed[e] = pack64x2(sym[2 * e], sym[2 * e + 1])
-        s = s + lvals[GEN ** (2 * e)] * sym[2 * e]
-        s = s + lvals[GEN ** (2 * e + 1)] * sym[2 * e + 1]
+        s = dot2(s, packed[e], lvals[GEN ** (2 * e)])
     st = StackBuf(KECCAK_STATE)
     keccak_cells(packed, st)
     return st[0], st[1], s

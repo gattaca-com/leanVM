@@ -1882,11 +1882,12 @@ pub fn aggregate_with_stats(
         let (c, m) = (CELL_SYMBOLS, CODEWORD_SYMBOLS);
         for j in 0..CELLS_PER_ROW {
             for i in 0..n_rows {
+                // Two symbols a cell, as the cell's hash reads them.
                 hints.push_iter(
                     "da_symbols",
                     witness.codewords[i * m + j * c..i * m + (j + 1) * c]
-                        .iter()
-                        .map(|&w| F192::from(F64(w))),
+                        .chunks(2)
+                        .map(|w| F192::new(w[0], w[1], 0)),
                 );
             }
         }
@@ -3370,6 +3371,31 @@ def main():
         );
     }
 
+    /// A DA child whose `DOT2` rows are left out of its table, their results written all the same,
+    /// fails the guest's run, in its bus GKR check.
+    #[test]
+    fn forged_dot2_rows_in_children_are_rejected() {
+        use leanvm_core::cpu::tamper::{self, Tamper};
+        leanvm_core::init_prover();
+        let signers = get_signers(2 * SMALL_LEAF_SIZE);
+        let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
+        tamper::set(Tamper::Dot2Dropped);
+        let right = aggregate(
+            &[],
+            signing(&signers[SMALL_LEAF_SIZE..], 0),
+            vec![],
+            &da_rows(1, 7),
+            None,
+            LOG_INV_RATE,
+        )
+        .expect("the forged DA leaf proves");
+        let result = aggregate(&[left, right], vec![], vec![], &[], None, LOG_INV_RATE);
+        assert!(
+            matches!(result, Err(AggregationError::ProofError(_))),
+            "a child with dropped DOT2 rows is rejected"
+        );
+    }
+
     /// A claim changed anywhere in the tree changes the commitment, so the statement no
     /// longer matches the proof: the verifier rejects it, on the wire too. A forged child
     /// commitment hint fails in the guest, whose rebuilt child statement matches no proof.
@@ -3606,7 +3632,7 @@ def main():
                     let start = i * CODEWORD_SYMBOLS + j * CELL_SYMBOLS;
                     hints.push_iter(
                         "da_symbols",
-                        words[start..start + CELL_SYMBOLS].iter().map(|&w| F192::from(F64(w))),
+                        words[start..start + CELL_SYMBOLS].chunks(2).map(|w| F192::new(w[0], w[1], 0)),
                     );
                 }
             }
