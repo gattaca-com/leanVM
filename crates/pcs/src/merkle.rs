@@ -16,10 +16,9 @@
 //!
 //! So one task hashes a block of leaves and climbs its subtree while the digests are in L1.
 //!
-//! The encode hands blocks over as it finishes them, so leaves are hashed while the rows are in L2.
+//! The encoder hands blocks over as it finishes them, so leaves are hashed while the rows are in L2.
 //!
 //! Above the blocks, the last block to finish a unit of nodes climbs it, so no pass waits on a barrier.
-
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -52,18 +51,31 @@ pub(crate) struct MerkleBuilder {
 impl MerkleBuilder {
     /// An empty tree of `num_leaves` leaves of `leaf_words`, each committing `row_words`.
     ///
-    /// A tree of `CUT_FROM` leaves or more is cut, so its blocks must hold whole leaf groups.
+    /// A tree of [`CUT_FROM`] leaves or more is cut, so its blocks must hold whole leaf groups.
     pub fn new(num_leaves: usize, row_words: usize, leaf_words: usize) -> Self {
-        let cut = if num_leaves >= CUT_FROM { CUT } else { 0 };
-        Self::with_bytes(num_leaves, 8 * row_words, 8 * leaf_words, cut)
+        Self::with_bytes(num_leaves, 8 * row_words, 8 * leaf_words, Self::cut_for(num_leaves))
+    }
+
+    /// As [`Self::new`], but the rows absorbed are compact: each is widened by `expansion` as it is staged.
+    pub(crate) fn with_expansion(num_leaves: usize, leaf_words: usize, expansion: &Expansion) -> Self {
+        let leaves = LeafHasher::expanding(expansion, 8 * leaf_words);
+        Self::build(num_leaves, leaves, Self::cut_for(num_leaves))
+    }
+
+    fn cut_for(num_leaves: usize) -> usize {
+        if num_leaves >= CUT_FROM { CUT } else { 0 }
     }
 
     fn with_bytes(num_leaves: usize, row_bytes: usize, leaf_bytes: usize, cut: usize) -> Self {
+        Self::build(num_leaves, LeafHasher::new(row_bytes, leaf_bytes), cut)
+    }
+
+    fn build(num_leaves: usize, leaves: LeafHasher, cut: usize) -> Self {
         assert!(num_leaves.is_power_of_two(), "num_leaves must be power of 2");
         Self {
             nodes: Nodes::new(num_leaves, cut),
             cut,
-            leaves: LeafHasher::new(row_bytes, leaf_bytes),
+            leaves,
             progress: Progress::new(num_leaves),
         }
     }
@@ -80,12 +92,6 @@ impl MerkleBuilder {
     fn absorb_bytes(&self, first_leaf: usize, rows: &[u8]) {
         let n = rows.len() / self.leaves.row_bytes();
         assert_eq!(rows.len(), n * self.leaves.row_bytes(), "whole rows");
-        // Every shape check comes before the claim, so a claimed block is always written.
-        let chunk = n.min(SCRATCH_LEAVES);
-        if self.cut > 0 {
-            assert!(n >= 1 << self.cut, "a block holds whole leaf groups");
-            assert!(n.is_multiple_of(chunk), "a block holds whole chunks");
-        }
         self.progress.claim(first_leaf, n);
         // SAFETY: the claim makes these leaves, and their subtree up to the unit, ours alone.
         unsafe {
@@ -94,6 +100,9 @@ impl MerkleBuilder {
                 return self.complete(0, first_leaf, n);
             }
             // The groups climb to the cut in a stack scratch, a chunk of leaves at a time, and only their tops are kept.
+            assert!(n >= 1 << self.cut, "a block holds whole leaf groups");
+            let chunk = n.min(SCRATCH_LEAVES);
+            assert!(n.is_multiple_of(chunk), "a block holds whole chunks");
             let tops = n >> self.cut;
             let mut scratch = [MaybeUninit::<Hash>::uninit(); 2 * SCRATCH_LEAVES];
             for (k, rows) in rows.chunks_exact(chunk * self.leaves.row_bytes()).enumerate() {
@@ -355,18 +364,13 @@ impl CutTree {
         let n = groups.len() * size;
         assert_eq!(group_rows.len(), n * row_words, "the rows of every group");
         // All groups' leaves as one flat tree up to the cut: a group is aligned, so no climb mixes two.
-        // An uncut tree stores every node, so it needs none of them.
-        let local = if self.cut == 0 || n == 0 {
-            Vec::new()
-        } else {
-            let mut nodes = Nodes::new(n, 0);
-            // SAFETY: the nodes are ours alone, the climb writes every level it reads, and the levels kept are written.
-            unsafe {
-                LeafHasher::new(8 * row_words, 8 * leaf_words).hash(cast_slice(group_rows), nodes.level_mut(0, 0, n));
-                nodes.climb(0, 0, n, self.cut);
-                nodes.tree.truncate(Self::start(n, self.cut));
-                nodes.assume_init()
-            }
+        let mut nodes = Nodes::new(n, 0);
+        // SAFETY: the nodes are ours alone, the climb writes every level it reads, and the levels kept are written.
+        let local = unsafe {
+            LeafHasher::new(8 * row_words, 8 * leaf_words).hash(cast_slice(group_rows), nodes.level_mut(0, 0, n));
+            nodes.climb(0, 0, n, self.cut);
+            nodes.tree.truncate(Self::start(n, self.cut));
+            nodes.assume_init()
         };
         let node = |level: usize, i: usize| {
             if level >= self.cut {
@@ -378,7 +382,47 @@ impl CutTree {
                 .expect("a sibling is in an opened group");
             local[Self::start(n, level) + group * width + i % width]
         };
-        PrunedMerklePaths::prune(self.num_leaves, positions, node, row)
+        PrunedMerklePaths::prune_with(self.num_leaves, positions, node, row)
+    }
+}
+
+/// How a compact row widens to a full row of `row_words`: the lanes it leaves out are zero.
+pub(crate) struct Expansion {
+    /// Compact lanes `src..src + len` are full lanes `dst..dst + len`, as `(dst, src, len)`.
+    runs: Vec<(usize, usize, usize)>,
+    enc_words: usize,
+    row_words: usize,
+}
+
+impl Expansion {
+    /// The map of a codeword of `blocks`, as `ProverData::blocks`. Stack block `b` is full lane `row_words - 1 - b`.
+    pub(crate) fn new(blocks: &[usize], enc_words: usize, row_words: usize) -> Self {
+        let pad = enc_words - blocks.len();
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for (i, &b) in blocks.iter().enumerate() {
+            let (dst, src) = (row_words - 1 - b, pad + i);
+            match runs.last_mut() {
+                Some((d, s, len)) if (*d + *len, *s + *len) == (dst, src) => *len += 1,
+                _ => runs.push((dst, src, 1)),
+            }
+        }
+        Self {
+            runs,
+            enc_words,
+            row_words,
+        }
+    }
+
+    /// Write the rows of `compact` as full rows into `full`, which holds zeros.
+    pub(crate) fn expand(&self, compact: &[F64], full: &mut [F64]) {
+        for (row, out) in compact
+            .chunks_exact(self.enc_words)
+            .zip(full.chunks_exact_mut(self.row_words))
+        {
+            for &(dst, src, len) in &self.runs {
+                out[dst..][..len].copy_from_slice(&row[src..][..len]);
+            }
+        }
     }
 }
 
@@ -391,18 +435,37 @@ enum LeafHasher {
         row_bytes: usize,
         state: [u64; STATE_LANES],
     },
-    /// The rest of the padding does not fill a block, so rows are zero-extended in a tile first.
+    /// The rest of the padding does not fill a block, or the rows are compact: rows are laid into a zeroed tile first.
     Staged {
         row_bytes: usize,
         image: usize,
         state: [u64; STATE_LANES],
+        /// Where the rows' runs go in a slot, as `(dst, src, len)` in words, `dst` counted from the full row's start.
+        runs: Vec<(usize, usize, usize)>,
+        /// Bytes of the slot before the full row.
+        offset: usize,
     },
 }
 
 impl LeafHasher {
     fn new(row_bytes: usize, leaf_bytes: usize) -> Self {
-        assert!(0 < row_bytes && row_bytes <= leaf_bytes, "a leaf holds its row");
-        let zero_blocks = (leaf_bytes - row_bytes) / RATE;
+        Self::staged(row_bytes, row_bytes, leaf_bytes, vec![(0, 0, row_bytes / 8)])
+    }
+
+    /// Hash the rows `expansion` widens.
+    fn expanding(expansion: &Expansion, leaf_bytes: usize) -> Self {
+        Self::staged(
+            8 * expansion.enc_words,
+            8 * expansion.row_words,
+            leaf_bytes,
+            expansion.runs.clone(),
+        )
+    }
+
+    /// `row_bytes` are the bytes of an absorbed row, `full_bytes` of the row the leaf commits.
+    fn staged(row_bytes: usize, full_bytes: usize, leaf_bytes: usize, runs: Vec<(usize, usize, usize)>) -> Self {
+        assert!(0 < full_bytes && full_bytes <= leaf_bytes, "a leaf holds its row");
+        let zero_blocks = (leaf_bytes - full_bytes) / RATE;
         let state = zero_prefix_state(zero_blocks);
         let image = leaf_bytes - zero_blocks * RATE;
         if image == row_bytes {
@@ -413,6 +476,8 @@ impl LeafHasher {
                 row_bytes,
                 image,
                 state,
+                runs,
+                offset: image - full_bytes,
             }
         }
     }
@@ -425,14 +490,16 @@ impl LeafHasher {
 
     /// Hash one leaf per row into `out`.
     fn hash(&self, rows: &[u8], out: &mut [MaybeUninit<Hash>]) {
-        match *self {
+        match self {
             Self::Direct { row_bytes, state } => {
-                hash_many_from_state(rows, row_bytes, &state, digests_as_bytes(out));
+                hash_many_from_state(rows, *row_bytes, state, digests_as_bytes(out));
             }
             Self::Staged {
                 row_bytes,
                 image,
                 state,
+                runs,
+                offset,
             } => {
                 // Whole batches per tile.
                 let per_tile = STAGE_TILE_BYTES / image;
@@ -443,8 +510,8 @@ impl LeafHasher {
                 };
                 let mut tile = Tile::new();
                 for (out, rows) in out.chunks_mut(per_tile).zip(rows.chunks(per_tile * row_bytes)) {
-                    let images = tile.extend(rows, row_bytes, image);
-                    hash_many_from_state(images, image, &state, digests_as_bytes(out));
+                    let images = tile.extend(rows, *row_bytes, *image, *offset, runs);
+                    hash_many_from_state(images, *image, state, digests_as_bytes(out));
                 }
             }
         }
@@ -459,14 +526,23 @@ impl Tile {
         Self([0; STAGE_TILE_BYTES / 8])
     }
 
-    /// Lay each `row_bytes` row at the end of its own `image`-byte slot, and return the slots.
+    /// Lay each `row_bytes` row into its own `image`-byte slot by `runs`, from `offset`, and return the slots.
     ///
-    /// The bytes before each row are never written, so they stay zero.
-    fn extend(&mut self, rows: &[u8], row_bytes: usize, image: usize) -> &[u8] {
+    /// The bytes no run writes are never written, so they stay zero.
+    fn extend(
+        &mut self,
+        rows: &[u8],
+        row_bytes: usize,
+        image: usize,
+        offset: usize,
+        runs: &[(usize, usize, usize)],
+    ) -> &[u8] {
         let tile: &mut [u8] = cast_slice_mut(&mut self.0);
         let n = rows.len() / row_bytes;
         for (slot, row) in tile.chunks_exact_mut(image).zip(rows.chunks_exact(row_bytes)) {
-            slot[image - row_bytes..].copy_from_slice(row);
+            for &(dst, src, len) in runs {
+                slot[offset + 8 * dst..][..8 * len].copy_from_slice(&row[8 * src..][..8 * len]);
+            }
         }
         &tile[..n * image]
     }
@@ -585,6 +661,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_rows_hash_like_widened_rows() {
+        // Invariant: laying compact rows by the map gives the leaves of the widened rows.
+        for (num_leaves, blocks, enc_words, row_words, leaf_words) in [
+            (256usize, vec![9usize, 8, 5, 4, 3, 0], 8usize, 16usize, 16usize),
+            (2048, vec![10, 9, 2, 1, 0], 8, 16, 64),
+            (64, vec![6, 5, 4], 8, 8, 40),
+            (1 << 13, vec![30, 28, 27, 3], 8, 32, 64),
+        ] {
+            let data: Vec<F64> = (0..enc_words * num_leaves)
+                .map(|i| F64(i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u64 | 1))
+                .collect();
+            let expansion = Expansion::new(&blocks, enc_words, row_words);
+            let mut full = vec![F64::ZERO; row_words * num_leaves];
+            expansion.expand(&data, &mut full);
+            let want = merkle_tree_padded_rows(&full, num_leaves, row_words, leaf_words);
+            let builder = MerkleBuilder::with_expansion(num_leaves, leaf_words, &expansion);
+            let rows = 1usize << num_leaves.ilog2().min(9).max(builder.cut as u32);
+            for b in (0..num_leaves / rows).rev() {
+                builder.absorb(b * rows, &data[b * rows * enc_words..][..rows * enc_words]);
+            }
+            let got = builder.finish();
+            assert_eq!(
+                got.root(),
+                *want.last().unwrap(),
+                "num_leaves={num_leaves} row_words={row_words}"
+            );
+        }
+    }
+
+    #[test]
     fn cut_tree_prunes_like_the_full_tree() {
         // Invariant: opening through the cut tree gives the octopus of the full tree.
         for (num_leaves, row_words, leaf_words) in [(256usize, 8usize, 16usize), (1 << 10, 24, 24), (32, 8, 8)] {
@@ -605,22 +711,20 @@ mod tests {
                 let group = cut.group_positions(&positions);
                 let rows: Vec<F64> = group.iter().flat_map(|&q| row(q)).copied().collect();
                 let got = cut.prune(&positions, row_words, leaf_words, &rows, row);
-                let level_start = |level: usize| 2 * num_leaves - ((2 * num_leaves) >> level);
-                let node = |level: usize, i: usize| full[level_start(level) + i];
-                assert_eq!(got, PrunedMerklePaths::prune(num_leaves, &positions, node, row));
+                assert_eq!(got, PrunedMerklePaths::prune(&full, num_leaves, &positions, row));
             }
         }
     }
 
     #[test]
     fn blocks_of_any_size_build_one_tree() {
-        // Invariant: the tree does not depend on the block size the encode picks.
+        // Invariant: the tree does not depend on the block size the encoder picks.
         let (num_leaves, row_words) = (1usize << 12, 6usize);
         let data: Vec<F64> = (0..row_words * num_leaves).map(|i| F64(i as u64 * 7 + 1)).collect();
         let want = merkle_tree_padded_rows(&data, num_leaves, row_words, row_words);
         for log_block in [0usize, 3, 5, 6, 9, 12] {
             let builder = MerkleBuilder::with_bytes(num_leaves, 8 * row_words, 8 * row_words, 0);
-            // Blocks arrive out of order, as the encode's tasks finish.
+            // Blocks arrive out of order, as the encoder's tasks finish.
             for b in (0..num_leaves >> log_block).rev() {
                 let rows = row_words << log_block;
                 builder.absorb(b << log_block, &data[b * rows..][..rows]);

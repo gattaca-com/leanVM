@@ -31,30 +31,34 @@
 //! # The components
 //!
 //! ```text
-//!     AdditiveNttF64 (the twiddles)
+//!     AdditiveNttF64 (facade)
 //!          |
-//!          +-- AdditiveNttF64::transform(Window, Source)
+//!          +-- Encoder::transform(Window, Source)
 //!          |       Plan                 where the layers split, and the task sizes
-//!          |       GatheredPass         far layers, one sweep each      -> Stage
-//!          |       DeepPass             near layers, rows to the sink
-//!          |            both run their groups through AdditiveNttF64::run_layers
-//!          +-- AdditiveNttF64::rows(Codeword)  rows read back from what the encode kept
+//!          |       GatheredPass         far layers, one sweep each      -> Stage, LateDrain
+//!          |       DeepPass             near layers, rows to the sink   -> LateDrain
+//!          |            both run their groups through Layers::run over the Twiddles
+//!          +-- CosetEncoder             small codewords, one coset at a time in cache
+//!          +-- Openings::rows(Kept)     rows read back from what the encode kept
 //! ```
 //!
 //! # Reading order
 //!
-//! 1. `encode.rs`: the three encodes, then `AdditiveNttF64::transform`, which is the spine.
+//! 1. `encode.rs`: the three encodes, then `Encoder::transform`, which is the spine.
 //! 2. `plan.rs`: why the layers split where they do.
 //! 3. `source.rs` and `window.rs`: the message, and the buffer it becomes.
 //! 4. `layers.rs`: a range of layers on one sub-block, with global twiddles.
-//! 5. `twiddles.rs`: the type, and the points of the domain.
-//! 6. `gathered.rs` and `stage.rs`: the far layers and the lane-major stage.
+//! 5. `twiddles.rs`: the points of the domain. Optional.
+//! 6. `gathered.rs`, `stage.rs` and `drain.rs`: the far layers, the lane-major stage and the late write-back.
 //! 7. `deep.rs`: the near layers.
-//! 8. `openings.rs`: the rows read back.
+//! 8. `cosets.rs` and `openings.rs`: the coset-major encode, and the rows read back.
 //! 9. `kernels.rs`, `scratch.rs` and `tests.rs`.
 
+mod cosets;
 mod deep;
+mod drain;
 mod encode;
+mod facade;
 mod gathered;
 mod kernels;
 mod layers;
@@ -68,7 +72,8 @@ mod tests;
 mod twiddles;
 mod window;
 
-pub use encode::{Codeword, Keep, RowSink};
+pub use encode::{Encoded, Keep, RowSink};
+pub use facade::AdditiveNttF64;
 pub(crate) use kernels::transpose_butterfly_lanes;
+pub use openings::{Kept, Openings, gather_rows};
 pub use plan::Plan;
-pub use twiddles::AdditiveNttF64;
