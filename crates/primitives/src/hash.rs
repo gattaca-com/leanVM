@@ -358,7 +358,9 @@ fn hash_from_state(data: &[u8], state: &[u64; STATE_LANES]) -> [u8; OUT_LEN] {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 mod x86 {
-    use super::{Lanes64, OUT_LEN, RATE_LANES, STATE_LANES};
+    use super::Lanes64;
+    #[cfg(target_feature = "avx512f")]
+    use super::{OUT_LEN, RATE_LANES, STATE_LANES};
     #[cfg(target_feature = "avx512f")]
     use crate::simd;
     use crate::{load_at, store_at};
