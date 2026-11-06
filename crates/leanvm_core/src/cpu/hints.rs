@@ -49,6 +49,9 @@ pub struct GPow {
     coarsed: usize,
     /// The last run's cell mapping, all zero again, for the next run to take.
     pub(crate) cells: Option<super::execute::Cells>,
+    /// The committed size the last proof had, as a base-2 logarithm, 0 before any: what the next
+    /// proof's reservations are sized from.
+    pub(crate) last_mu: usize,
 }
 
 /// Spacing of the coarse index, and so the most probes a missed lookup costs.
@@ -70,6 +73,7 @@ impl GPow {
             coarse: Vec::new(),
             coarsed: 0,
             cells: None,
+            last_mu: 0,
         }
     }
 
