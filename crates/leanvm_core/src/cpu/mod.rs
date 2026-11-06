@@ -17,7 +17,7 @@ use crate::tables::{
 };
 use crate::transcript::ProverState;
 use crate::witness;
-use primitives::field::{F64, F192, g_pow};
+use primitives::field::{F64, F192, F192Unreduced, g_pow};
 
 mod execute;
 pub mod hints;
@@ -398,35 +398,46 @@ fn table_spans() -> TableSpans {
         .collect()
 }
 
-/// The per-table inputs to the table sumcheck (§constraints), in schema order: each
-/// table's committed columns, its summand as one form over them (its identities
-/// weighted by its own `η`-range, its three bus forms by the shared powers at
-/// [`xi_form_base`]), and what that summand sums to, its bus forms' `η`-weighted
-/// shares, since its identities vanish.
-fn airs<'a>(
+/// The per-table inputs to the table sumcheck (§constraints), in schema order.
+/// The airs carry every committed column of their table, so a constraint indexes the
+/// value array directly and each table's three bus forms can be
+/// evaluated on the same values. The identities take the air's own `η`-range; the
+/// three forms take the shared powers at [`xi_form_base`], folded into the forms'
+/// coefficients once rather than multiplied onto every row's form value.
+fn airs(
     taus: &[usize; tables::N_TABLES],
-    bus: &leaf::BusProof,
-    cols: &'a [&'a [F64]],
-    spans: &[(usize, usize)],
-    xi: F192,
-) -> Vec<constraints::Air<'a>> {
-    let base = xi_form_base();
-    let pows = primitives::field::powers(xi, base + 3);
-    let offsets = constraints::xi_offsets(tables::tables().iter().map(|t| t.n_constraints()));
+    rows: &[usize; tables::N_TABLES],
+    forms: &[Vec<leaf::BusForm>; 3],
+    form_pows: [F192; 3],
+) -> Vec<constraints::Air<'static>> {
     tables::tables()
         .iter()
-        .zip(taus.iter().zip(spans))
+        .zip(taus.iter().zip(rows))
         .enumerate()
-        .map(|(t, (&table, (&tau, &(start, n))))| {
-            let identities = table.constraint(&pows[offsets[t]..][..table.n_constraints()]);
-            let bus_forms = (0..3).map(|s| bus.forms[s][t].scaled(pows[base + s]));
+        .map(|(t, (&table, (&tau, &rows)))| {
+            // One form, not three: the batch adds the three sides' evaluations
+            // anyway, and summing them here is a setup cost against a dot product
+            // and a product list per row per node.
+            let bus = leaf::BusForm::sum((0..3).map(|s| forms[s][t].scaled(form_pows[s])));
             constraints::Air {
                 tau,
-                cols: &cols[start..start + n],
-                form: leaf::BusForm::sum(bus_forms.chain([identities])),
-                sigma: (0..3).fold(F192::ZERO, |acc, s| acc + pows[base + s] * bus.sigmas[s][t]),
+                rows,
+                n_constraints: table.n_constraints(),
+                eval: Box::new(move |p, vals, quadratic| {
+                    let air = F192Unreduced::from(table.eval_constraint(p, vals, quadratic));
+                    (air ^ bus.eval_unreduced(vals, quadratic)).reduce()
+                }),
             }
         })
+        .collect()
+}
+
+/// Each table's claimed sum: its identities vanish, so what its summand comes to
+/// is its three bus forms, `η`-weighted. Prover-side only, to build the waiting
+/// line each round; the verifier needs just their total, which it derives.
+fn sigmas(bus: &[Vec<F192>; 3], form_pows: [F192; 3]) -> Vec<F192> {
+    (0..tables::tables().len())
+        .map(|t| (0..3).fold(F192::ZERO, |acc, s| acc + form_pows[s] * bus[s][t]))
         .collect()
 }
 
@@ -441,6 +452,13 @@ fn airs<'a>(
 /// the bus.
 pub fn xi_form_base() -> usize {
     tables::tables().iter().map(|t| t.n_constraints()).sum()
+}
+
+/// The three shared form powers `η^{base}, η^{base+1}, η^{base+2}`.
+fn xi_form_pows(xi: F192) -> [F192; 3] {
+    let base = xi_form_base();
+    let pows = primitives::field::powers(xi, base + 3);
+    [pows[base], pows[base + 1], pows[base + 2]]
 }
 
 /// The KECCAK table's claims on its output lanes, which are the Keccak reduction's claim on
@@ -621,20 +639,41 @@ pub fn prove_with(
     // reduction's output claim (outputs), so no separate pin claims are needed.
     let (owners, spans) = bus_wiring(program, &w.layout);
     // The columns are windows into `w.q`, so both stages read them in place: the
-    // table sumcheck builds a table's few `E` state columns from them on the round
-    // it joins and never writes the K-columns back.
+    // table sumcheck lifts each K-column into a fresh `E` copy on the round it
+    // joins and never writes the K-columns back.
     let (bus, table_claims) = {
         let l = &w.layout;
         let cols = w.columns();
         let bus = crate::stage!("Prove bus", || {
-            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &mut ps)
+            leaf::prove_balance(
+                &l.push,
+                &l.pull,
+                &l.count,
+                &cols,
+                &owners,
+                &spans,
+                &l.rows,
+                mem_used.next_multiple_of(1 << 10),
+                &mut ps,
+            )
         });
         let table_claims = crate::stage!("Prove constraints", || {
             // One sumcheck for all six tables (§constraints).
             // The eq point is the bus GKR's ζ, not a fresh one: that is what lets the
             // batch settle the bus forms alongside the constraints.
             let xi = ps.sample();
-            constraints::prove(&airs(&l.taus, &bus, &cols, &spans, xi), &bus.point, &mut ps)
+            let form_pows = xi_form_pows(xi);
+            let sigma = sigmas(&bus.sigmas, form_pows);
+            constraints::prove(
+                &airs(&l.taus, &l.rows, &bus.forms, form_pows),
+                &cols,
+                &spans,
+                xi,
+                &bus.point,
+                &sigma,
+                &bus.blocks,
+                &mut ps,
+            )
         });
         (bus, table_claims)
     };
