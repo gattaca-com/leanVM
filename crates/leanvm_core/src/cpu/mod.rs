@@ -530,8 +530,21 @@ impl Stats {
 /// run [`Stats`], or why no proof was made ([`ProveError`]). `log_inv_rate`
 /// selects the PCS rate and is announced in the Fiat-Shamir transcript before
 /// the commitment.
+///
+/// The g-power table comes from a process-wide pool and goes back to it, so a process that proves
+/// again skips its growth, and sizes its reservations from the last run. The cells are released.
+/// A proof running beside another takes a fresh table.
 pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
-    prove_with(program, &program.witness, public_input, log_inv_rate, &mut GPow::new())
+    static POOL: std::sync::Mutex<Vec<GPow>> = std::sync::Mutex::new(Vec::new());
+    let take = || POOL.lock().ok().and_then(|mut pool| pool.pop());
+    let mut gpow = take().unwrap_or_default();
+    let result = prove_with(program, &program.witness, public_input, log_inv_rate, &mut gpow);
+    // The cells go back to the system: kept, they would sit beside the next proof's buffers.
+    gpow.cells = None;
+    if let Ok(mut pool) = POOL.lock() {
+        pool.push(gpow);
+    }
+    result
 }
 
 /// [`prove`] with the witness streams `witness` in place of the program's own, so a shared
@@ -552,15 +565,20 @@ pub fn prove_with(
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
-    // Estimate from prepared memory and fixed bytecode, allowing room for instruction columns.
+    // The last proof's committed size, or else an estimate from prepared memory and fixed bytecode,
+    // allowing room for instruction columns.
     // An underestimate only leaves some pages for the exact reservation below to fault in.
-    let reserve_mu = (layout::committed_log(
-        crate::log2_ceil_usize(gpow.capacity()),
-        crate::log2_strict_usize(program.prog.len()),
-        [0; tables::N_TABLES],
-    ) + 1)
-        .max(program.min_log_committed)
-        .clamp(pcs::MIN_MU, pcs::MAX_MU);
+    let reserve_mu = if gpow.last_mu > 0 {
+        gpow.last_mu
+    } else {
+        (layout::committed_log(
+            crate::log2_ceil_usize(gpow.capacity()),
+            crate::log2_strict_usize(program.prog.len()),
+            [0; tables::N_TABLES],
+        ) + 1)
+            .max(program.min_log_committed)
+            .clamp(pcs::MIN_MU, pcs::MAX_MU)
+    };
     // Allocate on the proving thread so its later buffers use the same allocator arena.
     let mut reserve = if parallel::num_threads() > 1 {
         pcs::reserve_level1(reserve_mu, log_inv_rate)
@@ -626,6 +644,7 @@ pub fn prove_with(
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
     drop(pcs::reserve_level1(w.layout.shape.mu, log_inv_rate));
+    gpow.last_mu = w.layout.shape.mu;
     let committed = crate::stage!("Commit", || {
         pcs::commit(&mut ps, &w.q, &w.repeats, w.layout.shape, log_inv_rate)
     });
