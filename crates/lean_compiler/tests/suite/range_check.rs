@@ -7,7 +7,7 @@
 //! end-of-run resolution of the two touched cells.
 
 use lean_compiler::{compile, parse};
-use leanvm_core::cpu::{prove, verify};
+use leanvm_core::cpu::{DerefMode, Op, prove, verify};
 use primitives::field::{F64, F192, g_pow};
 
 use crate::common::mix;
@@ -165,4 +165,70 @@ def main():
 fn range_check_folded_non_gpower_bound_rejected() {
     let src = "def main():\n    x = GEN ** 3\n    assert log x < log 5\n    return\n";
     let _ = parse(src).map_err(|e| panic!("{e}"));
+}
+
+/// Each check's two `DEREF`s store into fresh cells that no other instruction
+/// names, so no two checks, and no check and any other access, share a touched
+/// cell.
+#[test]
+fn range_check_targets_are_fresh() {
+    let src = "\
+def main():
+    x = GEN ** 5
+    assert log x < 8
+    assert log x < 9
+    y = x * x
+    assert log y < 11
+    p = 1
+    p[1] = x
+    p[GEN] = y
+    return
+";
+    let prog = compile(&parse(src).expect("parse")).prog;
+    let names = |op: &Op| -> Vec<u32> {
+        match *op {
+            Op::Xor { a, b, c } | Op::Mul { a, b, c } => vec![a, b, c],
+            Op::Set { o, .. } => vec![o],
+            Op::Deref { o1, o3, .. } => vec![o1, o3],
+            Op::Jump { oc, od, of } => vec![oc, od, of],
+            Op::Keccak {
+                m, tail, b8, cap, out, ..
+            } => {
+                let mut v = m.to_vec();
+                v.extend((tail..tail + 4).chain(cap..cap + 4).chain(out..out + 13));
+                v.push(b8);
+                v
+            }
+        }
+    };
+    let targets: Vec<(usize, u32)> = (0..prog.len().saturating_sub(2))
+        .filter_map(|i| match prog[i..i + 3] {
+            [
+                Op::Deref {
+                    o1: x,
+                    o3: t1,
+                    mode: DerefMode::Cell,
+                    ..
+                },
+                Op::Mul { a, b: y, .. },
+                Op::Deref {
+                    o1,
+                    o3: t2,
+                    mode: DerefMode::Cell,
+                    ..
+                },
+            ] if a == x && o1 == y => Some([(i, t1), (i + 2, t2)]),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(targets.len(), 6, "three checks, two targets each");
+    for (pc, t) in targets {
+        for (j, op) in prog.iter().enumerate() {
+            assert!(
+                j == pc || !names(op).contains(&t),
+                "target {t} of pc {pc} also named at pc {j}: {op:?}"
+            );
+        }
+    }
 }
