@@ -12,7 +12,99 @@ use crate::transcript::ProverState;
 use primitives::field::{F64, F64x8, F192, F192x8, Prod8, mul2};
 use primitives::multilinear::{eq_table, interp};
 use primitives::stream::Stream;
-use std::ops::{Add, Deref, Mul, Range};
+use std::ops::{Add, Deref, DerefMut, Mul, Range};
+
+/// Stored leaf blocks: on the heap, or in a mapping of their own when almost none are written.
+///
+/// With several workers, GKR recomputes almost every bus leaf block or skips it as identity.
+/// On the heap, the unwritten extent would host later buffers and become resident.
+/// A mapping faults in only the written pages, and goes back to the system after the first fold.
+/// Leaves written in full stay on the heap, where the first fold reuses their buffer.
+pub enum Store<T> {
+    Heap(Vec<T>),
+    Mapped(Mapping<T>),
+}
+
+impl<T> Deref for Store<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Heap(v) => v,
+            Self::Mapped(m) => m,
+        }
+    }
+}
+
+impl<T> DerefMut for Store<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            Self::Heap(v) => v,
+            Self::Mapped(m) => m,
+        }
+    }
+}
+
+/// `len` plain values, zero until written, in an anonymous mapping of their own.
+pub struct Mapping<T> {
+    ptr: std::ptr::NonNull<T>,
+    len: usize,
+    bytes: usize,
+}
+
+// SAFETY: the mapping is owned like a `Vec<T>`, and shared access only reads.
+unsafe impl<T: Send> Send for Mapping<T> {}
+// SAFETY: as for `Send`.
+unsafe impl<T: Sync> Sync for Mapping<T> {}
+
+impl<T: primitives::Plain> Mapping<T> {
+    /// `len` zero values. Writes are scattered, so huge pages stay off: each would fault in 2 MiB.
+    pub fn new(len: usize) -> Self {
+        let bytes = (len * size_of::<T>()).max(1);
+        // SAFETY: an anonymous private mapping, checked for failure; zero bytes are plain values.
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "no mapping of {bytes} bytes for the leaves");
+            #[cfg(target_os = "linux")]
+            libc::madvise(p, bytes, libc::MADV_NOHUGEPAGE);
+            Self {
+                ptr: std::ptr::NonNull::new_unchecked(p.cast()),
+                len,
+                bytes,
+            }
+        }
+    }
+}
+
+impl<T> Deref for Mapping<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        // SAFETY: the mapping holds `len` plain values.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T> DerefMut for Mapping<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as in `deref`; the mapping is owned, so the borrow is unique.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T> Drop for Mapping<T> {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made, unmapped once.
+        unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.bytes) };
+    }
+}
 
 /// A product tree's leaves with its first radix-four layer, `quads[k] = leaves[4k] · … ·
 /// leaves[4k + 3]` (absent leaves are the identity), built by whoever wrote the leaves.
@@ -43,7 +135,7 @@ impl<F: TreeField> Leaves<'_, F> {
         let leaves = blocks_from_values(&values);
         let quads = (0..values.len().div_ceil(4)).map(|k| quad_at(&leaves, k)).collect();
         Self {
-            leaves: LeafData::Blocks(leaves),
+            leaves: LeafData::Blocks(Store::Heap(leaves)),
             len: values.len(),
             quads,
             ones: Vec::new(),
@@ -55,13 +147,13 @@ impl<F: TreeField> Leaves<'_, F> {
 
 /// Stored blocks, or columns read directly until the first fold.
 pub enum LeafData<'a, F: TreeField> {
-    Blocks(Vec<F::Block>),
+    Blocks(Store<F::Block>),
     Columns(Columns<'a, F>),
 }
 
 impl<F: TreeField> Default for LeafData<'_, F> {
     fn default() -> Self {
-        Self::Blocks(Vec::new())
+        Self::Blocks(Store::Heap(Vec::new()))
     }
 }
 
@@ -247,7 +339,7 @@ pub trait TreeField: primitives::Plain + Send + Sync + Mul<Output = Self> + 'sta
     fn product4(c: [Self; 4]) -> Self;
 
     /// The layer state over a table of `len` values held as blocks, whose tail is the identity.
-    fn state_from_blocks(blocks: Vec<Self::Block>, len: usize, width: usize) -> QuaternaryLayerState<'static>;
+    fn state_from_blocks(blocks: Store<Self::Block>, len: usize, width: usize) -> QuaternaryLayerState<'static>;
 
     /// The products of eight consecutive rows of four, from their 32 children: an even-odd split
     /// pairs neighbours, so two rounds of it leave four-fold products in order.
@@ -304,8 +396,11 @@ impl TreeField for F192 {
         lo * hi
     }
 
-    fn state_from_blocks(blocks: Vec<Block>, _len: usize, width: usize) -> QuaternaryLayerState<'static> {
-        QuaternaryLayerState::from_blocks(blocks, width)
+    fn state_from_blocks(blocks: Store<Block>, _len: usize, width: usize) -> QuaternaryLayerState<'static> {
+        match blocks {
+            Store::Heap(blocks) => QuaternaryLayerState::from_blocks(blocks, width),
+            Store::Mapped(leaves) => QuaternaryLayerState::from_leaves(leaves, width),
+        }
     }
 }
 
@@ -323,7 +418,7 @@ impl TreeField for F64 {
         (c0 * c1) * (c2 * c3)
     }
 
-    fn state_from_blocks(blocks: Vec<KBlock>, len: usize, width: usize) -> QuaternaryLayerState<'static> {
+    fn state_from_blocks(blocks: Store<KBlock>, len: usize, width: usize) -> QuaternaryLayerState<'static> {
         if blocks.len() < 2 {
             return QuaternaryLayerState::small((0..len).map(|l| Self::leaf(&blocks, l).embed()), width);
         }
@@ -1156,9 +1251,11 @@ fn fold_block_pairs<S: Source + ?Sized>(
 /// Two binary product levels contracted into one degree-four layer.
 pub struct QuaternaryLayerState<'a> {
     /// The table as blocks, one block for a table of at most 64 values.
-    /// Empty while the table is held as `first`.
+    /// Empty while the table is held as `first` or `leaves`.
     blocks: Vec<Block>,
     next_blocks: Vec<Block>,
+    /// A leaf table of at least two blocks, read as `blocks` until the first fold unmaps it.
+    leaves: Option<Mapping<Block>>,
     /// A table of at least two blocks that is not yet `E` blocks (base-field blocks, or rows), until
     /// the first fold: it then replaces `blocks`.
     first: Option<Box<dyn Table + 'a>>,
@@ -1193,11 +1290,25 @@ impl<'a> QuaternaryLayerState<'a> {
             // SAFETY: the first fold writes every slot of `next_blocks` before any read.
             next_blocks: unsafe { primitives::uninit_vec(blocks.len().div_ceil(2)) },
             blocks,
+            leaves: None,
             first: None,
             logical_rows: width,
             ones: Vec::new(),
             columns: Vec::new(),
             pending: None,
+        }
+    }
+
+    /// The state over a leaf table held as blocks, whose tail is the identity.
+    fn from_leaves(leaves: Mapping<Block>, width: usize) -> Self {
+        if leaves.len() < 2 {
+            return Self::from_blocks(leaves.to_vec(), width);
+        }
+        Self {
+            // SAFETY: the first fold writes every slot of `next_blocks` before any read.
+            next_blocks: unsafe { primitives::uninit_vec(leaves.len().div_ceil(2)) },
+            leaves: Some(leaves),
+            ..Self::from_blocks(Vec::new(), width)
         }
     }
 
@@ -1207,6 +1318,7 @@ impl<'a> QuaternaryLayerState<'a> {
             // SAFETY: the first fold writes every slot of `next_blocks` before any read.
             next_blocks: unsafe { primitives::uninit_vec(table.count().div_ceil(2)) },
             blocks: Vec::new(),
+            leaves: None,
             first: Some(table),
             logical_rows: width,
             ones: Vec::new(),
@@ -1226,8 +1338,13 @@ impl<'a> QuaternaryLayerState<'a> {
     fn round_message(&self, equality: &Equality) -> [F192; 4] {
         match &self.first {
             Some(first) => first.message(&self.ones, equality),
-            None => blocks_message(&self.blocks, &self.unstored(), equality),
+            None => blocks_message(&self.stored(), &self.unstored(), equality),
         }
+    }
+
+    /// The table as blocks, when it is not held as `first`.
+    fn stored(&self) -> &[Block] {
+        self.leaves.as_deref().unwrap_or(&self.blocks)
     }
 
     /// Fold every pair of blocks by `challenge` into `next_blocks`, and with an `equality` weigh the
@@ -1245,7 +1362,7 @@ impl<'a> QuaternaryLayerState<'a> {
     ) -> [F192; 4] {
         let equality = if pairs.is_some() { None } else { equality };
         let weights = pairs.map(|(weights, _)| weights);
-        let blocks = self.first.as_ref().map_or(self.blocks.len(), |first| first.count());
+        let blocks = self.first.as_ref().map_or(self.stored().len(), |first| first.count());
         let half = blocks.div_ceil(2);
         let count = if second.is_some() { half.div_ceil(2) } else { half };
         self.next_blocks.truncate(count);
@@ -1254,7 +1371,7 @@ impl<'a> QuaternaryLayerState<'a> {
         let (mut message, polynomial) = match &first {
             Some(first) => first.fold(&mut self.next_blocks, &unstored, challenge, second, equality, weights),
             None => fold_block_pairs(
-                &self.blocks,
+                &self.leaves.as_deref().unwrap_or(&self.blocks),
                 &mut self.next_blocks,
                 &unstored,
                 challenge,
@@ -1278,9 +1395,11 @@ impl<'a> QuaternaryLayerState<'a> {
             self.columns.clear();
         }
         std::mem::swap(&mut self.blocks, &mut self.next_blocks);
-        if first.is_some() {
+        let leaves = self.leaves.take();
+        if first.is_some() || leaves.is_some() {
             // The leaf table dies first, so the allocator can hand its pages to the next buffer.
-            drop(first);
+            // Mapped leaves go back to the system.
+            drop((first, leaves));
             // SAFETY: the next fold writes every slot of `next_blocks` before any read.
             self.next_blocks = unsafe { primitives::uninit_vec(count.div_ceil(2)) };
         }

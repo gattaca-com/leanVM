@@ -466,7 +466,7 @@ struct Side<'a> {
     tiled: bool,
     /// Whether aligned groups of four GKR blocks are left unstored for GKR to recompute.
     columns: bool,
-    leaves: Vec<gkr::Block>,
+    leaves: gkr::Store<gkr::Block>,
     quads: Vec<F192>,
     quads_done: Vec<usize>,
     /// Levels 4 and 6 of the blocks `publish_task` builds, in the `staged` runs of blocks; empty
@@ -609,13 +609,17 @@ pub fn build_leaves<'a>(
             let covered: usize = blocks.iter().map(|blk| 1usize << blk.kappa).sum();
             let block_count = explicit.div_ceil(gkr::BLOCK_VALUES);
             let tiled = covered == explicit;
-            let mut leaves: Vec<gkr::Block> = if tiled {
+            // With `columns`, GKR recomputes almost every block and skips the identity runs: a few
+            // hundred of some 600 000 blocks are written, and only their pages fault in.
+            let mut leaves = if tiled && columns {
+                gkr::Store::Mapped(gkr::Mapping::new(block_count))
+            } else if tiled {
                 // SAFETY: the per-block fills below cover `0..explicit` but for the identity blocks GKR
                 // never reads, each joins before this function returns, and the tail of the last block
                 // is written next.
-                unsafe { primitives::uninit_vec(block_count) }
+                gkr::Store::Heap(unsafe { primitives::uninit_vec(block_count) })
             } else {
-                vec![[F192x8::ONE; 8]; block_count]
+                gkr::Store::Heap(vec![[F192x8::ONE; 8]; block_count])
             };
             for l in explicit..gkr::BLOCK_VALUES * block_count {
                 gkr::set_leaf(&mut leaves, l, F192::ONE);
