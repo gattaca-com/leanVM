@@ -29,6 +29,13 @@ pub fn eq_eval(r: &[F128], x: &[F128]) -> F128 {
     r.iter().zip(x).map(|(&ri, &xi)| F128::ONE + ri + xi).product()
 }
 
+/// `eq(r, x)` at the binary point `r` whose bit `k` is bit `k` of `bits`.
+pub fn eq_eval_bits(bits: usize, x: &[F128]) -> F128 {
+    x.iter().enumerate().fold(F128::ONE, |acc, (k, &xk)| {
+        acc * if (bits >> k) & 1 == 1 { xk } else { F128::ONE + xk }
+    })
+}
+
 /// The `eq(r, ·)` table over `n = r.len()` variables. See [`fill_eq_table`].
 pub fn eq_table(r: &[F128]) -> Vec<F128> {
     // SAFETY: the fill writes every element before it reads any.
@@ -180,6 +187,41 @@ pub fn mle_eval_par(table: &[F64], point: &[F128]) -> F128 {
     parallel::map_reduce(table.len() >> low_vars, || F128::ZERO, eval, |a, b| a + b)
 }
 
+/// Rows of one task of [`mle_eval_many`].
+const MANY_ROWS: usize = 32;
+
+/// Several MLE evaluations in one dispatch, `(table, point)` each, with every large table cut into equal tasks
+/// so that a few tables still fill the pool. A caller already inside a dispatch must use [`mle_eval`].
+pub fn mle_eval_many(jobs: &[(&[F64], &[F128])]) -> Vec<F128> {
+    let split: Vec<Option<(Vec<Weights8>, Vec<F128>)>> = jobs
+        .iter()
+        .map(|(table, point)| {
+            (table.len() >= PAR_THRESHOLD)
+                .then(|| (packed_eq(&point[..MLE_LOW_VARS]), eq_table(&point[MLE_LOW_VARS..])))
+        })
+        .collect();
+    let tasks: Vec<(usize, usize)> = split
+        .iter()
+        .enumerate()
+        .flat_map(|(j, s)| (0..s.as_ref().map_or(1, |(_, high)| high.len().div_ceil(MANY_ROWS))).map(move |g| (j, g)))
+        .collect();
+    let parts = parallel::map_collect(tasks.len(), |t| {
+        let (j, g) = tasks[t];
+        let (table, point) = jobs[j];
+        let Some((low, high)) = &split[j] else {
+            return mle_eval(table, point);
+        };
+        (g * MANY_ROWS..((g + 1) * MANY_ROWS).min(high.len())).fold(F128::ZERO, |acc, row| {
+            acc + high[row] * dot_base(low, &table[row << MLE_LOW_VARS..(row + 1) << MLE_LOW_VARS]).reduce()
+        })
+    });
+    let mut out = vec![F128::ZERO; jobs.len()];
+    for (&(j, _), v) in tasks.iter().zip(parts) {
+        out[j] += v;
+    }
+    out
+}
+
 /// The variables of the L1-resident low `eq` table of an MLE evaluation.
 const MLE_LOW_VARS: usize = 10;
 
@@ -203,6 +245,26 @@ fn fold_ladder(mut cur: Vec<F128>, point: &[F128]) -> F128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_mles_match_one_by_one() {
+        let sizes = [2, 3, 11, 12, 16, 17];
+        let tables: Vec<Vec<F64>> = sizes
+            .iter()
+            .map(|&n| {
+                (0..1u64 << n)
+                    .map(|i| F64((i + n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+                    .collect()
+            })
+            .collect();
+        let points: Vec<Vec<F128>> = sizes
+            .iter()
+            .map(|&n| (0..n as u64).map(|i| F128::new(17 + i, 231 + 3 * i)).collect())
+            .collect();
+        let jobs: Vec<(&[F64], &[F128])> = tables.iter().zip(&points).map(|(t, p)| (&t[..], &p[..])).collect();
+        let want: Vec<F128> = jobs.iter().map(|&(t, p)| mle_eval(t, p)).collect();
+        assert_eq!(mle_eval_many(&jobs), want);
+    }
 
     #[test]
     fn parallel_mle_matches_folding() {

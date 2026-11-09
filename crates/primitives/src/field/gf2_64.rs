@@ -30,6 +30,12 @@ impl F64 {
         self.0 == 0
     }
 
+    /// The product with `x`: a shift, and the bit carried out folds back as `x^64 = 0x1B`.
+    #[inline]
+    pub const fn mul_x(self) -> Self {
+        Self((self.0 << 1) ^ ((self.0 >> 63) * R64))
+    }
+
     /// Squaring, as a bit spread followed by one reduction.
     ///
     /// Cross terms vanish in characteristic 2, so the square moves bit `i` to bit `2i`.
@@ -217,6 +223,21 @@ impl<'a> Product<&'a F64> for F64 {
     #[inline]
     fn product<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
         iter.copied().product()
+    }
+}
+
+/// `out[i] = x[i] * y[i]`, with all three slices of one length: eight at a time through
+/// [`super::F64x8`].
+pub fn mul_slices(out: &mut [F64], x: &[F64], y: &[F64]) {
+    use super::F64x8;
+    assert!(out.len() == x.len() && out.len() == y.len());
+    let (out8, out_tail) = out.as_chunks_mut::<8>();
+    let ((x8, x_tail), (y8, y_tail)) = (x.as_chunks::<8>(), y.as_chunks::<8>());
+    for ((o, a), b) in out8.iter_mut().zip(x8).zip(y8) {
+        *o = (F64x8::from_array(a) * F64x8::from_array(b)).to_array();
+    }
+    for ((o, &a), &b) in out_tail.iter_mut().zip(x_tail).zip(y_tail) {
+        *o = a * b;
     }
 }
 
@@ -542,6 +563,24 @@ mod tests {
             // The bit spread is the carry-less square, and squaring is the self-product.
             assert_eq!(square_wide(a), software::clmul(a, a));
             assert_eq!(F64(a).square(), F64(reference_mul(a, a)));
+        }
+    }
+
+    #[test]
+    fn mul_slices_matches_the_scalar_product() {
+        let mut rng = Rng::new(2);
+        // Lengths around the vector width, with the corners in the operands' top nibbles.
+        for len in [0, 1, 7, 8, 9, 23, 64] {
+            let mut word = || match rng.next_u8() % 4 {
+                0 => F64(CORNERS[rng.next_u8() as usize % CORNERS.len()]),
+                _ => F64(rng.next_u64()),
+            };
+            let x: Vec<F64> = (0..len).map(|_| word()).collect();
+            let y: Vec<F64> = (0..len).map(|_| word()).collect();
+            let mut out = vec![F64::ZERO; len];
+            mul_slices(&mut out, &x, &y);
+            let want: Vec<F64> = x.iter().zip(&y).map(|(&a, &b)| F64(reference_mul(a.0, b.0))).collect();
+            assert_eq!(out, want);
         }
     }
 
