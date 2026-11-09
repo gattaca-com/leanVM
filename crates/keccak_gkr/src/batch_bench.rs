@@ -43,7 +43,7 @@ pub fn run(n: usize, depth: usize, log_inv_rate: usize, plan: Plan) -> Report {
 
         let mut ps = batch_transcript(LABEL, shape, log_inv_rate);
         let t = Instant::now();
-        let (commitment, prover_data) = commit(&committed, mu, INITIAL_FOLDING_FACTOR, log_inv_rate);
+        let (commitment, prover_data) = commit(&committed, &[], mu, INITIAL_FOLDING_FACTOR, log_inv_rate);
         ps.add_root(&commitment.root);
         let commit_s = t.elapsed().as_secs_f64();
 

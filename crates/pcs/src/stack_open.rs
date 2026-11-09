@@ -57,6 +57,11 @@ use super::whir::{ProverConfig, ProverData};
 mod basis;
 
 pub(crate) use basis::Terms;
+#[cfg(test)]
+pub(crate) use basis::equal_blocks;
+
+/// Bits of the block a commit's repeat map tags: a block holds `2^EQUAL_BLOCK_LOG` words.
+pub const EQUAL_BLOCK_LOG: usize = basis::LOW_VARS;
 
 // ---------------------------------------------------------------------------
 // Claim types

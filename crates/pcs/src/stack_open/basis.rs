@@ -126,7 +126,7 @@ fn flush(folds: &mut [Option<[F192; ROWS]>], masses: &mut [F192], sigmas: &mut [
 }
 
 /// For each block of `2^LOW_VARS` words of `stack`, whether it equals the block before it.
-fn equal_blocks(stack: &[F64]) -> Vec<bool> {
+pub(crate) fn equal_blocks(stack: &[F64]) -> Vec<bool> {
     let blocks = primitives::cast_slice::<F64, u64>(stack)
         .as_chunks::<{ 1 << LOW_VARS }>()
         .0;

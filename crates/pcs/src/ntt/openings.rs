@@ -71,11 +71,21 @@ impl AdditiveNttF64 {
                 let sub_len = plan.sub_len();
                 self.finished_rows(&plan, positions, |_, sub| &words[sub * sub_len..][..sub_len])
             }
-            Codeword::Nothing(plan, n_lanes) => {
+            Codeword::Nothing {
+                plan,
+                ref blocks,
+                ref repeats,
+            } => {
                 let log_sub = plan.log_sub();
                 let mut subs: Vec<usize> = positions.iter().map(|q| q >> log_sub).collect();
                 subs.dedup();
-                let built = Rebuild::new(&plan, Lanes { words: msg, n_lanes }, &subs).run(self);
+                let lanes = Lanes {
+                    words: msg,
+                    repeats,
+                    blocks,
+                    rows: 1 << (plan.log_d - plan.start),
+                };
+                let built = Rebuild::new(&plan, lanes, &subs).run(self);
                 let sub_len = plan.sub_len();
                 self.finished_rows(&plan, positions, |i, _| &built[i * sub_len..][..sub_len])
             }
@@ -153,7 +163,7 @@ impl<'a> Rebuild<'a> {
         let (rows, log_step) = (1usize << g, plan.log_sub());
         let msg_rows = 1usize << (log_d - start);
         assert!(plan.rebuilds_from_lanes(), "one gathered pass reads the lanes");
-        assert_eq!(lanes.words.len(), lanes.n_lanes * msg_rows);
+        assert_eq!(lanes.rows, msg_rows);
         let mut next = 0;
         let cosets = subs
             .chunk_by(|a, b| a >> g == b >> g)
