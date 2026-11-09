@@ -131,7 +131,7 @@ pub fn aggregate_with_stats(
     for child in children {
         check_claim_tree(&child.tree).map_err(AggregationError::InvalidChild)?;
     }
-    // One single-threaded replay per worker: nothing inside dispatches.
+    // One statement hash and single-threaded replay per worker: nothing inside dispatches.
     let bytecode = scalar_bytecode();
     let summaries = parallel::map_collect(children.len(), |i| {
         let commit = tree_commitment(&children[i].tree);
