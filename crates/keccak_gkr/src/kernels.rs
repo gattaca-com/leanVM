@@ -11,6 +11,19 @@ use crate::keccak::row_positions;
 use crate::rmfe::RMFE;
 use crate::witness::BLOCK_WORDS;
 
+/// Defines the stage code's entry points over vector kernels of the same signature.
+macro_rules! entry {
+    ($($(#[$meta:meta])* fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)? => $kernel:ident;)*) => {$(
+        $(#[$meta])*
+        pub fn $name($($arg: $ty),*) $(-> $ret)? {
+            // SAFETY: every use of `entry!` sits in an item compiled only where the features of its
+            // kernel are enabled: the `cfg_select!` below picks the module, and the `cfg` of
+            // `products_clmul` and `clmul_kernel!` follow the enabled features.
+            unsafe { $kernel($($arg),*) }
+        }
+    )*};
+}
+
 cfg_select! {
     all(
         target_arch = "x86_64",
@@ -24,7 +37,8 @@ cfg_select! {
     all(
         target_arch = "x86_64",
         target_feature = "avx2",
-        target_feature = "pclmulqdq"
+        target_feature = "pclmulqdq",
+        not(target_feature = "avx512f")
     ) => {
         use avx2 as simd;
     }
@@ -42,22 +56,28 @@ cfg_select! {
 }
 
 /// Packs in a block position.
-pub(crate) const PACKS: usize = 32;
-/// Packs the bit-level rounds fold together: half a block.
-pub const GROUP: usize = 16;
-/// Variables indexing the packs of a group.
-pub(crate) const SKIP: usize = 4;
-/// Points of `{0, 1, infinity}^SKIP`, and those of them with a coordinate at infinity.
-pub(crate) const TERNARY: usize = 3usize.pow(SKIP as u32);
-pub(crate) const MIXED: usize = TERNARY - GROUP;
-/// The mixed points of a block position's two groups, rounded up to whole vectors.
+pub const PACKS: usize = 1 << PACK_VARS;
+pub const PACK_VARS: usize = 5;
+/// Variables indexing the packs the bit-level rounds fold together, a group.
+pub const SKIP: usize = 3;
+pub const GROUP: usize = 1 << SKIP;
+/// Groups in a block position.
+pub const GROUPS: usize = PACKS / GROUP;
+/// Points of `{0, 1, infinity}^SKIP`.
+pub const TERNARY: usize = 3usize.pow(SKIP as u32);
+/// Packs the kernels extend together: half a block, two groups.
+pub const HALF: usize = 16;
+/// Points of `{0, 1, infinity}^4` over a half with a coordinate at infinity. The rounds use those
+/// whose last coordinate, a half's group, is binary ([`used`]).
+pub const MIXED: usize = 81 - HALF;
+/// The mixed points of a block position's two halves, rounded up to whole vectors.
 pub const SLOTS: usize = (2 * MIXED).next_multiple_of(8);
 
 /// Sums of `value * weight word`, a 128-bit product each, laid out as the vector kernel leaves
 /// them: entry `i` of a run of eight sits at `lane(i)`.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
-pub struct Lanes(pub(crate) [u128; 4]);
+pub struct Lanes(pub [u128; 4]);
 
 /// The [`Lanes`] of entry `i`, and its lane there.
 #[inline(always)]
@@ -67,7 +87,7 @@ const fn lane(i: usize) -> (usize, usize) {
 
 /// Per mixed point of each group, the sum over positions of `weight * product`, as two
 /// partial products.
-pub struct SkipAcc(pub(crate) [[Lanes; SLOTS / 4]; 2]);
+pub struct SkipAcc(pub [[Lanes; SLOTS / 4]; 2]);
 
 impl SkipAcc {
     pub fn new() -> Box<Self> {
@@ -91,14 +111,14 @@ const HIGH: [(usize, usize); 9] = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1
 /// The mixed points of the low two variables, in the order their values fill a vector.
 const LOW_MIXED: [(usize, usize); 4] = [(2, 0), (2, 1), (0, 2), (1, 2)];
 
-/// The slot of output `i` of group `half` of a block position: each group's first 64 outputs
+/// The slot of output `i` of half `half` of a block position: each half's first 64 outputs
 /// are whole vectors, and their last outputs share a pair of slots.
 #[inline(always)]
 pub const fn slot(half: usize, i: usize) -> usize {
     if i < 64 { 64 * half + i } else { 128 + half }
 }
 
-/// Extend one group's values on the binary cube to the mixed points of `{0, 1, infinity}^SKIP`:
+/// Extend one half's values on the binary cube to the mixed points of `{0, 1, infinity}^4`:
 /// along each variable, the value at infinity is the sum of the two others.
 ///
 /// The values are four vectors of four, the high two variables across the vectors and the low
@@ -106,7 +126,7 @@ pub const fn slot(half: usize, i: usize) -> usize {
 /// the low variables have five mixed points: four filling a vector, and the sum of all four
 /// lanes. The outputs are the new vectors' binary points, every vector's four low mixed points,
 /// then every vector's lane sum; [`mixed_points`] names each by its ternary digits.
-pub(crate) fn extend_group(v: &[u32; GROUP]) -> [u32; MIXED] {
+pub fn extend_group(v: &[u32; HALF]) -> [u32; MIXED] {
     let q = |k: usize| -> [u32; 4] { v[4 * k..][..4].try_into().unwrap() };
     let x = |a: [u32; 4], b: [u32; 4]| -> [u32; 4] { std::array::from_fn(|l| a[l] ^ b[l]) };
     let (w4, w5) = (x(q(0), q(1)), x(q(2), q(3)));
@@ -124,19 +144,40 @@ pub(crate) fn extend_group(v: &[u32; GROUP]) -> [u32; MIXED] {
 
 /// The ternary index of each output of [`extend_group`]: variable `k`'s point is its `k`-th
 /// digit, with infinity as 2.
-pub(crate) fn mixed_points() -> [usize; MIXED] {
-    let index = |(c0, c1): (usize, usize), (c2, c3): (usize, usize)| c0 + 3 * c1 + 9 * c2 + 27 * c3;
-    std::array::from_fn(|i| match i {
+pub fn mixed_points() -> [usize; MIXED] {
+    std::array::from_fn(mixed_point)
+}
+
+/// Entry `i` of [`mixed_points`].
+pub const fn mixed_point(i: usize) -> usize {
+    const fn index((c0, c1): (usize, usize), (c2, c3): (usize, usize)) -> usize {
+        c0 + 3 * c1 + 9 * c2 + 27 * c3
+    }
+    match i {
         0..20 => index(((i % 4) & 1, (i % 4) >> 1), HIGH[4 + i / 4]),
         20..56 => index(LOW_MIXED[(i - 20) % 4], HIGH[(i - 20) / 4]),
         _ => index((2, 2), HIGH[i - 56]),
-    })
+    }
 }
 
-/// Both groups of a block position, at their [`slot`]s.
+/// Whether the rounds use the point of [`mixed_points`] index `p`: its group is binary.
+pub const fn used(p: usize) -> bool {
+    p / 27 < 2
+}
+
+/// Whether the rounds read [`slot`] `p`: the kernels may skip the others.
+pub const fn slot_used(p: usize) -> bool {
+    match p {
+        0..128 => used(mixed_point(p % 64)),
+        128..130 => used(mixed_point(64)),
+        _ => false,
+    }
+}
+
+/// Both halves of a block position, at their [`slot`]s.
 pub fn extend(packs: &[u32; PACKS], out: &mut [u32; SLOTS]) {
     for half in 0..2 {
-        let e = extend_group(packs[GROUP * half..][..GROUP].try_into().unwrap());
+        let e = extend_group(packs[HALF * half..][..HALF].try_into().unwrap());
         for (i, &e) in e.iter().enumerate() {
             out[slot(half, i)] = e;
         }
@@ -184,7 +225,7 @@ pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5
 pub fn skip_row_portable(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) {
     for x in 0..5 {
         let (b, c) = (&e[(x + 1) % 5], &e[(x + 2) % 5]);
-        for p in 0..SLOTS {
+        for p in (0..SLOTS).filter(|&p| slot_used(p)) {
             let product = mul_wide(b[p] as u64, c[p] as u64) as u64;
             let (v, l) = lane(p);
             for k in 0..2 {
@@ -194,16 +235,16 @@ pub fn skip_row_portable(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u
     }
 }
 
-/// For both groups of a block position, `sum over the group's packs of weights[.][q] * e[q]`,
+/// For every group of a block position, `sum over the group's packs of weights[.][q] * e[q]`,
 /// as two partial products.
 #[inline(always)]
-pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; 2] {
+pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; GROUPS] {
     simd::fold_groups(e, weights)
 }
 
-pub fn fold_groups_portable(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; 2] {
-    std::array::from_fn(|half| {
-        std::array::from_fn(|k| (0..GROUP).fold(0, |acc, q| acc ^ mul_wide(e[GROUP * half + q] as u64, weights[k][q])))
+pub fn fold_groups_portable(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; GROUPS] {
+    std::array::from_fn(|g| {
+        std::array::from_fn(|k| (0..GROUP).fold(0, |acc, q| acc ^ mul_wide(e[GROUP * g + q] as u64, weights[k][q])))
     })
 }
 
@@ -232,10 +273,9 @@ pub static NIBBLES: [[u8; 16]; 12] = {
     tables
 };
 
-/// [`skip_row`] over every row and slice of a block, the position weights as elements: per
-/// [`slot`], the two partial products.
+/// [`skip_row`] over every row and slice of a block, as three polynomial words per [`slot`].
 #[cfg(test)]
-fn skip_block_portable(block: &[u64], weights: &[[u64; 2]]) -> Vec<[u128; 2]> {
+fn skip_block_portable(block: &[u64], weights: &[[u64; 2]]) -> Vec<[u64; 3]> {
     let mut acc = SkipAcc::new();
     let mut extended = [[0u32; SLOTS]; 5];
     for r in 0..5 {
@@ -247,22 +287,47 @@ fn skip_block_portable(block: &[u64], weights: &[[u64; 2]]) -> Vec<[u128; 2]> {
             skip_row_portable(&mut acc, &extended, std::array::from_fn(|x| &weights[js[x]]));
         }
     }
-    (0..2 * MIXED).map(|i| acc.get(i)).collect()
+    (0..2 * MIXED).map(|i| crate::basis::carry(&acc.get(i))).collect()
+}
+
+/// The layer's position weights, by word for vector loads: word `k` of position `j` at `k * BITS + j`.
+pub struct SkipWeights(Vec<u64>);
+
+impl SkipWeights {
+    pub fn new(weights: Vec<[u64; 2]>) -> Self {
+        let bits = crate::keccak::BITS;
+        assert_eq!(weights.len(), bits);
+        let mut words = vec![0; 2 * bits];
+        for (j, w) in weights.iter().enumerate() {
+            for (k, &w) in w.iter().enumerate() {
+                words[k * bits + j] = w;
+            }
+        }
+        Self(words)
+    }
 }
 
 cfg_select! {
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
+    any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "vpclmulqdq",
+            not(target_feature = "avx512f")
+        )
     ) => {
-        pub(crate) use x86::SkipBlock;
+        pub use skip::SkipBlock;
     }
     _ => {
         /// [`skip_row`] over every row and slice of a block, a position at a time.
-        pub(crate) struct SkipBlock {
+        pub struct SkipBlock {
             acc: Box<SkipAcc>,
             extended: [[u32; SLOTS]; 5],
         }
@@ -276,7 +341,7 @@ cfg_select! {
             }
 
             /// Sum a block, the position weights as elements.
-            pub fn run(&mut self, block: &[u64], weights: &[[u64; 2]]) {
+            pub fn run(&mut self, block: &[u64], weights: &SkipWeights) {
                 self.acc.clear();
                 for r in 0..5 {
                     for z in 0..64 {
@@ -284,42 +349,44 @@ cfg_select! {
                         for x in 0..5 {
                             embed_extend(crate::witness::words(block, js[x]), &mut self.extended[x]);
                         }
-                        skip_row(&mut self.acc, &self.extended, std::array::from_fn(|x| &weights[js[x]]));
+                        let w: [[u64; 2]; 5] = std::array::from_fn(|x| {
+                            std::array::from_fn(|k| weights.0[k * crate::keccak::BITS + js[x]])
+                        });
+                        skip_row(&mut self.acc, &self.extended, std::array::from_fn(|x| &w[x]));
                     }
                 }
             }
 
-            /// The two partial products of slot `i`.
-            pub fn get(&self, i: usize) -> [u128; 2] {
-                self.acc.get(i)
+            /// The sum for slot `i`, as three polynomial words.
+            pub fn get(&self, i: usize) -> [u64; 3] {
+                crate::basis::carry(&self.acc.get(i))
             }
         }
     }
 }
 
-/// [`products`] on a register of [`Vector`](crate::clmul::Vector) lanes, two packs to a lane: the
-/// x86 form at every width.
+entry! {
+    /// [`products`] on a register of [`V`](crate::clmul::V) lanes, two packs to a lane: the x86 form
+    /// at every width.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+    fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] => products_vectors;
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
-#[inline(always)]
-pub fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
-    use crate::clmul::{V, Vector};
-    let ones = V::splat(RMFE.ones as u64);
-    let mut out = [0u64; PACKS];
-    for q in (0..PACKS).step_by(2 * V::N) {
-        // SAFETY: `2 * N` packs at `q`, and as many words.
-        unsafe {
-            let (za, zb, zc) = (
-                V::load_packs(a.as_ptr().add(q)),
-                V::load_packs(b.as_ptr().add(q)),
-                V::load_packs(c.as_ptr().add(q)),
-            );
+crate::clmul::clmul_kernel! {
+    fn products_vectors(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
+        use crate::clmul::V;
+        let ones = V::splat(RMFE.ones as u64);
+        let mut out = [0u64; PACKS];
+        for q in (0..PACKS).step_by(2 * V::N) {
+            let (za, zb, zc) = (V::load_packs(a, q), V::load_packs(b, q), V::load_packs(c, q));
             let linear = za.xor(zc);
             let even = zb.clmul::<0x00>(zc).xor(linear.clmul::<0x00>(ones));
             let odd = zb.clmul::<0x11>(zc).xor(linear.clmul::<0x11>(ones));
-            V::store(out.as_mut_ptr().add(q), even.unpacklo(odd));
+            V::store(&mut out, q, even.unpacklo(odd));
         }
+        out
     }
-    out
 }
 
 /// Compiled only where its features are, so its kernels are safe to call.
@@ -333,9 +400,15 @@ pub fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [
 mod x86 {
     use core::arch::x86_64::*;
 
+    use primitives::simd;
+
     use super::*;
-    pub use super::{embed_extend_portable as embed_extend, products_clmul as products, skip_row_portable as skip_row};
-    use crate::keccak::BITS;
+    // The prover folds groups with GF2P8AFFINE where AVX-512 VBMI is, as every such machine has it.
+    pub use super::{
+        embed_extend_portable as embed_extend, fold_groups_portable as fold_groups, products_clmul as products,
+        skip_row_portable as skip_row,
+    };
+    use crate::clmul::V;
 
     /// The matrices sending a pack's low and high byte to each byte of its embedding. An affine
     /// byte map reads output bit `t` off matrix byte `7 - t`.
@@ -365,194 +438,228 @@ mod x86 {
         m
     };
 
-    #[inline(always)]
-    pub fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
-        unsafe {
-            let v = _mm512_loadu_si512(words.as_ptr().cast());
-            let low = _mm512_or_si512(embedding_byte(v, 0), _mm512_slli_epi16(embedding_byte(v, 1), 8));
-            let high = embedding_byte(v, 2);
-            // Interleaving the halves leaves each lane's four low packs, then its four high ones.
-            let (first, second) = (_mm512_unpacklo_epi16(low, high), _mm512_unpackhi_epi16(low, high));
-            let mut out = [0u32; PACKS];
-            let order = |from: i64| {
-                _mm512_setr_epi64(
-                    from,
-                    from + 1,
-                    8 + from,
-                    9 + from,
-                    from + 2,
-                    from + 3,
-                    10 + from,
-                    11 + from,
-                )
-            };
-            _mm512_storeu_si512(
-                out.as_mut_ptr().cast(),
-                _mm512_permutex2var_epi64(first, order(0), second),
-            );
-            _mm512_storeu_si512(
-                out.as_mut_ptr().add(16).cast(),
-                _mm512_permutex2var_epi64(first, order(4), second),
-            );
-            out
-        }
+    entry! {
+        #[inline(always)]
+        fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] => embed_vector;
     }
 
-    /// Eight packs, a word each.
-    #[inline(always)]
-    unsafe fn load(p: *const u32) -> __m512i {
-        unsafe { _mm512_cvtepu32_epi64(_mm256_loadu_si256(p.cast())) }
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
+    #[inline]
+    fn embed_vector(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
+        let v = simd::load(words, 0);
+        let low = _mm512_or_si512(embedding_byte(v, 0), _mm512_slli_epi16(embedding_byte(v, 1), 8));
+        let high = embedding_byte(v, 2);
+        // Interleaving the halves leaves each lane's four low packs, then its four high ones.
+        let (first, second) = (_mm512_unpacklo_epi16(low, high), _mm512_unpackhi_epi16(low, high));
+        let mut out = [0u32; PACKS];
+        let order = |from: i64| {
+            _mm512_setr_epi64(
+                from,
+                from + 1,
+                8 + from,
+                9 + from,
+                from + 2,
+                from + 3,
+                10 + from,
+                11 + from,
+            )
+        };
+        simd::store(&mut out, 0, _mm512_permutex2var_epi64(first, order(0), second));
+        simd::store(&mut out, 1, _mm512_permutex2var_epi64(first, order(4), second));
+        out
     }
 
     /// Byte `k` of the embedding of each pack of `v`, in the low byte of the pack's 16 bits.
-    #[inline(always)]
-    unsafe fn embedding_byte(v: __m512i, k: usize) -> __m512i {
-        unsafe {
-            let lo = _mm512_gf2p8affine_epi64_epi8(v, _mm512_set1_epi64(MATRICES[0][k]), 0);
-            let hi = _mm512_gf2p8affine_epi64_epi8(v, _mm512_set1_epi64(MATRICES[1][k]), 0);
-            _mm512_and_si512(
-                _mm512_xor_si512(lo, _mm512_srli_epi16(hi, 8)),
-                _mm512_set1_epi16(0x00ff),
-            )
-        }
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
+    #[inline]
+    fn embedding_byte(v: __m512i, k: usize) -> __m512i {
+        let lo = _mm512_gf2p8affine_epi64_epi8(v, _mm512_set1_epi64(MATRICES[0][k]), 0);
+        let hi = _mm512_gf2p8affine_epi64_epi8(v, _mm512_set1_epi64(MATRICES[1][k]), 0);
+        _mm512_and_si512(
+            _mm512_xor_si512(lo, _mm512_srli_epi16(hi, 8)),
+            _mm512_set1_epi16(0x00ff),
+        )
     }
 
-    /// The packs of eight consecutive positions, embedded: `out[q]` holds pack `q` of position
-    /// `i` in word `i`. The positions' words are transposed first, so a register holds one word
-    /// of each, and a pack is then a field of every word alike.
+    /// The embedding needs no tables here.
+    pub type Tables = ();
+
     #[inline(always)]
-    unsafe fn embed8(positions: *const u64, out: &mut [__m512i; PACKS]) {
-        unsafe {
-            let a: [__m512i; 8] = std::array::from_fn(|i| _mm512_loadu_si512(positions.add(BLOCK_WORDS * i).cast()));
-            let b: [__m512i; 8] = std::array::from_fn(|i| {
-                if i % 2 == 0 {
-                    _mm512_unpacklo_epi64(a[i], a[i + 1])
-                } else {
-                    _mm512_unpackhi_epi64(a[i - 1], a[i])
-                }
-            });
-            let (low, high) = (
-                |x, y| _mm512_shuffle_i64x2::<0b10_00_10_00>(x, y),
-                |x, y| _mm512_shuffle_i64x2::<0b11_01_11_01>(x, y),
-            );
-            // Words `t` and `t + 4` of positions `4m ..`, pairs of positions to a lane.
-            let c: [__m512i; 8] = std::array::from_fn(|i| {
-                let (m, t) = (i / 4, i % 4);
-                let (x, y) = (b[4 * m + t % 2], b[4 * m + 2 + t % 2]);
-                if t < 2 { low(x, y) } else { high(x, y) }
-            });
-            let words = [
-                low(c[0], c[4]),
-                low(c[1], c[5]),
-                low(c[2], c[6]),
-                low(c[3], c[7]),
-                high(c[0], c[4]),
-                high(c[1], c[5]),
-                high(c[2], c[6]),
-                high(c[3], c[7]),
-            ];
-            let zero = _mm512_setzero_si512();
-            for (w, &v) in words.iter().enumerate() {
-                let low = _mm512_or_si512(embedding_byte(v, 0), _mm512_slli_epi16(embedding_byte(v, 1), 8));
-                let high = embedding_byte(v, 2);
-                // Per lane, the four packs of its even word, then of its odd one.
-                let (even, odd) = (_mm512_unpacklo_epi16(low, high), _mm512_unpackhi_epi16(low, high));
-                let (first, second) = (_mm512_unpacklo_epi32(even, odd), _mm512_unpackhi_epi32(even, odd));
-                out[4 * w] = _mm512_unpacklo_epi32(first, zero);
-                out[4 * w + 1] = _mm512_unpackhi_epi32(first, zero);
-                out[4 * w + 2] = _mm512_unpacklo_epi32(second, zero);
-                out[4 * w + 3] = _mm512_unpackhi_epi32(second, zero);
+    pub fn tables() -> Tables {}
+
+    /// One half's packs of eight consecutive positions, embedded: `out[q]` holds the half's
+    /// pack `q` of position `i` in word `i`. The positions' words are transposed first, so a
+    /// register holds one word of each, and a pack is then a field of every word alike.
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq,gfni")]
+    #[inline]
+    pub fn embed_positions(_: &Tables, positions: &[u64], half: usize, out: &mut [V; HALF]) {
+        let a: [__m512i; 8] = std::array::from_fn(|i| simd::load(positions, i));
+        let b: [__m512i; 8] = std::array::from_fn(|i| {
+            if i % 2 == 0 {
+                _mm512_unpacklo_epi64(a[i], a[i + 1])
+            } else {
+                _mm512_unpackhi_epi64(a[i - 1], a[i])
             }
+        });
+        let (low, high) = (
+            |x, y| _mm512_shuffle_i64x2::<0b10_00_10_00>(x, y),
+            |x, y| _mm512_shuffle_i64x2::<0b11_01_11_01>(x, y),
+        );
+        // Words `t` and `t + 4` of positions `4m ..`, pairs of positions to a lane.
+        let c: [__m512i; 8] = std::array::from_fn(|i| {
+            let (m, t) = (i / 4, i % 4);
+            let (x, y) = (b[4 * m + t % 2], b[4 * m + 2 + t % 2]);
+            if t < 2 { low(x, y) } else { high(x, y) }
+        });
+        let words: [__m512i; 4] = std::array::from_fn(|i| {
+            if half == 0 {
+                low(c[i], c[i + 4])
+            } else {
+                high(c[i], c[i + 4])
+            }
+        });
+        let zero = _mm512_setzero_si512();
+        for (w, &v) in words.iter().enumerate() {
+            let low = _mm512_or_si512(embedding_byte(v, 0), _mm512_slli_epi16(embedding_byte(v, 1), 8));
+            let high = embedding_byte(v, 2);
+            // Per lane, the four packs of its even word, then of its odd one.
+            let (even, odd) = (_mm512_unpacklo_epi16(low, high), _mm512_unpackhi_epi16(low, high));
+            let (first, second) = (_mm512_unpacklo_epi32(even, odd), _mm512_unpackhi_epi32(even, odd));
+            out[4 * w] = V(_mm512_unpacklo_epi32(first, zero));
+            out[4 * w + 1] = V(_mm512_unpackhi_epi32(first, zero));
+            out[4 * w + 2] = V(_mm512_unpacklo_epi32(second, zero));
+            out[4 * w + 3] = V(_mm512_unpackhi_epi32(second, zero));
         }
     }
+}
 
-    /// [`extend_group`] on registers, each of eight positions' values.
-    #[inline(always)]
-    unsafe fn extend8(v: &[__m512i], out: &mut [__m512i; MIXED]) {
-        unsafe {
-            let x = |a: [__m512i; 4], b: [__m512i; 4]| -> [__m512i; 4] {
-                std::array::from_fn(|l| _mm512_xor_si512(a[l], b[l]))
-            };
-            let q = |k: usize| -> [__m512i; 4] { std::array::from_fn(|l| v[4 * k + l]) };
-            let (w4, w5) = (x(q(0), q(1)), x(q(2), q(3)));
-            let w = [q(0), q(1), q(2), q(3), w4, w5, x(q(0), q(2)), x(q(1), q(3)), x(w4, w5)];
-            for (k, w) in w[4..].iter().enumerate() {
-                out[4 * k..][..4].copy_from_slice(w);
-            }
-            for (k, w) in w.iter().enumerate() {
-                let low = x([w[0], w[2], w[0], w[1]], [w[1], w[3], w[2], w[3]]);
-                out[20 + 4 * k..][..4].copy_from_slice(&low);
-                out[56 + k] = _mm512_xor_si512(low[0], low[1]);
-            }
-        }
-    }
+/// [`skip_row`] over every row and slice of a block, a register of positions at a time: each
+/// register holds one value of `2 * V::N` positions, so the extension is a sum of registers and
+/// each slot's products are a register's lanes, weighted by those positions' weights at once.
+/// The AVX-512 and AVX2 forms differ only in the embedding.
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ),
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "vpclmulqdq",
+        not(target_feature = "avx512f")
+    )
+))]
+mod skip {
+    use super::simd::{Tables, embed_positions, tables};
+    use super::*;
+    use crate::clmul::{V, clmul_kernel};
+    use crate::keccak::BITS;
 
-    /// [`skip_row`] over every row and slice of a block, eight slices at a time: each register
-    /// holds one value of eight positions, so the extension is a sum of registers and each slot's
-    /// products are a register's lanes, weighted by eight positions' weights at once.
+    /// Positions in a register.
+    const WIDTH: usize = 2 * V::N;
+
     pub struct SkipBlock {
-        /// Per slot, the even and odd positions' sums of each partial product.
-        acc: Vec<[__m512i; 4]>,
-        packs: [[__m512i; PACKS]; 5],
-        extended: [[__m512i; MIXED]; 5],
-        /// The weights by word: word `k` of position `j` at `k * BITS + j`.
-        weights: Vec<u64>,
+        /// Per slot, the low and high polynomial halves, each split into even and odd positions.
+        acc: Vec<[V; 4]>,
+        packs: [[V; HALF]; 5],
+        tile: [[V; 4]; 5],
+    }
+
+    clmul_kernel! {
+        /// One high-variable pair of [`extend_group`], leaving the low pair binary.
+        fn extend_high(v: &[V], high: usize) -> [V; 4] {
+            let x = |a: [V; 4], b: [V; 4]| -> [V; 4] { std::array::from_fn(|l| a[l].xor(b[l])) };
+            let q = |k: usize| -> [V; 4] { std::array::from_fn(|l| v[4 * k + l]) };
+            match high {
+                0..=3 => q(high),
+                4 => x(q(0), q(1)),
+                5 => x(q(2), q(3)),
+                6 => x(q(0), q(2)),
+                7 => x(q(1), q(3)),
+                8 => x(x(q(0), q(1)), x(q(2), q(3))),
+                _ => unreachable!(),
+            }
+        }
     }
 
     impl SkipBlock {
         pub fn new() -> Box<Self> {
-            let zero = unsafe { _mm512_setzero_si512() };
+            // SAFETY: the features of `V` are enabled at compile time.
+            let zero = unsafe { V::zero() };
             Box::new(Self {
                 acc: vec![[zero; 4]; 2 * MIXED],
-                packs: [[zero; PACKS]; 5],
-                extended: [[zero; MIXED]; 5],
-                weights: vec![0; 2 * BITS],
+                packs: [[zero; HALF]; 5],
+                tile: [[zero; 4]; 5],
             })
         }
 
         /// Sum a block, the position weights as elements.
-        pub fn run(&mut self, block: &[u64], weights: &[[u64; 2]]) {
-            assert!(block.len() >= BITS * BLOCK_WORDS && weights.len() >= BITS);
-            for (j, w) in weights[..BITS].iter().enumerate() {
-                for (k, &w) in w.iter().enumerate() {
-                    self.weights[k * BITS + j] = w;
-                }
-            }
-            // SAFETY: the features are enabled at compile time, and every position read is in
-            // the block, every weight in the table.
-            unsafe {
-                self.acc.fill([_mm512_setzero_si512(); 4]);
-                for r in 0..5 {
-                    for z in (0..64).step_by(8) {
-                        let js = row_positions(r, z);
-                        for (packs, &j) in self.packs.iter_mut().zip(&js) {
-                            embed8(block.as_ptr().add(BLOCK_WORDS * j), packs);
-                        }
-                        let w: [[__m512i; 2]; 5] = std::array::from_fn(|x| {
-                            std::array::from_fn(|k| {
-                                _mm512_loadu_si512(self.weights.as_ptr().add(k * BITS + js[x]).cast())
-                            })
-                        });
-                        for half in 0..2 {
-                            for (extended, packs) in self.extended.iter_mut().zip(&self.packs) {
-                                extend8(&packs[GROUP * half..][..GROUP], extended);
+        pub fn run(&mut self, block: &[u64], weights: &SkipWeights) {
+            assert!(block.len() >= BITS * BLOCK_WORDS);
+            // SAFETY: the features are enabled at compile time.
+            unsafe { self.sum(&tables(), block, weights) }
+        }
+
+        clmul_kernel! {
+            /// The sums over a block, whose positions [`run`](Self::run) has checked.
+            #[cfg_attr(target_feature = "gfni", target_feature(enable = "gfni"))]
+            fn sum(&mut self, t: &Tables, block: &[u64], weights: &SkipWeights) {
+                self.acc.fill([V::zero(); 4]);
+                for half in 0..2 {
+                    for r in 0..5 {
+                        for z in (0..64).step_by(WIDTH) {
+                            let js = row_positions(r, z);
+                            for (packs, &j) in self.packs.iter_mut().zip(&js) {
+                                embed_positions(t, &block[BLOCK_WORDS * j..][..WIDTH * BLOCK_WORDS], half, packs);
                             }
-                            for i in 0..MIXED {
-                                let e: [__m512i; 5] = std::array::from_fn(|x| self.extended[x][i]);
-                                let mut sums = [_mm512_setzero_si512(); 4];
-                                for x in 0..5 {
-                                    let (b, c) = (e[(x + 1) % 5], e[(x + 2) % 5]);
-                                    let even = _mm512_clmulepi64_epi128(b, c, 0x00);
-                                    let odd = _mm512_clmulepi64_epi128(b, c, 0x11);
-                                    for k in 0..2 {
-                                        let (s, w) = (&mut sums[2 * k..], w[x][k]);
-                                        s[0] = _mm512_xor_si512(s[0], _mm512_clmulepi64_epi128(even, w, 0x00));
-                                        s[1] = _mm512_xor_si512(s[1], _mm512_clmulepi64_epi128(odd, w, 0x10));
-                                    }
+                            let w: [[V; 2]; 5] =
+                                std::array::from_fn(|x| std::array::from_fn(|k| V::load(&weights.0, k * BITS + js[x])));
+                            // `HIGH[6..]` have the group at infinity, which the rounds do not use.
+                            for high in 0..6 {
+                                for (tile, packs) in self.tile.iter_mut().zip(&self.packs) {
+                                    *tile = extend_high(packs, high);
                                 }
-                                let acc = &mut self.acc[slot(half, i)];
-                                for (acc, sum) in acc.iter_mut().zip(sums) {
-                                    *acc = _mm512_xor_si512(*acc, sum);
+                                for i in 0..if high < 4 { 5 } else { 9 } {
+                                    let e: [V; 5] = std::array::from_fn(|x| {
+                                        let v = &self.tile[x];
+                                        match i {
+                                            0 => v[0].xor(v[1]),
+                                            1 => v[2].xor(v[3]),
+                                            2 => v[0].xor(v[2]),
+                                            3 => v[1].xor(v[3]),
+                                            4 => v[0].xor(v[1]).xor(v[2].xor(v[3])),
+                                            _ => v[i - 5],
+                                        }
+                                    });
+                                    let mut sums = [V::zero(); 4];
+                                    for x in 0..5 {
+                                        let (b, c) = (e[(x + 1) % 5], e[(x + 2) % 5]);
+                                        let (even, odd) = (b.clmul::<0x00>(c), b.clmul::<0x11>(c));
+                                        for k in 0..2 {
+                                            let (s, w) = (&mut sums[2 * k..], w[x][k]);
+                                            s[0] = s[0].xor(even.clmul::<0x00>(w));
+                                            s[1] = s[1].xor(odd.clmul::<0x10>(w));
+                                        }
+                                    }
+                                    let point = match i {
+                                        0..=3 => 20 + 4 * high + i,
+                                        4 => 56 + high,
+                                        _ => 4 * (high - 4) + i - 5,
+                                    };
+                                    // The products start at bits 0 and 64; combine their overlap before storing.
+                                    let sums = [
+                                        sums[0].xor(sums[2].low()),
+                                        sums[1].xor(sums[3].low()),
+                                        sums[2].high(),
+                                        sums[3].high(),
+                                    ];
+                                    let acc = &mut self.acc[slot(half, point)];
+                                    for (acc, sum) in acc.iter_mut().zip(sums) {
+                                        *acc = acc.xor(sum);
+                                    }
                                 }
                             }
                         }
@@ -561,125 +668,104 @@ mod x86 {
             }
         }
 
-        /// The two partial products of slot `i`.
-        pub fn get(&self, i: usize) -> [u128; 2] {
-            std::array::from_fn(|k| {
-                let mut lanes = [[0u128; 4]; 2];
-                for (lanes, &acc) in lanes.iter_mut().zip(&self.acc[i][2 * k..2 * k + 2]) {
-                    // SAFETY: four 128-bit lanes to a register.
-                    unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), acc) };
-                }
-                lanes.as_flattened().iter().fold(0, |a, &b| a ^ b)
-            })
-        }
-    }
-
-    /// The four sums are summed across their lanes together: two registers' lanes interleave into
-    /// one, which takes two shuffles where each register alone would leave the vector unit.
-    #[inline(always)]
-    pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; 2] {
-        unsafe {
-            // `acc[2 * half + k]`, four lanes to sum.
-            let mut acc = [_mm512_setzero_si512(); 4];
-            for g in 0..PACKS / 8 {
-                let ze = load(e.as_ptr().add(8 * g));
-                for k in 0..2 {
-                    let zw = _mm512_loadu_si512(weights[k].as_ptr().add(8 * (g % 2)).cast());
-                    let sum = &mut acc[2 * (g / 2) + k];
-                    *sum = _mm512_xor_si512(*sum, _mm512_clmulepi64_epi128(ze, zw, 0x00));
-                    *sum = _mm512_xor_si512(*sum, _mm512_clmulepi64_epi128(ze, zw, 0x11));
-                }
-            }
-            // Lanes `a0 + a2, a1 + a3, b0 + b2, b1 + b3`.
-            let pair = |a: __m512i, b: __m512i| {
-                _mm512_xor_si512(
-                    _mm512_shuffle_i64x2::<0b01_00_01_00>(a, b),
-                    _mm512_shuffle_i64x2::<0b11_10_11_10>(a, b),
-                )
-            };
-            // Of two pairs, the four sums, in the order of `acc`.
-            let (t, u) = (pair(acc[0], acc[1]), pair(acc[2], acc[3]));
-            let four = _mm512_xor_si512(
-                _mm512_shuffle_i64x2::<0b10_00_10_00>(t, u),
-                _mm512_shuffle_i64x2::<0b11_01_11_01>(t, u),
-            );
-            let mut a = [0u128; 4];
-            _mm512_storeu_si512(a.as_mut_ptr().cast(), four);
-            [[a[0], a[1]], [a[2], a[3]]]
+        /// The sum for slot `i`, as three polynomial words.
+        pub fn get(&self, i: usize) -> [u64; 3] {
+            let halves: [u128; 2] = std::array::from_fn(|k| {
+                let mut lanes = [0u128; V::N];
+                // SAFETY: the features of `V` are enabled at compile time.
+                unsafe { V::store(&mut lanes, 0, self.acc[i][2 * k].xor(self.acc[i][2 * k + 1])) };
+                lanes.iter().fold(0, |a, &b| a ^ b)
+            });
+            [halves[0] as u64, (halves[0] >> 64) as u64, halves[1] as u64]
         }
     }
 }
 
 /// Compiled only where its features are, so its kernels are safe to call. The embedding is
-/// NEON's nibble lookups, and the products are on a register of [`Vector`](crate::clmul::Vector)
+/// NEON's nibble lookups, and the products are on a register of [`V`](crate::clmul::V)
 /// lanes, two packs to a lane.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx2",
     target_feature = "pclmulqdq",
-    not(all(
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))
+    not(target_feature = "avx512f")
 ))]
 mod avx2 {
     use core::arch::x86_64::*;
 
     pub use super::products_clmul as products;
     use super::*;
-    use crate::clmul::{V, Vector};
+    use crate::clmul::{V, clmul_kernel};
+    use primitives::{load_at, store_at};
+
+    /// The nibble tables of the embedding, in both 128-bit lanes.
+    pub type Tables = [__m256i; 12];
+
+    #[inline(always)]
+    pub fn tables() -> Tables {
+        // SAFETY: AVX2 is enabled at compile time.
+        std::array::from_fn(|i| unsafe { _mm256_broadcastsi128_si256(load_at::<u8, __m128i>(&NIBBLES[i], 0)) })
+    }
+
+    /// The embedding of each pack of `v`: its low 16 bits, and its third byte in the low byte of a pack.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn embedding(t: &Tables, v: __m256i) -> (__m256i, __m256i) {
+        let mask = _mm256_set1_epi8(0x0f);
+        let (low_byte, high_byte) = (_mm256_set1_epi16(0x00ff), _mm256_set1_epi16(0xff00u16 as i16));
+        // A pack's low byte holds its nibbles 0 and 1, its high byte nibbles 2 and 3.
+        let nibbles = [
+            _mm256_and_si256(v, mask),
+            _mm256_and_si256(_mm256_srli_epi16::<4>(v), mask),
+        ];
+        // Byte `k` of the embedding of each byte, read as a pack's low byte or as its high one.
+        let look = |k: usize, high: usize| {
+            _mm256_xor_si256(
+                _mm256_shuffle_epi8(t[4 * k + 2 * high], nibbles[0]),
+                _mm256_shuffle_epi8(t[4 * k + 2 * high + 1], nibbles[1]),
+            )
+        };
+        let low = _mm256_or_si256(
+            _mm256_and_si256(
+                _mm256_xor_si256(look(0, 0), _mm256_srli_epi16::<8>(look(0, 1))),
+                low_byte,
+            ),
+            _mm256_and_si256(
+                _mm256_xor_si256(_mm256_slli_epi16::<8>(look(1, 0)), look(1, 1)),
+                high_byte,
+            ),
+        );
+        let high = _mm256_and_si256(
+            _mm256_xor_si256(look(2, 0), _mm256_srli_epi16::<8>(look(2, 1))),
+            low_byte,
+        );
+        (low, high)
+    }
 
     /// The 32 packs of a block position, embedded, four to a register.
-    #[inline(always)]
+    #[target_feature(enable = "avx2")]
+    #[inline]
     fn embed_vectors(words: &[u64; BLOCK_WORDS]) -> [__m128i; 8] {
-        // SAFETY: the loads are of the tables and the eight words.
-        unsafe {
-            let t: [__m256i; 12] =
-                std::array::from_fn(|i| _mm256_broadcastsi128_si256(_mm_loadu_si128(NIBBLES[i].as_ptr().cast())));
-            let mask = _mm256_set1_epi8(0x0f);
-            let (low_byte, high_byte) = (_mm256_set1_epi16(0x00ff), _mm256_set1_epi16(0xff00u16 as i16));
-            let mut out = [_mm_setzero_si128(); 8];
-            for half in 0..2 {
-                let v = _mm256_loadu_si256(words.as_ptr().add(4 * half).cast());
-                // A pack's low byte holds its nibbles 0 and 1, its high byte nibbles 2 and 3.
-                let nibbles = [
-                    _mm256_and_si256(v, mask),
-                    _mm256_and_si256(_mm256_srli_epi16(v, 4), mask),
-                ];
-                // Byte `k` of the embedding of each byte, read as a pack's low byte or as its high one.
-                let look = |k: usize, high: usize| {
-                    _mm256_xor_si256(
-                        _mm256_shuffle_epi8(t[4 * k + 2 * high], nibbles[0]),
-                        _mm256_shuffle_epi8(t[4 * k + 2 * high + 1], nibbles[1]),
-                    )
-                };
-                let low = _mm256_or_si256(
-                    _mm256_and_si256(_mm256_xor_si256(look(0, 0), _mm256_srli_epi16(look(0, 1), 8)), low_byte),
-                    _mm256_and_si256(
-                        _mm256_xor_si256(_mm256_slli_epi16(look(1, 0), 8), look(1, 1)),
-                        high_byte,
-                    ),
-                );
-                let high = _mm256_and_si256(_mm256_xor_si256(look(2, 0), _mm256_srli_epi16(look(2, 1), 8)), low_byte);
-                // Per lane, its four low packs, then its four high ones.
-                let (first, second) = (_mm256_unpacklo_epi16(low, high), _mm256_unpackhi_epi16(low, high));
-                out[4 * half] = _mm256_castsi256_si128(first);
-                out[4 * half + 1] = _mm256_castsi256_si128(second);
-                out[4 * half + 2] = _mm256_extracti128_si256::<1>(first);
-                out[4 * half + 3] = _mm256_extracti128_si256::<1>(second);
-            }
-            out
+        let t = tables();
+        let mut out = [_mm_setzero_si128(); 8];
+        for half in 0..2 {
+            let (low, high) = embedding(&t, load_at::<u64, __m256i>(words, 4 * half));
+            // Per lane, its four low packs, then its four high ones.
+            let (first, second) = (_mm256_unpacklo_epi16(low, high), _mm256_unpackhi_epi16(low, high));
+            out[4 * half] = _mm256_castsi256_si128(first);
+            out[4 * half + 1] = _mm256_castsi256_si128(second);
+            out[4 * half + 2] = _mm256_extracti128_si256::<1>(first);
+            out[4 * half + 3] = _mm256_extracti128_si256::<1>(second);
         }
+        out
     }
 
     #[inline(always)]
     pub fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
         let mut out = [0u32; PACKS];
-        for (i, v) in embed_vectors(words).into_iter().enumerate() {
-            // SAFETY: four packs at `4 * i`.
-            unsafe { _mm_storeu_si128(out.as_mut_ptr().add(4 * i).cast(), v) };
+        // SAFETY: the features are enabled at compile time.
+        for (i, v) in unsafe { embed_vectors(words) }.into_iter().enumerate() {
+            store_at(&mut out, 4 * i, v);
         }
         out
     }
@@ -687,135 +773,206 @@ mod avx2 {
     /// NEON's [`extend_group`] on the four vectors of a group: a vector's low mixed points are
     /// two shuffles, and its lane sum is returned for the last one, which [`embed_extend`] stores
     /// with the other group's.
-    #[inline(always)]
-    unsafe fn extend_vectors(v: &[__m128i], out: *mut u32) -> __m128i {
-        unsafe {
-            let (w4, w5) = (_mm_xor_si128(v[0], v[1]), _mm_xor_si128(v[2], v[3]));
-            let w = [
-                v[0],
-                v[1],
-                v[2],
-                v[3],
-                w4,
-                w5,
-                _mm_xor_si128(v[0], v[2]),
-                _mm_xor_si128(v[1], v[3]),
-                _mm_xor_si128(w4, w5),
-            ];
-            for (k, &w) in w[4..].iter().enumerate() {
-                _mm_storeu_si128(out.add(4 * k).cast(), w);
-            }
-            // Lanes `0 + 1, 2 + 3, 0 + 2, 1 + 3`.
-            let low: [__m128i; 9] = std::array::from_fn(|k| {
-                _mm_xor_si128(
-                    _mm_shuffle_epi32::<0b01_00_10_00>(w[k]),
-                    _mm_shuffle_epi32::<0b11_10_11_01>(w[k]),
-                )
-            });
-            for (k, &l) in low.iter().enumerate() {
-                _mm_storeu_si128(out.add(20 + 4 * k).cast(), l);
-            }
-            // Lanes 0 and 1 of a vector's low mixed points add to its lane sum: two vectors at a time.
-            let pair = |a: __m128i, b: __m128i| {
-                let z = _mm_unpacklo_epi32(a, b);
-                _mm_xor_si128(z, _mm_unpackhi_epi64(z, z))
-            };
-            for k in (0..8).step_by(4) {
-                let (p, q) = (pair(low[k], low[k + 1]), pair(low[k + 2], low[k + 3]));
-                _mm_storeu_si128(out.add(56 + k).cast(), _mm_unpacklo_epi64(p, q));
-            }
-            low[8]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn extend_vectors(v: &[__m128i], out: &mut [u32]) -> __m128i {
+        let (w4, w5) = (_mm_xor_si128(v[0], v[1]), _mm_xor_si128(v[2], v[3]));
+        let w = [
+            v[0],
+            v[1],
+            v[2],
+            v[3],
+            w4,
+            w5,
+            _mm_xor_si128(v[0], v[2]),
+            _mm_xor_si128(v[1], v[3]),
+            _mm_xor_si128(w4, w5),
+        ];
+        for (k, &w) in w[4..].iter().enumerate() {
+            store_at(out, 4 * k, w);
         }
+        // Lanes `0 + 1, 2 + 3, 0 + 2, 1 + 3`.
+        let low: [__m128i; 9] = std::array::from_fn(|k| {
+            _mm_xor_si128(
+                _mm_shuffle_epi32::<0b01_00_10_00>(w[k]),
+                _mm_shuffle_epi32::<0b11_10_11_01>(w[k]),
+            )
+        });
+        for (k, &l) in low.iter().enumerate() {
+            store_at(out, 20 + 4 * k, l);
+        }
+        // Lanes 0 and 1 of a vector's low mixed points add to its lane sum: two vectors at a time.
+        let pair = |a: __m128i, b: __m128i| {
+            let z = _mm_unpacklo_epi32(a, b);
+            _mm_xor_si128(z, _mm_unpackhi_epi64(z, z))
+        };
+        for k in (0..8).step_by(4) {
+            let (p, q) = (pair(low[k], low[k + 1]), pair(low[k + 2], low[k + 3]));
+            store_at(out, 56 + k, _mm_unpacklo_epi64(p, q));
+        }
+        low[8]
     }
 
-    #[inline(always)]
-    pub fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
+    entry! {
+        #[inline(always)]
+        fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) => embed_extend_vectors;
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn embed_extend_vectors(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
         let e = embed_vectors(words);
-        // SAFETY: each group's outputs lie in `out`.
-        unsafe {
-            let last0 = extend_vectors(&e[..4], out.as_mut_ptr());
-            let last1 = extend_vectors(&e[4..], out.as_mut_ptr().add(64));
-            let z = _mm_unpacklo_epi32(last0, last1);
-            _mm_storel_epi64(
-                out.as_mut_ptr().add(128).cast(),
-                _mm_xor_si128(z, _mm_unpackhi_epi64(z, z)),
-            );
-        }
+        let last0 = extend_vectors(&e[..4], out);
+        let last1 = extend_vectors(&e[4..], &mut out[64..]);
+        let z = _mm_unpacklo_epi32(last0, last1);
+        store_at(
+            out,
+            128,
+            _mm_cvtsi128_si64(_mm_xor_si128(z, _mm_unpackhi_epi64(z, z))) as u64,
+        );
     }
 
-    /// `2 * N` slots at a time, their sums over the row kept in registers. A slot's product lies
-    /// in the low word of its lane, which multiplies the weights as it is. The padding slots past
-    /// the last whole register are skipped: nothing reads their sums.
-    #[inline(always)]
-    pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) {
-        let w: [[V; 2]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
-        for p in (0..2 * MIXED).step_by(2 * V::N) {
-            // SAFETY: `p + 2 * N` is at most `SLOTS`.
-            let z: [V; 5] = std::array::from_fn(|x| unsafe { V::load_packs(e[x].as_ptr().add(p)) });
-            let mut sums = [[V::zero(); 2]; 2];
-            for x in 0..5 {
-                let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
-                let products = [zb.clmul::<0x00>(zc), zb.clmul::<0x11>(zc)];
-                for (k, sums) in sums.iter_mut().enumerate() {
-                    for (sum, product) in sums.iter_mut().zip(products) {
-                        *sum = sum.xor(product.clmul::<0x00>(w[x][k]));
+    entry! {
+        #[inline(always)]
+        fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) => skip_row_vectors;
+    }
+
+    clmul_kernel! {
+        /// `2 * N` slots at a time, their sums over the row kept in registers. A slot's product lies
+        /// in the low word of its lane, which multiplies the weights as it is. The padding slots past
+        /// the last whole register are skipped: nothing reads their sums.
+        fn skip_row_vectors(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) {
+            let w: [[V; 2]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
+            for p in (0..2 * MIXED).step_by(2 * V::N).filter(|&p| (p..p + 2 * V::N).any(slot_used)) {
+                let z: [V; 5] = std::array::from_fn(|x| V::load_packs(&e[x], p));
+                let mut sums = [[V::zero(); 2]; 2];
+                for x in 0..5 {
+                    let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
+                    let products = [zb.clmul::<0x00>(zc), zb.clmul::<0x11>(zc)];
+                    for (k, sums) in sums.iter_mut().enumerate() {
+                        for (sum, product) in sums.iter_mut().zip(products) {
+                            *sum = sum.xor(product.clmul::<0x00>(w[x][k]));
+                        }
+                    }
+                }
+                // Slot `p + h + 2 * l` is lane `l` of `sums[.][h]`, and those lanes lie side by side.
+                for (acc, sums) in acc.0.iter_mut().zip(sums) {
+                    for (h, sum) in sums.into_iter().enumerate() {
+                        let (v, l) = lane(p + h);
+                        let slot = &mut acc[v].0[l..];
+                        V::store(slot, 0, V::load(slot, 0).xor(sum));
                     }
                 }
             }
-            // Slot `p + h + 2 * l` is lane `l` of `sums[.][h]`, and those lanes lie side by side.
-            for (acc, sums) in acc.0.iter_mut().zip(sums) {
-                for (h, sum) in sums.into_iter().enumerate() {
-                    let (v, l) = lane(p + h);
-                    let slot = acc[v].0[l..].as_mut_ptr().cast::<u64>();
-                    // SAFETY: `N` lanes from `l`, a multiple of `N`.
-                    unsafe { V::store(slot, V::load(slot).xor(sum)) };
-                }
-            }
         }
     }
 
-    #[inline(always)]
-    pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; 2] {
-        std::array::from_fn(|half| {
-            let mut acc = [V::zero(); 2];
-            for q in (0..GROUP).step_by(2 * V::N) {
-                // SAFETY: `2 * N` packs and weights at `q`.
-                unsafe {
-                    let ze = V::load_packs(e.as_ptr().add(GROUP * half + q));
+    entry! {
+        #[inline(always)]
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; GROUPS] => fold_groups_vectors;
+    }
+
+    clmul_kernel! {
+        fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; GROUPS] {
+            std::array::from_fn(|g| {
+                let mut acc = [V::zero(); 2];
+                for q in (0..GROUP).step_by(2 * V::N) {
+                    let ze = V::load_packs(e, GROUP * g + q);
                     for (acc, weights) in acc.iter_mut().zip(weights) {
-                        let zw = V::load(weights.as_ptr().add(q));
+                        let zw = V::load(weights, q);
                         *acc = acc.xor(ze.clmul::<0x00>(zw)).xor(ze.clmul::<0x11>(zw));
                     }
                 }
-            }
-            acc.map(V::sum)
-        })
+                acc.map(|v| v.sum())
+            })
+        }
+    }
+
+    /// One half's packs of four consecutive positions, embedded: `out[q]` holds the half's pack
+    /// `q` of position `i` in word `i`.
+    #[cfg(target_feature = "vpclmulqdq")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub fn embed_positions(t: &Tables, positions: &[u64], half: usize, out: &mut [V; HALF]) {
+        // Word `w` of the half, of each of the four positions.
+        let r: [__m256i; 4] = std::array::from_fn(|i| load_at(positions, BLOCK_WORDS * i + 4 * half));
+        let (a0, a1) = (_mm256_unpacklo_epi64(r[0], r[1]), _mm256_unpackhi_epi64(r[0], r[1]));
+        let (a2, a3) = (_mm256_unpacklo_epi64(r[2], r[3]), _mm256_unpackhi_epi64(r[2], r[3]));
+        let words = [
+            _mm256_permute2x128_si256::<0x20>(a0, a2),
+            _mm256_permute2x128_si256::<0x20>(a1, a3),
+            _mm256_permute2x128_si256::<0x31>(a0, a2),
+            _mm256_permute2x128_si256::<0x31>(a1, a3),
+        ];
+        let zero = _mm256_setzero_si256();
+        for (w, &v) in words.iter().enumerate() {
+            let (low, high) = embedding(t, v);
+            // Per lane, the four packs of its even word, then of its odd one.
+            let (even, odd) = (_mm256_unpacklo_epi16(low, high), _mm256_unpackhi_epi16(low, high));
+            let (first, second) = (_mm256_unpacklo_epi32(even, odd), _mm256_unpackhi_epi32(even, odd));
+            out[4 * w] = V(_mm256_unpacklo_epi32(first, zero));
+            out[4 * w + 1] = V(_mm256_unpackhi_epi32(first, zero));
+            out[4 * w + 2] = V(_mm256_unpacklo_epi32(second, zero));
+            out[4 * w + 3] = V(_mm256_unpackhi_epi32(second, zero));
+        }
     }
 }
 
-/// Compiled only where its feature is, so its kernels are safe to call.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 mod neon {
     use core::arch::aarch64::*;
-    use core::mem::transmute;
 
-    use primitives::field::gf2_64::aarch64::{
-        pmull, pmull_hi as mul_hi_scheduled, pmull_hi_asm as mul_hi, pmull_lo_asm as mul_lo,
-    };
+    use primitives::field::gf2_64::aarch64 as pm;
+
+    // The field helpers are `unsafe fn`s that need `aes`, which this module's cfg enables.
+    #[inline(always)]
+    fn pmull(a: u64, b: u64) -> uint64x2_t {
+        // SAFETY: `aes` is enabled at compile time.
+        unsafe { pm::pmull(a, b) }
+    }
+    #[inline(always)]
+    fn mul_hi_scheduled(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        // SAFETY: `aes` is enabled at compile time.
+        unsafe { pm::pmull_hi(a, b) }
+    }
+    #[inline(always)]
+    fn mul_lo(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        // SAFETY: `aes` is enabled at compile time.
+        unsafe { pm::pmull_lo_asm(a, b) }
+    }
+    #[inline(always)]
+    fn mul_hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        // SAFETY: `aes` is enabled at compile time.
+        unsafe { pm::pmull_hi_asm(a, b) }
+    }
+
+    use primitives::{cast_slice, load_at, store_at};
 
     use super::*;
+
+    entry! {
+        #[inline(always)]
+        fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] => embed_vectors;
+    }
+
+    /// Sixteen bytes' even and odd bytes, two registers.
+    #[inline(always)]
+    fn load_deinterleaved(src: &[u8; 32]) -> uint8x16x2_t {
+        // SAFETY: the array is the 32 bytes `vld2q_u8` reads.
+        unsafe { vld2q_u8(src.as_ptr()) }
+    }
 
     /// A linear map is the sum of its nibbles' images, so each byte of sixteen embeddings is four
     /// table lookups.
     #[inline(always)]
-    pub fn embed(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
+    unsafe fn embed_vectors(words: &[u64; BLOCK_WORDS]) -> [u32; PACKS] {
         unsafe {
-            let t: [uint8x16_t; 12] = std::array::from_fn(|i| vld1q_u8(NIBBLES[i].as_ptr()));
+            let t: [uint8x16_t; 12] = std::array::from_fn(|i| load_at(&NIBBLES[i][..], 0));
             let mask = vdupq_n_u8(0x0f);
             let mut out = [0u32; PACKS];
             for half in 0..2 {
                 // Pack `q` is bytes `2q` and `2q + 1`: the low bytes and the high bytes of sixteen.
-                let bytes = vld2q_u8(words.as_ptr().cast::<u8>().add(32 * half));
+                let bytes = load_deinterleaved(cast_slice(&words[4 * half..][..4]).try_into().unwrap());
                 let nibbles = [
                     vandq_u8(bytes.0, mask),
                     vshrq_n_u8(bytes.0, 4),
@@ -830,11 +987,14 @@ mod neon {
                 let zero = vdupq_n_u8(0);
                 let (lo, hi) = (vzip1q_u8(b0, b1), vzip2q_u8(b0, b1));
                 let (top_lo, top_hi) = (vzip1q_u8(b2, zero), vzip2q_u8(b2, zero));
-                let dst = out.as_mut_ptr().add(16 * half);
                 for (i, (l, h)) in [(lo, top_lo), (hi, top_hi)].into_iter().enumerate() {
                     let (l, h) = (vreinterpretq_u16_u8(l), vreinterpretq_u16_u8(h));
-                    vst1q_u32(dst.add(8 * i), vreinterpretq_u32_u16(vzip1q_u16(l, h)));
-                    vst1q_u32(dst.add(8 * i + 4), vreinterpretq_u32_u16(vzip2q_u16(l, h)));
+                    store_at(&mut out[..], 16 * half + 8 * i, vreinterpretq_u32_u16(vzip1q_u16(l, h)));
+                    store_at(
+                        &mut out[..],
+                        16 * half + 8 * i + 4,
+                        vreinterpretq_u32_u16(vzip2q_u16(l, h)),
+                    );
                 }
             }
             out
@@ -843,19 +1003,22 @@ mod neon {
 
     /// Two packs, a lane each.
     #[inline(always)]
-    unsafe fn load(p: *const u32) -> uint64x2_t {
-        unsafe { vmovl_u32(vld1_u32(p)) }
+    unsafe fn load(src: &[u32], i: usize) -> uint64x2_t {
+        unsafe { vmovl_u32(load_at::<u32, uint32x2_t>(src, i)) }
     }
 
     /// [`extend_group`] on the four vectors of a group, the values staying in registers: a
     /// vector's low mixed points are two table lookups, and its lane sum is returned for the last
     /// one, which [`embed_extend`] stores with the other group's.
     #[inline(always)]
-    unsafe fn extend_vectors(v: [uint32x4_t; 4], out: *mut u32) -> uint32x4_t {
-        const FIRST: [u8; 16] = [0, 1, 2, 3, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
-        const SECOND: [u8; 16] = [4, 5, 6, 7, 12, 13, 14, 15, 8, 9, 10, 11, 12, 13, 14, 15];
+    unsafe fn extend_vectors(v: [uint32x4_t; 4], out: &mut [u32]) -> uint32x4_t {
         unsafe {
-            let (first, second) = (vld1q_u8(FIRST.as_ptr()), vld1q_u8(SECOND.as_ptr()));
+            const FIRST: [u8; 16] = [0, 1, 2, 3, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
+            const SECOND: [u8; 16] = [4, 5, 6, 7, 12, 13, 14, 15, 8, 9, 10, 11, 12, 13, 14, 15];
+            let (first, second) = (
+                load_at::<u8, uint8x16_t>(&FIRST, 0),
+                load_at::<u8, uint8x16_t>(&SECOND, 0),
+            );
             let (w4, w5) = (veorq_u32(v[0], v[1]), veorq_u32(v[2], v[3]));
             let w = [
                 v[0],
@@ -869,14 +1032,14 @@ mod neon {
                 veorq_u32(w4, w5),
             ];
             for (k, &w) in w[4..].iter().enumerate() {
-                vst1q_u32(out.add(4 * k), w);
+                store_at(out, 4 * k, w);
             }
             let low: [uint32x4_t; 9] = std::array::from_fn(|k| {
                 let b = vreinterpretq_u8_u32(w[k]);
                 vreinterpretq_u32_u8(veorq_u8(vqtbl1q_u8(b, first), vqtbl1q_u8(b, second)))
             });
             for (k, &l) in low.iter().enumerate() {
-                vst1q_u32(out.add(20 + 4 * k), l);
+                store_at(out, 20 + 4 * k, l);
             }
             // Lanes 0 and 1 of a vector's low mixed points add to its lane sum: two vectors at a time.
             let pair = |a: uint32x4_t, b: uint32x4_t| {
@@ -885,8 +1048,9 @@ mod neon {
             };
             for k in (0..8).step_by(4) {
                 let (p, q) = (pair(low[k], low[k + 1]), pair(low[k + 2], low[k + 3]));
-                vst1q_u32(
-                    out.add(56 + k),
+                store_at(
+                    out,
+                    56 + k,
                     vreinterpretq_u32_u64(vzip1q_u64(vreinterpretq_u64_u32(p), vreinterpretq_u64_u32(q))),
                 );
             }
@@ -894,20 +1058,22 @@ mod neon {
         }
     }
 
+    entry! {
+        #[inline(always)]
+        fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) => embed_extend_vectors;
+    }
+
     #[inline(always)]
-    pub fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
+    unsafe fn embed_extend_vectors(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
         unsafe {
-            let e = embed(words);
+            let e = embed_vectors(words);
             let v = |half: usize| -> [uint32x4_t; 4] {
-                std::array::from_fn(|k| vld1q_u32(e.as_ptr().add(16 * half + 4 * k)))
+                std::array::from_fn(|k| load_at::<u32, uint32x4_t>(&e, 16 * half + 4 * k))
             };
-            let last0 = extend_vectors(v(0), out.as_mut_ptr());
-            let last1 = extend_vectors(v(1), out.as_mut_ptr().add(64));
+            let last0 = extend_vectors(v(0), &mut out[..64]);
+            let last1 = extend_vectors(v(1), &mut out[64..128]);
             let z = vzip1q_u32(last0, last1);
-            vst1_u32(
-                out.as_mut_ptr().add(128),
-                vget_low_u32(veorq_u32(z, vextq_u32::<2>(z, z))),
-            );
+            store_at(&mut out[..], 128, vget_low_u32(veorq_u32(z, vextq_u32::<2>(z, z))));
         }
     }
 
@@ -919,34 +1085,40 @@ mod neon {
         unsafe { pmull(vgetq_lane_u64(a, 0), vgetq_lane_u64(b, 0)) }
     }
 
+    entry! {
+        #[inline(always)]
+        fn products(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] => products_vectors;
+    }
+
     #[inline(always)]
-    pub fn products(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
+    unsafe fn products_vectors(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [u64; PACKS] {
         unsafe {
             let ones = vdupq_n_u64(RMFE.ones as u64);
             let mut out = [0u64; PACKS];
             for q in (0..PACKS).step_by(2) {
-                let (za, zb, zc) = (
-                    load(a.as_ptr().add(q)),
-                    load(b.as_ptr().add(q)),
-                    load(c.as_ptr().add(q)),
-                );
+                let (za, zb, zc) = (load(a, q), load(b, q), load(c, q));
                 let linear = veorq_u64(za, zc);
                 let even = veorq_u64(mul_lo(zb, zc), mul_lo(linear, ones));
                 let odd = veorq_u64(mul_hi(zb, zc), mul_hi(linear, ones));
-                vst1q_u64(out.as_mut_ptr().add(q), vzip1q_u64(even, odd));
+                store_at(&mut out[..], q, vzip1q_u64(even, odd));
             }
             out
         }
     }
 
+    entry! {
+        #[inline(always)]
+        fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) => skip_row_vectors;
+    }
+
     /// Two slots at a time, their sums over the row kept in registers. The padding slots are
     /// skipped: [`extend`] never writes them, and nothing reads their sums.
     #[inline(always)]
-    pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) {
+    unsafe fn skip_row_vectors(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) {
         unsafe {
             let w: [[uint64x2_t; 2]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| vdupq_n_u64(weights[x][k])));
-            for p in (0..2 * MIXED).step_by(2) {
-                let z: [uint64x2_t; 5] = std::array::from_fn(|x| load(e[x].as_ptr().add(p)));
+            for p in (0..2 * MIXED).step_by(2).filter(|&p| slot_used(p) || slot_used(p + 1)) {
+                let z: [uint64x2_t; 5] = std::array::from_fn(|x| load(&e[x], p));
                 let mut sums = [[vdupq_n_u64(0); 2]; 2];
                 for x in 0..5 {
                     let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
@@ -959,28 +1131,30 @@ mod neon {
                 for (k, sums) in sums.iter().enumerate() {
                     for (h, &sum) in sums.iter().enumerate() {
                         let (v, l) = lane(p + h);
-                        let slot = (&mut acc.0[k][v].0[l] as *mut u128).cast::<u64>();
-                        vst1q_u64(slot, veorq_u64(vld1q_u64(slot), sum));
+                        let slot = &mut acc.0[k][v].0[l..];
+                        store_at(slot, 0, veorq_u64(load_at::<u128, uint64x2_t>(slot, 0), sum));
                     }
                 }
             }
         }
     }
 
+    entry! {
+        #[inline(always)]
+        fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; GROUPS] => fold_groups_vectors;
+    }
+
     #[inline(always)]
-    pub fn fold_groups(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; 2] {
+    unsafe fn fold_groups_vectors(e: &[u32; PACKS], weights: &[[u64; GROUP]; 2]) -> [[u128; 2]; GROUPS] {
         unsafe {
-            std::array::from_fn(|half| {
+            std::array::from_fn(|g| {
                 std::array::from_fn(|k| {
                     let mut acc = vdupq_n_u64(0);
                     for q in (0..GROUP).step_by(2) {
-                        let (ze, zw) = (
-                            load(e.as_ptr().add(GROUP * half + q)),
-                            vld1q_u64(weights[k].as_ptr().add(q)),
-                        );
+                        let (ze, zw) = (load(e, GROUP * g + q), load_at::<u64, uint64x2_t>(&weights[k], q));
                         acc = veorq_u64(acc, veorq_u64(mul_lo(ze, zw), mul_hi(ze, zw)));
                     }
-                    transmute::<uint64x2_t, u128>(acc)
+                    vgetq_lane_u64::<0>(acc) as u128 | (vgetq_lane_u64::<1>(acc) as u128) << 64
                 })
             })
         }
@@ -996,17 +1170,17 @@ mod tests {
     #[test]
     fn extension_follows_the_ternary_digits() {
         let mut rng = Rng::new(31);
-        let v: [u32; GROUP] = std::array::from_fn(|_| rng.next_u64() as u32);
+        let v: [u32; HALF] = std::array::from_fn(|_| rng.next_u64() as u32);
         let out = extend_group(&v);
         let points = mixed_points();
-        let mut seen = [false; TERNARY];
+        let mut seen = [false; 81];
         for (i, &p) in points.iter().enumerate() {
             // A digit at infinity sums both points of its variable.
-            let digits: [usize; SKIP] = std::array::from_fn(|k| p / 3usize.pow(k as u32) % 3);
+            let digits: [usize; 4] = std::array::from_fn(|k| p / 3usize.pow(k as u32) % 3);
             assert!(digits.contains(&2) && !seen[p]);
             seen[p] = true;
-            let expected = (0..GROUP)
-                .filter(|q| (0..SKIP).all(|k| digits[k] == 2 || digits[k] == q >> k & 1))
+            let expected = (0..HALF)
+                .filter(|q| (0..4).all(|k| digits[k] == 2 || digits[k] == q >> k & 1))
                 .fold(0, |acc, q| acc ^ v[q]);
             assert_eq!(out[i], expected, "output {i}");
         }
@@ -1043,19 +1217,24 @@ mod tests {
                 skip_row(&mut fast, &row, row_weights);
                 skip_row_portable(&mut slow, &row, row_weights);
             }
-            for slot in 0..SLOTS {
+            for slot in (0..SLOTS).filter(|&p| slot_used(p)) {
                 assert_eq!(fast.get(slot), slow.get(slot));
             }
             let fold: [[u64; GROUP]; 2] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64()));
             assert_eq!(fold_groups(&e, &fold), fold_groups_portable(&e, &fold));
         }
-        let block: Vec<u64> = (0..crate::witness::BLOCK_LEN).map(|_| rng.next_u64()).collect();
         let weights: Vec<[u64; 2]> = (0..BITS).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
+        let prepared = SkipWeights::new(weights.clone());
         let mut skip = SkipBlock::new();
-        skip.run(&block, &weights);
-        let expected = skip_block_portable(&block, &weights);
-        for (i, expected) in expected.iter().enumerate() {
-            assert_eq!(&skip.get(i), expected, "slot {i}");
+        for _ in 0..2 {
+            let block: Vec<u64> = (0..crate::witness::BLOCK_LEN).map(|_| rng.next_u64()).collect();
+            skip.run(&block, &prepared);
+            let expected = skip_block_portable(&block, &weights);
+            for i in (0..MIXED).filter(|&i| used(mixed_points()[i])) {
+                for half in 0..2 {
+                    assert_eq!(skip.get(slot(half, i)), expected[slot(half, i)], "output {i}");
+                }
+            }
         }
     }
 }
