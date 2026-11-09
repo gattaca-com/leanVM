@@ -486,7 +486,17 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
         let l = &w.layout;
         let cols = w.columns();
         let bus = crate::stage!("Prove bus", || {
-            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &mut ps)
+            leaf::prove_balance(
+                &l.push,
+                &l.pull,
+                &l.count,
+                &cols,
+                &owners,
+                &spans,
+                &l.rows,
+                mem_used.next_multiple_of(1 << 10),
+                &mut ps,
+            )
         });
         let table_claims = crate::stage!("Prove constraints", || {
             // One sumcheck for all six tables (§constraints).
@@ -494,7 +504,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
             // batch settle the bus forms alongside the constraints.
             let xi = ps.sample();
             let airs = airs(&l.taus, &l.rows, &bus, &cols, &spans, xi);
-            constraints::prove(&airs, &bus.point, &[], &mut ps)
+            constraints::prove(&airs, &bus.point, &bus.blocks, &mut ps)
         });
         (bus, table_claims)
     };
