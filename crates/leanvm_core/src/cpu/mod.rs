@@ -515,8 +515,9 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
     drop(pcs::reserve_level1(w.layout.shape.mu, log_inv_rate));
+    let repeats = w.layout.padding_repeats(mem_used);
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
+        pcs::commit(&mut ps, &w.q, &repeats, w.layout.shape, log_inv_rate)
     });
 
     // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
@@ -803,6 +804,32 @@ mod tests {
         prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
         assert_eq!(prog.len(), 16);
         Program::from_bytecode(prog, 64)
+    }
+
+    /// The layout's repeat map tags only blocks equal to their predecessor, and it finds the padding.
+    #[test]
+    fn padding_repeats_tags_only_repeats() {
+        let program = keccak_program(w(1), w(2), [w(3); 4], w(4));
+        let pi = [w(5), w(6)];
+        let (exec, keccak) = crate::keccak::while_executing(|step| program.execute_with(pi, hints::GPow::new(0), step));
+        let exec = exec.unwrap();
+        let witness = program.build(&exec, keccak);
+        let repeats = witness.layout.padding_repeats(exec.mem_used);
+        let blocks: Vec<_> = witness.q.chunks(1 << ::pcs::stack_open::EQUAL_BLOCK_LOG).collect();
+        assert_eq!(repeats.len(), blocks.len());
+        for (b, _) in repeats.iter().enumerate().filter(|(_, tagged)| **tagged) {
+            assert_eq!(
+                blocks[b],
+                blocks[b - 1],
+                "block {b} is tagged but differs from its predecessor"
+            );
+        }
+        let tagged = repeats.iter().filter(|&&t| t).count();
+        assert!(
+            tagged * 2 > repeats.len(),
+            "the padding is found: {tagged} of {}",
+            repeats.len()
+        );
     }
 
     /// A KECCAK writes the output cells its bytecode requests and no other, and the proof verifies.
