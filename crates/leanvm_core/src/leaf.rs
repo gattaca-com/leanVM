@@ -1437,7 +1437,10 @@ pub(crate) fn prove_balance(
     let gpow = index_k.map_or_else(Vec::new, |k| primitives::field::g_powers(1usize << k));
     // Push and pull are built together, so a table's columns are read once for both sides.
     // On machines that favor rebuilding, GKR recomputes most leaves from the columns with several threads.
-    let columns = parallel::num_threads() > 1 && primitives::REBUILD_OVER_STORE;
+    // On x86 without AVX-512 its first rounds are bound by the products, and stored leaves are faster.
+    let columns = parallel::num_threads() > 1
+        && primitives::REBUILD_OVER_STORE
+        && !cfg!(all(target_arch = "x86_64", not(target_feature = "avx512f")));
     let (push_leaves, pull_leaves, count_leaves, column_leaves) = crate::stage!("Bus leaves", || {
         let (leaves, column_leaves) = build_leaves(
             &[(push, &push_lay), (pull, &pull_lay)],
