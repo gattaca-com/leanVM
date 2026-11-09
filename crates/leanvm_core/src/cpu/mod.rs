@@ -531,10 +531,13 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
         .as_ref()
         .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
     drop(pcs::reserve_level1(shape.mu, log_inv_rate));
+    // The repeat map is of the full stack's layout, so a compact stack commits without one.
+    let repeats = if compact.is_some() { Vec::new() } else { w.layout.padding_repeats(mem_used) };
     let committed = crate::stage!("Commit", || {
         pcs::commit(
             &mut ps,
             &compact_q.as_deref().unwrap_or(&w.q)[..shape.committed_len()],
+            &repeats,
             shape,
             log_inv_rate,
         )
@@ -950,6 +953,35 @@ mod tests {
         prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
         assert_eq!(prog.len(), 16);
         Program::from_bytecode(prog, 64)
+    }
+
+    /// The layout's repeat map tags only blocks equal to their predecessor, and it finds the padding.
+    #[test]
+    fn padding_repeats_tags_only_repeats() {
+        let pi = [w(5), w(6)];
+        let mut found_padding = false;
+        for frame in [64, 1031, (1 << 16) + 3] {
+            let mut program = keccak_program(w(1), w(2), [w(3); 4], w(4));
+            program.main_frame = frame;
+            let (exec, keccak) =
+                crate::keccak::while_executing(|step| program.execute_with(pi, hints::GPow::new(0), step));
+            let exec = exec.unwrap();
+            let layout = program.layout(crate::log2_strict_usize(exec.mem.len()), exec.rows(), pi);
+            let witness = program.build(&exec, layout, keccak);
+            let repeats = witness.layout.padding_repeats(exec.mem_used);
+            let blocks: Vec<_> = witness.q.chunks(1 << ::pcs::stack_open::EQUAL_BLOCK_LOG).collect();
+            assert_eq!(repeats.len(), blocks.len());
+            assert!(!repeats[0]);
+            for (b, _) in repeats.iter().enumerate().filter(|(_, tagged)| **tagged) {
+                assert_eq!(
+                    blocks[b],
+                    blocks[b - 1],
+                    "block {b} is tagged but differs from its predecessor"
+                );
+            }
+            found_padding |= repeats.iter().any(|&tagged| tagged);
+        }
+        assert!(found_padding, "the fixtures include full repeated padding blocks");
     }
 
     /// A KECCAK writes the output cells its bytecode requests and no other, and the proof verifies.
