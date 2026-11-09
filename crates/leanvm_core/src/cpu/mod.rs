@@ -320,6 +320,7 @@ fn table_spans() -> TableSpans {
 /// shares, since its identities vanish.
 fn airs<'a>(
     taus: &[usize; tables::N_TABLES],
+    rows: &[usize; tables::N_TABLES],
     bus: &leaf::BusProof,
     cols: &'a [&'a [F64]],
     spans: &[(usize, usize)],
@@ -330,13 +331,14 @@ fn airs<'a>(
     let offsets = constraints::xi_offsets(tables::tables().iter().map(|t| t.n_constraints()));
     tables::tables()
         .iter()
-        .zip(taus.iter().zip(spans))
+        .zip(spans)
         .enumerate()
-        .map(|(t, (&table, (&tau, &(start, n))))| {
+        .map(|(t, (&table, &(start, n)))| {
             let identities = table.constraint(&pows[offsets[t]..][..table.n_constraints()]);
             let bus_forms = (0..3).map(|s| bus.forms[s][t].scaled(pows[base + s]));
             constraints::Air {
-                tau,
+                tau: taus[t],
+                rows: rows[t],
                 cols: &cols[start..start + n],
                 form: leaf::BusForm::sum(bus_forms.chain([identities])),
                 sigma: (0..3).map(|s| pows[base + s] * bus.sigmas[s][t]).sum(),
@@ -491,7 +493,8 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
             // The eq point is the bus GKR's ζ, not a fresh one: that is what lets the
             // batch settle the bus forms alongside the constraints.
             let xi = ps.sample();
-            constraints::prove(&airs(&l.taus, &bus, &cols, &spans, xi), &bus.point, &mut ps)
+            let airs = airs(&l.taus, &l.rows, &bus, &cols, &spans, xi);
+            constraints::prove(&airs, &bus.point, &[], &mut ps)
         });
         (bus, table_claims)
     };
