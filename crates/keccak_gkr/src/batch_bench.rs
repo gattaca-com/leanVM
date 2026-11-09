@@ -177,7 +177,7 @@ pub(crate) fn commit_stack(
     stack: &[F64],
     log_inv_rate: usize,
 ) -> (ProverData, StackClaim) {
-    let (commitment, prover_data) = commit(stack, shape.stack_log(), INITIAL_FOLDING_FACTOR, log_inv_rate);
+    let (commitment, prover_data) = commit(stack, &[], shape.stack_log(), INITIAL_FOLDING_FACTOR, log_inv_rate);
     ps.add_root(&commitment.root);
     let ood = pcs::ood::ood_sample(ps, stack, shape.stack_log());
     (prover_data, ood)

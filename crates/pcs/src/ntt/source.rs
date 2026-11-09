@@ -21,11 +21,15 @@ pub(super) enum Source<'a> {
     Lanes(Lanes<'a>),
 }
 
-/// A lane-major message: `n_lanes` lane blocks, each as long as the message has rows.
+/// A lane-major message: lane blocks of `rows` words each, of which `blocks.len()` are encoded.
 #[derive(Clone, Copy)]
 pub(super) struct Lanes<'a> {
     pub(super) words: &'a [F64],
-    pub(super) n_lanes: usize,
+    /// Tags the message's blocks of `2^EQUAL_BLOCK_LOG` words that equal their predecessor, or is empty.
+    pub(super) repeats: &'a [bool],
+    /// Block `blocks[i]` of the message is codeword lane `pad + i`, `pad = num_ntts - blocks.len()`.
+    pub(super) blocks: &'a [usize],
+    pub(super) rows: usize,
 }
 
 impl<'a> Source<'a> {
@@ -39,7 +43,7 @@ impl<'a> Source<'a> {
     /// A lane-major message gives its own length, and any other source the buffer's.
     pub(super) fn log_d(&self, win: &Window, start: usize) -> usize {
         match self {
-            Source::Lanes(lanes) => primitives::log2_strict_usize(lanes.words.len() / lanes.n_lanes) + start,
+            Source::Lanes(lanes) => primitives::log2_strict_usize(lanes.rows) + start,
             _ => primitives::log2_strict_usize(win.len() / win.num_ntts()),
         }
     }
@@ -49,7 +53,7 @@ impl<'a> Source<'a> {
         let Source::Lanes(lanes) = self else { return self };
         let num_ntts = win.num_ntts();
         let out = &mut win.words_mut()[..num_ntts << log_rows];
-        transpose_lane_major(out, lanes.words, lanes.n_lanes, num_ntts, log_rows);
+        transpose_lane_major(out, lanes.words, lanes.blocks, num_ntts, log_rows);
         Source::InPlace
     }
 

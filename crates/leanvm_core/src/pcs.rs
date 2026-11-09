@@ -106,7 +106,8 @@ pub fn commit(
         shape.committed_len(),
         "witness must be the committed lanes"
     );
-    let (commitment, prover_data) = whir_commit(witness, mu, LOG_BATCH, log_inv_rate);
+    // No repeat map yet: every lane is encoded.
+    let (commitment, prover_data) = whir_commit(witness, &[], mu, LOG_BATCH, log_inv_rate);
     ps.add_root(&commitment.root);
     let ood = ood_sample(ps, witness, mu);
     Committed {

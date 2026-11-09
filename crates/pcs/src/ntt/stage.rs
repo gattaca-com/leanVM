@@ -6,6 +6,7 @@ use primitives::stream::Stream;
 use super::scratch::with_scratch;
 use super::source::Lanes;
 use super::window::STREAM_MIN_WORDS;
+use crate::stack_open::EQUAL_BLOCK_LOG;
 
 /// Transpose a lane-major message into the row-major order the encodes read.
 ///
@@ -13,11 +14,12 @@ use super::window::STREAM_MIN_WORDS;
 ///
 /// ```text
 ///     input, lane-major:   [ block 0 | block 1 | ... | block n-1 ]   each 2^log_rows words
-///     output, row-major:   row x = [ 0, ..., 0, block n-1 word x, ..., block 0 word x ]
+///     output, row-major:   row x = [ 0, ..., 0, block b[0] word x, ..., block b[n-1] word x ]
 /// ```
 ///
-/// - A row is `row_words >= n` words: the first `row_words - n` lanes are zero padding.
-/// - Codeword lane `t` past the padding takes message block `row_words - 1 - t`.
+/// - `blocks` lists the `n` message blocks to encode, and a row is `row_words >= n` words:
+///   the first `row_words - n` lanes are zero padding.
+/// - Codeword lane `pad + i` takes message block `blocks[i]`. A commitment lists its blocks descending.
 /// - Any lane count works: a commitment encodes only the lanes that carry data, and a caller pads
 ///   the row to the vector width.
 ///
@@ -32,11 +34,14 @@ use super::window::STREAM_MIN_WORDS;
 /// - Each lane adds a contiguous burst of words to an L1-resident tile.
 /// - The finished tile goes out as one contiguous run.
 /// - That keeps an n-way gather at a `2^log_rows` stride near memory bandwidth.
-pub(super) fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize, row_words: usize, log_rows: usize) {
+pub(super) fn transpose_lane_major(out: &mut [F64], msg: &[F64], blocks: &[usize], row_words: usize, log_rows: usize) {
     let rows = 1usize << log_rows;
-    assert!(n_lanes > 0, "a commitment needs at least one lane");
-    assert!(n_lanes <= row_words, "a row holds its lanes");
-    assert_eq!(msg.len(), n_lanes * rows, "message is n_lanes contiguous lane blocks");
+    assert!(!blocks.is_empty(), "a commitment needs at least one lane");
+    assert!(blocks.len() <= row_words, "a row holds its lanes");
+    assert!(
+        blocks.iter().all(|&b| (b + 1) * rows <= msg.len()),
+        "a block lies in the message"
+    );
     assert_eq!(out.len(), row_words * rows, "the output is whole padded rows");
 
     /// Words per cache-resident row tile.
@@ -52,7 +57,7 @@ pub(super) fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize,
 
     // Nothing reads the output back before a buffer this large is evicted.
     let stream = out.len() >= STREAM_MIN_WORDS;
-    let pad = row_words - n_lanes;
+    let pad = row_words - blocks.len();
     parallel::chunks_mut(out, tile_rows * row_words, |t, out_tile| {
         with_scratch(out_tile.len(), |tile| {
             // First message row this tile covers.
@@ -63,7 +68,7 @@ pub(super) fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize,
                 if lane < pad {
                     slots.for_each(|slot| *slot = F64::ZERO);
                 } else {
-                    let src = &msg[(row_words - 1 - lane) * rows + r0..][..tile_rows];
+                    let src = &msg[blocks[lane - pad] * rows + r0..][..tile_rows];
                     for (slot, &word) in slots.zip(src) {
                         *slot = word;
                     }
@@ -109,23 +114,50 @@ pub(super) fn stage_subs(lane_major: bool, log_step: usize) -> usize {
 /// - It owns the message and the geometry of the fill: the step, the message rows, the row width and the batches.
 /// - [`Stage::fill`] moves one octet of lanes of `subs` batches of residues into a stage buffer.
 /// - A task fills the stage, then each block of the pass transforms a copy of each batch.
+///
+/// # Repeated blocks
+///
+/// - A line in a run of repeated blocks reads the equal line of the run's head instead, which is in cache.
+/// - The head line has the same residue: it lies `k * D` words back, `D = max(2^log_step, 2^EQUAL_BLOCK_LOG)`.
+/// - `D` is `m` blocks, so a block `r` repeats into its run reads `r / m * D` words back.
+/// - The fill read that line `k` stage rows before, so the run's other lines never leave DRAM.
 pub(super) struct Stage<'a> {
     lanes: Lanes<'a>,
     log_step: usize,
     msg_rows: usize,
     row_words: usize,
     subs: usize,
+    /// Per encoded lane and block of `2^EQUAL_BLOCK_LOG` words, how far back its lines are read, or empty.
+    back: Vec<usize>,
 }
 
 impl<'a> Stage<'a> {
     /// The stage of a pass whose groups are `2^log_step` rows apart, over `lanes` of `msg_rows` rows each.
     pub(super) fn new(lanes: Lanes<'a>, log_step: usize, msg_rows: usize, row_words: usize, subs: usize) -> Self {
+        let per_lane = msg_rows >> EQUAL_BLOCK_LOG;
+        let mut back = Vec::new();
+        if !lanes.repeats.is_empty() && per_lane > 0 {
+            let d = (1usize << log_step).max(1 << EQUAL_BLOCK_LOG);
+            back = vec![0; lanes.blocks.len() * per_lane];
+            for (back, &b) in back.chunks_exact_mut(per_lane).zip(lanes.blocks) {
+                let mut run = 0;
+                for (h, back) in back.iter_mut().enumerate() {
+                    run = if h > 0 && lanes.repeats[b * per_lane + h] {
+                        run + 1
+                    } else {
+                        0
+                    };
+                    *back = run / (d >> EQUAL_BLOCK_LOG) * d;
+                }
+            }
+        }
         Self {
             lanes,
             log_step,
             msg_rows,
             row_words,
             subs,
+            back,
         }
     }
 
@@ -134,7 +166,7 @@ impl<'a> Stage<'a> {
     /// - `stage` is `subs` stages of one batch each, and batch `u` starts at residue `t0 + u * BATCH`.
     /// - A row's tiles of all batches go together, so the adjacent lines of one lane block are read together.
     /// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
-    ///   is lane block `row_words - 1 - w` of the message, or zero while `w` is below the padding.
+    ///   is message block `blocks[w - pad]`, or zero while `w` is below the padding.
     /// - Residue `t0 + s` takes rows `t0 + s + i * step` for `i < rows`, `step = 2^log_step`.
     /// - The octet is lanes `8 * octet..8 * octet + 8`. Together with the residues, they are 64 lanes of one transform.
     /// - `stage` has `rows` rows of 64 words.
@@ -142,28 +174,21 @@ impl<'a> Stage<'a> {
     /// - One tile is 8 words of 8 lane blocks, so each 64 byte line of a lane block is read once, whole.
     #[inline]
     pub(super) fn fill(&self, stage: &mut [F64], t0: usize, octet: usize) {
-        let Self {
-            lanes: Lanes { words: msg, n_lanes },
-            log_step,
-            msg_rows,
-            row_words,
-            subs,
-        } = *self;
         // SAFETY: AVX-512F is enabled at compile time.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         unsafe {
-            fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, subs)
+            fill_stage_tiles(self, stage, t0, octet)
         }
         // SAFETY: AVX2 is enabled at compile time.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
         unsafe {
-            fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, subs)
+            fill_stage_tiles(self, stage, t0, octet)
         }
         #[cfg(not(any(
             all(target_arch = "x86_64", target_feature = "avx512f"),
             all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f"))
         )))]
-        fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, subs);
+        fill_stage_tiles(self, stage, t0, octet);
     }
 }
 
@@ -178,30 +203,34 @@ impl<'a> Stage<'a> {
     target_feature(enable = "avx2"),
     inline
 )]
-fn fill_stage_tiles(
-    stage: &mut [F64],
-    msg: &[F64],
-    t0: usize,
-    log_step: usize,
-    msg_rows: usize,
-    n_lanes: usize,
-    row_words: usize,
-    octet: usize,
-    subs: usize,
-) {
+fn fill_stage_tiles(st: &Stage, stage: &mut [F64], t0: usize, octet: usize) {
+    let Stage {
+        lanes: Lanes { words: msg, blocks, .. },
+        log_step,
+        msg_rows,
+        row_words,
+        subs,
+        ref back,
+    } = *st;
     let sub_words = stage.len() / subs;
     let rows = sub_words / (BATCH * 8);
-    let pad = row_words - n_lanes;
-    // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
-    let block = |k: usize| row_words - 1 - (8 * octet + k);
+    let pad = row_words - blocks.len();
+    let per_lane = msg_rows >> EQUAL_BLOCK_LOG;
+    // The first word of line `k` of the tile at message row `j`, which is lane `8 * octet + k`.
+    // A padding lane has none, and is never read.
+    let line = |k: usize, j: usize| {
+        (8 * octet + k).checked_sub(pad).map_or(0, |l| {
+            let back = back.get(l * per_lane + (j >> EQUAL_BLOCK_LOG)).copied().unwrap_or(0);
+            blocks[l] * msg_rows + j - back
+        })
+    };
     // The lines of a tile that are padding lanes.
     let pad_lines = (0..8).filter(|k| 8 * octet + k < pad).fold(0u8, |m, k| m | 1 << k);
     for i in 0..rows {
         for (u, sub) in stage.chunks_exact_mut(sub_words).enumerate() {
             // Line `k` of the tile: 8 residues of one lane block, or zeros for a padding lane.
             let j = t0 + u * BATCH + (i << log_step);
-            let src: [usize; 8] = std::array::from_fn(|k| block(k) * msg_rows + j);
-            fill_tile(sub, i * BATCH, msg, src, pad_lines);
+            fill_tile(sub, i * BATCH, msg, std::array::from_fn(|k| line(k, j)), pad_lines);
         }
     }
 }
