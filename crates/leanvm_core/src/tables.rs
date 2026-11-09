@@ -247,38 +247,49 @@ impl<'a> FillCtx<'a> {
         f: impl Fn(usize) -> [F64; N] + Sync,
     ) {
         let n = self.height;
-        let dst: [parallel::SendPtr<F64>; N] = std::array::from_fn(|k| {
+        assert!(n.is_power_of_two(), "a table's height is a power of two");
+        for k in 0..N {
             assert_eq!(out[at + k].len(), n, "column {} has the wrong window length", at + k);
             let col = at + k;
             self.written[col / 64].fetch_or(1 << (col % 64), std::sync::atomic::Ordering::Relaxed);
-            parallel::SendPtr(out[at + k].as_mut_ptr())
-        });
+        }
         assert!(n_rows <= n, "a table's rows must fit its cube");
         let padding: [F64; N] = std::array::from_fn(|k| self.padding[at + k]);
-        // A cache line of rows is gathered column by column, then streamed out: the
-        // stack is read by a later pass, so its lines need not be fetched.
-        const LINE: usize = 8;
-        parallel::for_each_chunk(n.div_ceil(LINE), |first, end| {
-            let stream = primitives::stream::Stream::new();
-            for b in first..end {
-                let start = b * LINE;
-                let len = LINE.min(n - start);
-                let mut buf = [[F64::ZERO; LINE]; N];
-                for j in 0..len {
-                    let i = start + j;
-                    let v = if i < n_rows { f(i) } else { padding };
+        // Runs of whole cache lines of rows are gathered column by column, then streamed out: the
+        // stack is read by a later pass, so its lines need not be fetched. A run past the rows is
+        // all padding and needs no gather.
+        const RUN: usize = 64;
+        const TASK: usize = 1 << 12;
+        let (task, run) = (n.min(TASK), n.min(RUN));
+        let windows: &mut [ColumnOut; N] = (&mut out[at..at + N]).try_into().unwrap();
+        parallel::map_reduce_chunks_mut(
+            windows.each_mut().map(|w| &mut **w),
+            [task; N],
+            || (),
+            || (),
+            |_, _, t, dst| {
+                let stream = primitives::stream::Stream::new();
+                let padded: [[F64; RUN]; N] = std::array::from_fn(|k| [padding[k]; RUN]);
+                let mut gathered = [[F64::ZERO; RUN]; N];
+                for base in (t * task..(t + 1) * task).step_by(run) {
+                    let rows = if base >= n_rows {
+                        &padded
+                    } else {
+                        for j in 0..run {
+                            let row = if base + j < n_rows { f(base + j) } else { padding };
+                            for k in 0..N {
+                                gathered[k][j] = row[k];
+                            }
+                        }
+                        &gathered
+                    };
                     for k in 0..N {
-                        buf[k][j] = v[k];
+                        stream.copy(&mut dst[k][base - t * task..][..run], &rows[k][..run]);
                     }
                 }
-                for (p, column) in dst.iter().zip(&buf) {
-                    // SAFETY: block `b` writes rows `start..start + len` of each of the
-                    // `N` windows, in bounds and disjoint from every other block's, and
-                    // the dispatch blocks until every write is finished.
-                    unsafe { stream.copy_uninit(p.add(start), &column[..len]) };
-                }
-            }
-        });
+            },
+            |(), ()| (),
+        );
     }
 
     /// The two `K`-lanes of the 128-bit word in memory cell `addr`.
@@ -523,17 +534,26 @@ impl Table for Arith {
     fn fill(&self, ctx: &FillCtx, out: &mut [ColumnOut]) {
         use arith::*;
         let rows = if self.is_xor { &ctx.trace.xor } else { &ctx.trace.mul };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // The offsets and both operand words come out of ONE bytecode decode: split
-        // across passes, the row's instruction is fetched once per pass.
-        ctx.cols(out, rows, OA, |r| {
+        // One pass: the row's instruction is decoded once, and every column is written from it.
+        ctx.cols(out, rows, PC, |r| {
             let (a, b, c) = ctx.ternary_operands(r.pc);
             let (va, vb) = (ctx.limbs(r.fp + a), ctx.limbs(r.fp + b));
-            [ctx.g_at(a), ctx.g_at(b), ctx.g_at(c), va[0], va[1], vb[0], vb[1]]
+            [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
+                ctx.g_at(a),
+                ctx.g_at(b),
+                ctx.g_at(c),
+                va[0],
+                va[1],
+                vb[0],
+                vb[1],
+                ctx.g_at(r.ra),
+                ctx.g_at(r.rb),
+                ctx.g_at(r.rc),
+                ctx.g_at(r.bytecode_read),
+            ]
         });
-        ctx.cols(out, rows, RA, |r| [r.ra, r.rb, r.rc].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -583,15 +603,18 @@ impl Table for SetTable {
             Op::Set { o, k } => (o, k),
             op => unreachable!("a SET row's pc {} holds {op:?}", r.pc),
         };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        ctx.col(out, rows, O, |r| ctx.g_at(imm(r).0));
-        ctx.cols(out, rows, K_LO, |r| {
-            let k = imm(r).1;
-            k.to_limbs().map(F64)
+        ctx.cols(out, rows, PC, |r| {
+            let (o, k) = imm(r);
+            [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
+                ctx.g_at(o),
+                F64(k.c0),
+                F64(k.c1),
+                ctx.g_at(r.r),
+                ctx.g_at(r.bytecode_read),
+            ]
         });
-        ctx.col(out, rows, R, |r| ctx.g_at(r.r));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -665,19 +688,19 @@ impl Table for DerefTable {
             Op::Deref { o1, o2, o3, mode } => (o1, o2, o3, mode),
             op => unreachable!("a DEREF row's pc {} holds {op:?}", r.pc),
         };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
         debug_assert!(
             rows.iter()
                 .all(|r| ctx.mem.word((r.fp + ins(r).0) as usize).as_base().is_some()),
             "deref pointer must be K-valued"
         );
-        // The three offsets, the two mode flags, the pointer lane and the local
-        // word all follow from ONE bytecode decode.
-        ctx.cols(out, rows, O1, |r| {
+        // One pass: the offsets, the two mode flags, the pointer lane and the local
+        // word all follow from one bytecode decode.
+        ctx.cols(out, rows, PC, |r| {
             let (o1, o2, o3, mode) = ins(r);
             let v3 = ctx.limbs(r.fp + o3);
             [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
                 ctx.g_at(o1),
                 ctx.g_at(o2),
                 ctx.g_at(o3),
@@ -686,10 +709,12 @@ impl Table for DerefTable {
                 F64(ctx.mem.word((r.fp + o1) as usize).c0),
                 v3[0],
                 v3[1],
+                ctx.g_at(r.r1),
+                ctx.g_at(r.r2),
+                ctx.g_at(r.r3),
+                ctx.g_at(r.bytecode_read),
             ]
         });
-        ctx.cols(out, rows, R1, |r| [r.r1, r.r2, r.r3].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
@@ -781,60 +806,55 @@ impl Table for JumpTable {
             op => unreachable!("a JUMP row's pc {} holds {op:?}", r.pc),
         };
         let cell = |r: &Jrow, o: u32| ctx.mem.word((r.fp + o) as usize);
-        let cond = |r: &Jrow| {
-            let c = cell(r, ins(r).0);
-            debug_assert!(c.as_base().is_some(), "a JUMP condition outside K at pc {}", r.pc);
-            F64(c.c0)
-        };
-        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
-        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
-        // The three offsets and the three cells they name come out of ONE decode.
-        // Those cells are K-valued on every row, taken or not (`cpu::execute`
-        // rejects anything else), so each is one lane and the memory flush carries
-        // literal zeros above it.
-        ctx.cols(out, rows, OC, |r| {
+        // The condition is K-valued, so its inverse is one F64 inversion. `c` decodes it once. The
+        // is-nonzero witness `w = c⁻¹` (0 where c = 0) comes from one batched Montgomery inversion:
+        // the forward pass leaves in `w[i]` the running product of the nonzero conditions before row
+        // `i`, and `acc` ends as their full product (nonzero, hence invertible). The taken indicator
+        // is `c ≠ 0`.
+        let mut c: Vec<F64> = Vec::with_capacity(rows.len());
+        let mut w: Vec<F64> = Vec::with_capacity(rows.len());
+        let mut acc = F64::ONE;
+        for r in rows.iter() {
+            let ci = F64(cell(r, ins(r).0).c0);
+            c.push(ci);
+            w.push(acc);
+            if !ci.is_zero() {
+                acc *= ci;
+            }
+        }
+        let mut inv = acc.inv();
+        for (wi, &ci) in w.iter_mut().zip(&c).rev() {
+            if ci.is_zero() {
+                *wi = F64::ZERO;
+            } else {
+                *wi = inv * *wi;
+                inv *= ci;
+            }
+        }
+        // One pass. The three offsets and the three cells they name come out of one decode.
+        // Those cells are K-valued on every row, taken or not (`cpu::execute` rejects
+        // anything else), so each is one lane and the memory flush carries literal zeros
+        // above it.
+        ctx.cols_at(out, rows.len(), PC, |i| {
+            let r = rows.get(i);
             let (oc, od, of) = ins(r);
             [
+                ctx.g_at(r.pc),
+                ctx.g_at(r.fp),
                 ctx.g_at(oc),
                 ctx.g_at(od),
                 ctx.g_at(of),
                 F64(cell(r, oc).c0),
                 F64(cell(r, od).c0),
                 F64(cell(r, of).c0),
+                ctx.g_at(r.rc),
+                ctx.g_at(r.rd),
+                ctx.g_at(r.rf),
+                ctx.g_at(r.bytecode_read),
+                w[i],
+                F64(!c[i].is_zero() as u64),
             ]
         });
-        // The is-nonzero witness `w = c⁻¹` (0 where c = 0) for every row, in one
-        // batched Montgomery inversion. `prefix[i]` is the
-        // running product of the nonzero conditions before row `i`, so `acc` ends
-        // as their full product (nonzero, hence invertible). The taken indicator
-        // `b = [c ≠ 0]` falls out of the same pass, so it costs no extra decode.
-        // The conditions lie in K, a subfield, so the inversion runs in K.
-        let (w, b) = {
-            let mut acc = F64::ONE;
-            let mut prefix: Vec<F64> = Vec::with_capacity(rows.len());
-            let mut b = vec![F64::ZERO; rows.len()];
-            for (i, r) in rows.iter().enumerate() {
-                prefix.push(acc);
-                let c = cond(r);
-                if !c.is_zero() {
-                    acc *= c;
-                    b[i] = F64::ONE;
-                }
-            }
-            let mut inv = acc.inv();
-            let mut w = vec![F64::ZERO; rows.len()];
-            for i in (0..rows.len()).rev() {
-                let c = cond(rows.get(i));
-                if !c.is_zero() {
-                    w[i] = inv * prefix[i];
-                    inv *= c;
-                }
-            }
-            (w, b)
-        };
-        ctx.cols_at(out, rows.len(), W, |i| [w[i], b[i]]);
-        ctx.cols(out, rows, RC, |r| [r.rc, r.rd, r.rf].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
     }
 }
 
