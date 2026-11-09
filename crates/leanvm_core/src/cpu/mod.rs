@@ -101,7 +101,7 @@ pub struct Program {
     /// Prover-side frame/buffer allocation hints (keyed by global pc) and the
     /// size of `main`'s frame: the nondeterminism [`Program::execute`] needs to
     /// run the program. Public verification ([`verify`]) ignores them.
-    pub(crate) hints: HashMap<u32, Vec<hints::RHint>>,
+    pub(crate) hints: hints::HintPlan,
     pub(crate) main_frame: u32,
     /// Named prover witness streams for the program's `hint_witness` calls
     /// ([`Program::set_witness`]): a stream is a sequence of *entries* (one
@@ -153,10 +153,10 @@ impl Program {
                 .finalize()
         };
         Self {
+            hints: hints::HintPlan::new(hints, prog.len()),
             prog,
             fiat_shamir_iv,
             bytecode_columns,
-            hints,
             main_frame,
             witness: HashMap::new(),
             fn_ranges: Vec::new(),
@@ -768,6 +768,105 @@ fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::SlotClaim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_plan_preserves_stream_order_and_run_local_cursors() {
+        use hints::RHint;
+        let stack = |base| RHint::WitnessStack {
+            name: "shared".into(),
+            base,
+            len: 1,
+        };
+        let hints = HashMap::from([
+            (
+                0,
+                vec![
+                    stack(3),
+                    RHint::FieldLimbs {
+                        value: 3,
+                        base: 4,
+                        len: 1,
+                    },
+                ],
+            ),
+            (
+                2,
+                vec![
+                    RHint::WitnessHeap {
+                        name: "shared".into(),
+                        ptr: 2,
+                        lo: 0,
+                        len: 1,
+                    },
+                    stack(7),
+                ],
+            ),
+            (
+                7,
+                vec![RHint::WitnessStack {
+                    name: "unused".into(),
+                    base: 9,
+                    len: 1,
+                }],
+            ),
+        ]);
+        let mut program = Program::assemble(
+            vec![
+                Op::Set {
+                    o: 2,
+                    k: F128::from(g_pow(16)),
+                },
+                Op::Xor { a: 3, b: 4, c: 5 },
+                Op::Xor { a: 16, b: 3, c: 6 },
+                Op::Xor { a: 7, b: 6, c: 8 },
+                Op::Set { o: 9, k: F128::ZERO },
+                Op::Set { o: 10, k: F128::ZERO },
+                Op::Set { o: 11, k: F128::ZERO },
+                Op::Xor { a: 0, b: 0, c: 0 },
+            ],
+            hints,
+            16,
+        );
+        let pi = [w(5), w(6)];
+        let missing = program.execute(pi).err().unwrap();
+        assert_eq!(missing.pc, 0);
+        assert!(matches!(missing.fault, Fault::Witness(ref s) if s.contains("no witness stream `shared`")));
+        program.set_witness("shared", vec![vec![w(1), w(2)]]);
+        let wrong_len = program.execute(pi).err().unwrap();
+        assert_eq!(wrong_len.pc, 0);
+        assert!(matches!(wrong_len.fault, Fault::Witness(ref s) if s.contains("holds 2 values")));
+        program.set_witness("shared", vec![vec![w(1)], vec![w(2)]]);
+        let exhausted = program.execute(pi).err().unwrap();
+        assert_eq!(exhausted.pc, 2);
+        assert!(matches!(exhausted.fault, Fault::Witness(ref s) if s.contains("exhausted")));
+        for values in [[w(3), w(11), w(19)], [w(7), w(13), w(23)]] {
+            // An extra entry and a missing stream at the halt pc remain unused.
+            program.set_witness("shared", values.into_iter().chain([w(99)]).map(|v| vec![v]).collect());
+            for p in [&program, &program.clone(), &program] {
+                let exec = p.execute(pi).unwrap();
+                assert_eq!(exec.mem.word(3), values[0]);
+                assert_eq!(exec.mem.word(4), values[0]);
+                assert_eq!(exec.mem.word(5), F128::ZERO);
+                assert_eq!(exec.mem.word(16), values[1]);
+                assert_eq!(exec.mem.word(7), values[2]);
+                assert_eq!(exec.mem.word(8), values[0] + values[1] + values[2]);
+                assert!(exec.unconstrained_reads.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_hint_pc_keeps_execution_preflight_order() {
+        let code = vec![Op::Xor { a: 0, b: 0, c: 0 }; 2];
+        let invalid = HashMap::from([(2, Vec::new())]);
+        let program = Program::assemble(code.clone(), invalid.clone(), 2);
+        assert!(std::panic::catch_unwind(|| program.execute([F128::ZERO; 2])).is_err());
+        let bad_frame = Program::assemble(code, invalid, hints::MAX_CELLS);
+        assert_eq!(
+            bad_frame.execute([F128::ZERO; 2]).err().unwrap().fault,
+            Fault::OutOfMemory
+        );
+    }
 
     #[test]
     fn dynamic_high_frame_keeps_its_memory_and_counts() {
