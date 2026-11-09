@@ -143,14 +143,15 @@ pub(crate) struct Blocks {
 }
 
 /// Run `run`, which reports the lanes of each step it executes, and compute the committed lanes
-/// behind it: executing is one thread's work, so the others take each block of steps as it
-/// completes instead of waiting for the last.
-pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LANES])) -> R) -> (R, Blocks) {
+/// behind it on `workers` threads: executing is one thread's work, so the others take each
+/// block of steps as it completes instead of waiting for the last.
+pub(crate) fn while_executing<R>(
+    workers: usize,
+    run: impl FnOnce(&mut dyn FnMut(&[u64; STATE_LANES])) -> R,
+) -> (R, Blocks) {
     type Job = (usize, Vec<[u64; STATE_LANES]>);
     let (jobs, queue) = std::sync::mpsc::channel::<Job>();
     let queue = std::sync::Mutex::new(queue);
-    // More workers than this slow the executing thread by more than they finish early.
-    let workers = parallel::num_threads() / 2;
     let (result, lanes, steps) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
@@ -250,7 +251,7 @@ mod tests {
         for n in [0, 1, 511, 512, 513, 1500, 4099] {
             let instances = sample_instances(n);
             let (expected, reference) = build_qkeccak(&instances);
-            let ((), blocks) = while_executing(|step| {
+            let ((), blocks) = while_executing(parallel::num_threads() / 2, |step| {
                 for state in &instances {
                     step(state);
                 }

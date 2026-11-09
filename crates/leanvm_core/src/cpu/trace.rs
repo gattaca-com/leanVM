@@ -13,6 +13,7 @@
 //! and the fill looks the power up.
 
 /// `XOR` or `MUL` row: the three cells are `fp·g^{a,b,c}`.
+#[derive(PartialEq, Debug)]
 pub(crate) struct Xrow {
     pub(crate) pc: u32,
     pub(crate) fp: u32, // frame base: address = fp + offset, operand = g^offset
@@ -21,12 +22,14 @@ pub(crate) struct Xrow {
     pub(crate) rc: u32,
     pub(crate) bytecode_read: u32,
 }
+#[derive(PartialEq, Debug)]
 pub(crate) struct Srow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
     pub(crate) r: u32,
     pub(crate) bytecode_read: u32,
 }
+#[derive(PartialEq, Debug)]
 pub(crate) struct Drow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
@@ -35,6 +38,7 @@ pub(crate) struct Drow {
     pub(crate) r3: u32,
     pub(crate) bytecode_read: u32,
 }
+#[derive(PartialEq, Debug)]
 pub(crate) struct Jrow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
@@ -48,6 +52,7 @@ pub(crate) struct Jrow {
 /// them (`tables::KeccakOp::cell`): the four `m` cells, the four `tail` cells, `b8`, the
 /// four `cap` cells, then the thirteen output cells, zero for one the row does not write.
 /// The input lanes are read back from the final memory image, the output lanes their permutation.
+#[derive(PartialEq, Debug)]
 pub(crate) struct Krow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
@@ -94,6 +99,14 @@ impl<T> Rows<T> {
 
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
         self.chunks.iter().flatten()
+    }
+
+    pub(crate) fn get_mut(&mut self, i: usize) -> &mut T {
+        &mut self.chunks[i >> CHUNK_LOG][i & (CHUNK - 1)]
+    }
+
+    pub(crate) fn into_iter(self) -> impl Iterator<Item = T> {
+        self.chunks.into_iter().flatten()
     }
 }
 

@@ -37,6 +37,9 @@ pub fn unified_guest() -> &'static Program {
     })
 }
 
+/// The witness streams the guest's two signature loops pop at the start of each iteration.
+pub(super) const SEGMENT_STREAMS: [&str; 2] = ["raw_index", "sp_raw_index"];
+
 pub(super) fn compile_guest(kbc: usize) -> Program {
     let replacements = placeholder_map(kbc);
     // `DBG_PLACEHOLDERS=path`: dump the baked guest constants, to read alongside
@@ -45,10 +48,16 @@ pub(super) fn compile_guest(kbc: usize) -> Program {
         let dump: String = replacements.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
         std::fs::write(&path, dump).expect("write DBG_PLACEHOLDERS");
     }
-    let guest = compile(
+    let mut guest = compile(
         &parse_with_replacements(include_str!("../../guests/lean_ethereum.py"), &replacements)
             .expect("the repository aggregation guest must parse"),
     );
+    // The signature checks execute as parallel segments unless `LEANVM_PAR_EXEC=0`.
+    if std::env::var("LEANVM_PAR_EXEC").is_ok_and(|v| v == "0") {
+        guest.segment_streams.clear();
+    } else {
+        guest.segment_streams = SEGMENT_STREAMS.iter().map(|s| s.to_string()).collect();
+    }
     // `DBG_DISASM=path`: dump the guest's disassembly, to read alongside a
     // `DBG_PROF_DUMP` per-pc profile. Function boundaries lead the dump, so the
     // pc a failed guest check reports can be resolved to a source function

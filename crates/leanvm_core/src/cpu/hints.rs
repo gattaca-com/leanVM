@@ -39,8 +39,14 @@ pub(crate) const MAX_INDEX: usize = 1 << verifier::MAX_LOG_BYTECODE;
 /// most `STRIDE` probes once. One past the table, a hinted g-power or a range
 /// check's complement, is found by `bounded_dlog` below the caller's bound, and the
 /// table grows to cover it.
+///
+/// What the run covered, the largest index any growth asked for, is kept apart from
+/// how far the table reaches: `reserve` extends the table past it for readers that
+/// share it, without covering more.
 pub struct GPow {
     pow: Vec<F64>,
+    /// Exponents the run covered: `log` resolves no other.
+    covered: usize,
     /// `k + 1` at the slot `g^k` mixes to, for the announced `k`; 0 marks an empty
     /// slot. Power-of-two length.
     index: Vec<u32>,
@@ -57,11 +63,12 @@ impl GPow {
     pub fn new(upto: usize) -> Self {
         let mut g = Self {
             pow: vec![F64::ONE],
+            covered: 1,
             index: vec![0; 1 << 13],
             announced: 0,
             coarse: Vec::new(),
         };
-        g.extend(upto);
+        g.grow_to(upto);
         g
     }
 
@@ -75,21 +82,41 @@ impl GPow {
         g
     }
 
-    /// `g^k`. Panics past the grown range, which is the honest outcome: every
-    /// index the interpreter reads has been covered by a [`Self::grow_to`].
+    /// `g^k`. Panics past the table, which is the honest outcome: every index the
+    /// interpreter reads has been covered by a [`Self::grow_to`].
     #[inline(always)]
     pub fn pow(&self, k: usize) -> F64 {
         self.pow[k]
     }
 
     /// The forward table, `g^0` to `g^{covered - 1}`.
-    pub(crate) fn into_powers(self) -> Vec<F64> {
+    pub(crate) fn into_powers(mut self) -> Vec<F64> {
+        self.pow.truncate(self.covered);
         self.pow
     }
 
-    /// Extend the forward table to cover index `upto`.
+    /// Exponents the run covered.
+    pub(crate) fn covered(&self) -> usize {
+        self.covered
+    }
+
+    /// Exponents the forward table holds, [`Self::reserve`]d ones included.
+    pub(crate) fn reserved(&self) -> usize {
+        self.pow.len()
+    }
+
+    /// Cover index `upto`.
     #[inline]
     pub fn grow_to(&mut self, upto: usize) {
+        if upto >= self.covered {
+            self.reserve(upto);
+            self.covered = upto + 1;
+        }
+    }
+
+    /// Extend the forward table to hold index `upto`, covering nothing more.
+    #[inline]
+    pub(crate) fn reserve(&mut self, upto: usize) {
         if upto >= self.pow.len() {
             self.extend(upto);
         }
@@ -169,6 +196,19 @@ impl GPow {
             self.note(k);
             k as u32
         })
+    }
+
+    /// [`Self::log_below`] without covering or announcing what it finds, for a reader that shares the
+    /// table: the same answer, since the exponent below `bound` is unique.
+    pub(crate) fn log_below_ro(&self, x: F64, bound: usize) -> Option<u32> {
+        debug_assert!(bound <= MAX_INDEX);
+        let k = match self.lookup(x) {
+            Some(k) => k as usize,
+            None => self
+                .resolve(x)
+                .or_else(|| bounded_dlog(x, crate::log2_ceil_usize(bound) as u32).map(|k| k as usize))?,
+        };
+        (k < bound).then_some(k as u32)
     }
 
     /// The exponent of `x` if announced: any covered one, for a table built by [`Self::dense`].
@@ -359,5 +399,22 @@ mod tests {
         assert_eq!(g.log_below(g.pow(100), 100), None);
         assert_eq!(g.log_below(g.pow(100), 101), Some(100));
         assert_eq!(g.log(F64::G.pow(MAX_CELLS as u128 + 5)), None);
+    }
+
+    /// Invariant: `reserve` extends the table for readers that share it without covering more; `grow_to`, `note`
+    /// and a lookup that resolves an exponent cover it, and the powers an execution keeps are the covered ones.
+    #[test]
+    fn reserve_covers_nothing() {
+        let mut g = GPow::new(1_000);
+        g.reserve(10_000);
+        assert!(g.reserved() > 10_000);
+        assert_eq!(g.covered(), 1_001);
+        g.grow_to(5_000);
+        assert_eq!(g.covered(), 5_001);
+        g.note(7_000);
+        assert_eq!(g.covered(), 7_001);
+        assert_eq!(g.log(g.pow(9_000)), Some(9_000));
+        assert_eq!(g.covered(), 9_001);
+        assert_eq!(g.into_powers().len(), 9_001);
     }
 }

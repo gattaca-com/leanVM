@@ -14,7 +14,7 @@ use super::statement::{lean_sphincs_claim_cells, lean_xmss_claim_cells, list_spl
 use super::{LeanSphincsClaim, LeanXmssClaim, MAX_RECURSIONS};
 use fiat_shamir::merkle::hash_to_scalars;
 use lean_da::{BLOB_SYMBOLS, CELL_SYMBOLS, CELLS_PER_ROW, CODEWORD_SYMBOLS};
-use leanvm_core::cpu::{from_scalar, prove, public_input_bytes, scalar_proof};
+use leanvm_core::cpu::{Program, from_scalar, prove, public_input_bytes, scalar_proof};
 use primitives::field::{F64, F128};
 use signatures::lean_sphincs::{LeanSphincsPublicKey, LeanSphincsSignature};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
@@ -65,11 +65,41 @@ pub fn aggregate_with_stats(
     declare: Option<&EthereumClaims>,
     log_inv_rate: usize,
 ) -> Result<(EthereumProof, leanvm_core::cpu::Stats), AggregationError> {
-    let declared_root = declare.map(|claims| claims.da_commitment);
     // `cpu::prove` checks the rate too, but only after the witness is built.
     if !(leanvm_core::pcs::MIN_LOG_INV_RATE..=leanvm_core::pcs::MAX_LOG_INV_RATE).contains(&log_inv_rate) {
         return Err(AggregationError::InvalidRate { log_inv_rate });
     }
+    let node = prepare(children, raw_lean_xmss, raw_lean_sphincs, blobs, declare)?;
+    let (proof, stats) = prove(&node.program, node.public_input, log_inv_rate)
+        .map_err(|e| AggregationError::ProofError(SnarkProveError(e)))?;
+    Ok((
+        EthereumProof {
+            claims: node.claims,
+            defer: node.defer,
+            proof,
+        },
+        stats,
+    ))
+}
+
+/// A node's run of the guest: the program with its witness installed, its public input, and
+/// what its proof will carry.
+pub(super) struct Node {
+    pub(super) program: Program,
+    pub(super) public_input: [F128; 2],
+    claims: EthereumClaims,
+    defer: DeferredClaim,
+}
+
+/// The guest's run for a node, everything but the proof.
+pub(super) fn prepare(
+    children: &[EthereumProof],
+    raw_lean_xmss: Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)>,
+    raw_lean_sphincs: Vec<(LeanSphincsPublicKey, lean_sphincs::Message, LeanSphincsSignature)>,
+    blobs: &[u64],
+    declare: Option<&EthereumClaims>,
+) -> Result<Node, AggregationError> {
+    let declared_root = declare.map(|claims| claims.da_commitment);
     if children.len() > MAX_RECURSIONS {
         return Err(AggregationError::TooLarge);
     }
@@ -325,18 +355,14 @@ pub fn aggregate_with_stats(
         forge(&mut hints);
     }
     hints.install(&mut program);
-    let (proof, stats) =
-        prove(&program, public_input, log_inv_rate).map_err(|e| AggregationError::ProofError(SnarkProveError(e)))?;
-    Ok((
-        EthereumProof {
-            claims: EthereumClaims {
-                lean_xmss: cover.lean_xmss.signers,
-                lean_sphincs: cover.lean_sphincs.signers,
-                da_commitment: da_root,
-            },
-            defer,
-            proof,
+    Ok(Node {
+        program,
+        public_input,
+        claims: EthereumClaims {
+            lean_xmss: cover.lean_xmss.signers,
+            lean_sphincs: cover.lean_sphincs.signers,
+            da_commitment: da_root,
         },
-        stats,
-    ))
+        defer,
+    })
 }

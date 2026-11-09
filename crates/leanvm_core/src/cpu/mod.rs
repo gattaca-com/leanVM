@@ -24,6 +24,7 @@ mod execute;
 pub mod hints;
 mod isa;
 pub mod layout;
+mod segments;
 mod trace;
 pub(crate) use execute::Cell;
 pub use execute::{ExecError, Execution, Fault, Memory};
@@ -106,6 +107,13 @@ pub struct Program {
     /// check reports a line rather than a pc to disassemble around. Empty for a
     /// hand-assembled program, and shorter than `prog`, which is padded.
     pub src_lines: Vec<u32>,
+    /// Witness streams that a loop of independent iterations pops once per iteration, at
+    /// its first instruction: [`Program::execute`] runs those iterations in parallel, with
+    /// the serial result (`cpu::segments`). Empty (the default) runs everything serially.
+    /// Prover-side only.
+    pub segment_streams: Vec<String>,
+    /// The steps a run may take before it fails with [`Fault::StepLimit`].
+    pub(crate) step_limit: usize,
 }
 
 /// The IV reinterprets the stacked bytecode table as bytes, which is its
@@ -147,7 +155,15 @@ impl Program {
             witness: HashMap::new(),
             fn_ranges: Vec::new(),
             src_lines: Vec::new(),
+            segment_streams: Vec::new(),
+            step_limit: execute::MAX_STEPS,
         }
+    }
+
+    /// Lowers the step limit, so a test can reach it.
+    #[doc(hidden)]
+    pub fn set_step_limit(&mut self, steps: usize) {
+        self.step_limit = steps.min(execute::MAX_STEPS);
     }
 
     /// The bytecode, a power of two long.
@@ -416,7 +432,15 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
     let (exec, keccak_blocks) = crate::stage!("Execute program", || {
-        crate::keccak::while_executing(|step| program.execute_with(public_input, step))
+        // More workers than half slow the executing thread by more than they finish early,
+        // but a segmented run passes most `KECCAK` rows on after its segments, when the pool
+        // is idle, so the witness gets every thread.
+        let workers = if program.may_segment() {
+            parallel::num_threads()
+        } else {
+            parallel::num_threads() / 2
+        };
+        crate::keccak::while_executing(workers, |step| program.execute_with(public_input, step))
     });
     let exec = exec.map_err(ProveError::Execution)?;
     // A live value that came from outside the constraint system would make the proof

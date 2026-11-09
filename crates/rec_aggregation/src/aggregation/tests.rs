@@ -1,9 +1,9 @@
 use super::cells::{count, pack_16_bytes};
 use super::deferred::{DeferredClaim, bytecode_sums, bytecode_value, bytecode_vars, stacked_bytecode};
 use super::error::{AggregateVerifyError, AggregationError};
-use super::guest::{compile_guest, unified_guest};
+use super::guest::{SEGMENT_STREAMS, compile_guest, unified_guest};
 use super::hints::{FORGE, Forgery, Hints, lean_xmss_hints};
-use super::node::aggregate;
+use super::node::{aggregate, prepare};
 use super::placeholders::placeholder_map;
 use super::proof::{EthereumClaims, EthereumProof, decode, encode};
 use super::statement::{CLAIM_GROUP, claim_list_digest, list_split};
@@ -165,6 +165,68 @@ fn aggregate_one_signer() {
     let aggregate = prove_leaf(&get_signers(1));
     aggregate.verify().expect("verifies");
     assert_eq!(aggregate.claims.lean_xmss[0].1, message());
+}
+
+/// Invariants: executing the signature loops as parallel segments gives the serial run's
+/// trace, memory image, counts, hint cursors and `KECCAK` lanes, for a leaf of both schemes
+/// and blobs; a mispredicted segment start, met after earlier segments merged, falls back to
+/// the serial run, with the same result.
+#[test]
+fn segmented_execution_is_serial() {
+    parallel::init();
+    let blobs = da_rows(2, 8);
+    let node = prepare(&[], get_signers(40), get_lean_sphincs_signers(24), &blobs, None).expect("a leaf");
+    let run = |streams: &[&str], skew| {
+        node.program
+            .execute_in_segments(node.public_input, streams, skew)
+            .expect("executes")
+    };
+    let (serial, serial_lanes, loops) = run(&[], 0);
+    assert_eq!(loops, 0);
+    let (segmented, lanes, loops) = run(&SEGMENT_STREAMS, 0);
+    assert!(
+        loops == 2 || parallel::num_threads() < 2,
+        "both signature loops ran as segments"
+    );
+    assert_eq!(serial.mismatch(&segmented), None);
+    assert!(
+        lanes == serial_lanes,
+        "the segmented run's KECCAK lanes are the serial run's"
+    );
+    let (fallback, lanes, loops) = run(&SEGMENT_STREAMS, 1);
+    assert_eq!(loops, 0, "a misprediction runs serially");
+    assert_eq!(serial.mismatch(&fallback), None);
+    assert!(lanes == serial_lanes, "a fallback's KECCAK lanes are the serial run's");
+}
+
+/// Invariant: a segmented run stops at the step limit at the instruction the serial run stops at, or completes as it
+/// does, wherever the limit falls: inside the segmented loops, in the serial tail, or at the last step. The limit is
+/// lowered through a test-only setter, the real one being far past any leaf.
+#[test]
+fn segmented_step_limit_is_serial() {
+    parallel::init();
+    let node = prepare(&[], get_signers(40), vec![], &[], None).expect("a leaf");
+    let (full, _, loops) = node
+        .program
+        .execute_in_segments(node.public_input, &SEGMENT_STREAMS, 0)
+        .expect("executes");
+    assert!(
+        loops > 0 || parallel::num_threads() < 2,
+        "the leaf's signature loops run as segments"
+    );
+    let total = full.cycles;
+    for limit in [total / 2, total - 1, total] {
+        let mut program = node.program.clone();
+        program.set_step_limit(limit);
+        let run = |streams: &[&str]| {
+            program
+                .execute_in_segments(node.public_input, streams, 0)
+                .map(|(e, _, _)| e.cycles)
+        };
+        let serial = run(&[]);
+        assert_eq!(serial.is_ok(), limit == total, "the serial run at limit {limit}");
+        assert_eq!(run(&SEGMENT_STREAMS), serial, "limit {limit} of {total}");
+    }
 }
 
 /// A leaf holding claims of both schemes, each list in its own region.

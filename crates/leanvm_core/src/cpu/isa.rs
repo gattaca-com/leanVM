@@ -55,6 +55,30 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// The largest offset the instruction adds to a base: how far past a frame or a pointer it
+    /// can reach.
+    pub(crate) fn max_offset(&self) -> u32 {
+        match *self {
+            Self::Xor { a, b, c } | Self::Mul { a, b, c } => a.max(b).max(c),
+            Self::Set { o, .. } => o,
+            Self::Deref { o1, o2, o3, .. } => o1.max(o2).max(o3),
+            Self::Jump { oc, od, of } => oc.max(od).max(of),
+            Self::Keccak {
+                m, tail, b8, cap, out, ..
+            } => {
+                let last = crate::keccak::STATE_CELLS as u32 - 1;
+                m.into_iter()
+                    .fold(0, u32::max)
+                    .max(tail + 3)
+                    .max(b8)
+                    .max(cap + 3)
+                    .max(out + last)
+            }
+        }
+    }
+}
+
 /// How many of a `KECCAK`'s thirteen output cells it writes, from `out` on: the first, the first two (a
 /// 256-bit digest), or all thirteen (a state a later block reads). Two bytecode flags carry the choice, so the
 /// program fixes it, never the prover.
