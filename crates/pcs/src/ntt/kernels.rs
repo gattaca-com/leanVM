@@ -27,6 +27,7 @@ fn fused_rows<const N: usize>(
     stride_rows: usize,
     num_ntts: usize,
     do_one: impl Fn(Option<[&[F64]; N]>, &mut [&mut [F64]; N]),
+    mut hook: impl FnMut(),
 ) {
     // Words from one slab to the next.
     let stride = stride_rows * num_ntts;
@@ -45,6 +46,7 @@ fn fused_rows<const N: usize>(
             .as_mut()
             .map(|slabs| slabs.each_mut().map(|slab| slab.next().unwrap()));
         do_one(srcs, &mut rows);
+        hook();
     }
 }
 
@@ -83,50 +85,44 @@ fn radix4_schedule(mut butterfly: impl FnMut(usize, usize, usize)) {
     butterfly(2, 3, 2);
 }
 
-/// Layers L, L+1 and L+2 fused into one sweep over a layer-L block.
+/// The butterflies of one radix-`N` row group, `N` 8 or 4: [`radix8_schedule`] or [`radix4_schedule`].
+#[inline(always)]
+fn schedule<const N: usize>(butterfly: impl FnMut(usize, usize, usize)) {
+    if N == 8 {
+        radix8_schedule(butterfly)
+    } else {
+        radix4_schedule(butterfly)
+    }
+}
+
+/// Layers L, L+1 and, for `N = 8`, L+2 fused into one sweep over a layer-L block, `N` rows at a time.
 ///
 /// ```text
-///     a group is 8 rows, e = (block rows) / 8 apart:  r, r + e, ..., r + 7e
+///     N = 8: a group is 8 rows, e = (block rows) / 8 apart:  r, r + e, ..., r + 7e
 ///
 ///     layer L     pairs rows 4e apart
 ///     layer L+1   pairs rows 2e apart
 ///     layer L+2   pairs rows  e apart
 /// ```
 ///
-/// - The eight rows stay in L1 across all twelve butterflies.
-/// - The seven twiddles are breadth-first: one for layer L, two for L+1, four for L+2.
-pub(super) fn butterfly_interleaved_fused_3layer(
+/// - The rows of a group stay in L1 across all its butterflies.
+/// - The `T = N - 1` twiddles are breadth-first: one for layer L, two for L+1, four for L+2.
+/// - `hook` runs after each row group.
+pub(super) fn butterfly_interleaved_fused<const N: usize, const T: usize>(
     block: &mut [F64],
     src: Option<&[F64]>,
-    t: &[F64; 7],
-    eighth: usize,
+    t: &[F64; T],
     num_ntts: usize,
+    hook: impl FnMut(),
 ) {
-    // On AVX-512 the whole sweep is one target-feature function, so each group's butterflies run on registers
-    // inside the sweep's loop: a call per group would pass the vectors through memory.
+    let stride_rows = block.len() / (N * num_ntts);
+    // On AVX-512 and AVX2 the whole sweep is one target-feature function, so each group's butterflies run on
+    // registers inside the sweep's loop: a call per group would pass the vectors through memory.
     #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    {
-        #[inline]
-        #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
-        fn sweep(block: &mut [F64], src: Option<&[F64]>, t: &[F64; 7], eighth: usize, num_ntts: usize) {
-            fused_sweep_avx512::<8, 7>(
-                block,
-                src,
-                eighth,
-                num_ntts,
-                t,
-                #[inline(always)]
-                |v, t| {
-                    radix8_schedule(
-                        #[inline(always)]
-                        |top, bot, k| butterfly_regs(v, top, bot, t[k]),
-                    );
-                },
-            );
-        }
-        // SAFETY: this code is compiled only where VPCLMULQDQ and AVX-512F are enabled, and `primitives`
-        // refuses to build there without the AVX-512BW the sweep adds.
-        unsafe { sweep(block, src, t, eighth, num_ntts) }
+    // SAFETY: this code is compiled only where VPCLMULQDQ and AVX-512F are enabled, and `primitives`
+    // refuses to build there without the AVX-512BW the sweep adds.
+    unsafe {
+        fused_sweep_avx512::<N, T>(block, src, stride_rows, num_ntts, t, hook)
     }
     #[cfg(all(
         target_arch = "x86_64",
@@ -134,27 +130,9 @@ pub(super) fn butterfly_interleaved_fused_3layer(
         target_feature = "avx2",
         not(target_feature = "avx512f")
     ))]
-    {
-        #[inline]
-        #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-        fn sweep(block: &mut [F64], src: Option<&[F64]>, t: &[F64; 7], eighth: usize, num_ntts: usize) {
-            avx2::fused_sweep::<8, 7>(
-                block,
-                src,
-                eighth,
-                num_ntts,
-                t,
-                #[inline(always)]
-                |v, t| {
-                    radix8_schedule(
-                        #[inline(always)]
-                        |top, bot, k| avx2::butterfly_regs(v, top, bot, t[k]),
-                    );
-                },
-            );
-        }
-        // SAFETY: this code is compiled only where VPCLMULQDQ and AVX2 are enabled.
-        unsafe { sweep(block, src, t, eighth, num_ntts) }
+    // SAFETY: this code is compiled only where VPCLMULQDQ and AVX2 are enabled.
+    unsafe {
+        avx2::fused_sweep::<N, T>(block, src, stride_rows, num_ntts, t, hook)
     }
     #[cfg(not(any(
         all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
@@ -165,12 +143,20 @@ pub(super) fn butterfly_interleaved_fused_3layer(
             not(target_feature = "avx512f")
         )
     )))]
-    fused_rows::<8>(block, src, eighth, num_ntts, |src, rows| {
-        radix8_butterflies(src, rows, t)
-    });
+    fused_rows::<N>(
+        block,
+        src,
+        stride_rows,
+        num_ntts,
+        |src, rows| {
+            copy_rows(src, rows);
+            schedule::<N>(|top, bot, k| butterfly_rows(rows, top, bot, t[k]));
+        },
+        hook,
+    );
 }
 
-/// The sweep of [`fused_rows`] with `kernel` on registers: [`fused_lanes_avx512`] for each row group.
+/// The sweep of [`fused_rows`] on registers: [`fused_lanes_avx512`] for each row group.
 #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 #[inline]
 #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
@@ -180,33 +166,29 @@ fn fused_sweep_avx512<const N: usize, const T: usize>(
     stride_rows: usize,
     num_ntts: usize,
     twiddles: &[F64; T],
-    kernel: impl Fn(&mut RowVectors<N>, &[Twiddle; T]),
+    hook: impl FnMut(),
 ) {
-    fused_rows::<N>(block, src, stride_rows, num_ntts, |src, rows| {
-        fused_lanes_avx512(
-            src,
-            rows,
-            twiddles,
-            #[inline(always)]
-            |v, t| kernel(v, t),
-        )
-    });
-}
-
-/// The twelve butterflies of one radix-8 row group, with its seven twiddles breadth-first.
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )
-)))]
-#[inline(always)]
-fn radix8_butterflies(src: Option<[&[F64]; 8]>, rows: &mut [&mut [F64]; 8], t: &[F64; 7]) {
-    copy_rows(src, rows);
-    radix8_schedule(|top, bot, k| butterfly_rows(rows, top, bot, t[k]));
+    fused_rows::<N>(
+        block,
+        src,
+        stride_rows,
+        num_ntts,
+        |src, rows| {
+            fused_lanes_avx512(
+                src,
+                rows,
+                twiddles,
+                #[inline(always)]
+                |v, t| {
+                    schedule::<N>(
+                        #[inline(always)]
+                        |top, bot, k| butterfly_regs(v, top, bot, t[k]),
+                    )
+                },
+            )
+        },
+        hook,
+    );
 }
 
 /// [`butterfly_lanes`] on rows `top` and `bot` of a row group.
@@ -242,105 +224,21 @@ fn copy_rows<const N: usize>(src: Option<[&[F64]; N]>, rows: &mut [&mut [F64]; N
     }
 }
 
-/// Layers L and L+1 fused into one sweep over a layer-L block, four rows at a time.
-///
-/// The three twiddles are breadth-first: one for layer L, two for L+1.
-pub(super) fn butterfly_interleaved_fused_2layer(
-    block: &mut [F64],
-    src: Option<&[F64]>,
-    t: &[F64; 3],
-    quarter: usize,
-    num_ntts: usize,
-) {
-    // On AVX-512 the sweep is one target-feature function, like the radix-8 one.
-    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-    {
-        #[inline]
-        #[target_feature(enable = "vpclmulqdq", enable = "avx512f", enable = "avx512bw")]
-        fn sweep(block: &mut [F64], src: Option<&[F64]>, t: &[F64; 3], quarter: usize, num_ntts: usize) {
-            fused_sweep_avx512::<4, 3>(
-                block,
-                src,
-                quarter,
-                num_ntts,
-                t,
-                #[inline(always)]
-                |v, t| {
-                    radix4_schedule(
-                        #[inline(always)]
-                        |top, bot, k| butterfly_regs(v, top, bot, t[k]),
-                    );
-                },
-            );
-        }
-        // SAFETY: as in `butterfly_interleaved_fused_3layer`.
-        unsafe { sweep(block, src, t, quarter, num_ntts) }
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    ))]
-    {
-        #[inline]
-        #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-        fn sweep(block: &mut [F64], src: Option<&[F64]>, t: &[F64; 3], quarter: usize, num_ntts: usize) {
-            avx2::fused_sweep::<4, 3>(
-                block,
-                src,
-                quarter,
-                num_ntts,
-                t,
-                #[inline(always)]
-                |v, t| {
-                    radix4_schedule(
-                        #[inline(always)]
-                        |top, bot, k| avx2::butterfly_regs(v, top, bot, t[k]),
-                    );
-                },
-            );
-        }
-        // SAFETY: this code is compiled only where VPCLMULQDQ and AVX2 are enabled.
-        unsafe { sweep(block, src, t, quarter, num_ntts) }
-    }
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-        all(
-            target_arch = "x86_64",
-            target_feature = "vpclmulqdq",
-            target_feature = "avx2",
-            not(target_feature = "avx512f")
-        )
-    )))]
-    fused_rows::<4>(block, src, quarter, num_ntts, |src, rows| {
-        radix4_butterflies(src, rows, t)
-    });
-}
-
-/// The four butterflies of one radix-4 row group.
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "vpclmulqdq",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )
-)))]
-#[inline(always)]
-fn radix4_butterflies(src: Option<[&[F64]; 4]>, rows: &mut [&mut [F64]; 4], t: &[F64; 3]) {
-    copy_rows(src, rows);
-    radix4_schedule(|top, bot, k| butterfly_rows(rows, top, bot, t[k]));
-}
-
+/// One layer over a block: [`butterfly_lanes`] on each row pair, then `hook`.
 #[inline]
-pub(super) fn butterfly_interleaved_block(block: &mut [F64], twiddle: F64, block_size_half: usize, num_ntts: usize) {
+pub(super) fn butterfly_interleaved_block(
+    block: &mut [F64],
+    twiddle: F64,
+    block_size_half: usize,
+    num_ntts: usize,
+    mut hook: impl FnMut(),
+) {
     let half_offset = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(half_offset);
     for r in 0..block_size_half {
         let off = r * num_ntts;
         butterfly_lanes(&mut top[off..off + num_ntts], &mut bot[off..off + num_ntts], twiddle);
+        hook();
     }
 }
 
@@ -751,16 +649,16 @@ mod avx2 {
     use primitives::field::gf2_64x2::x86_64::reduce_halves256;
     use primitives::{load_at, store_at};
 
-    use super::fused_rows;
+    use super::{fused_rows, schedule};
 
     /// Four-lane vectors of every row that a register kernel keeps in flight, as on AVX-512.
     const LANE_VECTORS: usize = 2;
 
     /// A broadcast twiddle, and whether it is zero: the butterfly is then `v' = v + u`, with no product.
-    pub(super) type Twiddle = (__m256i, bool);
+    type Twiddle = (__m256i, bool);
 
     /// The vectors of `N` rows held in registers: `v[row][k]` is vector `k` of the row.
-    pub(super) type RowVectors<const N: usize> = [[__m256i; LANE_VECTORS]; N];
+    type RowVectors<const N: usize> = [[__m256i; LANE_VECTORS]; N];
 
     /// `u ^ v * tw` in each of the four lanes, as `mul_xor_avx512`.
     #[inline]
@@ -808,7 +706,7 @@ mod avx2 {
     /// Butterfly rows `top` and `bot` of every vector in flight.
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
-    pub(super) fn butterfly_regs<const N: usize>(v: &mut RowVectors<N>, top: usize, bot: usize, (tw, zero): Twiddle) {
+    fn butterfly_regs<const N: usize>(v: &mut RowVectors<N>, top: usize, bot: usize, (tw, zero): Twiddle) {
         for k in 0..LANE_VECTORS {
             let (u, w) = (v[top][k], v[bot][k]);
             let new_u = if zero { u } else { mul_xor(u, w, tw) };
@@ -817,7 +715,7 @@ mod avx2 {
         }
     }
 
-    /// The sweep of [`fused_rows`] with `kernel` on registers: [`fused_lanes`] for each row group.
+    /// The sweep of [`fused_rows`] on registers: [`fused_lanes`] for each row group.
     #[inline]
     #[target_feature(enable = "vpclmulqdq", enable = "avx2")]
     pub(super) fn fused_sweep<const N: usize, const T: usize>(
@@ -826,17 +724,29 @@ mod avx2 {
         stride_rows: usize,
         num_ntts: usize,
         twiddles: &[F64; T],
-        kernel: impl Fn(&mut RowVectors<N>, &[Twiddle; T]),
+        hook: impl FnMut(),
     ) {
-        fused_rows::<N>(block, src, stride_rows, num_ntts, |src, rows| {
-            fused_lanes(
-                src,
-                rows,
-                twiddles,
-                #[inline(always)]
-                |v, t| kernel(v, t),
-            )
-        });
+        fused_rows::<N>(
+            block,
+            src,
+            stride_rows,
+            num_ntts,
+            |src, rows| {
+                fused_lanes(
+                    src,
+                    rows,
+                    twiddles,
+                    #[inline(always)]
+                    |v, t| {
+                        schedule::<N>(
+                            #[inline(always)]
+                            |top, bot, k| butterfly_regs(v, top, bot, t[k]),
+                        )
+                    },
+                )
+            },
+            hook,
+        );
     }
 
     /// `fused_lanes_avx512` at half the width: [`LANE_VECTORS`] four-lane vectors of every row at a time.

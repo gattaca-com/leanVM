@@ -82,32 +82,57 @@ pub(super) fn transpose_lane_major(out: &mut [F64], msg: &[F64], n_lanes: usize,
 /// Residues a lane-major first pass takes at once, as a log: one cache line of a lane block.
 pub(super) const LOG_BATCH: usize = 3;
 pub(super) const BATCH: usize = 1 << LOG_BATCH;
+/// Most batches a lane-major task fills side by side, so a lane's adjacent lines are read together.
+const STAGE_SUBS: usize = 2;
+
+/// Batches a lane-major task fills side by side, as one stage of that many batches.
+///
+/// # Why this value
+///
+/// - A batch reads one 64 byte line per lane block and row, 16 KB from the next row's.
+/// - Reading adjacent lines together uses each open DRAM page for more of the transfer.
+/// - A second batch's line is the neighbour of the first's, so the fill reads both in one pass.
+/// - The stage doubles to 2^(g + 10) words, which spills from L2 into L3.
+/// - Larger pools keep one batch to avoid crowding the shared caches.
+/// - A step under two batches has no neighbour line to read.
+pub(super) fn stage_subs(lane_major: bool, log_step: usize) -> usize {
+    let fits = log_step >= LOG_BATCH + STAGE_SUBS.ilog2() as usize;
+    if lane_major && fits && parallel::num_threads() <= 4 {
+        STAGE_SUBS
+    } else {
+        1
+    }
+}
 
 /// The transpose of a lane-major message through a stage, for one gathered pass.
 ///
-/// - It owns the message and the geometry of the fill: the step, the message rows and the row width.
-/// - [`Stage::fill`] moves one octet of lanes of a batch of residues into a stage buffer.
-/// - A task fills the stage, then each block of the pass transforms a copy of it.
+/// - It owns the message and the geometry of the fill: the step, the message rows, the row width and the batches.
+/// - [`Stage::fill`] moves one octet of lanes of `subs` batches of residues into a stage buffer.
+/// - A task fills the stage, then each block of the pass transforms a copy of each batch.
 pub(super) struct Stage<'a> {
     lanes: Lanes<'a>,
     log_step: usize,
     msg_rows: usize,
     row_words: usize,
+    subs: usize,
 }
 
 impl<'a> Stage<'a> {
     /// The stage of a pass whose groups are `2^log_step` rows apart, over `lanes` of `msg_rows` rows each.
-    pub(super) fn new(lanes: Lanes<'a>, log_step: usize, msg_rows: usize, row_words: usize) -> Self {
+    pub(super) fn new(lanes: Lanes<'a>, log_step: usize, msg_rows: usize, row_words: usize, subs: usize) -> Self {
         Self {
             lanes,
             log_step,
             msg_rows,
             row_words,
+            subs,
         }
     }
 
-    /// Transpose one octet of lanes of a batch of [`BATCH`] consecutive residues from `t0` into `stage`.
+    /// Transpose one octet of lanes of `subs` batches of [`BATCH`] consecutive residues from `t0` into `stage`.
     ///
+    /// - `stage` is `subs` stages of one batch each, and batch `u` starts at residue `t0 + u * BATCH`.
+    /// - A row's tiles of all batches go together, so the adjacent lines of one lane block are read together.
     /// - Message row `j` is `msg_rows` words apart per lane block, and word `w` of a row of `row_words` words
     ///   is lane block `row_words - 1 - w` of the message, or zero while `w` is below the padding.
     /// - Residue `t0 + s` takes rows `t0 + s + i * step` for `i < rows`, `step = 2^log_step`.
@@ -122,22 +147,23 @@ impl<'a> Stage<'a> {
             log_step,
             msg_rows,
             row_words,
+            subs,
         } = *self;
         // SAFETY: AVX-512F is enabled at compile time.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         unsafe {
-            fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet)
+            fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, subs)
         }
         // SAFETY: AVX2 is enabled at compile time.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
         unsafe {
-            fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet)
+            fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, subs)
         }
         #[cfg(not(any(
             all(target_arch = "x86_64", target_feature = "avx512f"),
             all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f"))
         )))]
-        fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet);
+        fill_stage_tiles(stage, msg, t0, log_step, msg_rows, n_lanes, row_words, octet, subs);
     }
 }
 
@@ -161,17 +187,22 @@ fn fill_stage_tiles(
     n_lanes: usize,
     row_words: usize,
     octet: usize,
+    subs: usize,
 ) {
-    let rows = stage.len() / (BATCH * 8);
+    let sub_words = stage.len() / subs;
+    let rows = sub_words / (BATCH * 8);
     let pad = row_words - n_lanes;
     // Lane block of line `k` of the tile, which is lane `8 * octet + k`.
     let block = |k: usize| row_words - 1 - (8 * octet + k);
     // The lines of a tile that are padding lanes.
     let pad_lines = (0..8).filter(|k| 8 * octet + k < pad).fold(0u8, |m, k| m | 1 << k);
     for i in 0..rows {
-        // Line `k` of the tile: 8 residues of one lane block, or zeros for a padding lane.
-        let src: [usize; 8] = std::array::from_fn(|k| block(k) * msg_rows + t0 + (i << log_step));
-        fill_tile(stage, i * BATCH, msg, src, pad_lines);
+        for (u, sub) in stage.chunks_exact_mut(sub_words).enumerate() {
+            // Line `k` of the tile: 8 residues of one lane block, or zeros for a padding lane.
+            let j = t0 + u * BATCH + (i << log_step);
+            let src: [usize; 8] = std::array::from_fn(|k| block(k) * msg_rows + j);
+            fill_tile(sub, i * BATCH, msg, src, pad_lines);
+        }
     }
 }
 

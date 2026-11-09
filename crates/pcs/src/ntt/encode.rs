@@ -32,7 +32,7 @@ pub(crate) enum Keep {
 
 /// What an encode kept of its codeword, for [`AdditiveNttF64::rows`] to read rows from.
 ///
-/// Each carries the encode's [`Plan`].
+/// Each but the coset-major one carries the encode's [`Plan`].
 pub(crate) enum Codeword {
     /// All of it.
     Whole(Vec<F64>, Plan),
@@ -40,13 +40,20 @@ pub(crate) enum Codeword {
     BeforeDeep(Vec<F64>, Plan),
     /// No buffer: each row is recomputed from the message of this many lane-major lanes.
     Nothing(Plan, usize),
+    /// No buffer: each row is recomputed, one coset at a time, from this row-major message.
+    Cosets {
+        msg: Vec<F64>,
+        num_ntts: usize,
+        log_inv_rate: usize,
+    },
 }
 
 impl Codeword {
-    /// The plan of the encode.
-    pub(crate) fn plan(&self) -> &Plan {
+    /// Words of the whole codeword, kept or not.
+    pub(crate) fn words(&self) -> usize {
         match self {
-            Self::Whole(_, plan) | Self::BeforeDeep(_, plan) | Self::Nothing(plan, _) => plan,
+            Self::Whole(_, plan) | Self::BeforeDeep(_, plan) | Self::Nothing(plan, _) => plan.words(),
+            Self::Cosets { msg, log_inv_rate, .. } => msg.len() << log_inv_rate,
         }
     }
 }
@@ -97,7 +104,7 @@ impl AdditiveNttF64 {
         let msg_rows = msg.len() / n_lanes;
         assert_eq!(msg.len(), n_lanes * msg_rows, "the message is n_lanes lane blocks");
         let log_d = log2_strict_usize(msg_rows) + log_inv_rate;
-        let by_halves = keep == Keep::Nothing && Plan::new(log_d, num_ntts, log_inv_rate).rebuilds_from_lanes();
+        let by_halves = keep == Keep::Nothing && Plan::new(log_d, num_ntts, log_inv_rate, true).rebuilds_from_lanes();
         let defer_deep = keep != Keep::Whole;
         // The cosets one pass holds: half of them when the opening rebuilds the rows.
         let held = (1usize << log_inv_rate) >> usize::from(by_halves);
@@ -200,7 +207,7 @@ impl AdditiveNttF64 {
         assert!(start <= log_d);
 
         // The plan reads the original message, before a lane-major one is transposed.
-        let plan = Plan::new(log_d, num_ntts, start);
+        let plan = Plan::new(log_d, num_ntts, start, matches!(src, Source::Lanes(_)));
 
         // Phase 1: gathered passes, each at most one L2 group of layers.
         //

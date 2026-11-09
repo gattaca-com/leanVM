@@ -3,6 +3,7 @@
 use primitives::field::F64;
 
 use super::encode::Codeword;
+use super::layers::no_hook;
 use super::plan::Plan;
 use super::scratch::with_scratch;
 use super::source::Lanes;
@@ -78,6 +79,11 @@ impl AdditiveNttF64 {
                 let sub_len = plan.sub_len();
                 self.finished_rows(&plan, positions, |i, _| &built[i * sub_len..][..sub_len])
             }
+            Codeword::Cosets {
+                ref msg,
+                num_ntts,
+                log_inv_rate,
+            } => self.coset_rows(msg, num_ntts, log_inv_rate, positions),
         }
     }
 
@@ -99,7 +105,17 @@ impl AdditiveNttF64 {
         } = *plan;
         built_rows(num_ntts, plan.log_sub(), positions, |i, sub_idx, live, sub| {
             let src = Some(src(i, sub_idx));
-            self.run_layers(sub, src, log_d, num_ntts, deep_start, deep_start, sub_idx, Some(live));
+            self.run_layers(
+                sub,
+                src,
+                log_d,
+                num_ntts,
+                deep_start,
+                deep_start,
+                sub_idx,
+                Some(live),
+                no_hook,
+            );
         })
     }
 }
@@ -150,7 +166,7 @@ impl<'a> Rebuild<'a> {
                 )
             })
             .collect();
-        let stage = Stage::new(lanes, log_step, msg_rows, num_ntts);
+        let stage = Stage::new(lanes, log_step, msg_rows, num_ntts, 1);
         Self {
             plan: *plan,
             stage,
@@ -194,6 +210,7 @@ impl<'a> Rebuild<'a> {
                                 start,
                                 *coset,
                                 live_rows,
+                                no_hook,
                             );
                             for (pos, &i) in run.clone().zip(live) {
                                 for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8]

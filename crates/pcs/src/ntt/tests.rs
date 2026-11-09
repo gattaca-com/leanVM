@@ -327,3 +327,42 @@ fn deferred_deep_rows_match_the_full_encode() {
     }
     assert!(splits > 0, "some shape plans a deferred deep pass");
 }
+
+/// The coset-major encode's handed-over rows, and the rows rebuilt from the message, equal the full encode's.
+#[test]
+fn coset_rows_match_the_full_encode() {
+    let mut rng = Rng::new(0xC05E7);
+    // Cover shared scratch and a coset occupying the scratch grouping budget on every target.
+    let large = primitives::log2_strict_usize(super::plan::L2_WORDS);
+    for (log_rows, lanes, log_inv_rate) in [
+        (5usize, 48usize, 6usize),
+        (9, 24, 4),
+        (7, 3, 3),
+        (6, 8, 1),
+        (large, 1, 1),
+    ] {
+        let log_d = log_rows + log_inv_rate;
+        let ntt = AdditiveNttF64::standard(log_d + 1);
+        let msg: Vec<F64> = (0..lanes << log_rows).map(|_| F64(rng.next_u64())).collect();
+        let mut want = vec![F64::ZERO; msg.len() << log_inv_rate];
+        want[..msg.len()].copy_from_slice(&msg);
+        ntt.encode_interleaved_in_place(&mut want, lanes, log_inv_rate);
+
+        let mut handed = vec![F64::ZERO; want.len()];
+        let codeword = ntt.encode_cosets(msg, lanes, log_inv_rate, &sink_into(&mut handed, lanes));
+        assert_eq!(handed, want, "handed-over rows, log_rows={log_rows}, lanes={lanes}");
+        // Repeated positions included.
+        let mut positions: Vec<usize> = (0..60).map(|_| rng.next_u64() as usize % (1 << log_d)).collect();
+        positions.extend([0, (1 << log_rows) - 1, 1 << log_rows, (1 << log_d) - 1]);
+        positions.extend_from_within(..5);
+        positions.sort_unstable();
+        let rows = ntt.rows(&codeword, &[], &positions);
+        for (&q, row) in positions.iter().zip(rows.chunks_exact(lanes)) {
+            assert_eq!(
+                row[..],
+                want[q * lanes..][..lanes],
+                "row {q}, log_rows={log_rows}, lanes={lanes}"
+            );
+        }
+    }
+}
