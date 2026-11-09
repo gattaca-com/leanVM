@@ -102,6 +102,18 @@ pub struct ProverData {
 ///   the commit keeps none and encodes half of the cosets at a time; otherwise it keeps them as below.
 const KEEP_CODEWORD_MAX_BYTES: usize = 1 << 30;
 
+/// Pool size from which an encode leaves rows out of its codeword where [`primitives::REBUILD_OVER_STORE`].
+///
+/// - Leaving rows out saves a DRAM write of the codeword, against a transform per opened sub-block.
+/// - One worker alone is ALU-bound, and deferring costs it 2.5 %.
+/// - From two workers on, nodes share DRAM: 4 concurrent 8:1 nodes on 2 threads each go 3.5-3.7 s -> 3.0 s.
+const DEFER_MIN_THREADS: usize = 2;
+
+/// Whether an encode leaves rows out of its codeword, see [`DEFER_MIN_THREADS`].
+fn defers() -> bool {
+    primitives::REBUILD_OVER_STORE && parallel::num_threads() >= DEFER_MIN_THREADS
+}
+
 /// Commit to the `F64` message of a `2^log_n`-word witness: the message is its
 /// leading `n_lanes` lane blocks of `2^(log_n - log_batch_size)` words each, one
 /// RS codeword per lane, Merkle-committed one leaf per codeword position, the
@@ -144,8 +156,10 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
                 Keep::Whole
             } else if n_positions * row_words * size_of::<F64>() > KEEP_CODEWORD_MAX_BYTES {
                 Keep::Nothing
-            } else {
+            } else if defers() {
                 Keep::BeforeDeep
+            } else {
+                Keep::Whole
             };
             ntt.encode_lane_major(message, n_lanes, row_words, log_inv_rate, keep, &on_rows)
         });
@@ -167,6 +181,7 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
 /// `num_interleaved` lanes, one Merkle leaf of `num_interleaved * 24` bytes.
 ///
 /// A codeword kept before its deep layers has them finished on the rows a query opens.
+/// A coset-major one keeps only the message, and rebuilds the cosets a query opens.
 pub(crate) struct LigeroWitness {
     ntt: AdditiveNttF64,
     codeword: Codeword,
@@ -233,8 +248,11 @@ pub(crate) fn ligero_commit_ext(
     )
     .in_scope(|| {
         let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
-        let defer_deep = primitives::REBUILD_OVER_STORE;
-        ntt.encode_interleaved_with(words(poly), row_words, log_inv_rate, defer_deep, &on_rows)
+        if defers() && AdditiveNttF64::encodes_by_coset(3 * poly.len()) {
+            ntt.encode_cosets(words(poly).to_vec(), row_words, log_inv_rate, &on_rows)
+        } else {
+            ntt.encode_interleaved_with(words(poly), row_words, log_inv_rate, defers(), &on_rows)
+        }
     });
     let tree = tracing::info_span!("Merkle").in_scope(|| builder.finish());
 
@@ -660,7 +678,8 @@ fn lane_sums<'a, const DELTA: bool>(
     out: &mut [F192],
     lanes: impl Iterator<Item = (F192, &'a [F64], &'a [F64], &'a [F64])> + Clone,
 ) {
-    const CHUNK: usize = 64;
+    // 256 outputs: their accumulators and each lane's inputs stay together in L1.
+    const CHUNK: usize = 32;
     for (k, out) in out.as_chunks_mut::<8>().0.chunks_mut(CHUNK).enumerate() {
         let mut acc = [Prod8::ZERO; CHUNK];
         for (w, cur, prev, next) in lanes.clone() {
@@ -1041,7 +1060,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         n_lanes >= 1 && n_lanes <= num_interleaved_0,
         "at most 2^initial_k lanes"
     );
-    assert_eq!(prover_data.codeword.plan().words(), block_len_0 * prover_data.row_words);
+    assert_eq!(prover_data.codeword.words(), block_len_0 * prover_data.row_words);
     assert!((n_lanes..=num_interleaved_0).contains(&prover_data.row_words));
 
     // Nothing is absorbed on entry. The commitment was bound by the `add_root` that

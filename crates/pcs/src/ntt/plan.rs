@@ -10,6 +10,7 @@ use super::stage::LOG_BATCH;
 /// - The near layers `deep_start..log_d` run as one deep pass over L2-sized sub-blocks.
 /// - It holds numbers only and is `Copy`, so an encode can keep it to read rows back.
 /// - [`AdditiveNttF64::rows`](super::AdditiveNttF64::rows) rebuilds a row from it, so it must come from the same pool size as the encode.
+/// - Its L2 budget, and so its layers' split, depends on the pool size: see [`l2_words`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Plan {
     pub(super) log_d: usize,
@@ -22,15 +23,16 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    /// The plan of an encode from layer `start`.
-    pub(super) fn new(log_d: usize, num_ntts: usize, start: usize) -> Self {
-        let deep_start = deep_start(log_d, num_ntts, start);
+    /// The plan of an encode from layer `start`, of a lane-major message or not, see [`l2_words`].
+    pub(super) fn new(log_d: usize, num_ntts: usize, start: usize, lane_major: bool) -> Self {
+        let l2_words = l2_words(lane_major);
+        let deep_start = deep_start(log_d, num_ntts, start, l2_words);
         Self {
             log_d,
             num_ntts,
             start,
             deep_start,
-            max_g: fit(L2_WORDS, num_ntts),
+            max_g: fit(l2_words, num_ntts),
         }
     }
 
@@ -131,11 +133,11 @@ fn par_log(log_d: usize) -> usize {
 ///
 /// - If every layer fits one L3 sub-block, the deep pass is the whole transform: one sweep.
 /// - Otherwise the deep pass keeps one L2 sub-block of layers.
-fn deep_start(log_d: usize, num_ntts: usize, start: usize) -> usize {
+fn deep_start(log_d: usize, num_ntts: usize, start: usize, l2_words: usize) -> usize {
     let deep = if log_d - start <= fit(L3_WORDS, num_ntts) {
         fit(L3_WORDS, num_ntts)
     } else {
-        fit(L2_WORDS, num_ntts)
+        fit(l2_words, num_ntts)
     };
     log_d.saturating_sub(deep).max(par_log(log_d)).max(start)
 }
@@ -145,6 +147,7 @@ fn deep_start(log_d: usize, num_ntts: usize, start: usize) -> usize {
 /// # Why this value
 ///
 /// - 2^17 words is 1 MiB, a whole Zen 5 L2.
+/// - Two SMT threads then spill each other's units into L3, which costs far less than a DRAM sweep.
 /// - At 51 lanes it plans one gathered pass plus the deep pass, where 2^16 words planned two plus one.
 ///
 /// # On Apple silicon
@@ -157,6 +160,27 @@ fn deep_start(log_d: usize, num_ntts: usize, start: usize) -> usize {
 pub(super) const L2_WORDS: usize = 1 << 17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub(super) const L2_WORDS: usize = 1 << 21;
+
+/// [`L2_WORDS`], or less for an encode that has no lane-major message on a pool of at most 4 threads.
+///
+/// # Why the smaller value
+///
+/// - 2^15 words is 256 KiB: a deep sub-block of 2^9 rows of 48 words is 192 KiB.
+/// - One thread per core owns its whole 1 MiB L2. The sub-block leaves room for the twiddles and the next sub-block.
+/// - The plan then has one more gathered layer and fewer deep ones.
+/// - Measured on the 8:1 extension encode of 2^22 words at 4 threads: 130 -> 123 ms.
+/// - 2^14 words plans a second gathered pass and costs 184 ms.
+/// - The lane-major base encode keeps [`L2_WORDS`]: 2^16 words plans a second gathered pass there and costs 40 %.
+/// - Larger pools keep [`L2_WORDS`]: their nodes share the L3 and the SMT threads share an L2.
+/// - Apple silicon keeps [`L2_WORDS`] whatever the plan.
+fn l2_words(lane_major: bool) -> usize {
+    let few_threads = !lane_major && parallel::num_threads() <= 4;
+    if few_threads && !cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        1 << 15
+    } else {
+        L2_WORDS
+    }
+}
 
 /// Deep sub-blocks cut per worker, as a log.
 ///
