@@ -25,7 +25,6 @@ pub mod hints;
 mod isa;
 pub mod layout;
 mod trace;
-pub(crate) use execute::Cell;
 pub use execute::{ExecError, Execution, Fault, Memory};
 pub use isa::{DerefMode, Op, OutCells};
 pub use layout::*;
@@ -107,6 +106,9 @@ pub struct Program {
     /// run the program. Public verification ([`verify`]) ignores them.
     pub(crate) hints: HashMap<u32, Vec<hints::RHint>>,
     pub(crate) main_frame: u32,
+    /// The largest operand offset in `prog`, so that every instruction access of a run is
+    /// within the cells it bounds. Same trust as `fiat_shamir_iv`.
+    pub(crate) max_offset: usize,
     /// Named prover witness streams for the program's `hint_witness` calls
     /// ([`Program::set_witness`]): a stream is a sequence of *entries* (one
     /// slice of values per `hint_witness` call; the same symbol may be
@@ -156,6 +158,7 @@ impl Program {
                 .finalize()
         };
         Self {
+            max_offset: prog.iter().map(Op::max_offset).max().unwrap_or(0) as usize,
             prog,
             fiat_shamir_iv,
             bytecode_columns,
@@ -427,14 +430,55 @@ impl Stats {
 /// run [`Stats`], or why no proof was made ([`ProveError`]). `log_inv_rate`
 /// selects the PCS rate and is announced in the Fiat-Shamir transcript before
 /// the commitment.
+///
+/// The g-power table comes from a process-wide pool and goes back to it. A process that proves
+/// again skips its growth and sizes its reservations from the last proof. A proof running beside
+/// another takes a fresh table.
 #[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
 pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
+    static POOL: std::sync::Mutex<Vec<hints::GPow>> = std::sync::Mutex::new(Vec::new());
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
-    let (exec, keccak_blocks) = crate::stage!("Execute program", || {
-        crate::keccak::while_executing(|step| program.execute_with(public_input, step))
+    let gpow = POOL.lock().ok().and_then(|mut pool| pool.pop());
+    let gpow = gpow.unwrap_or_else(|| hints::GPow::new(0));
+    // The last proof's committed size, or else an estimate from the table and the bytecode.
+    // An underestimate only leaves some pages for the exact reservation below to fault in.
+    let reserve_mu = if gpow.last_mu > 0 {
+        gpow.last_mu
+    } else {
+        let log_bytecode = crate::log2_strict_usize(program.prog.len());
+        let log_mem = crate::log2_ceil_usize(gpow.powers().len());
+        (layout::committed_log(log_mem, log_bytecode, [0; tables::N_TABLES]) + 1)
+            .max(program.min_log_committed)
+            .clamp(pcs::MIN_MU, pcs::MAX_MU)
+    };
+    // Allocated on the proving thread, so its later buffers use the same allocator arena.
+    let mut reserve = if parallel::num_threads() > 1 {
+        pcs::reserve_level1(reserve_mu, log_inv_rate)
+    } else {
+        Vec::new()
+    };
+    let prefault = tracing::info_span!("Pre-fault");
+    let (exec, keccak_blocks) = std::thread::scope(|scope| {
+        if reserve.capacity() != 0 {
+            // A single helper faults the reservation in and leaves the cores to execution and the Keccak workers.
+            scope.spawn(|| {
+                let _span = prefault.enter();
+                let pages = reserve.spare_capacity_mut();
+                for page in pages.iter_mut().step_by(4096) {
+                    page.write(0);
+                }
+                if let Some(last) = pages.last_mut() {
+                    last.write(0);
+                }
+            });
+        }
+        crate::stage!("Execute program", || {
+            crate::keccak::while_executing(|step| program.execute_with(public_input, gpow, step))
+        })
     });
+    drop(reserve);
     let exec = exec.map_err(ProveError::Execution)?;
     // A live value that came from outside the constraint system would make the proof
     // about a weaker statement than the program text, so it is refused here, on the one
@@ -444,12 +488,16 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     }
     let cycles = exec.cycles;
     let mut w = crate::stage!("Build witness", || program.build(&exec, keccak_blocks));
-    let mem_used = exec.mem_used;
-    drop(exec);
+    // The rest of the execution goes here; its g-power table goes back to the pool.
+    let Execution { mem_used, mut gpow, .. } = exec;
     if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&w.layout.shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
             log_committed: w.layout.shape.mu,
         });
+    }
+    gpow.last_mu = w.layout.shape.mu;
+    if let Ok(mut pool) = POOL.lock() {
+        pool.push(gpow);
     }
     let committed_size = w.committed_size();
     // The public statement (program digest + input) seeds the transcript, so
@@ -465,6 +513,8 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
 
     // Announce the prover's sizes, then commit, before sampling any challenge.
     announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
+    // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
+    drop(pcs::reserve_level1(w.layout.shape.mu, log_inv_rate));
     let committed = crate::stage!("Commit", || {
         pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
     });

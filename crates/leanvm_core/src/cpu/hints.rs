@@ -40,10 +40,13 @@ pub struct GPow {
     announced: usize,
     /// The same for every multiple `k` of `STRIDE` that `pow` covers.
     coarse: Vec<u32>,
+    /// The committed size of the last proof that used this table, as a base-2 logarithm, 0 before any.
+    /// The next proof sizes its reservations from it.
+    pub(crate) last_mu: usize,
 }
 
 /// Spacing of the coarse index, and so the most probes a missed lookup costs.
-const STRIDE: usize = 64;
+const STRIDE: usize = 16;
 
 impl GPow {
     /// Seeded with `g^0 = 1`, grown to cover index `upto`, nothing announced.
@@ -53,6 +56,7 @@ impl GPow {
             index: vec![0; 1 << 13],
             announced: 0,
             coarse: Vec::new(),
+            last_mu: 0,
         };
         g.extend(upto);
         g
@@ -76,8 +80,8 @@ impl GPow {
     }
 
     /// The forward table, `g^0` to `g^{covered - 1}`.
-    pub(crate) fn into_powers(self) -> Vec<F64> {
-        self.pow
+    pub(crate) fn powers(&self) -> &[F64] {
+        &self.pow
     }
 
     /// Extend the forward table to cover index `upto`.
@@ -120,9 +124,6 @@ impl GPow {
     /// is about to store it in memory as an address. Covers `k` first. Idempotent.
     pub fn note(&mut self, k: usize) {
         self.grow_to(k);
-        if find(&self.index, &self.pow, self.pow[k]).is_some() {
-            return;
-        }
         if 2 * (self.announced + 1) > self.index.len() {
             let wider = vec![0; 2 * self.index.len()];
             let old = std::mem::replace(&mut self.index, wider);
@@ -130,7 +131,16 @@ impl GPow {
                 insert(&mut self.index, self.pow[e as usize - 1], e as usize - 1);
             }
         }
-        insert(&mut self.index, self.pow[k], k);
+        // Exponents are distinct (`g` has order `2^64 − 1`), so one probe walk finds `k` or its free slot.
+        let mask = self.index.len() - 1;
+        let mut i = slot_of(self.pow[k].0, mask);
+        while self.index[i] != 0 {
+            if self.index[i] as usize == k + 1 {
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+        self.index[i] = k as u32 + 1;
         self.announced += 1;
     }
 
@@ -188,6 +198,39 @@ fn insert(table: &mut [u32], key: F64, k: usize) {
         i = (i + 1) & mask;
     }
     table[i] = k as u32 + 1;
+}
+
+/// Build the baby-step table of [`bounded_dlog`] before a timed region.
+pub(crate) fn setup() {
+    bounded_dlog(F64::ONE, 0);
+}
+
+/// Bounded discrete log for `hint_decompose_bits_exponent`: find n < 2^nbits
+/// with g^n = x, by baby-step giant-step (baby table g^j for j < 2^17,
+/// built once per process; giant step ×g^(-2^17)). Prover-side only: the
+/// guest re-verifies the hinted bits in-circuit.
+pub(super) fn bounded_dlog(x: F64, nbits: u32) -> Option<u128> {
+    const LOG_BABY: u32 = 17;
+    static TABLE: std::sync::OnceLock<(GPow, F64)> = std::sync::OnceLock::new();
+    let (baby, giant) = TABLE.get_or_init(|| {
+        let baby = GPow::dense((1usize << LOG_BABY) - 1);
+        // g^(2^17), one past the table; its inverse is the giant step.
+        let giant = mul_by_g(baby.pow((1usize << LOG_BABY) - 1)).inv();
+        (baby, giant)
+    });
+    let mut y = x;
+    let max_giant = if nbits > LOG_BABY {
+        1u64 << (nbits - LOG_BABY)
+    } else {
+        1
+    };
+    for a in 0..max_giant {
+        if let Some(j) = baby.lookup(y) {
+            return Some((a as u128) << LOG_BABY | j as u128);
+        }
+        y *= *giant;
+    }
+    None
 }
 
 /// The inverse of [`mul_by_g`]: bit 0 of its output says whether it folded.

@@ -26,7 +26,7 @@
 //! ingredient is sampled from `E`.
 
 use crate::transcript::ProverState;
-use primitives::field::F64;
+use primitives::field::{F64, F192};
 
 use ::pcs::stack_open::open_batch_mixed_whir_stacked;
 pub use ::pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim as SlotClaim};
@@ -49,6 +49,15 @@ const _: () = assert!(::pcs::whir::SECURITY_BITS == crate::SECURITY_BITS as usiz
 pub const MIN_MU: usize = 15;
 /// Largest committed size accepted by all verifiers and compiled into the recursion guest.
 pub const MAX_MU: usize = 28;
+
+/// Build the configurations for every supported witness size and PCS rate.
+pub(crate) fn setup() {
+    for rate in MIN_LOG_INV_RATE..=MAX_LOG_INV_RATE {
+        for mu in MIN_MU..=MAX_MU {
+            whir_config(mu, rate);
+        }
+    }
+}
 
 /// The shared WHIR config for a `2^μ`-word witness, memoized per `(μ, log_inv_rate)`.
 fn whir_config(mu: usize, log_inv_rate: usize) -> std::sync::Arc<ProverConfig> {
@@ -115,6 +124,20 @@ pub fn commit(
         mu,
         log_inv_rate,
     }
+}
+
+/// Reserve one extent the size of the level-1 commit's codeword and Merkle tree, the largest buffers
+/// of an opening. The bus's transients are carved from it and coalesce back when freed.
+/// The codeword then reuses their pages instead of mapping fresh ones.
+///
+/// That holds for an allocator that keeps freed extents (jemalloc with `dirty_decay_ms:-1`).
+/// One that unmaps on free (glibc) just maps and unmaps. A failed allocation is ignored.
+pub fn reserve_level1(mu: usize, log_inv_rate: usize) -> Vec<u8> {
+    let shapes = whir_config(mu, log_inv_rate).level_shapes(mu);
+    let bytes = shapes.block_len[1] * ((size_of::<F192>() << shapes.ks[1]) + 2 * size_of::<::pcs::merkle::Hash>());
+    let mut v = Vec::new();
+    let _ = v.try_reserve_exact(bytes);
+    v
 }
 
 // The batching challenges are just `sample()`d inside the stacked opener: every

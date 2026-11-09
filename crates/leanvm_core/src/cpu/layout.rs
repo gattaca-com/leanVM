@@ -519,18 +519,12 @@ impl Program {
         // The trace was emitted in the same walk as the memory image (no re-walk).
         let tr = &exec.trace;
         let cells = exec.mem.len();
-        let bytecode_size = self.prog.len();
         let log_mem = crate::log2_strict_usize(cells);
 
         let sch = schema();
-        // g^0..g^{span-1}, so every pc/frame/operand/count fill is an O(1) lookup instead
-        // of an O(log) power: a frame base or an operand is below the cells the run used.
-        // The run's own table covers them unless a count outgrew it.
-        let span = exec.mem_used.max(bytecode_size).max(tr.counts);
-        let gpow = match exec.gpow.get(..span) {
-            Some(gpow) => std::borrow::Cow::Borrowed(gpow),
-            None => std::borrow::Cow::Owned(primitives::field::g_powers(span)),
-        };
+        // g^0.., so every pc/frame/operand/count fill is an O(1) lookup instead of an
+        // O(log) power: the run's own table covers every one.
+        let gpow = exec.gpow.powers();
 
         // The public layout (flush/count blocks, placements, boundary, taus) is a pure
         // function of the program + announced sizes + public input, with no committed
@@ -583,7 +577,7 @@ impl Program {
         crate::stage!("Fill columns", || {
             for (t, table) in tables::tables().iter().enumerate() {
                 let (base, n) = (sch.base[t], table.n_committed_columns());
-                let ctx = FillCtx::new(tr, &exec.mem, &gpow, &self.prog, 1 << l.taus[t], table.padding());
+                let ctx = FillCtx::new(tr, &exec.mem, gpow, &self.prog, 1 << l.taus[t], table.padding());
                 tables::fill_table(*table, &ctx, &mut windows[base..base + n]);
             }
             // Shared columns. The 192-bit memory image splits into three K-limbs.
@@ -595,26 +589,24 @@ impl Program {
             // cache line of each at a time: nothing reads them before the commitment.
             const LINE: usize = 8;
             const BLOCK: usize = 1 << 10;
-            let page_log = Memory::page_log();
+            let written = exec.mem.cells(BLOCK);
             let image = [MEM_LO, MEM_HI, MEM_TOP, MFCNT].map(|c| {
                 assert_eq!(windows[c].len(), cells, "a memory column spans the image");
                 parallel::SendPtr(windows[c].as_mut_ptr())
             });
+            // A cell past the written ones is unwritten and never accessed.
+            let unwritten = [F64::ZERO, F64::ZERO, F64::ZERO, gpow[0]].map(|v| [v; LINE]);
             parallel::for_each_chunk(cells / BLOCK, |first, end| {
                 let stream = primitives::stream::Stream::new();
                 for b in first..end {
                     let at = b * BLOCK;
-                    let page = exec.mem.page(at >> page_log);
                     for line in (at..at + BLOCK).step_by(LINE) {
-                        let mut buf = [[F64::ZERO; LINE]; 4];
-                        for j in 0..LINE {
-                            let i = line + j;
-                            let cell = page.map_or(&Cell::UNWRITTEN, |p| &p[i & ((1 << page_log) - 1)]);
+                        let mut buf = unwritten;
+                        for (j, cell) in written.get(line..line + LINE).into_iter().flatten().enumerate() {
                             // counts ended at g^{A[i]}
-                            let values = cell.word.to_limbs().map(F64);
-                            buf[0][j] = values[0];
-                            buf[1][j] = values[1];
-                            buf[2][j] = values[2];
+                            buf[0][j] = F64(cell.word.c0);
+                            buf[1][j] = F64(cell.word.c1);
+                            buf[2][j] = F64(cell.word.c2);
                             buf[3][j] = gpow[cell.count as usize];
                         }
                         for (column, values) in image.iter().zip(&buf) {

@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use super::hints::MAX_CELLS;
+use super::hints::{GPow, MAX_CELLS, bounded_dlog};
 use super::*;
 use primitives::{
-    field::{F64, F192, mul_by_g},
+    field::{F64, F192},
     pretty_f64, pretty_integer,
 };
 
@@ -28,8 +28,9 @@ pub struct Execution {
     /// and an arithmetic back-solve writes its operand before reading it.
     pub unconstrained_reads: Vec<u32>,
     pub(crate) trace: Trace, // rows + final access-count columns, emitted in the same walk
-    /// `g^0, g^1, ..` as far as the run indexed them: every pc, frame base and cell it reached.
-    pub(crate) gpow: Vec<F64>,
+    /// `g^0, g^1, ..` as far as the run indexed them: every pc, frame base and cell it
+    /// reached, and the counts. The fill reads it, and [`prove`](super::prove) keeps it for the next run.
+    pub(crate) gpow: GPow,
 }
 
 impl Execution {
@@ -39,11 +40,9 @@ impl Execution {
     }
 }
 
-/// `log2` of the cells a [`Memory`] page holds.
-const PAGE_LOG: usize = 16;
-const PAGE: usize = 1 << PAGE_LOG;
-// The padded image is a whole number of pages.
-const _: () = assert!(PAGE_LOG <= MIN_LOG_MEM);
+/// Cells of address space a run reserves: a frame base or `DEREF` base below `MAX_CELLS`
+/// plus an operand offset below `MAX_CELLS` (checked at the start of a run).
+const LIMIT: usize = 2 * MAX_CELLS as usize;
 
 /// A cell's write state. A cell not `Written` holds ZERO; a `DEREF` between two
 /// unwritten cells links them, and a write to either reaches the other at once.
@@ -66,19 +65,47 @@ pub(crate) struct Cell {
     state: State,
 }
 
-impl Cell {
-    pub(crate) const UNWRITTEN: Self = Self {
-        word: F192::ZERO,
-        count: 0,
-        state: State::Unwritten,
-    };
+/// The cells of a run: one reserved, lazily faulted array of `LIMIT` cells, so that
+/// an access is one address computation and the image never moves. All zero is the
+/// unwritten cell, which is what untouched pages hold.
+pub(crate) struct Cells(&'static mut [Cell; LIMIT]);
+
+impl Cells {
+    fn reserve() -> Option<Self> {
+        let bytes = LIMIT * std::mem::size_of::<Cell>();
+        // SAFETY: an anonymous private mapping; failure is checked.
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            (p != libc::MAP_FAILED).then(|| {
+                // Huge pages are a hint: a failure only costs speed. macOS has no such advice.
+                #[cfg(target_os = "linux")]
+                libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+                // The mapping is page-aligned, zeroed, and unmapped only by `drop`, which consumes the borrow.
+                Self(&mut *p.cast())
+            })
+        }
+    }
 }
 
-/// The write-once data memory: `len` cells, a power of two, in pages, so that the
-/// image grows without moving what it holds. Cells past the last page are unwritten
-/// and never accessed.
+impl Drop for Cells {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `reserve` made, unmapped once.
+        unsafe { libc::munmap(std::ptr::from_mut(self.0).cast(), LIMIT * std::mem::size_of::<Cell>()) };
+    }
+}
+
+/// The write-once data memory: `len` cells, a power of two, of which the first `used`
+/// can be written; the rest are unwritten and never accessed.
 pub struct Memory {
-    pages: Vec<Box<[Cell]>>,
+    cells: Cells,
+    used: usize,
     len: usize,
 }
 
@@ -94,16 +121,16 @@ impl Memory {
 
     /// The word in cell `i`.
     pub fn word(&self, i: usize) -> F192 {
-        self.page(i >> PAGE_LOG).map_or(F192::ZERO, |p| p[i & (PAGE - 1)].word)
+        if i < self.used {
+            self.cells.0[i].word
+        } else {
+            F192::ZERO
+        }
     }
 
-    /// Page `p`'s cells, `None` past the last one.
-    pub(crate) fn page(&self, p: usize) -> Option<&[Cell]> {
-        self.pages.get(p).map(|p| &p[..])
-    }
-
-    pub(crate) fn page_log() -> usize {
-        PAGE_LOG
+    /// The cells up to the last one used, rounded up to a multiple of `to`.
+    pub(crate) fn cells(&self, to: usize) -> &[Cell] {
+        &self.cells.0[..self.used.next_multiple_of(to).min(LIMIT)]
     }
 }
 
@@ -261,31 +288,43 @@ impl Program {
     /// Compilation yields the `Program`; executing it (here) and proving it are
     /// separate later phases.
     pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
-        self.execute_with(public_input, &mut |_| {})
+        self.execute_with(public_input, GPow::new(0), &mut |_| {})
     }
 
-    /// [`Self::execute`], handing `keccak_step` the lanes each `KECCAK` row reads, in row order
-    /// and as the row runs.
+    /// [`Self::execute`] starting from `gpow`, a table an earlier run left. The table
+    /// is a function of the exponent alone and announcing more only widens its index,
+    /// so a run that starts from one skips growing and announcing it again.
+    /// `keccak_step` gets the lanes each `KECCAK` row reads, in row order and as the row runs.
     pub(crate) fn execute_with(
         &self,
         public_input: [F192; 2],
+        gpow: GPow,
         keccak_step: &mut dyn FnMut(&[u64; primitives::hash::STATE_LANES]),
     ) -> Result<Execution, ExecError> {
-        use super::hints::{BitsDest, GPow, RHint};
+        use super::hints::{BitsDest, RHint};
 
         let ending_pc = (self.prog.len() - 1) as u32; // last bytecode slot, g^{B-1}
 
-        // g^j, covering the pcs and return targets, the main frame and the range-check
-        // floor, then grown by each reservation, and its reverse index g^j ↦ j.
+        // g^j and its reverse index g^j ↦ j, covering the pcs and return targets, the
+        // main frame and the range-check floor, then grown by each reservation.
+        // A frame base is itself an exponent read from this table, so a step needs
+        // no coverage check of its own.
         let seed = (self.prog.len() + 2)
             .max(self.main_frame as usize)
             .max(1 << MIN_LOG_MEM);
-        let mut g = GPow::new(seed);
+        let mut g = gpow;
+        g.grow_to(seed);
+
+        // `max_offset` bounds every instruction access within `LIMIT`.
+        let max_off = self.max_offset + 1;
+        if max_off >= MAX_CELLS as usize - 2 || seed >= MAX_CELLS as usize {
+            return Err(ExecError::new(self, 0, Fault::OutOfMemory));
+        }
 
         // The write-once data memory, each cell's access count and write state with its word.
         let n0 = self.main_frame.max(2) as usize;
         let mut m = Mem {
-            pages: Vec::new(),
+            cells: Cells::reserve().ok_or_else(|| ExecError::new(self, 0, Fault::OutOfMemory))?,
             used: 0,
             counts: 0,
             links: HashMap::new(),
@@ -348,12 +387,13 @@ impl Program {
         let mut jump: Rows<Jrow> = Rows::new();
         let mut keccak: Rows<Krow> = Rows::new();
 
-        // The memory's pages, grown as the run reaches them. Every method on the hot
-        // path is `#[inline(always)]`: they sit in the interpreter's opcode loop.
+        // The memory's cells. Every method on the hot path is `#[inline(always)]`: they
+        // sit in the interpreter's opcode loop. The instructions' accesses are unchecked:
+        // a base is below `MAX_CELLS` and an offset is below the bound checked above.
         struct Mem<'a> {
-            pages: Vec<Box<[Cell]>>,
-            /// One past the highest cell accessed or reserved: every cell below it is
-            /// in a page.
+            cells: Cells,
+            /// One past the highest cell a hint or a store reached or the run reserved.
+            /// Instruction reads and counts do not move it: the end of the run scans for those.
             used: usize,
             /// The highest access count any cell reached.
             counts: u32,
@@ -372,34 +412,23 @@ impl Program {
             dbg_hint: Option<&'static str>,
         }
         impl Mem<'_> {
-            // Cover cell `idx`. All accessed cells satisfy cell < next_free after
-            // their frame's allocation, so this only ever extends.
+            // Cover cell `idx` for a store.
             #[inline(always)]
             fn ensure(&mut self, idx: usize) {
                 if idx >= self.used {
-                    self.grow(idx);
+                    assert!(idx < LIMIT, "address space overflow (program too large)");
+                    self.used = idx + 1;
                 }
             }
-            #[cold]
-            #[inline(never)]
-            fn grow(&mut self, idx: usize) {
-                self.used = idx + 1;
-                while self.pages.len() <= idx >> PAGE_LOG {
-                    // SAFETY: all zero is a valid `Cell`, the unwritten one.
-                    self.pages
-                        .push(unsafe { Box::<[Cell]>::new_zeroed_slice(PAGE).assume_init() });
-                }
-            }
-            /// Cell `c`, which `ensure` has covered.
+            /// Cell `c`, below `LIMIT`.
             #[inline(always)]
             fn at(&mut self, c: u32) -> &mut Cell {
-                let c = c as usize;
-                &mut self.pages[c >> PAGE_LOG][c & (PAGE - 1)]
+                debug_assert!((c as usize) < LIMIT);
+                &mut self.cells.0[c as usize]
             }
             #[inline(always)]
             fn covered(&self, c: u32) -> Option<&Cell> {
-                let c = c as usize;
-                (c < self.used).then(|| &self.pages[c >> PAGE_LOG][c & (PAGE - 1)])
+                self.cells.0.get(c as usize)
             }
             #[inline(always)]
             fn written(&self, cell: u32) -> bool {
@@ -415,7 +444,6 @@ impl Program {
             // there: the row is filled from the final image, which has to agree.
             #[inline(always)]
             fn read(&mut self, cell: u32) -> F192 {
-                self.ensure(cell as usize);
                 let c = self.at(cell);
                 let word = c.word;
                 if c.state != State::Written {
@@ -427,15 +455,15 @@ impl Program {
             // Write-once store, carried to every cell linked to this one.
             #[inline(always)]
             fn put(&mut self, cell: u32, v: F192) -> Result<(), ExecError> {
+                self.ensure(cell as usize);
                 if self.store(cell, v)? {
                     self.spread(cell, v)?;
                 }
                 Ok(())
             }
-            // `put` on one cell; whether it was linked.
+            // `put` on one cell, which is covered; whether it was linked.
             #[inline(always)]
             fn store(&mut self, cell: u32, v: F192) -> Result<bool, ExecError> {
-                self.ensure(cell as usize);
                 let c = self.at(cell);
                 let s = c.state;
                 if s == State::Written && c.word != v {
@@ -481,42 +509,30 @@ impl Program {
             // exponent. A run makes fewer than `2^32` accesses in all, so it cannot wrap.
             #[inline(always)]
             fn bump_access_count(&mut self, cell: u32) -> u32 {
-                self.ensure(cell as usize);
                 let c = self.at(cell);
                 let count = c.count;
                 c.count = count + 1;
                 self.counts = self.counts.max(count + 1);
                 count
             }
-        }
-        // Bounded discrete log for `hint_decompose_bits_exponent`: find n < 2^nbits
-        // with g^n = x, by baby-step giant-step (baby table g^j for j < 2^17,
-        // built once per process; giant step ×g^(-2^17)). Prover-side only: the
-        // guest re-verifies the hinted bits in-circuit.
-        fn bounded_dlog(x: F64, nbits: u32) -> Option<u128> {
-            const LOG_BABY: u32 = 17;
-            static TABLE: std::sync::OnceLock<(GPow, F64)> = std::sync::OnceLock::new();
-            let (baby, giant) = TABLE.get_or_init(|| {
-                let baby = GPow::dense((1usize << LOG_BABY) - 1);
-                // g^(2^17), one past the table; its inverse is the giant step.
-                let giant = mul_by_g(baby.pow((1usize << LOG_BABY) - 1)).inv();
-                (baby, giant)
-            });
-            let mut y = x;
-            let max_giant = if nbits > LOG_BABY {
-                1u64 << (nbits - LOG_BABY)
-            } else {
-                1
-            };
-            for a in 0..max_giant {
-                if let Some(j) = baby.lookup(y) {
-                    return Some((a as u128) << LOG_BABY | j as u128);
-                }
-                y *= *giant;
+            // `read`, then the cell's access count: the word and the count before it.
+            // Counts advance in the order the cells are listed, as the flushes do.
+            #[inline(always)]
+            fn read_counted(&mut self, cell: u32) -> (F192, u32) {
+                let word = self.read(cell);
+                (word, self.bump_access_count(cell))
             }
-            None
+            // `put`, then the cell's access count.
+            #[inline(always)]
+            fn put_counted(&mut self, cell: u32, v: F192) -> Result<u32, ExecError> {
+                let linked = self.store(cell, v)?;
+                let count = self.bump_access_count(cell);
+                if linked {
+                    self.spread(cell, v)?;
+                }
+                Ok(count)
+            }
         }
-
         // A runtime count (a loop's frame span, a `HeapBuf` size) as the exponent of
         // a g-power: the address table when it covers it, else a bounded discrete log.
         fn count(g: &mut GPow, x: F64) -> Option<u32> {
@@ -791,19 +807,16 @@ impl Program {
                     m.dbg_hint = None;
                 }
             }
-            // Cover the g-powers this step may index (g²·pc return target, g^fp).
-            g.grow_to((pc as usize + 2).max(fp as usize));
-
             let bytecode_read = {
                 let v = bytecode_count[pc as usize];
                 bytecode_count[pc as usize] = v + 1;
                 v
             };
 
-            // Loaded once: the shared Xor/Mul arm needs the discriminant again,
-            // and `Op` is wide enough that re-reading it costs a second load.
-            let op = self.prog[pc as usize];
-            match op {
+            // Matched through a reference: copying a wide `Op` out stages its fields
+            // on the stack, and reloading them there stalls the step.
+            let op = &self.prog[pc as usize];
+            match *op {
                 Op::Xor { a, b, c } | Op::Mul { a, b, c } => {
                     let is_xor = matches!(op, Op::Xor { .. });
                     let (aa, ab, ac) = (fp + a, fp + b, fp + c);
@@ -830,13 +843,10 @@ impl Program {
                             m.put(if ha { ab } else { aa }, m.get(ac) * vk.inv())?;
                         }
                     }
-                    let va = m.read(aa);
-                    let vb = m.read(ab);
+                    let (va, ra) = m.read_counted(aa);
+                    let (vb, rb) = m.read_counted(ab);
                     let vc = if is_xor { va + vb } else { va * vb };
-                    m.put(ac, vc)?;
-                    let ra = m.bump_access_count(aa);
-                    let rb = m.bump_access_count(ab);
-                    let rc = m.bump_access_count(ac);
+                    let rc = m.put_counted(ac, vc)?;
                     let row = Xrow {
                         pc,
                         fp,
@@ -854,8 +864,7 @@ impl Program {
                 }
                 Op::Set { o, k } => {
                     let a = fp + o;
-                    m.put(a, k)?;
-                    let r = m.bump_access_count(a);
+                    let r = m.put_counted(a, k)?;
                     set.push(Srow {
                         pc,
                         fp,
@@ -919,16 +928,16 @@ impl Program {
                     // otherwise not balance. A guest branches on g-powers; the one
                     // idiom that once branched on a word, `assert a != b`, takes an
                     // inverse hint instead (§sec:prog-div-ne).
-                    let c = in_k("JUMP condition", m.read(ac)).map_err(fail)?;
-                    let d = in_k("JUMP target", m.read(ad)).map_err(fail)?;
-                    let f = in_k("JUMP fp", m.read(af)).map_err(fail)?;
+                    let (c, rc) = m.read_counted(ac);
+                    let (d, rd) = m.read_counted(ad);
+                    let (f, rf) = m.read_counted(af);
+                    let c = in_k("JUMP condition", c).map_err(fail)?;
+                    let d = in_k("JUMP target", d).map_err(fail)?;
+                    let f = in_k("JUMP fp", f).map_err(fail)?;
                     // The is-nonzero witness `w = c⁻¹` is never used for control
                     // flow, only recorded as a witness column, so it is not
                     // computed here at all: `JumpTable::fill` batch-inverts every
                     // row's condition at once (§the trace rows in `cpu::trace`).
-                    let rc = m.bump_access_count(ac);
-                    let rd = m.bump_access_count(ad);
-                    let rf = m.bump_access_count(af);
                     let taken = !c.is_zero();
                     jump.push(Jrow {
                         pc,
@@ -957,8 +966,17 @@ impl Program {
                 }
                 Op::Keccak { .. } => {
                     use crate::keccak::{ROW_CELLS, STATE_CELLS};
-                    let k = crate::tables::KeccakOp::of(&op);
+                    let k = crate::tables::KeccakOp::of(op);
                     let cells: [u32; ROW_CELLS] = std::array::from_fn(|c| k.cell(fp, c));
+                    // The output cells are usually untouched and cold: fetch them while the permutation runs.
+                    #[cfg(target_arch = "x86_64")]
+                    for &c in &cells[STATE_CELLS..] {
+                        // SAFETY: a prefetch of any address is harmless.
+                        unsafe {
+                            let line = m.cells.0.as_ptr().wrapping_add(c as usize).cast();
+                            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(line)
+                        };
+                    }
                     let input: [F192; STATE_CELLS] = std::array::from_fn(|c| m.read(cells[c]));
                     // The table reads every cell with a literal zero top limb, so anything
                     // else could not balance the bus.
@@ -1052,7 +1070,14 @@ impl Program {
         // Pad memory to a power of two (the boundary tables read a dense image), at
         // least 2^MIN_LOG_MEM cells (doc §Memory), doubled until the stacked witness
         // reaches `min_log_committed`.
-        let mem_used = m.used;
+        // Instruction reads and counts left `used` behind: the highest cell with a state or
+        // a count, within an offset of the highest base, is the true end.
+        let top = (m.used.max(seed) + max_off + 1).min(LIMIT);
+        let touched = (m.used..top).rev().find(|&c| {
+            let cell = m.at(c as u32);
+            cell.state != State::Unwritten || cell.count != 0
+        });
+        let mem_used = touched.map_or(m.used, |c| m.used.max(c + 1));
         let mut cells = mem_used.next_power_of_two().max(1 << MIN_LOG_MEM);
         let taus = super::layout::table_logs(trace.row_counts());
         let log_bytecode = crate::log2_strict_usize(self.prog.len());
@@ -1061,16 +1086,19 @@ impl Program {
             cells *= 2;
         }
         assert!(cells <= 1 << MAX_LOG_MEM, "data memory exceeds 2^{MAX_LOG_MEM} cells");
+        // The fill looks up every pc, frame base, cell and count in this table.
+        g.grow_to(mem_used.max(self.prog.len()).max(trace.counts) - 1);
         Ok(Execution {
             mem: Memory {
-                pages: m.pages,
+                cells: m.cells,
+                used: mem_used,
                 len: cells,
             },
             cycles: steps,
             mem_used,
             unconstrained_reads: m.unwritten_reads,
             trace,
-            gpow: g.into_powers(),
+            gpow: g,
         })
     }
 }
