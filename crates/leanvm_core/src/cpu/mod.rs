@@ -104,7 +104,7 @@ pub struct Program {
     /// Prover-side frame/buffer allocation hints (keyed by global pc) and the
     /// size of `main`'s frame: the nondeterminism [`Program::execute`] needs to
     /// run the program. Public verification ([`verify`]) ignores them.
-    pub(crate) hints: HashMap<u32, Vec<hints::RHint>>,
+    pub(crate) hints: hints::HintPlan,
     pub(crate) main_frame: u32,
     /// The largest operand offset in `prog`, so that every instruction access of a run is
     /// within the cells it bounds. Same trust as `fiat_shamir_iv`.
@@ -159,10 +159,10 @@ impl Program {
         };
         Self {
             max_offset: prog.iter().map(Op::max_offset).max().unwrap_or(0) as usize,
+            hints: hints::HintPlan::new(hints, prog.len()),
             prog,
             fiat_shamir_iv,
             bytecode_columns,
-            hints,
             main_frame,
             witness: HashMap::new(),
             fn_ranges: Vec::new(),

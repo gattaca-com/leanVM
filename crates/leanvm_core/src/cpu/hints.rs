@@ -261,6 +261,69 @@ pub enum BitsDest {
     Heap(Off),
 }
 
+/// The hints of a program flattened into a dense per-pc index, built once at assembly.
+///
+/// A map keyed by pc would be probed each step for what is almost always a miss, so
+/// `at` holds, per pc, 0 for no hints or `1 + i` for list `i`. List `i` is
+/// `hints[starts[i]..starts[i + 1]]`, and `streams` holds per hint the index into
+/// `named` of its witness stream (`u32::MAX` for a hint that has none).
+#[derive(Clone)]
+pub(crate) struct HintPlan {
+    pub(crate) at: Vec<u32>,
+    starts: Vec<u32>,
+    hints: Vec<RHint>,
+    streams: Vec<u32>,
+    /// Per distinct witness stream, a hint that names it, so a run resolves each name once.
+    named: Vec<u32>,
+}
+
+impl HintPlan {
+    pub(crate) fn new(hints: std::collections::HashMap<u32, Vec<RHint>>, code_len: usize) -> Self {
+        let mut plan = Self {
+            at: vec![0; code_len],
+            starts: vec![0],
+            hints: Vec::new(),
+            streams: Vec::new(),
+            named: Vec::new(),
+        };
+        for (pc, hs) in hints {
+            for h in hs {
+                let id = stream_name(&h).map_or(u32::MAX, |name| {
+                    let same = |&i: &u32| stream_name(&plan.hints[i as usize]) == Some(name);
+                    plan.named.iter().position(same).unwrap_or_else(|| {
+                        plan.named.push(plan.hints.len() as u32);
+                        plan.named.len() - 1
+                    }) as u32
+                });
+                plan.hints.push(h);
+                plan.streams.push(id);
+            }
+            plan.starts.push(plan.hints.len() as u32);
+            plan.at[pc as usize] = plan.starts.len() as u32 - 1;
+        }
+        plan
+    }
+
+    /// The hints at list `at - 1` (`at` from [`Self::at`]), each with its stream index.
+    pub(crate) fn list(&self, at: u32) -> impl Iterator<Item = (&RHint, u32)> {
+        let r = self.starts[at as usize - 1] as usize..self.starts[at as usize] as usize;
+        self.hints[r.clone()].iter().zip(self.streams[r].iter().copied())
+    }
+
+    /// The names of the distinct witness streams, in stream index order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.named.iter().filter_map(|&i| stream_name(&self.hints[i as usize]))
+    }
+}
+
+/// The witness stream a hint pops, if any.
+fn stream_name(h: &RHint) -> Option<&str> {
+    match h {
+        RHint::WitnessStack { name, .. } | RHint::WitnessHeap { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
 /// A hint resolved to concrete offsets/sizes, keyed by global program counter.
 #[derive(Clone, Debug)]
 pub enum RHint {

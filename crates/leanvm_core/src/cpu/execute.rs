@@ -345,35 +345,15 @@ impl Program {
         let (mut pc, mut fp) = (0u32, 0u32);
         let mut steps = 0usize;
         // Witness streams, resolved by name once so a pop indexes one.
-        let mut streams: Vec<Stream> = Vec::new();
-        let mut stream_of: HashMap<&str, u32> = HashMap::new();
-        // Per-pc hint index. `self.hints` is keyed by pc, so probing it each step
-        // costs a hash of the counter for what is almost always a miss; the
-        // program has one bytecode slot per pc, so flatten the map into a dense
-        // table: 0 = no hints, otherwise the 1-based index into `hint_lists`, whose
-        // entries pair a pc's hints with where their streams start in `hint_streams`.
-        let mut hint_at = vec![0u32; self.prog.len()];
-        let mut hint_lists: Vec<(&[RHint], usize)> = Vec::with_capacity(self.hints.len());
-        let mut hint_streams: Vec<u32> = Vec::new();
-        for (&hpc, hs) in &self.hints {
-            hint_lists.push((hs.as_slice(), hint_streams.len()));
-            hint_at[hpc as usize] = hint_lists.len() as u32;
-            for h in hs {
-                let (RHint::WitnessStack { name, .. } | RHint::WitnessHeap { name, .. }) = h else {
-                    hint_streams.push(u32::MAX);
-                    continue;
-                };
-                let s = *stream_of.entry(name).or_insert_with(|| {
-                    streams.push(Stream {
-                        name,
-                        entries: self.witness.get(name).map(Vec::as_slice),
-                        next: 0,
-                    });
-                    streams.len() as u32 - 1
-                });
-                hint_streams.push(s);
-            }
-        }
+        let plan = &self.hints;
+        let mut streams: Vec<Stream> = plan
+            .names()
+            .map(|name| Stream {
+                name,
+                entries: self.witness.get(name).map(Vec::as_slice),
+                next: 0,
+            })
+            .collect();
         // `DBG_PROF=1`: per-pc step counts, printed as a per-function cycle
         // profile after the run (needs `fn_ranges`, i.e. a compiled program).
         let mut prof: Option<Vec<u64>> = std::env::var("DBG_PROF").is_ok().then(|| vec![0u64; self.prog.len()]);
@@ -578,9 +558,8 @@ impl Program {
             }
 
             // Apply the hints scheduled before this instruction.
-            if hint_at[pc as usize] != 0 {
-                let (hs, first) = hint_lists[hint_at[pc as usize] as usize - 1];
-                for (h, &stream) in hs.iter().zip(&hint_streams[first..]) {
+            if plan.at[pc as usize] != 0 {
+                for (h, stream) in plan.list(plan.at[pc as usize]) {
                     m.dbg_hint = Some(match h {
                         RHint::FrameAddress { .. } => "FrameAddress",
                         RHint::AllocFrames { .. } => "AllocFrames",
