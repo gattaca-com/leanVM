@@ -57,7 +57,12 @@ use super::whir_config::{BATCH_GRINDING_BITS, MAX_STACKED_CLAIMS};
 
 mod basis;
 
+#[cfg(test)]
+pub(crate) use basis::equal_blocks;
 pub(crate) use basis::{SWEEP, Terms};
+
+/// Bits of the block a commit's repeat map tags: a block holds `2^EQUAL_BLOCK_LOG` words.
+pub const EQUAL_BLOCK_LOG: usize = basis::LOW_VARS;
 
 // ---------------------------------------------------------------------------
 // Claim types
