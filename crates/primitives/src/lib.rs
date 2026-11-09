@@ -227,6 +227,23 @@ pub unsafe fn filled_vec<T: Plain>(len: usize, fill: impl FnOnce(&mut [T])) -> V
     v
 }
 
+/// One vector per length in `lens`, filled in place by `fill`: [`filled_vecs`] for a count known at run time.
+///
+/// # Safety
+///
+/// As [`filled_vecs`]: `fill` must write every element before it reads it.
+#[must_use]
+pub unsafe fn filled_cols<T: Plain>(
+    lens: impl IntoIterator<Item = usize>,
+    fill: impl FnOnce(&mut [&mut [T]]),
+) -> Vec<Vec<T>> {
+    // SAFETY: `fill` writes each element before reading it, by the caller's contract.
+    let mut vs: Vec<Vec<T>> = lens.into_iter().map(|len| unsafe { uninit_vec(len) }).collect();
+    let mut slices: Vec<&mut [T]> = vs.iter_mut().map(|v| &mut v[..]).collect();
+    fill(&mut slices);
+    vs
+}
+
 /// A vector of `len` uninitialized elements, for a fill that outlives one scope.
 ///
 /// Prefer [`filled_vec`], which keeps the fill next to the allocation.

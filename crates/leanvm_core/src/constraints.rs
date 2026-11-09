@@ -32,10 +32,11 @@
 //! verifier certifies that maximum with one hinted `g`-power (§recursion), so there
 //! are no rounds in which no table has joined.
 
+use crate::gkr::prefetch_lines;
 use crate::leaf::BusForm;
 use crate::transcript::ProverState;
-use primitives::field::{F64, F64x8, F192, F192x8, Prod8};
-use primitives::multilinear::{eq_table, interp, mle_eval, poly_eval, shrink_eq_high};
+use primitives::field::{F64, F64x8, F192, F192Unreduced, F192x8, Prod8, Weights8, dot_base};
+use primitives::multilinear::{eq_table, interp, poly_eval, shrink_eq_high};
 
 /// One table's involved columns' evaluations at its table-sumcheck point.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +48,8 @@ pub struct Claims {
 /// One table's place in the shared batch.
 pub struct Air<'a> {
     pub tau: usize,
+    /// Rows before the table's padding, at most `2^tau`.
+    pub rows: usize,
     /// Its committed columns, `2^tau` values each, read in place.
     pub cols: &'a [&'a [F64]],
     /// Its summand, a degree-2 form over `cols`.
@@ -70,11 +73,156 @@ pub fn xi_offsets(n_constraints: impl Iterator<Item = usize>) -> Vec<usize> {
 /// A linear form over a table's columns, as `(column, coefficient)` terms.
 type Lin = Vec<(usize, F192)>;
 
+/// Blocks ahead that the passes over the `K` columns prefetch: they read many columns at once,
+/// more streams than the hardware prefetcher follows.
+const PREFETCH: usize = 4;
+
 /// Blocks of eight rows per task of the round passes.
 const TASK_BLOCKS: usize = 128;
 
-/// Vectors per task of a fold.
-const FOLD_CHUNK: usize = 1 << 10;
+/// Variables of a block of rows: the eq tables of the bus and of the constraints split here.
+pub const BLOCK_VARS: usize = 10;
+pub const BLOCK: usize = 1 << BLOCK_VARS;
+
+/// What the bus computed for one table while summing its columns at `ζ`: for every column and every
+/// product pair its forms use, the dot of each block of `2^BLOCK_VARS` rows against `eq(ζ[..BLOCK_VARS])`.
+/// Since `eq` factors by block, these give the round sums of everything linear in the columns with no pass
+/// over rows. A table of at most one block carries none (`n_blocks == 0`).
+#[derive(Default)]
+pub struct TableBlocks {
+    pub n_blocks: usize,
+    pub n_cols: usize,
+    /// The pairs whose products' dots follow the columns', in LOCAL column indices.
+    pub pairs: Vec<(usize, usize)>,
+    /// Column runs, then pair runs, each `n_blocks` dots.
+    pub dots: Vec<F192>,
+}
+
+impl TableBlocks {
+    fn run(&self, i: usize) -> &[F192] {
+        &self.dots[i * self.n_blocks..][..self.n_blocks]
+    }
+
+    fn prod(&self, a: usize, b: usize) -> Option<&[F192]> {
+        let i = self.pairs.iter().position(|&p| p == (a, b) || p == (b, a))?;
+        Some(self.run(self.n_cols + i))
+    }
+}
+
+/// `Σ w·v` over the `(w, v)` terms.
+fn dot_e(terms: impl Iterator<Item = (F192, F192)>) -> F192 {
+    terms
+        .fold(F192Unreduced::ZERO, |acc, (w, v)| acc ^ w.mul_unreduced(v))
+        .reduce()
+}
+
+/// A block-dotted table's linear part, per block: `lb[h] = Σ_c lin_c·D_c(h)`, folded with the
+/// challenges like a state column, and `end[h] = lb[h] + Σ q_ab·PD_ab(h)`, the whole endpoint
+/// before the table joins.
+struct Dots {
+    lb: Vec<F192>,
+    end: Vec<F192>,
+}
+
+impl Dots {
+    /// `None` when the table has no blocks, or its form multiplies a pair the bus did not sum.
+    fn new(form: &Form, blocks: &TableBlocks) -> Option<Self> {
+        if blocks.n_blocks == 0 {
+            return None;
+        }
+        let prods = form
+            .groups
+            .iter()
+            .flat_map(|(left, right)| right.iter().map(move |&(c, q)| Some((q, blocks.prod(*left, c)?))))
+            .collect::<Option<Vec<_>>>()?;
+        let at = |terms: &[(F192, &[F192])], h: usize| dot_e(terms.iter().map(|&(w, run)| (w, run[h])));
+        let lin: Vec<_> = form.lin.iter().map(|&(c, w)| (w, blocks.run(c))).collect();
+        let lb: Vec<F192> = (0..blocks.n_blocks).map(|h| at(&lin, h)).collect();
+        let end = (0..blocks.n_blocks).map(|h| lb[h] + at(&prods, h)).collect();
+        Some(Self { lb, end })
+    }
+}
+
+/// `Σ_{h < eqh.len()} eqh[h]·v[h + off]`: the endpoint sum of per-block values, `off` the upper half's.
+fn block_endpoint(v: &[F192], eqh: &[F192], at_one: bool) -> F192 {
+    let off = if at_one { eqh.len() } else { 0 };
+    dot_e(eqh.iter().copied().zip(v[off..].iter().copied()))
+}
+
+/// Every column's `F_c(x) = Σ_h eqh[h]·col_c[x + BLOCK·h]`, `BLOCK` values each, column after column:
+/// the column folded by the challenges above the block, which leave `BLOCK` rows.
+///
+/// Only the first `real` blocks are read. Every block past them holds the same value in each of a
+/// column's rows (a table's padding), so together they add that value times their weights to every `x`.
+pub fn partial_evals(cols: &[&[F64]], eqh: &[F192], real: usize) -> Vec<F192> {
+    /// Vectors per set of accumulators.
+    const VECS: usize = 4;
+    /// Rows per set of accumulators.
+    const STEP: usize = 8 * VECS;
+    /// Sets of accumulators per column.
+    const STEPS: usize = BLOCK / STEP;
+    /// Blocks ahead that the reads are prefetched: a stride of `BLOCK` rows is beyond the hardware prefetcher.
+    const AHEAD: usize = 16;
+    let real = real.min(eqh.len());
+    let mass = eqh[real..].iter().fold(F192::ZERO, |acc, &e| acc + e);
+    // SAFETY: the fill writes every element before it reads any.
+    unsafe {
+        primitives::filled_vec(cols.len() * BLOCK, |out| {
+            parallel::chunks_mut(out, BLOCK, |c, out| {
+                let col = cols[c];
+                let padding = (real < eqh.len())
+                    .then(|| F192x8::splat(mass).mul_base_unreduced(F64x8::from_array(&[col[real * BLOCK]; 8])));
+                for x in (0..BLOCK).step_by(STEP) {
+                    let mut acc = [Prod8::ZERO; VECS];
+                    // The reads of all columns in order: by column, then set of accumulators, then block.
+                    let ahead = (c * STEPS + x / STEP) * real + AHEAD;
+                    let (mut set, mut block) = (ahead / real.max(1), ahead % real.max(1));
+                    for (h, &e) in eqh[..real].iter().enumerate() {
+                        if let Some(next_col) = cols.get(set / STEPS) {
+                            let p = next_col.as_ptr().wrapping_add(block * BLOCK + set % STEPS * STEP);
+                            prefetch_lines(p.cast(), 64 * VECS);
+                        }
+                        block += 1;
+                        if block == real {
+                            (set, block) = (set + 1, 0);
+                        }
+                        let w = F192x8::splat(e);
+                        for (v, a) in acc.iter_mut().enumerate() {
+                            *a ^= w.mul_base_unreduced(load_k(col, h * BLOCK + x + 8 * v));
+                        }
+                    }
+                    for (v, a) in acc.iter_mut().enumerate() {
+                        if let Some(padding) = padding {
+                            *a ^= padding;
+                        }
+                        out[x + 8 * v..][..8].copy_from_slice(&a.reduce_lanes().to_array());
+                    }
+                }
+            });
+        })
+    }
+}
+
+/// Each column's evaluation at `chi`, for a table of at most `BLOCK` rows.
+fn evals_at(cols: &[&[F64]], chi: &[F192]) -> Vec<F192> {
+    debug_assert!(chi.len() <= BLOCK_VARS);
+    let mut eq = eq_table(chi);
+    // A table below one vector of rows is zero-padded.
+    eq.resize(eq.len().max(8), F192::ZERO);
+    let eq: Vec<Weights8> = eq.as_chunks::<8>().0.iter().map(Weights8::new).collect();
+    cols.iter()
+        .map(|col| {
+            let mut padded = [F64::ZERO; 8];
+            let rows = if col.len() < 8 {
+                padded[..col.len()].copy_from_slice(col);
+                &padded[..]
+            } else {
+                col
+            };
+            dot_base(&eq, rows).reduce()
+        })
+        .collect()
+}
 
 /// A table's summand `P(v) = constant + lin(v) + Σ_g v[left_g] · right_g(v)`, its products grouped
 /// by a shared column. Its homogeneous quadratic part is `Q(v) = Σ_g v[left_g] · right_g(v)`.
@@ -87,6 +235,8 @@ struct Form {
     groups: Vec<(usize, Lin)>,
     /// Every column a term reads, ascending.
     used: Vec<usize>,
+    /// The columns the products read, ascending.
+    quad_used: Vec<usize>,
 }
 
 impl Form {
@@ -129,18 +279,22 @@ impl Form {
             });
             groups.push((left, right));
         }
-        let mut used: Vec<usize> = lin.iter().map(|t| t.0).collect();
+        let mut quad_used = Vec::new();
         for (left, right) in &groups {
-            used.push(*left);
-            used.extend(right.iter().map(|t| t.0));
+            quad_used.push(*left);
+            quad_used.extend(right.iter().map(|t| t.0));
         }
-        used.sort_unstable();
-        used.dedup();
+        let mut used: Vec<usize> = lin.iter().map(|t| t.0).chain(quad_used.iter().copied()).collect();
+        for cols in [&mut used, &mut quad_used] {
+            cols.sort_unstable();
+            cols.dedup();
+        }
         Self {
             constant: form.constant,
             lin,
             groups,
             used,
+            quad_used,
         }
     }
 
@@ -149,16 +303,25 @@ impl Form {
         1 + 2 * self.groups.len()
     }
 
+    /// The columns a pass reads: those of `lin` and the products, or only the products without `with_lin`.
+    fn read(&self, with_lin: bool) -> &[usize] {
+        if with_lin { &self.used } else { &self.quad_used }
+    }
+
     /// The state of the first `rows` (at most eight) rows, unfolded, from the `K` columns.
-    fn small_state(&self, cols: &[&[F64]], rows: usize) -> State {
-        let dot = |terms: &Lin, i: usize| terms.iter().map(|&(c, w)| w.mul_base(cols[c][i])).sum();
-        let column = |value: &dyn Fn(usize) -> F192| {
-            F192x8::from_array(&std::array::from_fn(|i| if i < rows { value(i) } else { F192::ZERO }))
+    fn small_state(&self, cols: &[&[F64]], rows: usize) -> Vec<Col> {
+        let dot = |terms: &Lin, i: usize| {
+            terms
+                .iter()
+                .fold(F192::ZERO, |acc, &(c, w)| acc + w.mul_base(cols[c][i]))
         };
-        let mut state = vec![column(&|i| dot(&self.lin, i))];
-        for (left, right) in &self.groups {
-            state.push(column(&|i| F192::from(cols[*left][i])));
-            state.push(column(&|i| dot(right, i)));
+        let mut state = vec![vec![F192x8::ZERO]; self.width()];
+        for i in 0..rows {
+            state[0][0].set_lane(i, dot(&self.lin, i));
+            for (g, (left, right)) in self.groups.iter().enumerate() {
+                state[1 + 2 * g][0].set_lane(i, F192::from(cols[*left][i]));
+                state[2 + 2 * g][0].set_lane(i, dot(right, i));
+            }
         }
         state
     }
@@ -178,12 +341,11 @@ fn splat(terms: &Lin) -> Vec<(usize, F192x8)> {
 
 /// A worker's scratch for [`load_rows`] over `n` columns: `end` and `sum`.
 fn rows_scratch(n: usize) -> (Vec<F64x8>, Vec<F64x8>) {
-    let zero = F64x8::from_array(&[F64::ZERO; 8]);
-    (vec![zero; n], vec![zero; n])
+    (vec![F64x8::ZERO; n], vec![F64x8::ZERO; n])
 }
 
-/// Loads the vectors of rows `i` and `i + half` of every column in `read`: `end` takes the upper vector
-/// with `at_one` and the lower without, `sum` their sum.
+/// Loads the vectors of rows `i` and `i + half` of every column in `read`, after prefetching the ones
+/// `PREFETCH` blocks on: `end` takes the upper vector with `at_one` and the lower without, `sum` their sum.
 #[inline(always)]
 fn load_rows(
     cols: &[&[F64]],
@@ -194,18 +356,72 @@ fn load_rows(
     (end, sum): &mut (Vec<F64x8>, Vec<F64x8>),
 ) {
     for &c in read {
+        let ahead = cols[c].as_ptr().wrapping_add(i + 8 * PREFETCH);
+        prefetch_lines(ahead.cast(), 64);
+        prefetch_lines(ahead.wrapping_add(half).cast(), 64);
         let (lo, hi) = (load_k(cols[c], i), load_k(cols[c], i + half));
         (end[c], sum[c]) = (if at_one { hi } else { lo }, lo + hi);
     }
 }
 
-/// A joined table's folded state: per vector of eight rows, its `width` columns side by side,
-/// `state[b * width + c]`. Below eight rows, one vector per column holds them all.
-type State = Vec<F192x8>;
+/// A joined state column: one `F192x8` per eight rows, below eight rows one vector holding them all.
+type Col = Vec<F192x8>;
+
+/// The eq table and `at_one` of the round after a fold or join. With them the pass also returns
+/// that round's message, from the rows it has just built.
+type Next<'a> = Option<(&'a [F192], bool)>;
 
 /// The blocks task `t` covers out of `n`.
 fn task_blocks(t: usize, n: usize) -> std::ops::Range<usize> {
     t * TASK_BLOCKS..((t + 1) * TASK_BLOCKS).min(n)
+}
+
+/// A task's `range` of the first `n` blocks, then of the next `n` when a pass is fused (`passes == 2`).
+fn over_passes(range: std::ops::Range<usize>, n: usize, passes: usize) -> impl Iterator<Item = usize> {
+    (0..passes).flat_map(move |p| range.clone().map(move |b| b + p * n))
+}
+
+/// What the columns hand each task of a pass: its `range` of their first `n` blocks and, with
+/// `passes == 2`, of their next `n`. Task-major, so a task's columns are consecutive, and the width.
+fn task_parts<'a>(
+    cols: impl Iterator<Item = &'a mut [F192x8]>,
+    n: usize,
+    passes: usize,
+) -> (Vec<&'a mut [F192x8]>, Vec<&'a mut [F192x8]>, usize) {
+    let (mut firsts, mut seconds) = (Vec::new(), Vec::new());
+    for col in cols {
+        let (first, second) = if passes == 2 {
+            col.split_at_mut(n)
+        } else {
+            (col, &mut [][..])
+        };
+        firsts.push(first.chunks_mut(TASK_BLOCKS));
+        seconds.push(second.chunks_mut(TASK_BLOCKS));
+    }
+    let (width, tasks) = (firsts.len(), n.div_ceil(TASK_BLOCKS));
+    let (mut first, mut second) = (Vec::with_capacity(tasks * width), Vec::new());
+    for _ in 0..tasks {
+        first.extend(firsts.iter_mut().filter_map(Iterator::next));
+        if passes == 2 {
+            second.extend(seconds.iter_mut().filter_map(Iterator::next));
+        }
+    }
+    (first, second, width)
+}
+
+/// Block `j` of column `c`, as a task with blocks from `start` holds it: `n` blocks per pass, `first` and `second`.
+fn block_mut<'p>(
+    first: &'p mut [&mut [F192x8]],
+    second: &'p mut [&mut [F192x8]],
+    (n, start): (usize, usize),
+    c: usize,
+    j: usize,
+) -> &'p mut F192x8 {
+    if j < n {
+        &mut first[c][j - start]
+    } else {
+        &mut second[c][j - n - start]
+    }
 }
 
 fn xor2(a: [Prod8; 2], b: [Prod8; 2]) -> [Prod8; 2] {
@@ -218,12 +434,14 @@ fn finish([endpoint, slope]: [Prod8; 2], constant: F192) -> [F192; 2] {
 
 /// An active round of a table that has not joined: its message from the `K` columns, in place.
 /// Per vector of rows, the linear forms are `E x K` mixed dots, and every product of the
-/// summand is one mixed product against a reduced `right_g`.
-fn message_k(form: &Form, cols: &[&[F64]], eqr: &[F192], half: usize, at_one: bool) -> [F192; 2] {
+/// summand is one mixed product against a reduced `right_g`. Without `with_end` the endpoint is
+/// left at the constant: the caller has the rest from the bus's block dots.
+fn message_k(form: &Form, cols: &[&[F64]], eqr: &[F192], half: usize, at_one: bool, with_end: bool) -> [F192; 2] {
     if half < 8 {
+        debug_assert!(with_end, "a table with block dots is taller than a vector");
         return message_e(form, &form.small_state(cols, 2 * half), eqr, half, at_one);
     }
-    let lin = splat(&form.lin);
+    let lin = if with_end { splat(&form.lin) } else { Vec::new() };
     let rights: Vec<_> = form.groups.iter().map(|(_, right)| splat(right)).collect();
     let dot = |terms: &[(usize, F192x8)], vals: &[F64x8]| {
         terms
@@ -238,16 +456,18 @@ fn message_k(form: &Form, cols: &[&[F64]], eqr: &[F192], half: usize, at_one: bo
         |rows, acc, t| {
             for b in task_blocks(t, blocks) {
                 let i = 8 * b;
-                load_rows(cols, &form.used, i, half, at_one, rows);
+                load_rows(cols, form.read(with_end), i, half, at_one, rows);
                 let (end, sum) = &*rows;
                 let (mut endpoint, mut slope) = (dot(&lin, end), Prod8::ZERO);
                 for ((left, _), right) in form.groups.iter().zip(&rights) {
-                    endpoint ^= dot(right, end).reduce_lanes().mul_base_unreduced(end[*left]);
+                    if with_end {
+                        endpoint ^= dot(right, end).reduce_lanes().mul_base_unreduced(end[*left]);
+                    }
                     slope ^= dot(right, sum).reduce_lanes().mul_base_unreduced(sum[*left]);
                 }
                 let eq = load_e(eqr, i);
-                acc[0] ^= endpoint.reduce_lanes().mul_unreduced(eq);
-                acc[1] ^= slope.reduce_lanes().mul_unreduced(eq);
+                acc[0] ^= endpoint.reduce_lanes().mul_unreduced(eq).merge_parities();
+                acc[1] ^= slope.reduce_lanes().mul_unreduced(eq).merge_parities();
             }
         },
         xor2,
@@ -255,14 +475,42 @@ fn message_k(form: &Form, cols: &[&[F64]], eqr: &[F192], half: usize, at_one: bo
     finish(acc, form.constant)
 }
 
+/// A joined table's round message over the block pairs of `range`: `eq·endpoint` and `eq·slope`, unreduced.
+/// `col(c, b)` gives the `[lo, hi]` blocks of pair `b` in state column `c`. Without `with_lin` the
+/// endpoint leaves out `lin`: the caller adds it from the bus's block dots.
+#[inline(always)]
+fn message_blocks(
+    form: &Form,
+    with_lin: bool,
+    at_one: bool,
+    eqr: &[F192],
+    range: std::ops::Range<usize>,
+    col: impl Fn(usize, usize) -> [F192x8; 2],
+) -> [Prod8; 2] {
+    let end = |p: [F192x8; 2]| if at_one { p[1] } else { p[0] };
+    let mut acc = [Prod8::ZERO; 2];
+    for b in range {
+        let lin = if with_lin { end(col(0, b)) } else { F192x8::ZERO };
+        let (mut endpoint, mut slope) = (Prod8::ZERO, Prod8::ZERO);
+        for g in 0..form.groups.len() {
+            let (left, right) = (col(1 + 2 * g, b), col(2 + 2 * g, b));
+            endpoint ^= end(left).mul_unreduced(end(right));
+            slope ^= (left[0] + left[1]).mul_unreduced(right[0] + right[1]);
+        }
+        let eq = load_e(eqr, 8 * b);
+        acc[0] ^= (endpoint.reduce_lanes() + lin).mul_unreduced(eq).merge_parities();
+        acc[1] ^= slope.reduce_lanes().mul_unreduced(eq).merge_parities();
+    }
+    acc
+}
+
 /// An active round of a joined table, from its folded state.
-fn message_e(form: &Form, state: &State, eqr: &[F192], half: usize, at_one: bool) -> [F192; 2] {
+fn message_e(form: &Form, state: &[Col], eqr: &[F192], half: usize, at_one: bool) -> [F192; 2] {
     if half < 8 {
         // Fewer row pairs than a vector: `[Σ_i eqr[i]·end_i, Σ_i eqr[i]·Q(lo_i + hi_i)]` by lanes.
         // `eqr` sums to one, so the form's constant seeds the endpoint.
-        let rows: Vec<[F192; 8]> = state.iter().map(|v| v.to_array()).collect();
         return (0..half).fold([form.constant, F192::ZERO], |acc, i| {
-            let (lo, hi) = (|c: usize| rows[c][i], |c: usize| rows[c][i + half]);
+            let (lo, hi) = (|c: usize| state[c][0].lane(i), |c: usize| state[c][0].lane(i + half));
             let end = |c| if at_one { hi(c) } else { lo(c) };
             let (mut endpoint, mut slope) = (end(0), F192::ZERO);
             for g in (1..state.len()).step_by(2) {
@@ -272,24 +520,16 @@ fn message_e(form: &Form, state: &State, eqr: &[F192], half: usize, at_one: bool
             [acc[0] + eqr[i] * endpoint, acc[1] + eqr[i] * slope]
         });
     }
-    let (blocks, width) = (half / 8, form.width());
-    let (lows, highs) = state.split_at(blocks * width);
+    let (blocks, with_lin) = (half / 8, !state[0].is_empty());
     let acc = parallel::fold_reduce(
         blocks.div_ceil(TASK_BLOCKS),
         || [Prod8::ZERO; 2],
         |acc, t| {
-            for b in task_blocks(t, blocks) {
-                let (lo, hi) = (&lows[b * width..][..width], &highs[b * width..][..width]);
-                let end = if at_one { hi } else { lo };
-                let (mut endpoint, mut slope) = (Prod8::ZERO, Prod8::ZERO);
-                for g in (1..width).step_by(2) {
-                    endpoint ^= end[g].mul_unreduced(end[g + 1]);
-                    slope ^= (lo[g] + hi[g]).mul_unreduced(lo[g + 1] + hi[g + 1]);
-                }
-                let eq = load_e(eqr, 8 * b);
-                acc[0] ^= (endpoint.reduce_lanes() + end[0]).mul_unreduced(eq);
-                acc[1] ^= slope.reduce_lanes().mul_unreduced(eq);
-            }
+            let range = task_blocks(t, blocks);
+            let m = message_blocks(form, with_lin, at_one, eqr, range, |c, b| {
+                [state[c][b], state[c][b + blocks]]
+            });
+            *acc = xor2(*acc, m);
         },
         xor2,
     );
@@ -298,100 +538,207 @@ fn message_e(form: &Form, state: &State, eqr: &[F192], half: usize, at_one: bool
 
 /// The round a table joins, after its challenge `r`: the state `lo + r·(lo + hi)` of every
 /// entry, built straight from the `K` columns. By linearity `lin` and `right_g` take the
-/// terms `w·lo + (w·r)·(lo + hi)`, so no row pays an `E x E` product.
-fn join(form: &Form, cols: &[&[F64]], r: F192, half: usize) -> State {
+/// terms `w·lo + (w·r)·(lo + hi)`, so no row pays an `E x E` product. Without `with_lin`,
+/// `lin` is left an empty column. With `next`, a task builds the block pairs `(b, b + h/2)` the next
+/// round pairs, which give its message.
+fn join(
+    form: &Form,
+    cols: &[&[F64]],
+    r: F192,
+    half: usize,
+    with_lin: bool,
+    next: Next,
+) -> (Vec<Col>, Option<[F192; 2]>) {
     if half < 8 {
+        debug_assert!(with_lin, "a table with block dots is taller than a vector");
         let mut state = form.small_state(cols, 2 * half);
-        fold_state(&mut state, r, half);
-        return state;
+        fold_state(form, &mut state, r, half, None);
+        return (state, None);
     }
     let (blocks, width) = (half / 8, form.width());
-    let pair = |terms: &Lin| -> Vec<_> {
+    let skip = usize::from(!with_lin);
+    let project = |terms: &Lin| -> Vec<_> {
         terms
             .iter()
             .map(|&(c, w)| (c, F192x8::splat(w), F192x8::splat(w * r)))
             .collect()
     };
-    let lin = pair(&form.lin);
-    let rights: Vec<_> = form.groups.iter().map(|(_, right)| pair(right)).collect();
+    let (lin, rights) = (
+        if with_lin { project(&form.lin) } else { Vec::new() },
+        form.groups.iter().map(|(_, right)| project(right)).collect::<Vec<_>>(),
+    );
     let r8 = F192x8::splat(r);
-    // SAFETY: every task writes all `width` entries of each of its blocks.
-    unsafe {
-        primitives::filled_vec(blocks * width, |state| {
-            parallel::chunks_mut(state, TASK_BLOCKS * width, |t, out| {
-                let mut rows = rows_scratch(cols.len());
-                for (b, out) in task_blocks(t, blocks).zip(out.chunks_exact_mut(width)) {
-                    load_rows(cols, &form.used, 8 * b, half, false, &mut rows);
-                    let (lo, sum) = &rows;
-                    let dot = |terms: &[(usize, F192x8, F192x8)]| {
-                        terms
-                            .iter()
-                            .fold(Prod8::ZERO, |acc, &(c, w, wr)| {
-                                acc ^ w.mul_base_unreduced(lo[c]) ^ wr.mul_base_unreduced(sum[c])
-                            })
-                            .reduce_lanes()
-                    };
-                    out[0] = dot(&lin);
-                    for (g, ((left, _), right)) in form.groups.iter().zip(&rights).enumerate() {
-                        out[1 + 2 * g] = F192x8::from(lo[*left]) + r8.mul_base_unreduced(sum[*left]).reduce_lanes();
-                        out[2 + 2 * g] = dot(right);
+    let (n, passes) = if next.is_some() { (blocks / 2, 2) } else { (blocks, 1) };
+    let mut acc = [Prod8::ZERO; 2];
+    // The pass writes every block of every entry.
+    // SAFETY: the fill writes every element before it reads any.
+    let state: Vec<Col> = unsafe {
+        primitives::filled_cols((0..width).map(|c| if c < skip { 0 } else { blocks }), |outs| {
+            let columns = outs[skip..].iter_mut().map(|c| &mut c[..]);
+            let (mut first, mut second, parts) = task_parts(columns, n, passes);
+            acc = parallel::map_reduce_chunks_mut(
+                [&mut first[..], &mut second[..]],
+                [parts.max(1); 2],
+                || rows_scratch(cols.len()),
+                || [Prod8::ZERO; 2],
+                |rows, acc, t, [first, second]| {
+                    let range = task_blocks(t, n);
+                    let (start, at) = (range.start, (n, range.start));
+                    for j in over_passes(range.clone(), n, passes) {
+                        load_rows(cols, form.read(with_lin), 8 * j, half, false, rows);
+                        let (lo, sum) = &*rows;
+                        let dot = |terms: &[(usize, F192x8, F192x8)]| {
+                            terms
+                                .iter()
+                                .fold(Prod8::ZERO, |acc, &(c, w, wr)| {
+                                    acc ^ w.mul_base_unreduced(lo[c]) ^ wr.mul_base_unreduced(sum[c])
+                                })
+                                .reduce_lanes()
+                        };
+                        let mut put = |c: usize, v: F192x8| *block_mut(first, second, at, c - skip, j) = v;
+                        if with_lin {
+                            put(0, dot(&lin));
+                        }
+                        for (g, ((left, _), right)) in form.groups.iter().zip(&rights).enumerate() {
+                            put(
+                                1 + 2 * g,
+                                F192x8::from(lo[*left]) + r8.mul_base_unreduced(sum[*left]).reduce_lanes(),
+                            );
+                            put(2 + 2 * g, dot(right));
+                        }
                     }
-                }
-            });
+                    if let Some((eqr, at_one)) = next {
+                        let col = |c: usize, b: usize| [first[c - skip][b - start], second[c - skip][b - start]];
+                        *acc = xor2(*acc, message_blocks(form, with_lin, at_one, eqr, range, col));
+                    }
+                },
+                xor2,
+            );
         })
-    }
+    };
+    (state, next.map(|_| finish(acc, form.constant)))
 }
 
-/// The state folded by `r`, `v[i] = v[i] + r·(v[i] + v[i + half])` in every column, the upper half dropped.
-/// From eight rows up the halves are whole vectors, so the fold is elementwise.
-fn fold_state(state: &mut State, r: F192, half: usize) {
+/// Every non-empty column of `state` folded by `r`, `col[i] = col[i] + r·(col[i] + col[i + half])`, the upper
+/// half dropped. With `next`, a task folds the block pairs `(b, b + h/2)` the next round pairs, which give its message.
+fn fold_state(form: &Form, state: &mut [Col], r: F192, half: usize, next: Next) -> Option<[F192; 2]> {
     if half < 8 {
-        for v in state.iter_mut() {
-            let mut rows = v.to_array();
-            (0..half).for_each(|i| rows[i] = interp(rows[i], rows[i + half], r));
-            *v = F192x8::from_array(&rows);
+        for col in state {
+            let v = &mut col[0];
+            (0..half).for_each(|i| v.set_lane(i, interp(v.lane(i), v.lane(i + half), r)));
         }
-        return;
+        return None;
     }
-    let r8 = F192x8::splat(r);
-    let n = state.len() / 2;
-    let (lows, highs) = state.split_at_mut(n);
-    parallel::chunks_mut(lows, FOLD_CHUNK, |t, lows| {
-        for (lo, &hi) in lows.iter_mut().zip(&highs[t * FOLD_CHUNK..]) {
-            *lo = *lo + (*lo + hi) * r8;
-        }
-    });
-    state.truncate(n);
+    let (blocks, r8, with_lin) = (half / 8, F192x8::splat(r), !state[0].is_empty());
+    let skip = usize::from(!with_lin);
+    let (mut lows, mut highs) = (Vec::with_capacity(state.len()), Vec::with_capacity(state.len()));
+    for col in &mut state[skip..] {
+        let (low, high) = col.split_at_mut(blocks);
+        lows.push(low);
+        highs.push(&*high);
+    }
+    let (n, passes) = if next.is_some() { (blocks / 2, 2) } else { (blocks, 1) };
+    let (mut first, mut second, parts) = task_parts(lows.iter_mut().map(|c| &mut **c), n, passes);
+    let acc = parallel::map_reduce_chunks_mut(
+        [&mut first[..], &mut second[..]],
+        [parts.max(1); 2],
+        || (),
+        || [Prod8::ZERO; 2],
+        |(), acc, t, [first, second]| {
+            let range = task_blocks(t, n);
+            let (start, at) = (range.start, (n, range.start));
+            for (c, high) in highs.iter().enumerate() {
+                for j in over_passes(range.clone(), n, passes) {
+                    let lo = block_mut(first, second, at, c, j);
+                    *lo = *lo + (*lo + high[j]) * r8;
+                }
+            }
+            if let Some((eqr, at_one)) = next {
+                let col = |c: usize, b: usize| [first[c - skip][b - start], second[c - skip][b - start]];
+                *acc = xor2(*acc, message_blocks(form, with_lin, at_one, eqr, range, col));
+            }
+        },
+        xor2,
+    );
+    state.iter_mut().for_each(|c| c.truncate(blocks));
+    next.map(|_| finish(acc, form.constant))
+}
+
+/// A block dot column folded by `r`: `lb[h] = lb[h] + r·(lb[h] + lb[h + half])`, the upper half dropped.
+fn fold_lb(lb: &mut Vec<F192>, r: F192) {
+    let half = lb.len() / 2;
+    for i in 0..half {
+        lb[i] = interp(lb[i], lb[i + half], r);
+    }
+    lb.truncate(half);
 }
 
 /// One table of the batch, and what the rounds have made of it.
 struct Table<'a> {
     tau: usize,
+    rows: usize,
     sigma: F192,
     /// Its summand's factor: the challenges it sat out, then the eq factors of the rounds it was active.
     weight: F192,
     form: Form,
     cols: &'a [&'a [F64]],
+    dots: Option<Dots>,
     /// The folded state, once the table has joined: a few `E` columns, the batch's largest transients.
-    state: Option<State>,
+    state: Option<Vec<Col>>,
+    /// The message a fold or join already made for the next round.
+    pending: Option<[F192; 2]>,
+    /// [`partial_evals`] of the columns, once the challenges above a block are drawn.
+    partial: Option<Vec<F192>>,
 }
 
 impl Table<'_> {
     /// The message of the round that binds variable `m`, while the table is active.
-    fn message(&self, eqr: &[F192], m: usize, at_one: bool) -> [F192; 2] {
+    fn message(&mut self, eqr: &[F192], eqh: &[F192], m: usize, at_one: bool) -> [F192; 2] {
         let (form, half) = (&self.form, 1 << m);
-        match &self.state {
-            Some(state) => message_e(form, state, eqr, half, at_one),
-            None => message_k(form, self.cols, eqr, half, at_one),
+        let mut p = match (self.pending.take(), &self.state) {
+            (Some(p), _) => p,
+            (None, Some(state)) => message_e(form, state, eqr, half, at_one),
+            (None, None) => message_k(form, self.cols, eqr, half, at_one, self.dots.is_none()),
+        };
+        // The block dots stand in for the sum over rows of `lin`, and before the join of the whole endpoint.
+        if let Some(dots) = &self.dots {
+            p[0] += block_endpoint(if self.state.is_some() { &dots.lb } else { &dots.end }, eqh, at_one);
         }
+        p
     }
 
     /// Binds variable `m` to `r`: the join of a table that has not joined, the fold of one that has.
-    fn bind(&mut self, r: F192, m: usize) {
-        match &mut self.state {
-            Some(state) => fold_state(state, r, 1 << m),
-            None => self.state = Some(join(&self.form, self.cols, r, 1 << m)),
+    fn bind(&mut self, r: F192, m: usize, next: Next) {
+        // A dotted table's state has no `lin` until the partial evals, which come after round `BLOCK_VARS`.
+        let next = next.filter(|_| m != BLOCK_VARS || self.dots.is_none());
+        self.pending = match &mut self.state {
+            Some(state) => fold_state(&self.form, state, r, 1 << m, next),
+            None => {
+                let (state, message) = join(&self.form, self.cols, r, 1 << m, self.dots.is_none(), next);
+                self.state = Some(state);
+                message
+            }
+        };
+        if let Some(dots) = &mut self.dots {
+            fold_lb(&mut dots.lb, r);
         }
+    }
+
+    /// With the challenges above a block drawn (`chi`), leaves every column as `BLOCK` values. A dotted
+    /// table, which is now a block tall, gets its `lin` column from them and leaves the dots.
+    fn fold_to_block(&mut self, chi: &[F192]) {
+        let f = partial_evals(
+            self.cols,
+            &eq_table(&chi[BLOCK_VARS..self.tau]),
+            self.rows.div_ceil(BLOCK),
+        );
+        if self.dots.take().is_some() {
+            let lin = |x: usize| dot_e(self.form.lin.iter().map(|&(c, w)| (w, f[c * BLOCK + x])));
+            self.state.as_mut().expect("the table joined")[0] = (0..BLOCK / 8)
+                .map(|b| F192x8::from_array(&std::array::from_fn(|l| lin(8 * b + l))))
+                .collect();
+        }
+        self.partial = Some(f);
     }
 }
 
@@ -410,22 +757,39 @@ fn round_polynomial([endpoint, quadratic]: [F192; 2], zeta: F192, claim: F192, w
 /// Prove that every table's batched constraint vanishes on all of its rows, as ONE
 /// sumcheck over `max τ_t` variables. Returns the per-table claims, in input order, on the
 /// nested points `ρ[..τ_t]`.
-pub fn prove(airs: &[Air<'_>], zeta: &[F192], ps: &mut ProverState) -> Vec<Claims> {
+///
+/// `blocks` are the bus's block dots at the same `zeta` (empty when there are none, as in unit tests).
+/// A table that has them, and whose products are all among the bus's pairs, never sums its linear part
+/// over rows while it is taller than a block: its endpoint sums come from the dots. Once the challenges
+/// above a block are drawn, one pass leaves every column as `BLOCK` values, from which the linear part
+/// of the rest and the final claims follow.
+pub fn prove(airs: &[Air<'_>], zeta: &[F192], blocks: &[TableBlocks], ps: &mut ProverState) -> Vec<Claims> {
     let n = airs.iter().map(|a| a.tau).max().unwrap_or(0);
     debug_assert!(zeta.len() >= n, "the eq point must cover the tallest table");
     let mut tables: Vec<Table> = airs
         .iter()
-        .map(|air| Table {
-            tau: air.tau,
-            sigma: air.sigma,
-            weight: F192::ONE,
-            form: Form::new(&air.form),
-            cols: air.cols,
-            state: None,
+        .enumerate()
+        .map(|(t, air)| {
+            let form = Form::new(&air.form);
+            Table {
+                tau: air.tau,
+                rows: air.rows,
+                sigma: air.sigma,
+                weight: F192::ONE,
+                dots: blocks.get(t).and_then(|b| Dots::new(&form, b)),
+                form,
+                cols: air.cols,
+                state: None,
+                pending: None,
+                partial: None,
+            }
         })
         .collect();
     // ONE eq table over the low (still free) variables serves every active table.
     let mut eqr = eq_table(&zeta[..n.saturating_sub(1)]);
+    // The same table over the variables above a block, for the block dots.
+    let top = n.saturating_sub(1);
+    let mut eqh = eq_table(&zeta[BLOCK_VARS.min(top)..top]);
     let mut chi = vec![F192::ZERO; n];
     // `k`, the challenges drawn so far, common to every table that is still waiting.
     let mut k = F192::ONE;
@@ -440,11 +804,14 @@ pub fn prove(airs: &[Air<'_>], zeta: &[F192], ps: &mut ProverState) -> Vec<Claim
         let u = k * waiting;
         let mut msg = [F192::ZERO; 2];
         for t in tables.iter_mut().filter(|t| t.tau > m) {
-            let p = t.message(&eqr, m, at_one);
+            let p = t.message(&eqr, &eqh, m, at_one);
             msg[0] += t.weight * p[0];
             msg[1] += t.weight * p[1];
         }
         shrink_eq_high(&mut eqr);
+        if eqh.len() > 1 {
+            shrink_eq_high(&mut eqh);
+        }
         // The running claim recovers the missing endpoint of the quadratic cofactor.
         // The fold stays separate: its challenge only exists after this message is bound.
         let h = round_polynomial(msg, zeta[m], claim, u);
@@ -454,31 +821,53 @@ pub fn prove(airs: &[Air<'_>], zeta: &[F192], ps: &mut ProverState) -> Vec<Claim
         chi[m] = rk;
         k *= rk;
         let eq_k = F192::ONE + zeta[m] + rk;
+        // `eqr` now serves round `m - 1`, whose message a fold or join can make once its rows are built,
+        // unless it is shorter than a vector.
+        let next = (m >= 4).then(|| (&eqr[..], zeta[m - 1].is_zero()));
         for t in &mut tables {
             if t.tau > m {
                 t.weight *= eq_k;
-                t.bind(rk, m);
+                t.bind(rk, m, next);
             } else {
                 t.weight *= rk;
             }
         }
+        // Every state is now one block tall: the tables above a block fold their columns once more.
+        if m == BLOCK_VARS {
+            crate::stage!("Constraint partial evals", || {
+                for t in tables.iter_mut().filter(|t| t.tau > BLOCK_VARS) {
+                    t.fold_to_block(&chi);
+                }
+            });
+        }
     }
 
-    // Each column's evaluation at its table's point, one task per column: the columns were never folded.
-    crate::stage!("Constraint evals", || {
+    // Each column's evaluation at its table's point: the columns were never folded one by one, so
+    // this is one dot per column, over a block's values if the pass above left them.
+    let all_evals = crate::stage!("Constraint evals", || {
+        let low = eq_table(&chi[..BLOCK_VARS.min(n)]);
         tables
             .iter()
-            .map(|t| {
-                let chi = &chi[..t.tau];
-                let evals = parallel::map_collect(t.cols.len(), |c| mle_eval(t.cols[c], chi));
-                ps.add_scalars(&evals);
-                Claims {
-                    chi: chi.to_vec(),
-                    evals,
+            .map(|t| match &t.partial {
+                Some(f) => {
+                    let dot = |col: &[F192]| dot_e(low.iter().copied().zip(col.iter().copied()));
+                    f.chunks(BLOCK).map(dot).collect()
                 }
+                None => evals_at(t.cols, &chi[..t.tau]),
             })
-            .collect()
-    })
+            .collect::<Vec<_>>()
+    });
+    tables
+        .iter()
+        .zip(all_evals)
+        .map(|(t, evals)| {
+            ps.add_scalars(&evals);
+            Claims {
+                chi: chi[..t.tau].to_vec(),
+                evals,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -555,7 +944,8 @@ mod tests {
     }
 
     /// Every round of a table's life, at row counts on both sides of one vector: the join's
-    /// message and state, then each fold and joined message, against the naive formulas.
+    /// message and state, then each fold and joined message, against the naive formulas. The
+    /// message a join or fold makes for the next round is checked too, for both `at_one`.
     #[test]
     fn round_messages_match_naive_evaluation() {
         let mut s = 7;
@@ -569,12 +959,17 @@ mod tests {
                 .map(|c| c.iter().map(|&x| F192::from(x)).collect())
                 .collect();
             let mut eqr = eq_table(&(0..m).map(|_| random_e(&mut s)).collect::<Vec<_>>());
-            let mut state: Option<State> = None;
+            let mut state: Option<Vec<Col>> = None;
+            let mut pending = None;
             let mut half = 1usize << m;
             while half >= 1 {
+                if let Some((message, at_one)) = pending.take() {
+                    let want = naive_message(&pows, &naive_cols, &eqr, half, at_one);
+                    assert_eq!(message, want, "fused m {m} half {half}");
+                }
                 for at_one in [false, true] {
                     let got = match &state {
-                        None => message_k(&form, &views, &eqr, half, at_one),
+                        None => message_k(&form, &views, &eqr, half, at_one, true),
                         Some(st) => message_e(&form, st, &eqr, half, at_one),
                     };
                     assert_eq!(
@@ -585,14 +980,110 @@ mod tests {
                 }
                 let r = random_e(&mut s);
                 shrink_eq_high(&mut eqr);
-                match &mut state {
-                    None => state = Some(join(&form, &views, r, half)),
-                    Some(st) => fold_state(st, r, half),
-                }
+                let at_one = half.trailing_zeros() % 2 == 1;
+                let next = (half >= 16).then_some((&eqr[..], at_one));
+                let message = match &mut state {
+                    None => {
+                        let (st, message) = join(&form, &views, r, half, true, next);
+                        state = Some(st);
+                        message
+                    }
+                    Some(st) => fold_state(&form, st, r, half, next),
+                };
+                pending = message.map(|message| (message, at_one));
                 for c in &mut naive_cols {
                     *c = (0..half).map(|i| interp(c[i], c[i + half], r)).collect();
                 }
                 half /= 2;
+            }
+        }
+    }
+
+    /// The bus's dots of a table: per block of rows, each column's and each product's against `eq(zeta[..BLOCK_VARS])`.
+    fn blocks_of(cols: &[Vec<F64>], zeta: &[F192], pairs: &[(usize, usize)]) -> TableBlocks {
+        let n_blocks = cols[0].len() >> BLOCK_VARS;
+        let low = eq_table(&zeta[..BLOCK_VARS]);
+        let products = pairs
+            .iter()
+            .map(|&(a, b)| cols[a].iter().zip(&cols[b]).map(|(&x, &y)| x * y).collect::<Vec<F64>>());
+        let dots = cols
+            .iter()
+            .cloned()
+            .chain(products)
+            .flat_map(|run| {
+                let low = &low;
+                (0..n_blocks).map(move |h| {
+                    run[h * BLOCK..][..BLOCK]
+                        .iter()
+                        .zip(low)
+                        .fold(F192::ZERO, |acc, (&v, &w)| acc + w.mul_base(v))
+                })
+            })
+            .collect();
+        TableBlocks {
+            n_blocks,
+            n_cols: cols.len(),
+            pairs: pairs.to_vec(),
+            dots,
+        }
+    }
+
+    /// Tables of different heights in one batch, from empty to a few blocks: each table's claims are its
+    /// columns' true evaluations at a prefix of the tallest table's point, and the bus's block dots change
+    /// no byte of the transcript. Tables above a block join at, above and below its height, one of them
+    /// lacks a product's dots, and two zero coordinates of `zeta` make those rounds read the upper halves.
+    #[test]
+    fn ragged_batch_claims_are_true_evaluations() {
+        let taus = [13usize, 12, 11, 12, 5, 9, 6, 0, 1, 4];
+        let mut s = 5;
+        let cols: Vec<Vec<Vec<F64>>> = taus.iter().map(|&tau| random_columns(&mut s, 1 << tau)).collect();
+        let views: Vec<Vec<&[F64]>> = cols.iter().map(|t| t.iter().map(|c| &c[..]).collect()).collect();
+        let airs: Vec<Air<'_>> = taus
+            .iter()
+            .zip(&views)
+            .map(|(&tau, cols)| {
+                let pows: Vec<F192> = (0..3).map(|_| random_e(&mut s)).collect();
+                Air {
+                    tau,
+                    rows: 1 << tau,
+                    cols,
+                    form: synth(&pows),
+                    sigma: random_e(&mut s),
+                }
+            })
+            .collect();
+        let mut zeta: Vec<F192> = (0..13).map(|_| random_e(&mut s)).collect();
+        zeta[10] = F192::ZERO;
+        zeta[11] = F192::ZERO;
+        // The form multiplies (0,1), (0,3), (0,4) and (5,5); the bus names a pair either way round.
+        let pairs = [(1, 0), (0, 3), (4, 0), (5, 5)];
+        let blocks: Vec<TableBlocks> = taus
+            .iter()
+            .zip(&cols)
+            .enumerate()
+            .map(|(t, (&tau, table))| match tau > BLOCK_VARS {
+                true => blocks_of(table, &zeta, if t == 3 { &pairs[..2] } else { &pairs }),
+                false => TableBlocks::default(),
+            })
+            .collect();
+        let form = Form::new(&airs[0].form);
+        assert!(
+            Dots::new(&form, &blocks[0]).is_some(),
+            "all of the form's pairs are dotted"
+        );
+        assert!(Dots::new(&form, &blocks[3]).is_none(), "a pair is missing");
+        let run = |blocks: &[TableBlocks]| {
+            let mut ps = ProverState::from_label(b"zc-test");
+            let claims = prove(&airs, &zeta, blocks, &mut ps);
+            (claims, ps.sample())
+        };
+        let (plain, dotted) = (run(&[]), run(&blocks));
+        assert_eq!(plain, dotted);
+        let tallest = &dotted.0[0].chi;
+        for ((claim, &tau), table) in dotted.0.iter().zip(&taus).zip(&cols) {
+            assert_eq!(claim.chi, tallest[..tau]);
+            for (eval, col) in claim.evals.iter().zip(table) {
+                assert_eq!(*eval, primitives::multilinear::mle_eval(col, &claim.chi));
             }
         }
     }
