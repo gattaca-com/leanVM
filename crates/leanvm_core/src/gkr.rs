@@ -1637,9 +1637,9 @@ pub(crate) fn prove_products_from<C: TreeField>(
                 } else {
                     None
                 };
-                // A fold whose table has two more rounds before the last weighs their polynomial. Its
-                // products cost more than the halved fold traffic saves below eight workers.
-                let next = (two_rounds && parallel::num_threads() >= 8 && round + 3 < round_count)
+                // A fold whose table has two more rounds before the last weighs their polynomial.
+                // `two_rounds` asks for four workers, and from four on the halved fold traffic pays for the products.
+                let next = (two_rounds && round + 3 < round_count)
                     .then(|| (Equality::new(&point[round + 3..]), point[round + 2]));
                 messages = std::array::from_fn(|s| {
                     let tree = &mut trees[s];
