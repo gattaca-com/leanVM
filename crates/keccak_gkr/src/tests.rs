@@ -213,14 +213,12 @@ fn proof_verifies_against_the_commitment() {
 
 /// The witness of every block run, the padding ones included.
 fn dense(shape: Shape, inputs: &[[u64; LANES]]) -> Witness {
-    let mut extent = Extent::new(0, shape.n_blocks());
-    for g in 0..shape.n_blocks() {
+    let mut extent = Extent::new(0, shape.n_blocks(), shape.depth());
+    for (g, slot) in extent.slots().iter_mut().enumerate() {
         let inputs = &inputs[(g * BLOCK).min(inputs.len())..((g + 1) * BLOCK).min(inputs.len())];
-        // SAFETY: each block's slot, written once.
-        unsafe { block(shape.depth(), inputs, Some(extent.slot(g)), |_, _, _| {}) };
+        block(shape.depth(), inputs, Some(slot), |_, _, _| {});
     }
-    // SAFETY: every block was written just above.
-    unsafe { Witness::from_extents(shape, vec![extent], shape.n_blocks(), None) }
+    Witness::from_extents(shape, vec![extent], shape.n_blocks(), None)
 }
 
 /// The padding block, run once for the blocks after the last input, proves what running each
@@ -272,5 +270,5 @@ fn a_broken_committed_state_is_rejected() {
 #[test]
 #[should_panic(expected = "fit in memory")]
 fn an_extent_too_large_to_address_is_refused() {
-    Extent::new(0, 1 << 55);
+    Extent::new(0, 1 << 55, 12);
 }
