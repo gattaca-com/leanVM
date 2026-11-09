@@ -169,16 +169,22 @@ fn range_check_folded_non_gpower_bound_rejected() {
 
 /// Each check's two `DEREF`s store into fresh cells that no other instruction
 /// names, so no two checks, and no check and any other access, share a touched
-/// cell.
+/// cell. Covers the constant, runtime and `c·g^j` bounds, in one frame: offsets
+/// are frame-relative, so the program has no other function.
 #[test]
 fn range_check_targets_are_fresh() {
     let src = "\
 def main():
+    nb = StackBuf(1)
+    hint_witness(nb[0:1], \"n\")
+    n = nb[0]
     x = GEN ** 5
     assert log x < 8
     assert log x < 9
     y = x * x
     assert log y < 11
+    assert log x < log n
+    assert log x < log n * GEN
     p = 1
     p[1] = x
     p[GEN] = y
@@ -222,7 +228,7 @@ def main():
         })
         .flatten()
         .collect();
-    assert_eq!(targets.len(), 6, "three checks, two targets each");
+    assert_eq!(targets.len(), 10, "five checks, two targets each");
     for (pc, t) in targets {
         for (j, op) in prog.iter().enumerate() {
             assert!(
