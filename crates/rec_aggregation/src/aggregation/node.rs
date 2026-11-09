@@ -121,23 +121,25 @@ pub fn aggregate_with_stats(
     // recomputed: the batching sumcheck below forces every batched value to be
     // the true evaluation, and the root discharges the one claim they reduce to.
     let _span = tracing::info_span!("Replay children").entered();
-    let mut public_inputs = Vec::with_capacity(children.len());
     let child_da: Vec<[u8; 32]> = children
         .iter()
         .map(|child| verifier::da::digest(child.claims.da_commitment))
         .collect();
     for child in children {
         check_signer_set(&child.claims).map_err(AggregationError::InvalidChild)?;
-        public_inputs.push(child.vm_public_input());
     }
-    // One single-threaded replay per worker: nothing inside dispatches.
+    // One statement hash and single-threaded replay per worker: nothing inside dispatches.
     let bytecode = scalar_bytecode();
     let summaries = parallel::map_collect(children.len(), |i| {
-        let public_input = public_input_bytes(&public_inputs[i]);
-        verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof))
+        let pi = children[i].vm_public_input();
+        let public_input = public_input_bytes(&pi);
+        (
+            pi,
+            verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof)),
+        )
     });
     let mut replayed = Vec::with_capacity(children.len());
-    for (pi, summary) in public_inputs.into_iter().zip(summaries) {
+    for (pi, summary) in summaries {
         let summary =
             summary.map_err(|e| AggregationError::InvalidChild(AggregateVerifyError::Snark(SnarkVerifyError(e))))?;
         replayed.push((pi, summary));
