@@ -4,7 +4,7 @@
 //! Three surfaces, in increasing order of how much of the machine they touch:
 //!
 //! - [`keccak_f`], the Keccak-f\[1600\] permutation, which the VM's `KECCAK` opcode computes
-//!   and `keccak_gkr` proves, and [`keccak_f_many`], its batched form.
+//!   and `keccak_gkr` proves.
 //! - [`hash`] / [`Hasher`], Keccak-256 over bytes.
 //! - [`hash_many`], the batched form: [`LANES`] independent equal-length inputs
 //!   hashed together with the state transposed across lanes, which is how the
@@ -90,7 +90,8 @@ pub const PI: [usize; STATE_LANES] = {
 /// lanes. The permutation is written once over this trait, so each backend
 /// supplies only XOR, the χ step and the rotations.
 ///
-/// `load` and `store` move the `WIDTH` words from `src[i]` on, unaligned and bounds-checked.
+/// `load` and `store` move the `WIDTH` words from `src[i]` on, unaligned, through the
+/// bounds-checked [`load_at`] and [`store_at`].
 trait Lanes64: Copy {
     const WIDTH: usize;
 
@@ -417,6 +418,38 @@ mod x86 {
         }
     }
 
+    /// Transpose an 8x8 matrix of 64-bit words, rows in registers.
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    fn transpose8(r: [__m512i; 8]) -> [__m512i; 8] {
+        // SAFETY: AVX-512F is enabled at compile time, and these intrinsics touch only registers.
+        unsafe {
+            // Pairs of words, then 128-bit lane picks to finish.
+            let (a0, a1) = (_mm512_unpacklo_epi64(r[0], r[1]), _mm512_unpackhi_epi64(r[0], r[1]));
+            let (a2, a3) = (_mm512_unpacklo_epi64(r[2], r[3]), _mm512_unpackhi_epi64(r[2], r[3]));
+            let (a4, a5) = (_mm512_unpacklo_epi64(r[4], r[5]), _mm512_unpackhi_epi64(r[4], r[5]));
+            let (a6, a7) = (_mm512_unpacklo_epi64(r[6], r[7]), _mm512_unpackhi_epi64(r[6], r[7]));
+            let b0 = _mm512_shuffle_i64x2::<0x88>(a0, a2);
+            let b1 = _mm512_shuffle_i64x2::<0x88>(a1, a3);
+            let b2 = _mm512_shuffle_i64x2::<0xDD>(a0, a2);
+            let b3 = _mm512_shuffle_i64x2::<0xDD>(a1, a3);
+            let b4 = _mm512_shuffle_i64x2::<0x88>(a4, a6);
+            let b5 = _mm512_shuffle_i64x2::<0x88>(a5, a7);
+            let b6 = _mm512_shuffle_i64x2::<0xDD>(a4, a6);
+            let b7 = _mm512_shuffle_i64x2::<0xDD>(a5, a7);
+            [
+                _mm512_shuffle_i64x2::<0x88>(b0, b4),
+                _mm512_shuffle_i64x2::<0x88>(b1, b5),
+                _mm512_shuffle_i64x2::<0x88>(b2, b6),
+                _mm512_shuffle_i64x2::<0x88>(b3, b7),
+                _mm512_shuffle_i64x2::<0xDD>(b0, b4),
+                _mm512_shuffle_i64x2::<0xDD>(b1, b5),
+                _mm512_shuffle_i64x2::<0xDD>(b2, b6),
+                _mm512_shuffle_i64x2::<0xDD>(b3, b7),
+            ]
+        }
+    }
+
     /// AVX-512: eight lanes, a native rotate, and `vpternlogq` for both χ and
     /// the five-way column parity.
     #[cfg(target_feature = "avx512f")]
@@ -471,7 +504,7 @@ mod x86 {
                     let input = &data[l * len + byte_offset + 64 * g..];
                     simd::load_prefix(input, 0, n)
                 });
-                let cols = simd::transpose8(rows);
+                let cols = transpose8(rows);
                 for (w, col) in cols.into_iter().enumerate().take(n) {
                     st[8 * g + w] = Self(simd::xor(st[8 * g + w].0, col));
                 }
@@ -482,12 +515,13 @@ mod x86 {
         fn store_digests(st: &[Self; STATE_LANES], out: &mut [u8]) {
             assert_eq!(out.len(), 8 * OUT_LEN);
             // Rows are the four digest words of each input, then four zero words.
-            let zero = simd::from_words([0; 8]);
-            let rows = simd::transpose8([st[0].0, st[1].0, st[2].0, st[3].0, zero, zero, zero, zero]);
-            for (pair, [first, second]) in rows.as_chunks::<2>().0.iter().enumerate() {
+            // SAFETY: AVX-512F is enabled at compile time, and the intrinsic touches only registers.
+            let zero = unsafe { _mm512_setzero_si512() };
+            let rows = transpose8([st[0].0, st[1].0, st[2].0, st[3].0, zero, zero, zero, zero]);
+            for (pair, rows) in rows.as_chunks::<2>().0.iter().enumerate() {
                 // Low 256 bits of two inputs' rows side by side: lanes 0, 1 of the first, then of the second.
                 // SAFETY: as above, a register-only intrinsic under compile-time AVX-512F.
-                let both = unsafe { _mm512_shuffle_i64x2::<0x44>(*first, *second) };
+                let both = unsafe { _mm512_shuffle_i64x2::<0x44>(rows[0], rows[1]) };
                 simd::store(out, pair, both);
             }
         }
@@ -509,14 +543,12 @@ mod arm {
 
         #[inline(always)]
         fn load(src: &[u64], i: usize) -> Self {
-            let words: &[u64; 2] = src[i..i + 2].try_into().unwrap();
-            // SAFETY: `words` is two readable words, and NEON is in the aarch64 baseline.
+            let words = &src[i..i + 2];
             Self(unsafe { vld1q_u64(words.as_ptr()) })
         }
         #[inline(always)]
         fn store(self, dst: &mut [u64], i: usize) {
-            let words: &mut [u64; 2] = (&mut dst[i..i + 2]).try_into().unwrap();
-            // SAFETY: `words` is two writable words, and NEON is in the aarch64 baseline.
+            let words = &mut dst[i..i + 2];
             unsafe { vst1q_u64(words.as_mut_ptr(), self.0) }
         }
         #[inline(always)]
@@ -662,8 +694,7 @@ fn hash_many_with<S: Lanes64>(data: &[u8], len: usize, state: &[u64; STATE_LANES
     let n = out.len() / OUT_LEN;
     assert_eq!((data.len(), out.len()), (n * len, n * OUT_LEN));
     let groups = n / S::WIDTH;
-    for g in 0..groups {
-        let digests = &mut out[g * S::WIDTH * OUT_LEN..][..S::WIDTH * OUT_LEN];
+    for (g, digests) in out.chunks_exact_mut(S::WIDTH * OUT_LEN).enumerate() {
         hash_group::<S>(&data[g * S::WIDTH * len..][..S::WIDTH * len], len, state, digests);
     }
     for i in groups * S::WIDTH..n {
@@ -683,6 +714,12 @@ pub fn hash_many(data: &[u8], len: usize, out: &mut [u8]) {
 /// whole blocks (see [`zero_prefix_state`]). Byte-identical to hashing each full image.
 pub fn hash_many_from_state(data: &[u8], len: usize, state: &[u64; STATE_LANES], out: &mut [u8]) {
     hash_many_with::<Backend>(data, len, state, out)
+}
+
+/// Keccak-f of [`LANES`] copies of `state` whose lane `lane` holds `first + i` in copy `i`: the
+/// smallest `i` whose output lane 0 has no bit of `mask` set.
+pub fn grind_lane(state: &[u64; STATE_LANES], lane: usize, first: u64, mask: u64) -> Option<usize> {
+    grind_lane_with::<Backend>(state, lane, first, mask)
 }
 
 /// The state [`hash`] of `data` permutes last: every whole block absorbed and the padded final
@@ -744,38 +781,15 @@ fn digest_halves_from_with<S: Lanes64>(template: &[u64; STATE_LANES], at: usize,
     }
 }
 
-/// Keccak-f\[1600\] of every state in place, [`LANES`] at a time.
-pub fn keccak_f_many(states: &mut [[u64; STATE_LANES]]) {
-    let (groups, rest) = states.as_chunks_mut::<LANES>();
-    for group in groups {
-        permute_group::<Backend>(group);
-    }
-    for state in rest {
-        keccak_f(state);
-    }
-}
-
-/// Keccak-f of `S::WIDTH` states, transposed into one vector per lane and back.
 #[inline(always)]
-fn permute_group<S: Lanes64>(states: &mut [[u64; STATE_LANES]]) {
-    debug_assert_eq!(states.len(), S::WIDTH);
-    // `buf[i * WIDTH + l]` is state `l`'s lane `i`.
-    let mut buf = [0u64; STATE_LANES * MAX_WIDTH];
-    for (l, state) in states.iter().enumerate() {
-        for (i, &lane) in state.iter().enumerate() {
-            buf[i * S::WIDTH + l] = lane;
-        }
-    }
-    let mut st: [S; STATE_LANES] = std::array::from_fn(|i| S::load(&buf, i * S::WIDTH));
+fn grind_lane_with<S: Lanes64>(state: &[u64; STATE_LANES], lane: usize, first: u64, mask: u64) -> Option<usize> {
+    let nonces: [u64; MAX_WIDTH] = std::array::from_fn(|i| first + i as u64);
+    let mut st: [S; STATE_LANES] = std::array::from_fn(|i| S::splat(state[i]));
+    st[lane] = S::load(&nonces, 0);
     permute(&mut st);
-    for (i, lane) in st.iter().enumerate() {
-        lane.store(&mut buf, i * S::WIDTH);
-    }
-    for (l, state) in states.iter_mut().enumerate() {
-        for (i, lane) in state.iter_mut().enumerate() {
-            *lane = buf[i * S::WIDTH + l];
-        }
-    }
+    let mut out = [0u64; MAX_WIDTH];
+    st[0].store(&mut out, 0);
+    out[..S::WIDTH].iter().position(|w| w & mask == 0)
 }
 
 #[cfg(test)]
@@ -950,14 +964,23 @@ mod tests {
                     }
                 }
             }
-            let states: Vec<[u64; STATE_LANES]> = (0..S::WIDTH as u64)
-                .map(|l| std::array::from_fn(|i| (l << 32) ^ (i as u64 * 0x9E37_79B9)))
+            let state: [u64; STATE_LANES] = std::array::from_fn(|i| (i as u64 * 0x9E37_79B9) ^ 0xA5A5);
+            let outs: Vec<u64> = (0..S::WIDTH as u64)
+                .map(|i| {
+                    let mut copy = state;
+                    copy[7] = 1000 + i;
+                    keccak_f(&mut copy);
+                    copy[0]
+                })
                 .collect();
-            let mut got = states.clone();
-            permute_group::<S>(&mut got);
-            for (mut want, got) in states.into_iter().zip(got) {
-                keccak_f(&mut want);
-                assert_eq!(got, want, "{name}: permutation");
+            assert_eq!(grind_lane_with::<S>(&state, 7, 1000, 0), Some(0), "{name}: mask 0");
+            for mask in [0x3, 0xff, u64::MAX] {
+                let want = outs.iter().position(|w| w & mask == 0);
+                assert_eq!(
+                    grind_lane_with::<S>(&state, 7, 1000, mask),
+                    want,
+                    "{name}: mask {mask:#x}"
+                );
             }
         }
         check::<u64>("scalar");

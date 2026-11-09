@@ -33,7 +33,8 @@ pub fn iota_bit(round: usize, z: usize) -> bool {
     RC[round - 1] >> z & 1 == 1
 }
 
-/// `pi(rho(theta(a)))`, over any XOR group.
+/// `pi(rho(theta(a)))`, over any XOR group: the reference the sliced form in `witness` is tested against.
+#[cfg(test)]
 pub fn linear<T: Copy + Default>(a: &[T], out: &mut [T], xor: impl Fn(T, T) -> T) {
     let mut c = [T::default(); 320];
     for x in 0..5 {
