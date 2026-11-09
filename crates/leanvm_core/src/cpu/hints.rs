@@ -47,10 +47,12 @@ pub struct GPow {
     announced: usize,
     /// The same for every multiple `k` of `STRIDE` that `pow` covers.
     coarse: Vec<u32>,
+    /// Committed log-size of the last proof to use this table, for optional reservations.
+    pub(crate) last_mu: usize,
 }
 
 /// Spacing of the coarse index, and so the most probes a missed lookup costs.
-const STRIDE: usize = 64;
+const STRIDE: usize = 16;
 
 impl GPow {
     /// Seeded with `g^0 = 1`, grown to cover index `upto`, nothing announced.
@@ -60,6 +62,7 @@ impl GPow {
             index: vec![0; 1 << 13],
             announced: 0,
             coarse: Vec::new(),
+            last_mu: 0,
         };
         g.extend(upto);
         g
@@ -83,8 +86,8 @@ impl GPow {
     }
 
     /// The forward table, `g^0` to `g^{covered - 1}`.
-    pub(crate) fn into_powers(self) -> Vec<F64> {
-        self.pow
+    pub(crate) fn powers(&self) -> &[F64] {
+        &self.pow
     }
 
     /// Extend the forward table to cover index `upto`.
@@ -127,9 +130,6 @@ impl GPow {
     /// is about to store it in memory as an address. Covers `k` first. Idempotent.
     pub fn note(&mut self, k: usize) {
         self.grow_to(k);
-        if find(&self.index, &self.pow, self.pow[k]).is_some() {
-            return;
-        }
         if 2 * (self.announced + 1) > self.index.len() {
             let wider = vec![0; 2 * self.index.len()];
             let old = std::mem::replace(&mut self.index, wider);
@@ -137,7 +137,16 @@ impl GPow {
                 insert(&mut self.index, self.pow[e as usize - 1], e as usize - 1);
             }
         }
-        insert(&mut self.index, self.pow[k], k);
+        // Distinct exponents have distinct powers: one probe walk finds k or its free slot.
+        let mask = self.index.len() - 1;
+        let mut i = slot_of(self.pow[k].0, mask);
+        while self.index[i] != 0 {
+            if self.index[i] as usize == k + 1 {
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+        self.index[i] = k as u32 + 1;
         self.announced += 1;
     }
 

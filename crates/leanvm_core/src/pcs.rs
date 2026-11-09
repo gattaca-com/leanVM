@@ -26,7 +26,7 @@
 //! ingredient is sampled from `E`.
 
 use crate::transcript::ProverState;
-use primitives::field::F64;
+use primitives::field::{F64, F128};
 
 use ::pcs::ood::ood_sample;
 use ::pcs::stack_open::open_batch_mixed_whir_stacked;
@@ -116,6 +116,16 @@ pub fn commit(
         log_inv_rate,
         ood,
     }
+}
+
+/// Reserve the level-1 codeword and Merkle extent for allocators that retain freed pages.
+/// Failure is harmless; an allocator that unmaps on free gains nothing from the reservation.
+pub(crate) fn reserve_level1(mu: usize, log_inv_rate: usize) -> Vec<u8> {
+    let shapes = whir_config(mu, log_inv_rate).level_shapes(mu);
+    let bytes = shapes.block_len[1] * ((size_of::<F128>() << shapes.ks[1]) + 2 * size_of::<::pcs::merkle::Hash>());
+    let mut v = Vec::new();
+    let _ = v.try_reserve_exact(bytes);
+    v
 }
 
 // The batching challenges are just `sample()`d inside the stacked opener: every

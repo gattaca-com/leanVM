@@ -503,7 +503,7 @@ impl Program {
         // of an O(log) power: a frame base or an operand is below the cells the run used.
         // The run's own table covers them unless a count outgrew it.
         let span = exec.mem_used.max(bytecode_size).max(tr.counts);
-        let gpow = match exec.gpow.get(..span) {
+        let gpow = match exec.gpow.powers().get(..span) {
             Some(gpow) => std::borrow::Cow::Borrowed(gpow),
             None => std::borrow::Cow::Owned(primitives::field::g_powers(span)),
         };
