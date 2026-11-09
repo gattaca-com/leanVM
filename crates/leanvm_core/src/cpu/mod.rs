@@ -433,12 +433,45 @@ impl Stats {
 /// the commitment.
 #[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
 pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
+    static POOL: std::sync::Mutex<Vec<hints::GPow>> = std::sync::Mutex::new(Vec::new());
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
-    let (exec, keccak_blocks) = crate::stage!("Execute program", || {
-        crate::keccak::while_executing(|step| program.execute_with(public_input, step))
+    program.check_main_frame().map_err(ProveError::Execution)?;
+    let gpow = POOL.lock().ok().and_then(|mut pool| pool.pop());
+    let gpow = gpow.unwrap_or_else(|| hints::GPow::new(0));
+    let reserve_mu = if gpow.last_mu > 0 {
+        gpow.last_mu
+    } else {
+        let log_mem = crate::log2_ceil_usize(gpow.powers().len().max(program.main_frame as usize).max(2));
+        (program.layout(log_mem, [0; tables::N_TABLES], public_input).shape.mu + 1)
+            .clamp(pcs::MIN_STACKED_LOG, pcs::MAX_STACKED_LOG)
+    };
+    let mut reserve = if parallel::num_threads() > 1 {
+        pcs::reserve_level1(reserve_mu, log_inv_rate)
+    } else {
+        Vec::new()
+    };
+    let prefault = tracing::info_span!("Pre-fault");
+    let (exec, keccak_blocks) = std::thread::scope(|scope| {
+        if reserve.capacity() != 0 {
+            // An optional helper touches the reservation while execution uses the proving thread.
+            let _ = std::thread::Builder::new().spawn_scoped(scope, || {
+                let _span = prefault.enter();
+                let pages = reserve.spare_capacity_mut();
+                for page in pages.iter_mut().step_by(4096) {
+                    page.write(0);
+                }
+                if let Some(last) = pages.last_mut() {
+                    last.write(0);
+                }
+            });
+        }
+        crate::stage!("Execute program", || {
+            crate::keccak::while_executing(|step| program.execute_with(public_input, gpow, step))
+        })
     });
+    drop(reserve);
     let exec = exec.map_err(ProveError::Execution)?;
     // A live value that came from outside the constraint system would make the proof
     // about a weaker statement than the program text, so it is refused here, on the one
@@ -465,8 +498,19 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
     }
     let cycles = exec.cycles;
     let mut w = crate::stage!("Build witness", || program.build(&exec, layout, keccak_blocks));
-    let mem_used = exec.mem_used;
-    drop(exec);
+    let Execution {
+        mem,
+        trace,
+        unconstrained_reads,
+        mem_used,
+        mut gpow,
+        cycles: _,
+    } = exec;
+    drop((mem, trace, unconstrained_reads));
+    gpow.last_mu = shape.mu;
+    if let Ok(mut pool) = POOL.lock() {
+        pool.push(gpow);
+    }
     let committed_size = compact.as_ref().map_or_else(|| w.committed_size(), |c| c.placed);
     // The public statement (program digest + input) seeds the transcript, so
     // every challenge depends on the exact program and public input.
@@ -486,6 +530,7 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
     let compact_q = compact
         .as_ref()
         .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
+    drop(pcs::reserve_level1(shape.mu, log_inv_rate));
     let committed = crate::stage!("Commit", || {
         pcs::commit(
             &mut ps,
@@ -720,6 +765,110 @@ fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::SlotClaim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_high_frame_keeps_its_memory_and_counts() {
+        let high = 1 << 16;
+        let fill = Op::Xor { a: 0, b: 0, c: 0 };
+        let jump = Op::Jump { oc: 0, od: 0, of: 1 };
+        let pi = [F128::from(g_pow(3)), F128::from(g_pow(high))];
+        let program = Program::from_bytecode(
+            vec![
+                jump,
+                fill,
+                fill,
+                Op::Set {
+                    o: 0,
+                    k: F128::from(g_pow(7)),
+                },
+                Op::Set { o: 1, k: F128::ONE },
+                jump,
+                fill,
+                fill,
+            ],
+            2,
+        );
+        let mut warm = hints::GPow::new(0);
+        warm.note(high);
+        let cold = program.execute(pi).unwrap();
+        let warm = program.execute_with(pi, warm, &mut |_| {}).unwrap();
+        for exec in [&cold, &warm] {
+            assert_eq!(exec.mem_used, high + 2);
+            assert_eq!(exec.mem.len(), (high + 2).next_power_of_two());
+            assert_eq!(exec.mem.word(high), F128::from(g_pow(7)));
+            assert_eq!(exec.mem.word(high + 1), F128::ONE);
+            assert_eq!(exec.mem.page(high >> Memory::page_log()).unwrap()[0].count, 3);
+        }
+        let (first, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &first).unwrap();
+        let (second, _) = prove(&program, pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        assert_eq!(first.to_bytes(), second.to_bytes());
+    }
+
+    #[test]
+    fn executor_bounds_depend_on_executed_accesses() {
+        let halt = Op::Xor { a: 0, b: 0, c: 0 };
+        let jump = Op::Jump { oc: 0, od: 0, of: 1 };
+        let pi = [F128::from(g_pow(3)), F128::ONE];
+        let mut bad = vec![
+            Op::Set {
+                o: hints::MAX_CELLS,
+                k: F128::ZERO,
+            },
+            Op::Set {
+                o: u32::MAX,
+                k: F128::ZERO,
+            },
+        ];
+        for offset in [hints::MAX_CELLS - 1, u32::MAX] {
+            for (tail, cap) in [(offset, 0), (0, offset)] {
+                bad.push(Op::Keccak {
+                    m: [0; 4],
+                    tail,
+                    b8: 0,
+                    cap,
+                    out: 0,
+                    in_odd: false,
+                    out_odd: false,
+                    out_cells: OutCells::One,
+                });
+            }
+        }
+        for op in bad {
+            let executed = Program::from_bytecode(vec![op, halt], 2);
+            assert_eq!(executed.execute(pi).err().unwrap().fault, Fault::OutOfMemory);
+            let unreachable = Program::from_bytecode(vec![jump, op, op, halt], 2);
+            assert_eq!(unreachable.execute(pi).unwrap().cycles, 1);
+        }
+        let bad_frame = Program::from_bytecode(vec![halt, halt], hints::MAX_CELLS);
+        assert_eq!(bad_frame.execute(pi).err().unwrap().fault, Fault::OutOfMemory);
+        assert!(matches!(
+            prove(&bad_frame, pi, crate::pcs::TEST_LOG_INV_RATE),
+            Err(ProveError::Execution(ExecError {
+                fault: Fault::OutOfMemory,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn jump_bound_rejects_cached_and_uncached_targets() {
+        let target = 100;
+        let pi = [F128::from(g_pow(target)), F128::ONE];
+        let program = Program::from_bytecode(vec![Op::Jump { oc: 0, od: 0, of: 1 }, Op::Xor { a: 0, b: 0, c: 0 }], 2);
+        let cold = program.execute(pi).err().unwrap();
+        let mut warm = hints::GPow::new(0);
+        warm.note(target);
+        let warm = program.execute_with(pi, warm, &mut |_| {}).err().unwrap();
+        assert_eq!(cold, warm);
+        assert!(matches!(
+            cold.fault,
+            Fault::NotAGPower {
+                what: "JUMP target",
+                ..
+            }
+        ));
+    }
 
     /// A K-embedded immediate (extension limb zero).
     fn w(x: u64) -> F128 {
