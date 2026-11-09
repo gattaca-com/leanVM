@@ -151,6 +151,48 @@ pub struct Layout {
     pub rows: [usize; tables::N_TABLES],
 }
 
+impl Layout {
+    /// The stack's repeat map for [`::pcs::whir::commit`], from the layout alone.
+    ///
+    /// - A block of `2^EQUAL_BLOCK_LOG` words repeats its predecessor where both lie in one constant run.
+    /// - A run is a table column past its rows, a memory column past the `mem_used` cells, or the zero tail.
+    /// - Every other block is untagged, which only costs the commit a read.
+    pub(crate) fn padding_repeats(&self, mem_used: usize) -> Vec<bool> {
+        use ::pcs::stack_open::EQUAL_BLOCK_LOG as LOG;
+        let end = self.shape.committed_len();
+        let mut repeats = vec![false; end >> LOG];
+        // Words `from..to` hold one value: tag each whole block there but the first.
+        let mut constant = |from: usize, to: usize| {
+            let first = from.div_ceil(1 << LOG) + 1;
+            repeats[first.min(to >> LOG)..to >> LOG].fill(true);
+        };
+        let (sch, steps) = (schema(), 1 << self.taus[tables::KECCAK_TABLE]);
+        for (i, p) in self.placements.iter().enumerate() {
+            let table = (0..tables::N_TABLES).rev().find(|&t| i >= sch.base[t]);
+            let (start, data) = match (keccak_value(i), table) {
+                // The spare slots of `q_keccak` carry KECCAK columns.
+                (Some(KeccakLane::Slot(s)), Some(t)) if s >= crate::keccak::SLOTS => {
+                    (self.placements[QKECCAK].offset + s * steps, self.rows[t])
+                }
+                _ if p.is_virtual() => continue,
+                (_, Some(t)) => (p.offset, self.rows[t]),
+                _ if i <= MFCNT => (p.offset, mem_used),
+                _ => continue,
+            };
+            let len = if p.is_virtual() { steps } else { 1 << p.n_vars };
+            constant(start + data, start + len);
+        }
+        let placed = self
+            .placements
+            .iter()
+            .filter(|p| !p.is_virtual())
+            .map(|p| 1 << p.n_vars)
+            .sum();
+        constant(placed, end);
+        repeats
+    }
+}
+
 /// The prover's witness: the stacked multilinear `q`, which holds every committed
 /// column at its placed offset, plus the public [`Layout`] (and the sizes needed to
 /// announce it).
