@@ -16,5 +16,8 @@ keccak_gkr.workspace = true
 verifier.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 lean_compiler.workspace = true
