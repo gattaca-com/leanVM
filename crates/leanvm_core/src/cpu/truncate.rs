@@ -9,6 +9,7 @@ use crate::tables;
 use crate::witness::{self, Placement, StackShape};
 use ::pcs::stack_open::EQUAL_BLOCK_LOG;
 use primitives::field::{F64, F192};
+use primitives::hash::{PI, RC, RHO, STATE_LANES};
 
 /// A column keeps its rows to within `2^TRUNC_D` of its real count, in pieces of at least `2^MIN_PIECE_LOG` rows.
 const TRUNC_D: usize = 4;
@@ -40,6 +41,77 @@ struct Item {
     dst: usize,
 }
 
+/// Keccak-f's first `n` rounds on `a`.
+fn keccak_rounds(a: &mut [u64; STATE_LANES], n: usize) {
+    for &rc in &RC[..n] {
+        let c: [u64; 5] = std::array::from_fn(|x| a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]);
+        let mut b = [0u64; STATE_LANES];
+        for i in 0..STATE_LANES {
+            let d = c[(i % 5 + 4) % 5] ^ c[(i % 5 + 1) % 5].rotate_left(1);
+            b[PI[i]] = (a[i] ^ d).rotate_left(RHO[i]);
+        }
+        for i in 0..STATE_LANES {
+            let row = i / 5 * 5;
+            a[i] = b[i] ^ (!b[row + (i % 5 + 1) % 5] & b[row + (i % 5 + 2) % 5]);
+        }
+        a[0] ^= rc;
+    }
+}
+
+/// `eq(bits(i), point)`, bit 0 first.
+fn eq_bits(i: usize, point: &[F192]) -> F192 {
+    point
+        .iter()
+        .enumerate()
+        .map(|(j, &x)| if i >> j & 1 == 1 { x } else { F192::ONE + x })
+        .product()
+}
+
+/// `q_keccak` in the QT layout: its chunks `< c` are copied to `o`, chunk `ch` of slot `s` at `g * (s + 64 * ch)`.
+/// The chunks past them equal the public pad `pad[slot]`.
+struct Region {
+    tau: usize,
+    g_log: usize,
+    /// Chunks of `2^g_log` steps that are committed.
+    c: usize,
+    /// Words the other items occupy, and the region's offset.
+    s_o: usize,
+    o: usize,
+    /// Length of the stack the opener gets: the region's end, to whole lanes.
+    ext: usize,
+    pad: [F64; 64],
+}
+
+impl Region {
+    /// `1 + sum_{i < c} eq(bits(i), rho_chunk)`, the weight of the pad's chunks.
+    fn u(&self, rho_chunk: &[F192]) -> F192 {
+        F192::ONE + (0..self.c).map(|i| eq_bits(i, rho_chunk)).sum::<F192>()
+    }
+
+    /// `rho = (steplo, chunk, slot)` as `(steplo, slot, chunk)`.
+    fn rotate(&self, rho: &[F192]) -> Vec<F192> {
+        let (steplo, rest) = rho.split_at(self.g_log);
+        let (chunk, slot) = rest.split_at(self.tau - self.g_log);
+        [steplo, slot, chunk].concat()
+    }
+
+    /// Asserts that `q_keccak` holds the pad past its covered chunks.
+    fn check_pad(&self, qk: &[F64]) {
+        if self.c << self.g_log == 1 << self.tau {
+            return;
+        }
+        let mut bad = Vec::new();
+        for (s, &want) in self.pad.iter().enumerate() {
+            let col = &qk[s << self.tau..][..1 << self.tau];
+            if col[col.len() - 1] != want {
+                bad.push((s, col[col.len() - 1].0, want.0));
+            }
+            debug_assert!(col[self.c << self.g_log..].iter().all(|&x| x == want), "slot {s} has data past the pad");
+        }
+        assert!(bad.is_empty(), "q_keccak does not end in the pad; (slot, held, expected): {bad:x?}");
+    }
+}
+
 /// The compact stack's layout: the items of every committed column, in increasing column then offset.
 pub(super) struct Compact {
     items: Vec<Item>,
@@ -48,6 +120,8 @@ pub(super) struct Compact {
     pub(super) shape: StackShape,
     /// Words the items occupy.
     pub(super) placed: usize,
+    /// The QT layout, when it commits fewer words than keeping `q_keccak` whole: then the `QKECCAK` item is unused.
+    region: Option<Region>,
 }
 
 impl Compact {
@@ -74,22 +148,53 @@ impl Compact {
             items.extend(pieces(p.n_vars, real).map(|(off, b)| Item { col: c, off, b, dst: 0 }));
         }
         starts.push(items.len());
-        let kappas: Vec<Option<usize>> = items.iter().map(|it| Some(it.b)).collect();
-        let (placements, shape) = witness::placements_of(&kappas);
-        for (it, p) in items.iter_mut().zip(&placements) {
-            it.dst = p.offset;
+        let kappas = |skip: Option<usize>| -> Vec<Option<usize>> {
+            items.iter().map(|it| (Some(it.col) != skip).then_some(it.b)).collect()
+        };
+        let (placements, mut shape) = witness::placements_of(&kappas(None));
+        let mut dsts: Vec<usize> = placements.iter().map(|p| p.offset).collect();
+        let mut placed = items.iter().map(|it| 1 << it.b).sum();
+        // QT: `q_keccak` as the region `R`, after the other items.
+        let kt = tables::KECCAK_TABLE;
+        let (tau, rows) = (l.taus[kt], l.rows[kt]);
+        assert_eq!(l.placements[QKECCAK].n_vars, 6 + tau, "q_keccak is 64 slots of the KECCAK table");
+        let g_log = tau.min(tau.saturating_sub(TRUNC_D).max(MIN_PIECE_LOG));
+        let c = rows.max(1).div_ceil(1 << g_log).min(1 << (tau - g_log));
+        let (offsets, s_o) = witness::stack_offsets(&kappas(Some(QKECCAK)));
+        let o = s_o.next_multiple_of(1 << (6 + tau));
+        let placed_qt = o + ((c * 64) << g_log);
+        let mu = crate::log2_ceil_usize(o + (1 << (6 + tau))).max(pcs::MIN_MU);
+        let qt = StackShape {
+            mu,
+            n_lanes: placed_qt.div_ceil(1 << (mu - pcs::LOG_BATCH)).max(1),
+        };
+        let mut region = None;
+        if qt.committed_len() < shape.committed_len() {
+            assert!(g_log >= EQUAL_BLOCK_LOG, "a chunk is whole repeat blocks");
+            let mut pad = [F64::ZERO; 64];
+            let mut state = [0u64; STATE_LANES];
+            keccak_rounds(&mut state, 12);
+            for (p, &lane) in pad[25..50].iter_mut().zip(&state) {
+                *p = F64(lane);
+            }
+            let ext = (o + (1 << (6 + tau))).next_multiple_of(1 << (mu - pcs::LOG_BATCH));
+            region = Some(Region { tau, g_log, c, s_o, o, ext, pad });
+            (dsts, shape, placed) = (offsets, qt, placed_qt);
+        }
+        for (it, dst) in items.iter_mut().zip(dsts) {
+            it.dst = dst;
         }
         if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&shape.mu) {
             return Err(ProveError::WitnessOutOfRange {
                 log_committed: shape.mu,
             });
         }
-        let placed = items.iter().map(|it| 1 << it.b).sum();
         Ok(Self {
             items,
             starts,
             shape,
             placed,
+            region,
         })
     }
 
@@ -121,21 +226,46 @@ impl Compact {
                 );
             }
         }
-        // SAFETY: `split_stack` hands out one window per item, tiling `0..placed`, and zeroes the tail.
-        // The loop below writes every window.
-        let mut compact = unsafe { witness::alloc_stack(self.shape) };
-        let placements: Vec<Placement> = self
+        let qk = l.placements[QKECCAK];
+        let qk_words = &q[qk.offset..][..1 << qk.n_vars];
+        let items: Vec<&Item> = self
             .items
+            .iter()
+            .filter(|it| self.region.is_none() || it.col != QKECCAK)
+            .collect();
+        let placements: Vec<Placement> = items
             .iter()
             .map(|it| Placement {
                 n_vars: it.b,
                 offset: it.dst,
             })
             .collect();
-        for (it, window) in self.items.iter().zip(witness::split_stack(&mut compact, &placements)) {
+        // SAFETY: `split_stack` hands out one window per item, tiling `0..placed` (a QT stack's items tile
+        // `0..s_o`), and zeroes the tail. The loops below write every window, and in a QT stack the gap
+        // before the region, the region and the zeros past it.
+        let mut compact = match &self.region {
+            None => unsafe { witness::alloc_stack(self.shape) },
+            Some(r) => unsafe { primitives::uninit_vec::<F64>(r.ext) },
+        };
+        let split = self.region.as_ref().map_or(compact.len(), |r| r.s_o);
+        let (head, rest) = compact.split_at_mut(split);
+        for (it, window) in items.iter().zip(witness::split_stack(head, &placements)) {
             let src = &q[l.placements[it.col].offset + it.off..][..window.len()];
             parallel::chunks_mut(window, COPY_CHUNK, |i, chunk| {
                 chunk.copy_from_slice(&src[i * COPY_CHUNK..][..chunk.len()]);
+            });
+        }
+        if let Some(r) = &self.region {
+            r.check_pad(qk_words);
+            let (gap, rest) = rest.split_at_mut(r.o - r.s_o);
+            let (region, tail) = rest.split_at_mut((r.c * 64) << r.g_log);
+            parallel::chunks_mut(gap, COPY_CHUNK, |_, chunk| chunk.fill(F64::ZERO));
+            parallel::chunks_mut(tail, COPY_CHUNK, |_, chunk| chunk.fill(F64::ZERO));
+            let g = 1 << r.g_log;
+            parallel::chunks_mut(region, 64 * g, |ch, block| {
+                for (s, dst) in block.chunks_exact_mut(g).enumerate() {
+                    dst.copy_from_slice(&qk_words[(s << r.tau) + ch * g..][..g]);
+                }
             });
         }
         compact
@@ -146,13 +276,30 @@ impl Compact {
     /// tail block are untagged; the rest of the zero tail is tagged.
     pub(super) fn repeats(&self, full: &[bool], l: &super::Layout) -> Vec<bool> {
         let mut repeats = vec![false; self.shape.committed_len() >> EQUAL_BLOCK_LOG];
-        for it in self.items.iter().filter(|it| it.b >= EQUAL_BLOCK_LOG) {
+        let skip = |it: &&Item| self.region.is_some() && it.col == QKECCAK;
+        for it in self.items.iter().filter(|it| it.b >= EQUAL_BLOCK_LOG && !skip(it)) {
             let (from, to) = (
                 (l.placements[it.col].offset + it.off) >> EQUAL_BLOCK_LOG,
                 it.dst >> EQUAL_BLOCK_LOG,
             );
             let blocks = 1 << (it.b - EQUAL_BLOCK_LOG);
             repeats[to + 1..to + blocks].copy_from_slice(&full[from + 1..from + blocks]);
+        }
+        if let Some(r) = &self.region {
+            // Each chunk keeps its blocks' flags, the first block of a chunk untagged. The gap before the region is zero.
+            let blocks = 1 << (r.g_log - EQUAL_BLOCK_LOG);
+            let from_qk = l.placements[QKECCAK].offset >> EQUAL_BLOCK_LOG;
+            for ch in 0..r.c {
+                for s in 0..64 {
+                    let to = (r.o >> EQUAL_BLOCK_LOG) + blocks * (s + 64 * ch);
+                    let from = from_qk + (s << (r.tau - EQUAL_BLOCK_LOG)) + ch * blocks;
+                    repeats[to + 1..to + blocks].copy_from_slice(&full[from + 1..from + blocks]);
+                }
+            }
+            let gap = r.s_o.div_ceil(1 << EQUAL_BLOCK_LOG) + 1..r.o >> EQUAL_BLOCK_LOG;
+            if !gap.is_empty() {
+                repeats[gap].fill(true);
+            }
         }
         let tail = (self.placed.div_ceil(1 << EQUAL_BLOCK_LOG) + 1).min(repeats.len());
         repeats[tail..].fill(true);
@@ -176,8 +323,24 @@ impl Compact {
         claims: Vec<SlotClaim>,
         mut ring: RingSwitchOpen,
     ) -> (Vec<SlotClaim>, RingSwitchOpen) {
-        ring.offset = self.qkeccak_offset(l, ring.offset);
         let qk = l.placements[QKECCAK];
+        if let Some(r) = &self.region {
+            // Characteristic 2: the pad's share adds where the design subtracts it.
+            ring.offset = r.o;
+            for claim in &mut ring.claims {
+                let (chunk, slot) = claim.suffix_point[r.g_log..].split_at(r.tau - r.g_log);
+                let u = r.u(chunk);
+                let eq_slots: Vec<F192> = (0..64).map(|s| eq_bits(s, slot)).collect();
+                let slices = claim.s_hat_v.as_mut().expect("the reduction sends its slices");
+                for (i, slice) in slices.iter_mut().enumerate() {
+                    let share: F192 = (0..64).filter(|&s| r.pad[s].0 >> i & 1 == 1).map(|s| eq_slots[s]).sum();
+                    *slice += u * share;
+                }
+                claim.suffix_point = r.rotate(&claim.suffix_point);
+            }
+        } else {
+            ring.offset = self.qkeccak_offset(l, ring.offset);
+        }
         let mapped = claims
             .into_iter()
             .map(|claim| {
@@ -190,6 +353,27 @@ impl Compact {
                     unreachable!("the prover builds Point claims")
                 };
                 if (qk.offset..qk.offset + (1 << qk.n_vars)).contains(&offset) {
+                    if let Some(r) = &self.region {
+                        let tau = r.tau;
+                        let (point, pad) = if zeta.len() == tau {
+                            // A slot claim: the slot's bits go between the step's and the chunk's.
+                            let slot = (offset - qk.offset) >> tau;
+                            let bits: Vec<F192> = (0..6).map(|j| if slot >> j & 1 == 1 { F192::ONE } else { F192::ZERO }).collect();
+                            let (steplo, chunk) = zeta.split_at(r.g_log);
+                            ([steplo, &bits, chunk].concat(), F192::from(r.pad[slot]) * r.u(chunk))
+                        } else {
+                            // The Keccak output claim, at the whole region.
+                            assert!(offset == qk.offset && zeta.len() == 6 + tau, "the output claim covers q_keccak");
+                            let chunk = &zeta[r.g_log..tau];
+                            let phat: F192 = (0..64).map(|s| F192::from(r.pad[s]) * eq_bits(s, &zeta[tau..])).sum();
+                            (r.rotate(&zeta), phat * r.u(chunk))
+                        };
+                        return SlotClaim::Point {
+                            offset: r.o,
+                            low_point: point,
+                            value: value + pad,
+                        };
+                    }
                     return SlotClaim::Point {
                         offset: self.qkeccak_offset(l, offset),
                         low_point: zeta,
@@ -245,6 +429,61 @@ impl Compact {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A xorshift generator, enough for test data.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self((seed * 0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn ext_vec(&mut self, n: usize) -> Vec<F192> {
+            (0..n).map(|_| F192::new(self.next_u64(), self.next_u64(), self.next_u64())).collect()
+        }
+    }
+
+    fn mle(w: &[F64], point: &[F192]) -> F192 {
+        w.iter().enumerate().map(|(i, &x)| F192::from(x) * eq_bits(i, point)).sum()
+    }
+
+    #[test]
+    fn rounds_match_the_permutation() {
+        let mut rng = Rng::new(7);
+        let mut a: [u64; STATE_LANES] = std::array::from_fn(|_| rng.next_u64());
+        let mut expected = a;
+        keccak_rounds(&mut a, 24);
+        primitives::hash::keccak_f(&mut expected);
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn rotation_and_pad_identity() {
+        let (tau, g_log, c) = (12, 10, 2);
+        let mut rng = Rng::new(11);
+        let pad: [F64; 64] = std::array::from_fn(|_| F64(rng.next_u64()));
+        let r = Region { tau, g_log, c, s_o: 0, o: 0, ext: 1 << (6 + tau), pad };
+        let g = 1 << g_log;
+        let mut q = vec![F64::ZERO; 64 << tau];
+        for (i, x) in q.iter_mut().enumerate() {
+            *x = if i % (1 << tau) < c * g { F64(rng.next_u64()) } else { pad[i >> tau] };
+        }
+        let mut region = vec![F64::ZERO; 64 << tau];
+        for s in 0..64 {
+            for ch in 0..c {
+                region[g * (s + 64 * ch)..][..g].copy_from_slice(&q[(s << tau) + ch * g..][..g]);
+            }
+        }
+        let rho = rng.ext_vec(6 + tau);
+        let (chunk, slot) = rho[g_log..].split_at(tau - g_log);
+        let phat: F192 = (0..64).map(|s| F192::from(pad[s]) * eq_bits(s, slot)).sum();
+        assert_eq!(mle(&q, &rho), mle(&region, &r.rotate(&rho)) + phat * r.u(chunk));
+    }
 
     #[test]
     fn pieces_follow_the_verifier_rule() {

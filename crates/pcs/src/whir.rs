@@ -91,6 +91,8 @@ pub struct ProverData {
     codeword: Codeword,
     /// Words per codeword row: the committed lanes, with zero lanes in front up to the vector width.
     row_words: usize,
+    /// The committed lanes. The opened stack may hold more, all zero.
+    n_lanes: usize,
     /// How the encoded rows widen to `row_words`, if the encode left all-zero lanes out.
     expansion: Option<Expansion>,
     pub(crate) merkle_tree: merkle::CutTree,
@@ -208,6 +210,7 @@ pub fn commit(
             ntt,
             codeword,
             row_words,
+            n_lanes,
             expansion,
             merkle_tree,
         },
@@ -1123,7 +1126,9 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         .as_ref()
         .map_or(prover_data.row_words, |e| e.enc_words());
     assert_eq!(prover_data.codeword.words(), block_len_0 * enc_words);
-    assert!((n_lanes..=num_interleaved_0).contains(&prover_data.row_words));
+    let committed_lanes = prover_data.n_lanes;
+    assert!((committed_lanes..=num_interleaved_0).contains(&prover_data.row_words));
+    assert!(n_lanes >= committed_lanes);
 
     // Nothing is absorbed on entry. The commitment was bound by the `add_root` that
     // transmitted it, and the target is `sum_i lambda^i * claim_i` over claim values bound by their
@@ -1186,12 +1191,12 @@ pub(crate) fn recursive_prover_with_prepared_basis(
     let row_words = prover_data.row_words;
     let group_0 = l0_tree.group_positions(&queries_0);
     let group_rows_0 = prover_data.rows(&stack, &group_0);
-    let image = |q| &fetched_row(&group_0, &group_rows_0, row_words, q)[row_words - n_lanes..];
+    let image = |q| &fetched_row(&group_0, &group_rows_0, row_words, q)[row_words - committed_lanes..];
     let mut opened_rows_0 = Vec::with_capacity(queries_0.len() * num_interleaved_0);
     // The induce folds a lane-ASCENDING row against the lane eq table: reversing the image puts
     // block `b` at index `b` and the absent lanes' zeros at the end, where they contribute nothing.
     for &q in &queries_0 {
-        let zeros = std::iter::repeat_n(F64::ZERO, num_interleaved_0 - n_lanes);
+        let zeros = std::iter::repeat_n(F64::ZERO, num_interleaved_0 - committed_lanes);
         opened_rows_0.extend(image(q).iter().rev().copied().chain(zeros));
     }
     ps.hint_merkle(l0_tree.open(&queries_0, row_words, num_interleaved_0, &group_rows_0, image));

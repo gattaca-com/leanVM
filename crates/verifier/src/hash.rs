@@ -48,7 +48,12 @@ pub const KECCAK_PI: [usize; STATE_LANES] = {
     pi
 };
 pub fn keccak_f(a: &mut [u64; STATE_LANES]) {
-    for rc in KECCAK_RC {
+    keccak_rounds(a, ROUNDS);
+}
+
+/// The first `rounds` rounds of Keccak-f[1600].
+pub fn keccak_rounds(a: &mut [u64; STATE_LANES], rounds: usize) {
+    for rc in KECCAK_RC[..rounds].iter().copied() {
         // Row by row, so every index is a constant: an index computed per lane vectorizes to gathers.
         let c: [u64; 5] = std::array::from_fn(|x| a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]);
         let d: [u64; 5] = std::array::from_fn(|x| c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1));

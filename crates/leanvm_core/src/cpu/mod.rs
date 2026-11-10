@@ -557,7 +557,8 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     let committed = crate::stage!("Commit", || {
         pcs::commit(
             &mut ps,
-            compact_q.as_deref().unwrap_or(&w.q),
+            // A QT stack goes on past the committed lanes, in zeros.
+            &compact_q.as_deref().unwrap_or(&w.q)[..shape.committed_len()],
             &repeats,
             shape,
             log_inv_rate,
