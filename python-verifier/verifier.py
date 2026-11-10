@@ -354,12 +354,17 @@ LANE_MASK = 2**64 - 1
 
 def keccak_f(lanes: Sequence[int]) -> list[int]:
     """Keccak-f[1600]."""
+    return keccak_rounds(lanes, ROUNDS)
+
+
+def keccak_rounds(lanes: Sequence[int], rounds: int) -> list[int]:
+    """The first `rounds` rounds of Keccak-f[1600]."""
     a = list(lanes)
 
     def rot(x: int, n: int) -> int:
         return ((x << n) | (x >> (64 - n))) & LANE_MASK if n else x
 
-    for rc in KECCAK_RC:
+    for rc in KECCAK_RC[:rounds]:
         c = [a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20] for x in range(5)]
         a = [a[i] ^ c[(i - 1) % 5] ^ rot(c[(i + 1) % 5], 1) for i in range(STATE_LANES)]
         b = [0] * STATE_LANES
@@ -558,8 +563,23 @@ class ColumnClaim:
         placement = layout.placements[self.column]
         if placement is None:
             return None
-        point = placement.stack_point(self.point, layout.stack_log)
-        return (lambda x: eq_eval(point, x), self.value)
+        if layout.qt is not None and (qt := layout.qt.claim(self.column, self.point, self.value, layout.stack_log)) is not None:
+            qt_point, qt_value = qt
+            return (lambda x: eq_eval(qt_point, x), qt_value)
+        pieces = [piece for piece in layout.pieces if piece.column == self.column]
+        if not pieces:
+            point = placement.stack_point(self.point, layout.stack_log)
+            return (lambda x: eq_eval(point, x), self.value)
+        # A truncated column is its pieces then the public pad: `C(zeta) = sum_j e_j piece_j(zeta[:b_j]) + pad (1 + sum_j e_j)`.
+        zeta = self.point
+        parts = []
+        for piece in pieces:
+            b = piece.placement.variables
+            e = reduce(mul, (zeta[i] if piece.off >> i & 1 else ONE + zeta[i] for i in range(b, placement.variables)), ONE)
+            parts.append((e, piece.placement.stack_point(zeta[:b], layout.stack_log)))
+        pad = ONE if self.column == MEMORY_FINAL_COUNTERS else ZERO
+        value = self.value + pad * (ONE + sum((e for e, _ in parts), ZERO))
+        return (lambda x: sum((e * eq_eval(point, x) for e, point in parts), ZERO), value)
 
 
 BUS_BITS = 4  # bus communicates tuples of 2^BUS_BITS field elements
@@ -697,6 +717,98 @@ KECCAK_BITS = 64 * STATE_LANES
 KECCAK_LOCAL_BITS = 11  # a bit position is z + 64 * lane, in a cube of 2048
 KECCAK_LANE_BITS = 5
 
+# A truncated proof commits each memory and table column as power-of-two pieces covering its real rows.
+TRUNC_D = 4
+MIN_PIECE_LOG = 10
+
+
+@dataclass(frozen=True)
+class Truncation:
+    """What the rate word announces of a truncated proof: its memory cells, and whether q_keccak is a region (QT)."""
+
+    mem_count: int
+    qt: bool
+
+
+def pieces(k: int, real: int) -> list[tuple[int, int]]:
+    """The pieces, (offset in the column, log size) by increasing offset, that commit the first `real` rows of a column of
+    2^k rows: the prefix rounded up to a multiple of 2^max(k - TRUNC_D, MIN_PIECE_LOG), cut by its binary digits."""
+    if k <= MIN_PIECE_LOG:
+        return [(0, k)]
+    g_log = max(k - TRUNC_D, MIN_PIECE_LOG)
+    covered = min(-(-max(real, 1) // 2**g_log) * 2**g_log, 2**k)
+    if covered == 2**k:
+        return [(0, k)]
+    out, off = [], 0
+    for b in range(k - 1, g_log - 1, -1):
+        if covered >> b & 1:
+            out.append((off, b))
+            off += 2**b
+    return out
+
+
+@dataclass(frozen=True)
+class Piece:
+    """One piece of a truncated column, laid in the stack at `placement`; `off` is its first row in the column."""
+
+    column: int
+    off: int
+    placement: Placement
+
+
+def qt_pad() -> tuple[int, ...]:
+    """What a padding step holds in each slot: zero but for slots 25..50, the state after KECCAK_DEPTH rounds on zero."""
+    state = keccak_rounds([0] * STATE_LANES, KECCAK_DEPTH)
+    return (0,) * STATE_LANES + tuple(state) + (0,) * (2**QKECCAK_SLOT_BITS - 2 * STATE_LANES)
+
+
+@dataclass(frozen=True)
+class Qt:
+    """The truncated q_keccak: only its first c chunks of 2^g_log steps are committed, as a region of 2^(6 + tau) words at
+    `offset`, laid out (steplo, slot, chunk). The rest of each slot is the public pad."""
+
+    offset: int
+    tau: int
+    g_log: int
+    c: int
+    pad: tuple[int, ...]
+
+    def placement(self) -> Placement:
+        return Placement(QKECCAK_SLOT_BITS + self.tau, self.offset)
+
+    def uncovered(self, y: Sequence[E]) -> E:
+        """1 + sum_{i < c} eq(bits(i), y): the weight of the uncovered chunks at y."""
+        return ONE + sum(eq_kernel(y)[: self.c], ZERO)
+
+    def pad_mle(self, x: Sequence[E]) -> E:
+        return sum((eq * E(p) for eq, p in zip(eq_kernel(x), self.pad, strict=True)), ZERO)
+
+    def rotate(self, point: Sequence[E]) -> MultilinearPoint:
+        """The region point of a point (steplo, chunk, slot) of the full layout: (steplo, slot, chunk)."""
+        steplo, chunk, slot = point[: self.g_log], point[self.g_log : self.tau], point[self.tau :]
+        return (*steplo, *slot, *chunk)
+
+    def claim(self, column: int, point: Sequence[E], value: E, stack_log: int) -> tuple[MultilinearPoint, E] | None:
+        """The stack point and value of a claim on q_keccak's output or on one of its slot columns; None otherwise."""
+        if column == QKECCAK:
+            chunk, slot = point[self.g_log : self.tau], point[self.tau :]
+            region_point, value = self.rotate(point), value + self.pad_mle(slot) * self.uncovered(chunk)
+        else:
+            base = GLOBAL_COLUMN_BASES[OP_KECCAK]
+            if column < base or (slot := KECCAK_SLOT_OF.get(column - base)) is None:
+                return None
+            low, chunk = point[: self.g_log], point[self.g_log :]
+            region_point = (*low, *_selector_point(slot, QKECCAK_SLOT_BITS), *chunk)
+            value = value + self.uncovered(chunk) * E(self.pad[slot])
+        return self.placement().stack_point(region_point, stack_log), value
+
+    def ring_inputs(self, point: Sequence[E], slices: Sequence[E]) -> tuple[MultilinearPoint, list[E]]:
+        """The ring switch's inputs for the committed region: the point rotated, the slices plus the pad's share."""
+        u = self.uncovered(point[self.g_log : self.tau])
+        eq = eq_kernel(point[self.tau :])
+        shares = [sum((e for e, p in zip(eq, self.pad, strict=True) if p >> i & 1), ZERO) for i in range(len(slices))]
+        return self.rotate(point), [s + u * share for s, share in zip(slices, shares, strict=True)]
+
 
 @dataclass(frozen=True)
 class Layout:
@@ -709,6 +821,11 @@ class Layout:
     placements: tuple[Placement | None, ...]  # None for a column nothing commits: the KECCAK output lanes
     stack_log: int
     table_log_heights: tuple[int, ...]
+    # The pieces of the truncated columns, by column then offset; empty unless the proof is truncated. A truncated column's
+    # placement keeps its `variables`, its `index` meaning nothing.
+    pieces: tuple[Piece, ...] = ()
+    # Set when a truncated proof commits q_keccak as a region (`placements[QKECCAK]` is then the region's).
+    qt: Qt | None = None
 
 
 def _cols(columns: Sequence[str], *names: str) -> tuple[int, ...]:
@@ -984,9 +1101,15 @@ GLOBAL_COLUMN_BASES = tuple(NUM_GLOBAL_COLUMNS + sum(TABLE_WIDTHS[:table]) for t
 TABLE_LOG_FLOORS = (0, 0, 0, 0, 0, KECCAK_MIN_STEPS_LOG)  # each table's least log height: 0, but the Keccak reduction's block of steps for KECCAK
 
 
-def build_layout(bytecode: Sequence[K], log_memory: int, table_rows: Sequence[int]) -> Layout:
+def build_layout(bytecode: Sequence[K], log_memory: int, table_rows: Sequence[int], truncation: Truncation | None = None) -> Layout:
     log_bytecode = log2_strict(len(bytecode)) - BUS_BITS
-    require(16 <= log_memory <= 32 and all(rows <= 2**32 for rows in table_rows) and 0 <= log_bytecode <= 32, "invalid announced table sizes")
+    require(
+        16 <= log_memory <= 32
+        and all(rows <= 2**32 for rows in table_rows)
+        and 0 <= log_bytecode <= 32
+        and (truncation is None or 1 <= truncation.mem_count <= 2**log_memory),
+        "invalid announced table sizes",
+    )
     # A table's height is the least power of two holding its rows.
     table_log_heights = tuple(max(log2_ceil(rows), floor) for rows, floor in zip(table_rows, TABLE_LOG_FLOORS, strict=True))
 
@@ -1014,9 +1137,36 @@ def build_layout(bytecode: Sequence[K], log_memory: int, table_rows: Sequence[in
     outputs = range(base + KECCAK_OUT, base + KECCAK_OUT + STATE_LANES)
     slots = {column: KECCAK_SLOT_OF.get(column - base) for column in range(len(kappas))}
     blocks = {column: kappa for column, kappa in enumerate(kappas) if slots[column] is None and column not in outputs}
-    block_offsets, total_log = stack_offsets(list(blocks.values()))
-    offsets = dict(zip(blocks, block_offsets))
+    # The stacked items: a block each, or its pieces for a truncated column (the memory and the table columns).
+    items: list[tuple[int, int, int]] = []  # (column, offset in the column, kappa)
+    for column, kappa in blocks.items():
+        real = None
+        if truncation is not None and column <= MEMORY_FINAL_COUNTERS:
+            real = truncation.mem_count
+        elif truncation is not None and column >= NUM_GLOBAL_COLUMNS:
+            real = table_rows[max(t for t, table_base in enumerate(GLOBAL_COLUMN_BASES) if table_base <= column)]
+        items += [(column, off, b) for off, b in pieces(kappa, real)] if real is not None else [(column, 0, kappa)]
+    # A truncated proof may announce q_keccak as a region (QT), after the other items.
+    qt = None
+    if truncation is not None and truncation.qt:
+        tau = table_log_heights[OP_KECCAK]
+        g_log = min(tau, max(tau - TRUNC_D, MIN_PIECE_LOG))
+        c = min(-(-max(table_rows[OP_KECCAK], 1) // 2**g_log), 2 ** (tau - g_log))
+        items = [item for item in items if item[0] != QKECCAK]
+        offset = -(-sum(2**kappa for *_, kappa in items) // 2 ** (QKECCAK_SLOT_BITS + tau)) * 2 ** (QKECCAK_SLOT_BITS + tau)
+        qt = Qt(offset, tau, g_log, c, qt_pad())
+    item_offsets, total_log = stack_offsets([kappa for *_, kappa in items])
+    if qt is not None:
+        total_log = log2_ceil(qt.offset + 2 ** (QKECCAK_SLOT_BITS + qt.tau))
     stack_log = max(MIN_STACKED_LOG, total_log)  # Floor at the PCS minimum
+    offsets: dict[int, int] = {}
+    piece_list = []
+    for (column, off, kappa), index in zip(items, item_offsets, strict=True):
+        offsets.setdefault(column, index)
+        if truncation is not None and column not in (BYTECODE_FINAL_COUNTERS, QKECCAK):
+            piece_list.append(Piece(column, off, Placement(kappa, index)))
+    if qt is not None:
+        offsets[QKECCAK] = qt.offset
 
     def placement(column: int, kappa: int) -> Placement | None:
         if (slot := slots[column]) is not None:
@@ -1024,7 +1174,19 @@ def build_layout(bytecode: Sequence[K], log_memory: int, table_rows: Sequence[in
         return None if column in outputs else Placement(kappa, offsets[column])
 
     placements = [placement(column, kappa) for column, kappa in enumerate(kappas)]
-    return Layout(log_memory, log_bytecode, bytecode, tuple(push), tuple(pull), tuple(count), tuple(placements), stack_log, tuple(table_log_heights))
+    return Layout(
+        log_memory,
+        log_bytecode,
+        bytecode,
+        tuple(push),
+        tuple(pull),
+        tuple(count),
+        tuple(placements),
+        stack_log,
+        tuple(table_log_heights),
+        tuple(piece_list),
+        qt,
+    )
 
 
 # WHIR opening ----------------------------------------------------------------
@@ -1479,12 +1641,20 @@ def verify_execution(bytecode: Sequence[K], public_input: Digest, proof: Proof) 
 
     # 1] memory log-size, table row counts, and log-inv-rate in WHIR
     announced = transcript.next_scalars(2 + len(TABLES))
-    require(all(value.c1 == value.c2 == 0 for value in announced), "announced size has a nonzero high limb")
+    # The last word is (rate, flag, mem_count). Flag 1 announces a truncated proof over mem_count memory cells.
+    # Flag 2 announces one whose q_keccak is a region (QT).
+    rate_word = announced[-1]
+    flag, mem_count = int(rate_word.c1), int(rate_word.c2)
+    require(
+        all(value.c1 == value.c2 == 0 for value in announced[:-1]) and flag <= 2 and (flag != 0 or mem_count == 0),
+        "announced size has a nonzero high limb",
+    )
     log_memory = int(announced[0].c0)
     table_rows = tuple(int(value.c0) for value in announced[1 : 1 + len(TABLES)])
-    log_inverse_rate = int(announced[-1].c0)
+    log_inverse_rate = int(rate_word.c0)
     require(1 <= log_inverse_rate <= 4, "invalid PCS inverse rate")
-    layout = build_layout(bytecode, log_memory, table_rows)
+    truncation = Truncation(mem_count, flag == 2) if flag != 0 else None
+    layout = build_layout(bytecode, log_memory, table_rows, truncation)
     require(MIN_STACKED_LOG <= layout.stack_log <= MAX_STACKED_LOG, "committed size outside the PCS window")
 
     # 2] parse WHIR commitment: one Merkle root (No OOD, our PCS is only List-binding).
@@ -1522,6 +1692,8 @@ def verify_execution(bytecode: Sequence[K], public_input: Digest, proof: Proof) 
     # 7] Ring-switching
     # That claim is supported on q_keccak's region of the stack, so its weight carries the
     # placement's selector, and it leads the batch, taking the first power.
+    if layout.qt is not None:
+        point, slices = layout.qt.ring_inputs(point, slices)
     target, weight = ring_switch(point, slices, transcript)
     qkeccak = layout.placements[QKECCAK]
     ringswitch = (lambda x: qkeccak.eq_above(x) * weight(x[: qkeccak.variables]), target)

@@ -46,12 +46,13 @@ const LOOP_STEPS: usize = 16_384;
 /// verifier on them.
 fn spawn_python(directory: &Path, proof: &Proof) -> Child {
     let fixture = fixture();
+    spawn_python_on(directory, &fixture.bytecode_table(), &fixture.public_input, proof)
+}
+
+/// [`spawn_python`] for a proof of another program, `bytecode_table`, on the statement `public_input`.
+fn spawn_python_on(directory: &Path, bytecode_table: &[u64], public_input: &[F192; 2], proof: &Proof) -> Child {
     std::fs::create_dir_all(directory).expect("create test directory");
-    let table = fixture
-        .bytecode_table()
-        .into_iter()
-        .flat_map(u64::to_le_bytes)
-        .collect();
+    let table = bytecode_table.iter().copied().flat_map(u64::to_le_bytes).collect();
     let mut openings = Vec::new();
     for path in proof.merkle_openings.iter().flatten() {
         openings.extend(path.leaf_index.to_le_bytes());
@@ -60,7 +61,7 @@ fn spawn_python(directory: &Path, proof: &Proof) -> Child {
     }
     let files = [
         ("bytecode.bin", table),
-        ("public_input.bin", public_input_bytes(&fixture.public_input).to_vec()),
+        ("public_input.bin", public_input_bytes(public_input).to_vec()),
         (
             "stream.bin",
             proof
@@ -183,6 +184,55 @@ fn test_python_verifier() {
         .collect();
     for (log_inv_rate, run) in (1..).zip(runs) {
         assert_eq!(verdict(run), "verification succeeded", "rate {log_inv_rate}");
+    }
+    std::fs::remove_dir_all(directory).expect("remove test directory");
+}
+
+/// 38000 permutations: a KECCAK table of 2^16 rows, ten of its sixteen chunks covered. The stack's lanes are an eighth
+/// of q_keccak, so as a region it commits fewer words.
+const KECCAK_SOURCE: &str = r#"
+from snark_lib import *
+
+STEPS = 38000
+
+def main():
+    chain = HeapBuf(2 * STEPS + 2)
+    chain[1] = 5
+    chain[GEN] = 7
+    for i in mul_range(1, GEN ** STEPS):
+        keccak(chain[i * i:i * i + 2], chain[i * i:i * i + 2], chain[i * i * GEN * GEN:i * i * GEN * GEN + 2])
+    return
+"#;
+
+/// Both verifiers accept a truncated proof, with q_keccak whole (the fixture) and as a region (QT).
+#[test]
+fn truncated_proofs_verify() {
+    let fixture = fixture();
+    let keccaks = compile(&parse_with_replacements(KECCAK_SOURCE, &BTreeMap::new()).expect("parse zkDSL program"));
+    let directory = test_directory("truncated");
+    let runs: Vec<Child> = [
+        (&fixture.program, fixture.public_input, false),
+        (&keccaks, [F192::ZERO; 2], true),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(case, (program, statement, qt))| {
+        let mut program = program.clone();
+        program.truncate = true;
+        let bytecode_table: Vec<u64> = leanvm_core::cpu::layout::bytecode_table(&program.prog)
+            .iter()
+            .map(|word| word.0)
+            .collect();
+        let proof = scalar_proof(&prove(&program, statement, 1).unwrap().0);
+        let public_input = public_input_bytes(&statement);
+        let summary =
+            verify_execution(&Bytecode::new(&bytecode_table), &public_input, &proof).expect("the proof verifies");
+        assert_eq!(summary.truncation.map(|t| t.qt), Some(qt), "case {case}");
+        spawn_python_on(&directory.join(case.to_string()), &bytecode_table, &statement, &proof)
+    })
+    .collect();
+    for (case, run) in runs.into_iter().enumerate() {
+        assert_eq!(verdict(run), "verification succeeded", "case {case}");
     }
     std::fs::remove_dir_all(directory).expect("remove test directory");
 }

@@ -30,6 +30,7 @@ pub use execute::{ExecError, Execution, Fault, Memory};
 pub use isa::{DerefMode, Op, OutCells};
 pub use layout::*;
 pub(crate) use trace::{Drow, Jrow, Krow, Rows, Srow, Trace, Xrow};
+pub use truncate::{piece_digits, qt_pad};
 
 /// Data-memory size bounds (doc §Memory): memory is `2^h` cells with
 /// `MIN_LOG_MEM ≤ h ≤ MAX_LOG_MEM`. The prover pads up to the minimum; the
@@ -83,21 +84,21 @@ fn digest_words(halves: &[F192; 2]) -> [F64; 4] {
 /// here; it seeds the transcript at construction (see [`fs_seed`]). The boundary
 /// states are derived from the program, so they need no binding.
 ///
-/// A truncated proof (`truncate` holds the memory cells in use) sends the rate word as
-/// `(rate, 1, mem_used)`, which the verifier reads as the flag and the memory count.
+/// A truncated proof (`truncate` holds its memory count and whether q_keccak is a region) sends
+/// the rate word as `(rate, flag, mem_count)`. Flag 1 is a truncated proof, flag 2 one with the region.
 fn announce_public(
     ps: &mut ProverState,
     log_mem: usize,
     rows: [usize; tables::N_TABLES],
     log_inv_rate: usize,
-    truncate: Option<usize>,
+    truncate: Option<(usize, bool)>,
 ) {
     ps.add_scalar(F192::new(log_mem as u64, 0, 0));
     for n in rows {
         ps.add_scalar(F192::new(n as u64, 0, 0));
     }
-    let (flag, mem_used) = truncate.map_or((0, 0), |mem_used| (1, mem_used as u64));
-    ps.add_scalar(F192::new(log_inv_rate as u64, flag, mem_used));
+    let (flag, mem_count) = truncate.map_or((0, 0), |(mem_count, qt)| (1 + qt as u64, mem_count as u64));
+    ps.add_scalar(F192::new(log_inv_rate as u64, flag, mem_count));
 }
 
 #[derive(Clone)]
@@ -146,7 +147,7 @@ pub struct Program {
     /// the verifier nor the guest needs a new parameter to certify. Prover-side only.
     pub min_log_committed: usize,
     /// Commit only the covered prefix of each table and memory column ([`truncate`]). Prover-side choice,
-    /// announced in the proof; the recursion guest does not read such proofs yet.
+    /// announced in the proof, which the recursion guest reads too.
     pub truncate: bool,
 }
 
@@ -512,10 +513,11 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     // The rest of the execution goes here; its g-power table goes back to the pool.
     let Execution { mem_used, mut gpow, .. } = exec;
     // A truncated proof commits the compact stack; everything before the PCS open reads the full `w.q`.
-    let compact = program
-        .truncate
-        .then(|| truncate::Compact::new(&w.layout, mem_used))
-        .transpose()?;
+    let compact = if program.truncate {
+        truncate::Compact::reaching(&w.layout, mem_used, program.min_log_committed)?
+    } else {
+        None
+    };
     let shape = compact.as_ref().map_or(w.layout.shape, |c| c.shape);
     if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
@@ -544,7 +546,7 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
         w.log_mem,
         w.layout.rows,
         log_inv_rate,
-        compact.as_ref().map(|_| mem_used),
+        compact.as_ref().map(truncate::Compact::announced),
     );
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
     drop(pcs::reserve_level1(shape.mu, log_inv_rate));

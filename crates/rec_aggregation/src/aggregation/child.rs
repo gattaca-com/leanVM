@@ -56,6 +56,23 @@ pub(super) fn col_groups(sources: &[(usize, usize)]) -> Vec<usize> {
         .collect()
 }
 
+/// Whether a truncated proof cuts a column of this kappa source: the memory's and the tables' are.
+pub(super) fn cut(source: (usize, usize)) -> bool {
+    source.0 >= 1 && source.1 == 0
+}
+
+/// A cut column group's slots in the stacked order: piece `j` is `2^(kappa - j)` rows, `j = 0` the whole column.
+pub(super) const PIECES: usize = 5;
+
+/// The placement slots `(group, piece)`: [`PIECES`] for a cut group, one for any other.
+pub(super) fn col_slots(sources: &[(usize, usize)], groups: &[usize]) -> Vec<(usize, usize)> {
+    groups
+        .iter()
+        .enumerate()
+        .flat_map(|(g, &start)| (0..if cut(sources[start]) { PIECES } else { 1 }).map(move |j| (g, j)))
+        .collect()
+}
+
 /// Config + hints for the recursion guest (`guests/lean_ethereum.py`), built
 /// from the REAL `cpu::layout` of the inner program, the `summary` the
 /// `verifier` crate read out of the child's `proof`, and that proof's Merkle
@@ -82,9 +99,9 @@ pub(super) fn gen_verify(
     // the placeholder map is SHAPE-INDEPENDENT (the definition of generic). A
     // child that verifies and has an arm fits them; one that does not need not.
     let fits = side_layouts.iter().all(|side| side.mu <= MU_CAP) && proof.stream.len() <= STREAM_CAP;
-    if !(MU_MIN..=MU_MAX).contains(&layout.shape.mu) || !fits {
+    if !(MU_MIN..=MU_MAX).contains(&summary.stack_log) || !fits {
         return Err(AggregationError::ChildOutOfRange {
-            log_committed: layout.shape.mu,
+            log_committed: summary.stack_log,
         });
     }
 
@@ -96,7 +113,7 @@ pub(super) fn gen_verify(
 
     let taus = layout.taus;
     // ---- the stacked opening: config + the opening summary ----
-    let stack = whir_shape(layout.shape.mu, summary.log_inv_rate);
+    let stack = whir_shape(summary.stack_log, summary.log_inv_rate);
 
     // ---- hints ----
     // The program's whole share of a bytecode leaf: ONE value, the stacked
@@ -156,25 +173,44 @@ pub(super) fn gen_verify(
     for (compact, &global) in committed_globals.iter().enumerate() {
         compact_col[global] = compact;
     }
-    let mut col_order = committed_globals;
-    col_order.sort_by_key(|&global| layout.placements[global].offset);
-    // The order by column group (`col_groups`): its columns are consecutive in it.
-    let groups = col_groups(&col_sources.iter().flatten().copied().collect::<Vec<_>>());
-    let group_of = |compact: usize| groups.partition_point(|&start| start <= compact) - 1;
-    let mut col_group_order: Vec<F192> = Vec::new();
-    let mut last_group = usize::MAX;
-    for &global in &col_order {
-        let group = group_of(compact_col[global]);
-        if group != last_group {
-            col_group_order.push(count(group));
-            last_group = group;
-        }
-    }
-    assert_eq!(
-        col_group_order.len(),
-        groups.len(),
-        "a column group's columns are consecutive"
-    );
+    // The order by placement slot (`col_slots`): a slot's columns are consecutive in it. The present
+    // slots go first, by descending kappa then first column; the absent ones follow, in slot order.
+    let cks: Vec<(usize, usize)> = col_sources.iter().flatten().copied().collect();
+    let groups = col_groups(&cks);
+    let truncation = summary.truncation;
+    let source_log = |source: usize| match source {
+        0 => 0,
+        1 => summary.log_memory,
+        s => taus[s - 2],
+    };
+    let digits = |source: usize| {
+        let k = source_log(source);
+        let real = match truncation {
+            None => 1 << k,
+            Some(t) if source == 1 => t.mem_count as usize,
+            Some(_) => summary.table_rows[source - 2] as usize,
+        };
+        leanvm_core::cpu::piece_digits(k, real)
+    };
+    let qkeccak = compact_col[leanvm_core::cpu::QKECCAK];
+    let mut slots: Vec<(bool, usize, usize, usize)> = col_slots(&cks, &groups)
+        .into_iter()
+        .enumerate()
+        .map(|(slot, (g, j))| {
+            let (source, adj) = cks[groups[g]];
+            let present = if cut((source, adj)) {
+                digits(source)[j]
+            } else {
+                groups[g] != qkeccak || truncation.is_none_or(|t| !t.qt)
+            };
+            (present, source_log(source) + adj - j, groups[g], slot)
+        })
+        .collect();
+    slots.sort_by_key(|&(present, kappa, start, slot)| match present {
+        true => (0, std::cmp::Reverse(kappa), start),
+        false => (1, std::cmp::Reverse(0), slot),
+    });
+    let col_slot_order: Vec<F192> = slots.iter().map(|s| count(s.3)).collect();
 
     // ---- Hints for the stacked WHIR opening ----
     // Share the upper Merkle tree across queries. Unknown, unused subtrees stay
@@ -247,7 +283,7 @@ pub(super) fn gen_verify(
         ("zc_tau_max", vec![count(*taus.iter().max().unwrap())]),
         // Every table's log height, which the guest certifies against its row count.
         ("table_logs", taus.iter().map(|&t| count(t)).collect()),
-        ("col_group_order", col_group_order),
+        ("col_slot_order", col_slot_order),
         ("block_group_order", sort_order),
     ];
     hints.extend(query_hints);

@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub const MEM_LO: usize = 0;
 pub const MEM_HI: usize = 1;
 pub const MEM_TOP: usize = 2;
-pub(crate) const MFCNT: usize = 3; // per-cell memory access count, g^{A[i]}
+pub const MFCNT: usize = 3; // per-cell memory access count, g^{A[i]}
 pub(crate) const BFCNT: usize = 4; // per-pc bytecode execution count, g^{A[pc]}
 // The Keccak reduction's committed states `q_keccak`, in the SAME stack as every
 // other column (single PCS). Size `2^(SLOT_LOG + tau)` F64 words for `2^tau`

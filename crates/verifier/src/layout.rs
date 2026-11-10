@@ -90,6 +90,13 @@ pub const MAX_STACKED_LOG: usize = 28;
 const TRUNC_D: usize = 4;
 const MIN_PIECE_LOG: usize = 10;
 
+/// What the rate word announces of a truncated proof: its memory cells, and whether q_keccak is a region (QT).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Truncation {
+    pub mem_count: u64,
+    pub qt: bool,
+}
+
 /// The pieces, `(offset in the column, log size)` by increasing offset, that commit the first `real` rows of a
 /// column of `2^k` rows: the prefix rounded up to a multiple of `2^max(k - TRUNC_D, MIN_PIECE_LOG)`, cut by its binary digits.
 fn pieces(k: usize, real: u64) -> Vec<(u64, usize)> {
@@ -615,9 +622,10 @@ pub fn build_layout<'a>(
     bytecode: &'a Bytecode,
     log_memory: u64,
     table_rows: &[u64],
-    mem_count: Option<u64>, // the announced memory cells of a truncated proof
+    truncation: Option<Truncation>,
 ) -> Result<Layout<'a>, VerifierError> {
     let log_bytecode = log2_strict(bytecode.len() as u64)?;
+    let mem_count = truncation.map(|t| t.mem_count);
     require(
         (16..=32).contains(&log_memory)
             && table_rows.iter().all(|&rows| rows <= 1 << MAX_TABLE_LOG)
@@ -702,10 +710,9 @@ pub fn build_layout<'a>(
     };
     let (mut item_offsets, total_log) = stack(&items);
     let mut stack_log = MIN_STACKED_LOG.max(total_log); // Floor at the PCS minimum
-    // A truncated proof may commit q_keccak as a region instead (QT), when that makes the stack smaller.
-    let committed = |placed: u64, mu: usize| placed.div_ceil(1 << (mu - 6)) << (mu - 6);
+    // A truncated proof may announce q_keccak as a region instead (QT), after the other items.
     let mut qt = None;
-    if mem_count.is_some() {
+    if truncation.is_some_and(|t| t.qt) {
         let tau = table_log_heights[OP_KECCAK];
         let g_log = tau.min(tau.saturating_sub(TRUNC_D).max(MIN_PIECE_LOG));
         let g_rows = 1u64 << g_log;
@@ -715,17 +722,14 @@ pub fn build_layout<'a>(
         let other_words: u64 = others.iter().map(|&(.., kappa)| 1u64 << kappa).sum();
         let offset = other_words.next_multiple_of(1 << (6 + tau));
         let qt_log = MIN_STACKED_LOG.max(log2_ceil(offset + (1 << (6 + tau))));
-        let whole: u64 = items.iter().map(|&(.., kappa)| 1u64 << kappa).sum();
-        if committed(offset + (c << (6 + g_log)), qt_log) < committed(whole, stack_log) {
-            qt = Some(Qt {
-                offset,
-                tau,
-                g_log,
-                c,
-                pad: qt_pad(),
-            });
-            (items, item_offsets, stack_log) = (others, other_offsets, qt_log);
-        }
+        qt = Some(Qt {
+            offset,
+            tau,
+            g_log,
+            c,
+            pad: qt_pad(),
+        });
+        (items, item_offsets, stack_log) = (others, other_offsets, qt_log);
     }
     let mut offsets: BTreeMap<usize, u64> = BTreeMap::new();
     let mut piece_list = Vec::new();
