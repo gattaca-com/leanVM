@@ -29,7 +29,7 @@ use crate::transcript::ProverState;
 use primitives::field::{F64, F192};
 
 use ::pcs::stack_open::open_batch_mixed_whir_stacked;
-pub use ::pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim as SlotClaim};
+pub use ::pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim as SlotClaim, StackPart};
 use ::pcs::whir::ProverConfig;
 use ::pcs::whir::{ProverData, commit as whir_commit, config_for_rate};
 

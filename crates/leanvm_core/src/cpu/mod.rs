@@ -25,6 +25,7 @@ pub mod hints;
 mod isa;
 pub mod layout;
 mod trace;
+mod truncate;
 pub use execute::{ExecError, Execution, Fault, Memory};
 pub use isa::{DerefMode, Op, OutCells};
 pub use layout::*;
@@ -81,12 +82,22 @@ fn digest_words(halves: &[F192; 2]) -> [F64; 4] {
 /// ([`layout::table_logs`]). The public statement (program + input) is not announced
 /// here; it seeds the transcript at construction (see [`fs_seed`]). The boundary
 /// states are derived from the program, so they need no binding.
-fn announce_public(ps: &mut ProverState, log_mem: usize, rows: [usize; tables::N_TABLES], log_inv_rate: usize) {
+///
+/// A truncated proof (`truncate` holds the memory cells in use) sends the rate word as
+/// `(rate, 1, mem_used)`, which the verifier reads as the flag and the memory count.
+fn announce_public(
+    ps: &mut ProverState,
+    log_mem: usize,
+    rows: [usize; tables::N_TABLES],
+    log_inv_rate: usize,
+    truncate: Option<usize>,
+) {
     ps.add_scalar(F192::new(log_mem as u64, 0, 0));
     for n in rows {
         ps.add_scalar(F192::new(n as u64, 0, 0));
     }
-    ps.add_scalar(F192::new(log_inv_rate as u64, 0, 0));
+    let (flag, mem_used) = truncate.map_or((0, 0), |mem_used| (1, mem_used as u64));
+    ps.add_scalar(F192::new(log_inv_rate as u64, flag, mem_used));
 }
 
 #[derive(Clone)]
@@ -134,6 +145,9 @@ pub struct Program {
     /// which keeps the committed size a function of the announced sizes, so neither
     /// the verifier nor the guest needs a new parameter to certify. Prover-side only.
     pub min_log_committed: usize,
+    /// Commit only the covered prefix of each table and memory column ([`truncate`]). Prover-side choice,
+    /// announced in the proof; the recursion guest does not read such proofs yet.
+    pub truncate: bool,
 }
 
 /// The IV reinterprets the stacked bytecode table as bytes, which is its
@@ -168,6 +182,7 @@ impl Program {
             fn_ranges: Vec::new(),
             src_lines: Vec::new(),
             min_log_committed: 0,
+            truncate: false,
         }
     }
 
@@ -389,6 +404,9 @@ pub struct Stats {
     pub mem_used: usize,
     /// Bytecode instructions, before the pad to a power of two ([`Program::code_len`]).
     pub bytecode: usize,
+    /// The committed stack is `2^mu` words, of which `n_lanes` lane blocks are encoded.
+    pub mu: usize,
+    pub n_lanes: usize,
 }
 
 impl Stats {
@@ -422,6 +440,7 @@ impl Stats {
         parts.push(format!("MEMORY 2^{}", log2(self.mem_used)));
         parts.push(format!("BYTECODE 2^{}", log2(self.bytecode)));
         parts.push(format!("TOTAL_COMMITTED 2^{}", log2(self.committed)));
+        parts.push(format!("STACK mu {} lanes {}", self.mu, self.n_lanes));
         parts.join("  ")
     }
 }
@@ -492,16 +511,22 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     let mut w = crate::stage!("Build witness", || program.build(&exec, keccak_blocks));
     // The rest of the execution goes here; its g-power table goes back to the pool.
     let Execution { mem_used, mut gpow, .. } = exec;
-    if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&w.layout.shape.mu) {
+    // A truncated proof commits the compact stack; everything before the PCS open reads the full `w.q`.
+    let compact = program
+        .truncate
+        .then(|| truncate::Compact::new(&w.layout, mem_used))
+        .transpose()?;
+    let shape = compact.as_ref().map_or(w.layout.shape, |c| c.shape);
+    if !(pcs::MIN_MU..=pcs::MAX_MU).contains(&shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
-            log_committed: w.layout.shape.mu,
+            log_committed: shape.mu,
         });
     }
-    gpow.last_mu = w.layout.shape.mu;
+    gpow.last_mu = shape.mu;
     if let Ok(mut pool) = POOL.lock() {
         pool.push(gpow);
     }
-    let committed_size = w.committed_size();
+    let committed_size = compact.as_ref().map_or_else(|| w.committed_size(), |c| c.placed);
     // The public statement (program digest + input) seeds the transcript, so
     // every challenge depends on the exact program and public input.
     debug_assert!(
@@ -514,12 +539,29 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     );
 
     // Announce the prover's sizes, then commit, before sampling any challenge.
-    announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
+    announce_public(
+        &mut ps,
+        w.log_mem,
+        w.layout.rows,
+        log_inv_rate,
+        compact.as_ref().map(|_| mem_used),
+    );
     // Before the commit, so its codeword takes the reserved extent and its pages serve the bus and the level-1 commit.
-    drop(pcs::reserve_level1(w.layout.shape.mu, log_inv_rate));
-    let repeats = w.layout.padding_repeats(mem_used);
+    drop(pcs::reserve_level1(shape.mu, log_inv_rate));
+    let mut repeats = w.layout.padding_repeats(mem_used);
+    let compact_q = compact.as_ref().map(|c| {
+        let q = crate::stage!("Compact copy", || c.copy(&w.q, &w.layout));
+        repeats = c.repeats(&repeats, &w.layout);
+        q
+    });
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, &w.q, &repeats, w.layout.shape, log_inv_rate)
+        pcs::commit(
+            &mut ps,
+            compact_q.as_deref().unwrap_or(&w.q),
+            &repeats,
+            shape,
+            log_inv_rate,
+        )
     });
 
     // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
@@ -586,7 +628,17 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     });
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
-    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, &slots, &ring) });
+    // The reduction was the last reader of the full stack: a truncated proof opens the compact one.
+    let full_q = std::mem::take(&mut w.q);
+    let (q, slots, ring) = match (compact.as_ref(), compact_q) {
+        (Some(c), Some(compact_q)) => {
+            drop(full_q);
+            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
+            (compact_q, slots, ring)
+        }
+        _ => (full_q, slots, ring),
+    };
+    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, q, &slots, &ring) });
     Ok((
         ps.into_proof(),
         Stats {
@@ -596,6 +648,8 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
             log_mem: w.log_mem,
             mem_used,
             bytecode: program.code_len(),
+            mu: shape.mu,
+            n_lanes: shape.n_lanes,
         },
     ))
 }
