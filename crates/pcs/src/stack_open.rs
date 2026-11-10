@@ -74,20 +74,57 @@ pub enum StackClaim {
         low_point: Vec<F128>,
         value: F128,
     },
+    /// One claim of weight `sum_j scale_j * eq(low_point_j, .)` at `offset_j`, with claimed value `value`.
+    Sum { value: F128, parts: Vec<StackPart> },
+}
+
+/// One part of a [`StackClaim::Sum`]: `scale * eq(low_point, .)` on the aligned slice at `offset`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackPart {
+    pub offset: usize,
+    pub low_point: Vec<F128>,
+    pub scale: F128,
 }
 
 impl StackClaim {
     #[inline]
     pub fn value(&self) -> F128 {
-        let StackClaim::Point { value, .. } = self;
-        *value
+        match self {
+            StackClaim::Point { value, .. } | StackClaim::Sum { value, .. } => *value,
+        }
     }
 
-    /// The aligned dyadic range of the stack its weight is supported on.
-    fn range(&self) -> (usize, usize) {
-        let StackClaim::Point { offset, low_point, .. } = self;
-        (*offset, *offset + (1usize << low_point.len()))
+    /// Whether every aligned dyadic range its weight is supported on ends within `len`.
+    fn fits(&self, len: usize) -> bool {
+        match self {
+            StackClaim::Point { offset, low_point, .. } => *offset + (1usize << low_point.len()) <= len,
+            StackClaim::Sum { parts, .. } => parts.iter().all(|p| p.offset + (1usize << p.low_point.len()) <= len),
+        }
     }
+}
+
+/// One point per Point claim and per Sum part, each with its batching coefficient (`lambda`, or `lambda * scale`).
+fn flatten(claims: &[StackClaim], lambdas: &[F128]) -> (Vec<StackClaim>, Vec<F128>) {
+    let (mut points, mut coefficients) = (Vec::new(), Vec::new());
+    for (claim, &lambda) in claims.iter().zip(lambdas) {
+        match claim {
+            StackClaim::Point { .. } => {
+                points.push(claim.clone());
+                coefficients.push(lambda);
+            }
+            StackClaim::Sum { parts, .. } => {
+                for part in parts {
+                    points.push(StackClaim::Point {
+                        offset: part.offset,
+                        low_point: part.low_point.clone(),
+                        value: F128::ZERO,
+                    });
+                    coefficients.push(lambda * part.scale);
+                }
+            }
+        }
+    }
+    (points, coefficients)
 }
 
 /// One ring-switched claim on the q_keccak sub-block: the 64 bit-slice MLEs of
@@ -155,7 +192,7 @@ pub fn open_batch_mixed_whir_stacked(
         "q_keccak slice must fit inside the stack"
     );
     assert!(
-        point_claims.iter().all(|c| c.range().1 <= 1 << log_n),
+        point_claims.iter().all(|c| c.fits(1 << log_n)),
         "every claim must live inside the stack"
     );
     assert!(
@@ -212,8 +249,9 @@ pub fn open_batch_mixed_whir_stacked(
     // lifted weight over the stack is never built.
     let lane_vars = log_n - config.initial_k;
     let rings: Vec<_> = rs_outputs.into_iter().map(|output| output.weight).collect();
+    let (points, coefficients) = flatten(point_claims, lambdas_pd);
     let initial_basis = tracing::info_span!("Basis")
-        .in_scope(|| basis::initial_basis(&stack, log_n, lane_vars, point_claims, lambdas_pd, ring, &rings));
+        .in_scope(|| basis::initial_basis(&stack, log_n, lane_vars, &points, &coefficients, ring, &rings));
 
     // 4. One WHIR over the full stack against the combined claim (the
     //    prover takes the stack; no copy).
@@ -324,7 +362,9 @@ mod tests {
                 let mut dense = vec![F128::ZERO; lane_block << LANE_ROUNDS];
                 ring_switch::combine_deferred_chunk(&rs_outputs, &mut dense[offset..offset + qkeccak_len]);
                 for (claim, &lambda) in claims.iter().zip(&lambdas) {
-                    let StackClaim::Point { offset, low_point, .. } = claim;
+                    let StackClaim::Point { offset, low_point, .. } = claim else {
+                        unreachable!("the test builds Point claims only")
+                    };
                     for j in 0..1usize << low_point.len() {
                         let w = low_point.iter().enumerate().fold(lambda, |w, (i, &p_i)| {
                             w * if (j >> i) & 1 == 1 { p_i } else { F128::ONE + p_i }
@@ -373,5 +413,41 @@ mod tests {
                 assert_eq!(w, reference.w, "{context}, weight");
             }
         }
+    }
+
+    /// A Sum claim over the two halves of a column flattens to the weight and target of the Point claim on the column.
+    #[test]
+    fn sum_of_halves_matches_the_point_on_the_whole_column() {
+        let mut rng = Rng::new(0x5B17);
+        let (lane_vars, vars, offset) = (8usize, 7usize, 128usize);
+        let stack: Vec<F64> = (0..2 << lane_vars).map(|_| F64(rng.next_u64())).collect();
+        let ring = RingSwitchOpen {
+            offset: 0,
+            claims: Vec::new(),
+        };
+        let (point, value, lambda) = (rng.ext_vec(vars), rng.ext(), rng.ext());
+        let top = point[vars - 1];
+        let part = |offset, scale| StackPart {
+            offset,
+            low_point: point[..vars - 1].to_vec(),
+            scale,
+        };
+        let whole = [StackClaim::Point {
+            offset,
+            low_point: point.clone(),
+            value,
+        }];
+        let halves = [StackClaim::Sum {
+            value,
+            parts: vec![part(offset, F128::ONE + top), part(offset + (1 << (vars - 1)), top)],
+        }];
+        let run = |claims: &[StackClaim]| {
+            let (points, coefficients) = flatten(claims, &[lambda]);
+            let basis = basis::initial_basis(&stack, lane_vars, &points, &coefficients, &ring, &[]);
+            let target = claims.iter().map(|c| lambda * c.value()).sum();
+            let (_, msg) = SumcheckProver::new(stack.clone(), basis, target, 1 << lane_vars);
+            (msg, target)
+        };
+        assert_eq!(run(&whole), run(&halves));
     }
 }

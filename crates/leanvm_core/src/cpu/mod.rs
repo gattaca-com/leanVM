@@ -25,6 +25,7 @@ pub mod hints;
 mod isa;
 pub mod layout;
 mod trace;
+mod truncate;
 pub(crate) use execute::Cell;
 pub use execute::{ExecError, Execution, Fault, Memory};
 pub use isa::{DerefMode, Op, OutCells};
@@ -66,12 +67,21 @@ fn digest_words(halves: &[F128; 2]) -> [F64; 4] {
 /// ([`layout::table_logs`]). The public statement (program + input) is not announced
 /// here; it seeds the transcript at construction (see [`fs_seed`]). The boundary
 /// states are derived from the program, so they need no binding.
-fn announce_public(ps: &mut ProverState, log_mem: usize, rows: [usize; tables::N_TABLES], log_inv_rate: usize) {
+///
+/// A truncated proof packs `(mem_used << 1) | 1` in the rate word's high limb.
+fn announce_public(
+    ps: &mut ProverState,
+    log_mem: usize,
+    rows: [usize; tables::N_TABLES],
+    log_inv_rate: usize,
+    truncate: Option<usize>,
+) {
     ps.add_scalar(F128::new(log_mem as u64, 0));
     for n in rows {
         ps.add_scalar(F128::new(n as u64, 0));
     }
-    ps.add_scalar(F128::new(log_inv_rate as u64, 0));
+    let memory = truncate.map_or(0, |mem_used| ((mem_used as u64) << 1) | 1);
+    ps.add_scalar(F128::new(log_inv_rate as u64, memory));
 }
 
 #[derive(Clone)]
@@ -106,6 +116,8 @@ pub struct Program {
     /// check reports a line rather than a pc to disassemble around. Empty for a
     /// hand-assembled program, and shorter than `prog`, which is padded.
     pub src_lines: Vec<u32>,
+    /// Commit the covered prefixes of memory and table columns.
+    pub truncate: bool,
 }
 
 /// The IV reinterprets the stacked bytecode table as bytes, which is its
@@ -147,6 +159,7 @@ impl Program {
             witness: HashMap::new(),
             fn_ranges: Vec::new(),
             src_lines: Vec::new(),
+            truncate: false,
         }
     }
 
@@ -367,6 +380,9 @@ pub struct Stats {
     pub mem_used: usize,
     /// Bytecode instructions, before the pad to a power of two ([`Program::code_len`]).
     pub bytecode: usize,
+    /// The committed stack is `2^mu` words, of which `n_lanes` lane blocks are encoded.
+    pub mu: usize,
+    pub n_lanes: usize,
 }
 
 impl Stats {
@@ -400,6 +416,7 @@ impl Stats {
         parts.push(format!("MEMORY 2^{}", log2(self.mem_used)));
         parts.push(format!("BYTECODE 2^{}", log2(self.bytecode)));
         parts.push(format!("TOTAL_COMMITTED 2^{}", log2(self.committed)));
+        parts.push(format!("STACK mu {} lanes {}", self.mu, self.n_lanes));
         parts.join("  ")
     }
 }
@@ -425,23 +442,26 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
     if !exec.unconstrained_reads.is_empty() {
         return Err(ProveError::UnconstrainedReads(exec.unconstrained_reads));
     }
-    // The layout follows from the run's sizes alone: a run past the window is refused
-    // before its witness is built.
     let layout = program.layout(
         crate::log2_strict_usize(exec.mem.len()),
         exec.trace.row_counts(),
         public_input,
     );
-    if layout.shape.mu > pcs::MAX_STACKED_LOG {
+    let compact = program
+        .truncate
+        .then(|| truncate::Compact::new(&layout, exec.mem_used))
+        .transpose()?;
+    let shape = compact.as_ref().map_or(layout.shape, |c| c.shape);
+    if !(pcs::MIN_STACKED_LOG..=pcs::MAX_STACKED_LOG).contains(&shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
-            log_committed: layout.shape.mu,
+            log_committed: shape.mu,
         });
     }
     let cycles = exec.cycles;
     let mut w = crate::stage!("Build witness", || program.build(&exec, layout, keccak_blocks));
     let mem_used = exec.mem_used;
     drop(exec);
-    let committed_size = w.committed_size();
+    let committed_size = compact.as_ref().map_or_else(|| w.committed_size(), |c| c.placed);
     // The public statement (program digest + input) seeds the transcript, so
     // every challenge depends on the exact program and public input.
     let mut ps = ProverState::new(
@@ -449,10 +469,19 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
         digest_words(&public_input),
     );
 
-    // Announce the prover's sizes, then commit and take the commitment's OOD sample, before sampling any other challenge.
-    announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate);
+    // Announce sizes and commit before sampling any challenge.
+    announce_public(
+        &mut ps,
+        w.log_mem,
+        w.layout.rows,
+        log_inv_rate,
+        compact.as_ref().map(|_| mem_used),
+    );
+    let compact_q = compact
+        .as_ref()
+        .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
+        pcs::commit(&mut ps, compact_q.as_deref().unwrap_or(&w.q), shape, log_inv_rate)
     });
 
     // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
@@ -509,7 +538,17 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
     });
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
-    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, &slots, &ring) });
+    // The reduction was the last reader of the full stack: a truncated proof opens the compact one.
+    let full_q = std::mem::take(&mut w.q);
+    let (q, slots, ring) = match (compact.as_ref(), compact_q) {
+        (Some(c), Some(compact_q)) => {
+            drop(full_q);
+            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
+            (compact_q, slots, ring)
+        }
+        _ => (full_q, slots, ring),
+    };
+    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, q, &slots, &ring) });
     Ok((
         ps.into_proof(),
         Stats {
@@ -519,6 +558,8 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
             log_mem: w.log_mem,
             mem_used,
             bytecode: program.code_len(),
+            mu: shape.mu,
+            n_lanes: shape.n_lanes,
         },
     ))
 }

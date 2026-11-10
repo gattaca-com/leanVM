@@ -53,10 +53,20 @@ pub fn aggregate(
     declare: Option<&EthereumClaims>,
     log_inv_rate: usize,
 ) -> Result<EthereumProof, AggregationError> {
-    aggregate_with_stats(children, raw_lean_xmss, raw_lean_sphincs, blobs, declare, log_inv_rate).map(|(sig, _)| sig)
+    aggregate_inner(
+        children,
+        raw_lean_xmss,
+        raw_lean_sphincs,
+        blobs,
+        declare,
+        log_inv_rate,
+        false,
+    )
+    .map(|(sig, _)| sig)
 }
 
 /// [`aggregate`], under the same contract, also returning the prover's statistics (what the CLI's benchmarks report).
+/// Its proof is truncated, which the recursion guest does not read yet.
 pub fn aggregate_with_stats(
     children: &[EthereumProof],
     raw_lean_xmss: Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)>,
@@ -64,6 +74,26 @@ pub fn aggregate_with_stats(
     blobs: &[u64],
     declare: Option<&EthereumClaims>,
     log_inv_rate: usize,
+) -> Result<(EthereumProof, leanvm_core::cpu::Stats), AggregationError> {
+    aggregate_inner(
+        children,
+        raw_lean_xmss,
+        raw_lean_sphincs,
+        blobs,
+        declare,
+        log_inv_rate,
+        true,
+    )
+}
+
+fn aggregate_inner(
+    children: &[EthereumProof],
+    raw_lean_xmss: Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)>,
+    raw_lean_sphincs: Vec<(LeanSphincsPublicKey, lean_sphincs::Message, LeanSphincsSignature)>,
+    blobs: &[u64],
+    declare: Option<&EthereumClaims>,
+    log_inv_rate: usize,
+    truncate: bool,
 ) -> Result<(EthereumProof, leanvm_core::cpu::Stats), AggregationError> {
     let declared_root = declare.map(|claims| claims.da_commitment);
     // `cpu::prove` checks the rate too, but only after the witness is built.
@@ -320,6 +350,7 @@ pub fn aggregate_with_stats(
 
     let public_input = statement_digest(&cover.lean_xmss.signers, &cover.lean_sphincs.signers, da, &defer);
     let mut program = guest.clone();
+    program.truncate = truncate;
     #[cfg(test)]
     if let Some(forge) = FORGE.with(|forge| forge.borrow_mut().take()) {
         forge(&mut hints);

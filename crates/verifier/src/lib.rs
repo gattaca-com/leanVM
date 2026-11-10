@@ -246,15 +246,18 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
 
     // 1] memory log-size, table row counts, and log-inv-rate in WHIR
     let announced = transcript.next_scalars(2 + N_TABLES)?;
+    // The last word is `(rate, (mem_count << 1) | 1)`: a low bit of 1 announces a truncated proof, over `mem_count` memory cells.
+    let rate_word = announced[1 + N_TABLES];
     require(
-        announced.iter().all(|value| value.c1 == 0),
+        announced[..1 + N_TABLES].iter().all(|value| value.c1 == 0) && (rate_word.c1 == 0 || rate_word.c1 & 1 == 1),
         VerifierError::AnnouncedHighLimb,
     )?;
     let log_memory = announced[0].c0;
     let table_rows: Vec<u64> = announced[1..1 + N_TABLES].iter().map(|value| value.c0).collect();
-    let log_inverse_rate = announced[1 + N_TABLES].c0;
+    let log_inverse_rate = rate_word.c0;
     require((1..=4).contains(&log_inverse_rate), VerifierError::PcsInverseRate)?;
-    let layout = build_layout(bytecode, log_memory, &table_rows)?;
+    let mem_count = (rate_word.c1 & 1 == 1).then_some(rate_word.c1 >> 1);
+    let layout = build_layout(bytecode, log_memory, &table_rows, mem_count)?;
     require(
         (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&layout.stack_log),
         VerifierError::CommittedSize,

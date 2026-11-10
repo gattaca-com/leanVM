@@ -490,7 +490,9 @@ pub(super) fn initial_basis(
     // The claims' lane weights, then the rings', each `1 << lane_bits` long.
     let mut lanes: Vec<F128> = Vec::new();
     for (c, claim) in claims.iter().enumerate() {
-        let StackClaim::Point { offset, low_point, .. } = claim;
+        let StackClaim::Point { offset, low_point, .. } = claim else {
+            unreachable!("initial_basis takes flattened Point claims")
+        };
         let factors = point_factors(low_point, *offset, bits);
         let (low, rest) = factors.split_at(low_vars);
         let (mid, lane) = rest.split_at(lane_vars - low_vars);

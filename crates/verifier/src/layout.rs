@@ -93,6 +93,36 @@ pub const MAX_LOG_BYTECODE: usize = 30;
 pub const MIN_STACKED_LOG: usize = 16;
 pub const MAX_STACKED_LOG: usize = 30;
 
+const TRUNC_D: usize = 4;
+const MIN_PIECE_LOG: usize = 10;
+
+/// The pieces, `(offset in the column, log size)` by increasing offset, that commit the first `real` rows of a
+/// column of `2^k` rows: the prefix rounded up to a multiple of `2^max(k - TRUNC_D, MIN_PIECE_LOG)`, cut by its binary digits.
+fn pieces(k: usize, real: u64) -> Vec<(u64, usize)> {
+    if k <= MIN_PIECE_LOG {
+        return vec![(0, k)];
+    }
+    let g_log = (k - TRUNC_D).max(MIN_PIECE_LOG);
+    let covered = (real.max(1).div_ceil(1 << g_log) << g_log).min(1 << k);
+    if covered == 1 << k {
+        return vec![(0, k)];
+    }
+    let mut off = 0;
+    let mut out = Vec::new();
+    for b in (g_log..k).rev().filter(|&b| covered >> b & 1 == 1) {
+        out.push((off, b));
+        off += 1 << b;
+    }
+    out
+}
+
+/// One piece of a truncated column, laid in the stack at `placement`.
+pub struct Piece {
+    pub column: usize,
+    pub off: u64, // the piece's first row in its column
+    pub placement: Placement,
+}
+
 pub struct Layout<'a> {
     pub log_memory: usize,
     pub log_bytecode: usize,
@@ -103,6 +133,9 @@ pub struct Layout<'a> {
     pub count: Vec<BusBlock>,
     /// Where each column sits, `None` for a column nothing commits: the `KECCAK` output lanes.
     pub placements: Vec<Option<Placement>>,
+    /// The pieces of the truncated columns, by column then offset; empty unless the proof is truncated. A truncated
+    /// column's placement keeps its `variables`, its `index` meaning nothing.
+    pub pieces: Vec<Piece>,
     pub stack_log: usize,
     pub table_log_heights: Vec<usize>,
     pub keccak: KeccakShape,
@@ -548,12 +581,14 @@ pub fn build_layout<'a>(
     bytecode: &'a Bytecode,
     log_memory: u64,
     table_rows: &[u64],
+    mem_count: Option<u64>, // the announced memory cells of a truncated proof
 ) -> Result<Layout<'a>, VerifierError> {
     let log_bytecode = log2_strict(bytecode.len() as u64)?;
     require(
         (MIN_LOG_MEMORY as u64..=MAX_LOG_MEMORY as u64).contains(&log_memory)
             && table_rows.iter().all(|&rows| rows <= 1 << MAX_TABLE_LOG)
-            && (BUS_BITS..=MAX_LOG_BYTECODE + BUS_BITS).contains(&log_bytecode),
+            && (BUS_BITS..=MAX_LOG_BYTECODE + BUS_BITS).contains(&log_bytecode)
+            && mem_count.is_none_or(|count| (1..=1 << log_memory).contains(&count)),
         VerifierError::AnnouncedTableSizes,
     )?;
     let log_bytecode = log_bytecode - BUS_BITS;
@@ -583,7 +618,45 @@ pub fn build_layout<'a>(
 
     let keccak = keccak_shape(&table_log_heights);
     let kappas = column_kappas(&tables, log_memory, log_bytecode, &table_log_heights);
-    let (offsets, stack_log) = stack(&kappas);
+    let blocks = stacked_blocks(kappas.len());
+    // The stacked items: a block each, or its pieces for a truncated column (the memory and the table columns).
+    let mut items: Vec<(usize, u64, usize)> = Vec::new(); // (column, offset in the column, kappa)
+    for &column in &blocks {
+        let real = match (mem_count, column) {
+            (Some(count), 0..=MEMORY_FINAL_COUNTERS) => Some(count),
+            (Some(_), NUM_GLOBAL_COLUMNS..) => {
+                let table = GLOBAL_COLUMN_BASES.iter().rposition(|&base| base <= column);
+                table.map(|table| table_rows[table])
+            }
+            _ => None,
+        };
+        match real {
+            Some(real) => items.extend(
+                pieces(kappas[column], real)
+                    .into_iter()
+                    .map(|(off, b)| (column, off, b)),
+            ),
+            None => items.push((column, 0, kappas[column])),
+        }
+    }
+    let item_kappas: Vec<usize> = items.iter().map(|&(.., kappa)| kappa).collect();
+    let (item_offsets, total_log) = stack_offsets(&item_kappas);
+    let mut offsets: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut piece_list = Vec::new();
+    for (&(column, off, kappa), index) in items.iter().zip(item_offsets) {
+        offsets.entry(column).or_insert(index);
+        if mem_count.is_some() && column != BYTECODE_FINAL_COUNTERS && column != QKECCAK {
+            piece_list.push(Piece {
+                column,
+                off,
+                placement: Placement {
+                    variables: kappa,
+                    index,
+                },
+            });
+        }
+    }
+    let stack_log = MIN_STACKED_LOG.max(total_log); // Floor at the PCS minimum
     let placement = |(column, &kappa): (usize, &usize)| {
         let index = match qkeccak_slot(column) {
             Some(slot) => offsets[&QKECCAK] + ((slot as u64) << kappa),
@@ -604,8 +677,55 @@ pub fn build_layout<'a>(
         pull,
         count,
         placements,
+        pieces: piece_list,
         stack_log,
         table_log_heights,
         keccak,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multilinear::multilinear_eval;
+
+    #[test]
+    fn pieces_cover_the_prefix() {
+        assert_eq!(pieces(19, 280940), [(0, 18), (262144, 15)]);
+        assert_eq!(pieces(22, 2374000), [(0, 21), (2097152, 19)]);
+        assert_eq!(pieces(10, 5), [(0, 10)]);
+        assert_eq!(pieces(19, 1 << 19), [(0, 19)]);
+        assert_eq!(pieces(19, 0), [(0, 15)]);
+    }
+
+    #[test]
+    fn pieces_and_pad_give_the_column() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut random = || E::new(next(), next());
+        let k = 12;
+        let zeta: Vec<E> = (0..k).map(|_| random()).collect();
+        for pad in [ZERO, ONE] {
+            let layout = pieces(k, 2500);
+            assert_eq!(layout, [(0, 11), (2048, 10)]);
+            let covered = 3072;
+            let column: Vec<E> = (0..1 << k)
+                .map(|row| if row < covered { random() } else { pad })
+                .collect();
+            let (mut e_sum, mut sum) = (ZERO, ZERO);
+            for &(off, b) in &layout {
+                let e = (b..k).fold(ONE, |e, i| e * if off >> i & 1 == 1 { zeta[i] } else { ONE + zeta[i] });
+                let piece = &column[off as usize..off as usize + (1 << b)];
+                sum += e * multilinear_eval(piece, &zeta[..b]).unwrap();
+                e_sum += e;
+            }
+            let expected = multilinear_eval(&column, &zeta).unwrap();
+            assert_eq!(expected, sum + pad * (ONE + e_sum));
+        }
+    }
 }

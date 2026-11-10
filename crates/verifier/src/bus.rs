@@ -111,8 +111,41 @@ pub struct ColumnClaim {
 impl ColumnClaim {
     /// `None` for a column nothing commits, whose claim never reaches the stack.
     pub fn on_stack(&self, layout: &Layout) -> Option<StackClaim<'static>> {
-        let point = layout.placements[self.column]?.stack_point(&self.point, layout.stack_log);
-        Some((Box::new(move |x| eq_eval(&point, x)), self.value))
+        let placement = layout.placements[self.column]?;
+        let mut pieces = layout
+            .pieces
+            .iter()
+            .filter(|piece| piece.column == self.column)
+            .peekable();
+        if pieces.peek().is_none() {
+            let point = placement.stack_point(&self.point, layout.stack_log);
+            return Some((Box::new(move |x| eq_eval(&point, x)), self.value));
+        }
+        // A truncated column is its pieces then the public pad: `C(zeta) = sum_j e_j piece_j(zeta[..b_j]) + pad (1 + sum_j e_j)`.
+        let zeta = &self.point;
+        let parts: Vec<(E, Vec<E>)> = pieces
+            .map(|piece| {
+                let b = piece.placement.variables;
+                let e = (b..placement.variables).fold(ONE, |e, i| {
+                    e * if piece.off >> i & 1 == 1 {
+                        zeta[i]
+                    } else {
+                        ONE + zeta[i]
+                    }
+                });
+                (e, piece.placement.stack_point(&zeta[..b], layout.stack_log))
+            })
+            .collect();
+        let pad = if self.column == MEMORY_FINAL_COUNTERS {
+            ONE
+        } else {
+            ZERO
+        };
+        let value = self.value + pad * (ONE + E::sum(parts.iter().map(|(e, _)| *e)));
+        Some((
+            Box::new(move |x| E::sum(parts.iter().map(|(e, point)| *e * eq_eval(point, x)))),
+            value,
+        ))
     }
 }
 
