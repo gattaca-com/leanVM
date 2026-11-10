@@ -57,6 +57,26 @@ fn keccak_rounds(a: &mut [u64; STATE_LANES], n: usize) {
     }
 }
 
+/// What a QT padding step holds in each slot of `q_keccak`: zero but for slots `25..50`,
+/// the state after the first `keccak::DEPTH` rounds on the zero state.
+pub fn qt_pad() -> [u64; 64] {
+    let mut pad = [0u64; 64];
+    let mut state = [0u64; STATE_LANES];
+    keccak_rounds(&mut state, crate::keccak::DEPTH);
+    pad[STATE_LANES..2 * STATE_LANES].copy_from_slice(&state);
+    pad
+}
+
+/// The pieces' digits of a column of `2^k` rows whose first `real` rows are real: bit `j` of the result says a piece
+/// of `2^(k - j)` rows, `j = 0` being the whole column.
+pub fn piece_digits(k: usize, real: usize) -> [bool; 5] {
+    let mut digits = [false; 5];
+    for (_, b) in pieces(k, real) {
+        digits[k - b] = true;
+    }
+    digits
+}
+
 /// `eq(bits(i), point)`, bit 0 first.
 fn eq_bits(i: usize, point: &[F128]) -> F128 {
     point
@@ -127,6 +147,8 @@ pub(super) struct Compact {
     pub(super) placed: usize,
     /// The QT layout, when it commits fewer words than keeping `q_keccak` whole: then the `QKECCAK` item is unused.
     region: Option<Region>,
+    /// The memory cells the memory columns' pieces cover.
+    mem_count: usize,
 }
 
 impl Compact {
@@ -179,12 +201,7 @@ impl Compact {
         };
         let mut region = None;
         if qt.committed_len() < shape.committed_len() {
-            let mut pad = [F64::ZERO; 64];
-            let mut state = [0u64; STATE_LANES];
-            keccak_rounds(&mut state, crate::keccak::DEPTH);
-            for (p, &lane) in pad[25..50].iter_mut().zip(&state) {
-                *p = F64(lane);
-            }
+            let pad = qt_pad().map(F64);
             let ext = (o + (1 << (6 + tau))).next_multiple_of(1 << (mu - pcs::LOG_BATCH));
             region = Some(Region {
                 tau,
@@ -211,7 +228,25 @@ impl Compact {
             shape,
             placed,
             region,
+            mem_count: mem_used,
         })
+    }
+
+    /// The compact layout of `l` whose stack reaches `2^floor` words, if one does.
+    /// It truncates the memory to `mem_used` cells, else keeps it whole; past that it gives up.
+    pub(super) fn reaching(l: &super::Layout, mem_used: usize, floor: usize) -> Result<Option<Self>, ProveError> {
+        for mem_count in [mem_used, 1 << l.placements[MFCNT].n_vars] {
+            let compact = Self::new(l, mem_count)?;
+            if compact.shape.mu >= floor {
+                return Ok(Some(compact));
+            }
+        }
+        Ok(None)
+    }
+
+    /// What the rate word announces: the memory count, and whether q_keccak is a region.
+    pub(super) fn announced(&self) -> (usize, bool) {
+        (self.mem_count, self.region.is_some())
     }
 
     fn column(&self, c: usize) -> &[Item] {

@@ -31,6 +31,7 @@ pub use execute::{ExecError, Execution, Fault, Memory};
 pub use isa::{DerefMode, Op, OutCells};
 pub use layout::*;
 pub(crate) use trace::{Drow, Jrow, Krow, Rows, Srow, Trace, Xrow};
+pub use truncate::{piece_digits, qt_pad};
 
 /// The data memory's size bounds (doc §Memory): `2^h` cells, `MIN_LOG_MEMORY ≤ h ≤ MAX_LOG_MEMORY`.
 pub use verifier::{MAX_LOG_MEMORY, MIN_LOG_MEMORY};
@@ -68,19 +69,20 @@ fn digest_words(halves: &[F128; 2]) -> [F64; 4] {
 /// here; it seeds the transcript at construction (see [`fs_seed`]). The boundary
 /// states are derived from the program, so they need no binding.
 ///
-/// A truncated proof packs `(mem_used << 1) | 1` in the rate word's high limb.
+/// A truncated proof (`truncate` holds its memory count and whether q_keccak is a region) packs
+/// `(mem_count << 2) | flag` in the rate word's high limb. Flag 1 is a truncated proof, flag 2 one with the region.
 fn announce_public(
     ps: &mut ProverState,
     log_mem: usize,
     rows: [usize; tables::N_TABLES],
     log_inv_rate: usize,
-    truncate: Option<usize>,
+    truncate: Option<(usize, bool)>,
 ) {
     ps.add_scalar(F128::new(log_mem as u64, 0));
     for n in rows {
         ps.add_scalar(F128::new(n as u64, 0));
     }
-    let memory = truncate.map_or(0, |mem_used| ((mem_used as u64) << 1) | 1);
+    let memory = truncate.map_or(0, |(mem_count, qt)| ((mem_count as u64) << 2) | (1 + qt as u64));
     ps.add_scalar(F128::new(log_inv_rate as u64, memory));
 }
 
@@ -447,10 +449,12 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
         exec.trace.row_counts(),
         public_input,
     );
-    let compact = program
-        .truncate
-        .then(|| truncate::Compact::new(&layout, exec.mem_used))
-        .transpose()?;
+    let compact = if program.truncate {
+        let floor = verifier::min_execution_stacked_log(crate::log2_strict_usize(program.prog.len()));
+        truncate::Compact::reaching(&layout, exec.mem_used, floor)?
+    } else {
+        None
+    };
     let shape = compact.as_ref().map_or(layout.shape, |c| c.shape);
     if !(pcs::MIN_STACKED_LOG..=pcs::MAX_STACKED_LOG).contains(&shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
@@ -475,7 +479,7 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
         w.log_mem,
         w.layout.rows,
         log_inv_rate,
-        compact.as_ref().map(|_| mem_used),
+        compact.as_ref().map(truncate::Compact::announced),
     );
     let compact_q = compact
         .as_ref()

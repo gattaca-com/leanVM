@@ -3,7 +3,8 @@
 use super::MAX_RECURSIONS;
 use super::cells::pack_16_bytes;
 use super::child::{
-    MU_CAP, QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, block_groups, col_groups, merkle_cap_depth, whir_shape,
+    MU_CAP, QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, block_groups, col_groups, col_slots, cut,
+    merkle_cap_depth, whir_shape,
 };
 use super::claim_pool::{ClaimSite, coord_difference, coord_kind, coord_scale, push_coord_terms, walk_claims};
 use super::deferred::RECURSION_AGG_LABEL;
@@ -469,7 +470,48 @@ fn claim_placeholders(
     ps("CLAIM_QKECCAK_SLOT_BITS", literals(&cpqbits));
     ps("QKECCAK_COMMITTED_COL", qkeccak_compact.to_string());
     ps("QKECCAK_VARS_CAP", (33 + slot_log).to_string());
+
+    // A truncated proof cuts every column of kappa source `(s, 0)`, `s >= 1`, but q_keccak into pieces.
+    // A claim on one weighs each piece by the eq of its point's top coordinates: one set per point
+    // buffer and source, its `combo`.
+    let cks: Vec<(usize, usize)> = col_sources_pm.iter().flatten().copied().collect();
+    let pieced = |column: usize| column != qkeccak_compact && cks[column].0 >= 1 && cks[column].1 == 0;
+    let mut combos: Vec<(usize, usize)> = Vec::new();
+    let claim_combo: Vec<usize> = claims
+        .iter()
+        .map(|c| {
+            if c.buffer == POINT_BUF_KECCAK_OUT || c.buffer == POINT_BUF_QKECCAK_RHO || !pieced(c.column) {
+                return NO_COMBO;
+            }
+            let combo = (c.buffer, cks[c.column].0);
+            combos.iter().position(|&x| x == combo).unwrap_or_else(|| {
+                combos.push(combo);
+                combos.len() - 1
+            })
+        })
+        .collect();
+    let mfcnt = compact_col_pm[leanvm_core::cpu::MFCNT];
+    assert!(pieced(mfcnt), "the memory counters are cut");
+    ps("NO_COMBO", NO_COMBO.to_string());
+    ps("N_COMBOS", combos.len().to_string());
+    ps("COMBO_BUF", literals(combos.iter().map(|c| c.0)));
+    ps("COMBO_SRC", literals(combos.iter().map(|c| c.1)));
+    ps("CLAIM_COMBO", literals(&claim_combo));
+    ps("MFCNT_COMMITTED_COL", mfcnt.to_string());
+    // Under QT a slot's claim adds the pad of its slot past the covered chunks.
+    let pad = leanvm_core::cpu::qt_pad();
+    ps(
+        "CLAIM_QT_PAD",
+        literals(claims.iter().map(|c| match c.buffer {
+            POINT_BUF_QKECCAK_RHO => pad[c.qkeccak_slot],
+            _ => 0,
+        })),
+    );
+    ps("QT_PAD", literals(pad));
 }
+
+/// The combo of a claim that is not on a cut column.
+const NO_COMBO: usize = 1000;
 
 /// The table sumcheck's tables and xi layout.
 fn table_placeholders(ps: &mut impl FnMut(&str, String)) {
@@ -730,7 +772,16 @@ fn opening_placeholders(kbc: usize, ps: &mut impl FnMut(&str, String)) {
     let groups = col_groups(&cks);
     ps("N_COL_GROUPS", groups.len().to_string());
     ps("COL_GROUP_START", literals(groups.iter().copied().chain([cks.len()])));
-    ps("PCS_MIN_MU", verifier::MIN_STACKED_LOG.to_string());
+    ps("COL_CUT", literals(cks.iter().map(|&source| cut(source) as usize)));
+    ps(
+        "COL_GROUP_PIECED",
+        literals(groups.iter().map(|&start| cut(cks[start]) as usize)),
+    );
+    let slots = col_slots(&cks, &groups);
+    ps("N_SLOTS", slots.len().to_string());
+    ps("SLOT_GROUP", literals(slots.iter().map(|s| s.0)));
+    ps("SLOT_PIECE", literals(slots.iter().map(|s| s.1)));
+    ps("PCS_MIN_MU", leanvm_core::pcs::MIN_STACKED_LOG.to_string());
     ps(
         "LIG_LOG_MSG_COLS_CAP",
         cands
