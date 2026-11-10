@@ -337,6 +337,10 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
 
     // 7] Ring-switching
     let (point, slices) = openings.inputs;
+    let (point, slices) = match &layout.qt {
+        Some(qt) => qt.ring_inputs(point, slices),
+        None => (point, slices),
+    };
     let (ringswitch_target, ringswitch_weight) = ring_switch(point, &slices, &mut transcript)?;
     // That claim is supported on q_keccak's region of the stack, so its weight carries the
     // placement's selector, and it leads the batch, taking the first power.

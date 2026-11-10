@@ -443,10 +443,16 @@ mod tests {
         }];
         let run = |claims: &[StackClaim]| {
             let (points, coefficients) = flatten(claims, &[lambda]);
-            let basis = basis::initial_basis(&stack, lane_vars, &points, &coefficients, &ring, &[]);
-            let target = claims.iter().map(|c| lambda * c.value()).sum();
-            let (_, msg) = SumcheckProver::new(stack.clone(), basis, target, 1 << lane_vars);
-            (msg, target)
+            let basis = basis::initial_basis(&stack, lane_vars + 1, lane_vars, &points, &coefficients, &ring, &[]);
+            let target: F128 = claims.iter().map(|c| lambda * c.value()).sum();
+            let mut lanes = LaneRounds::new(stack.clone(), basis, 1 << lane_vars, false);
+            let table = lanes.table();
+            lanes.fold(&FoldChallenges {
+                alpha: lambda,
+                beta: top,
+            });
+            let (p, w, _) = lanes.finish();
+            (table, p, w, target)
         };
         assert_eq!(run(&whole), run(&halves));
     }

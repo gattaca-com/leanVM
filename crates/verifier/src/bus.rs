@@ -112,6 +112,9 @@ impl ColumnClaim {
     /// `None` for a column nothing commits, whose claim never reaches the stack.
     pub fn on_stack(&self, layout: &Layout) -> Option<StackClaim<'static>> {
         let placement = layout.placements[self.column]?;
+        if let Some((point, value)) = layout.qt_claim(self.column, &self.point, self.value) {
+            return Some((Box::new(move |x| eq_eval(&point, x)), value));
+        }
         let mut pieces = layout
             .pieces
             .iter()

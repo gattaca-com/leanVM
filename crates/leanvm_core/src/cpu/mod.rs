@@ -481,7 +481,12 @@ pub fn prove(program: &Program, public_input: [F128; 2], log_inv_rate: usize) ->
         .as_ref()
         .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
     let committed = crate::stage!("Commit", || {
-        pcs::commit(&mut ps, compact_q.as_deref().unwrap_or(&w.q), shape, log_inv_rate)
+        pcs::commit(
+            &mut ps,
+            &compact_q.as_deref().unwrap_or(&w.q)[..shape.committed_len()],
+            shape,
+            log_inv_rate,
+        )
     });
 
     // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
