@@ -185,7 +185,12 @@ impl Qt {
         let (chunk, slot) = point[self.g_log..].split_at(self.tau - self.g_log);
         let (u, eq) = (self.uncovered(chunk), eq_kernel(slot));
         for (i, slice) in slices.iter_mut().enumerate() {
-            let share = E::sum(eq.iter().zip(self.pad).filter(|(_, p)| p >> i & 1 == 1).map(|(e, _)| *e));
+            let share = E::sum(
+                eq.iter()
+                    .zip(self.pad)
+                    .filter(|(_, p)| p >> i & 1 == 1)
+                    .map(|(e, _)| *e),
+            );
             *slice += u * share;
         }
         (self.rotate(&point), slices)

@@ -106,9 +106,15 @@ impl Region {
             if col[col.len() - 1] != want {
                 bad.push((s, col[col.len() - 1].0, want.0));
             }
-            debug_assert!(col[self.c << self.g_log..].iter().all(|&x| x == want), "slot {s} has data past the pad");
+            debug_assert!(
+                col[self.c << self.g_log..].iter().all(|&x| x == want),
+                "slot {s} has data past the pad"
+            );
         }
-        assert!(bad.is_empty(), "q_keccak does not end in the pad; (slot, held, expected): {bad:x?}");
+        assert!(
+            bad.is_empty(),
+            "q_keccak does not end in the pad; (slot, held, expected): {bad:x?}"
+        );
     }
 }
 
@@ -157,7 +163,11 @@ impl Compact {
         // QT: `q_keccak` as the region `R`, after the other items.
         let kt = tables::KECCAK_TABLE;
         let (tau, rows) = (l.taus[kt], l.rows[kt]);
-        assert_eq!(l.placements[QKECCAK].n_vars, 6 + tau, "q_keccak is 64 slots of the KECCAK table");
+        assert_eq!(
+            l.placements[QKECCAK].n_vars,
+            6 + tau,
+            "q_keccak is 64 slots of the KECCAK table"
+        );
         let g_log = tau.min(tau.saturating_sub(TRUNC_D).max(MIN_PIECE_LOG));
         let c = rows.max(1).div_ceil(1 << g_log).min(1 << (tau - g_log));
         let (offsets, s_o) = witness::stack_offsets(&kappas(Some(QKECCAK)));
@@ -178,7 +188,15 @@ impl Compact {
                 *p = F64(lane);
             }
             let ext = (o + (1 << (6 + tau))).next_multiple_of(1 << (mu - pcs::LOG_BATCH));
-            region = Some(Region { tau, g_log, c, s_o, o, ext, pad });
+            region = Some(Region {
+                tau,
+                g_log,
+                c,
+                s_o,
+                o,
+                ext,
+                pad,
+            });
             (dsts, shape, placed) = (offsets, qt, placed_qt);
         }
         for (it, dst) in items.iter_mut().zip(dsts) {
@@ -358,12 +376,17 @@ impl Compact {
                         let (point, pad) = if zeta.len() == tau {
                             // A slot claim: the slot's bits go between the step's and the chunk's.
                             let slot = (offset - qk.offset) >> tau;
-                            let bits: Vec<F192> = (0..6).map(|j| if slot >> j & 1 == 1 { F192::ONE } else { F192::ZERO }).collect();
+                            let bits: Vec<F192> = (0..6)
+                                .map(|j| if slot >> j & 1 == 1 { F192::ONE } else { F192::ZERO })
+                                .collect();
                             let (steplo, chunk) = zeta.split_at(r.g_log);
                             ([steplo, &bits, chunk].concat(), F192::from(r.pad[slot]) * r.u(chunk))
                         } else {
                             // The Keccak output claim, at the whole region.
-                            assert!(offset == qk.offset && zeta.len() == 6 + tau, "the output claim covers q_keccak");
+                            assert!(
+                                offset == qk.offset && zeta.len() == 6 + tau,
+                                "the output claim covers q_keccak"
+                            );
                             let chunk = &zeta[r.g_log..tau];
                             let phat: F192 = (0..64).map(|s| F192::from(r.pad[s]) * eq_bits(s, &zeta[tau..])).sum();
                             (r.rotate(&zeta), phat * r.u(chunk))
@@ -444,12 +467,17 @@ mod tests {
             self.0
         }
         fn ext_vec(&mut self, n: usize) -> Vec<F192> {
-            (0..n).map(|_| F192::new(self.next_u64(), self.next_u64(), self.next_u64())).collect()
+            (0..n)
+                .map(|_| F192::new(self.next_u64(), self.next_u64(), self.next_u64()))
+                .collect()
         }
     }
 
     fn mle(w: &[F64], point: &[F192]) -> F192 {
-        w.iter().enumerate().map(|(i, &x)| F192::from(x) * eq_bits(i, point)).sum()
+        w.iter()
+            .enumerate()
+            .map(|(i, &x)| F192::from(x) * eq_bits(i, point))
+            .sum()
     }
 
     #[test]
@@ -467,11 +495,23 @@ mod tests {
         let (tau, g_log, c) = (12, 10, 2);
         let mut rng = Rng::new(11);
         let pad: [F64; 64] = std::array::from_fn(|_| F64(rng.next_u64()));
-        let r = Region { tau, g_log, c, s_o: 0, o: 0, ext: 1 << (6 + tau), pad };
+        let r = Region {
+            tau,
+            g_log,
+            c,
+            s_o: 0,
+            o: 0,
+            ext: 1 << (6 + tau),
+            pad,
+        };
         let g = 1 << g_log;
         let mut q = vec![F64::ZERO; 64 << tau];
         for (i, x) in q.iter_mut().enumerate() {
-            *x = if i % (1 << tau) < c * g { F64(rng.next_u64()) } else { pad[i >> tau] };
+            *x = if i % (1 << tau) < c * g {
+                F64(rng.next_u64())
+            } else {
+                pad[i >> tau]
+            };
         }
         let mut region = vec![F64::ZERO; 64 << tau];
         for s in 0..64 {
