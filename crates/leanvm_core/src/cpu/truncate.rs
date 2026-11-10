@@ -151,9 +151,8 @@ impl Compact {
                 (l.placements[it.col].offset + it.off) >> EQUAL_BLOCK_LOG,
                 it.dst >> EQUAL_BLOCK_LOG,
             );
-            for i in 1..1 << (it.b - EQUAL_BLOCK_LOG) {
-                repeats[to + i] = full[from + i];
-            }
+            let blocks = 1 << (it.b - EQUAL_BLOCK_LOG);
+            repeats[to + 1..to + blocks].copy_from_slice(&full[from + 1..from + blocks]);
         }
         let tail = (self.placed.div_ceil(1 << EQUAL_BLOCK_LOG) + 1).min(repeats.len());
         repeats[tail..].fill(true);
