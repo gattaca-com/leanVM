@@ -2,20 +2,24 @@
 //! One bytecode (`guests/lean_ethereum.py`) serves every node of an aggregation tree.
 //!
 //! A node verifies `n_raw_lean_xmss` leanXMSS signatures, `n_raw_lean_sphincs` leanSPHINCS
-//! signatures and `n_children` sub-proofs **of this same bytecode**, and
-//! by default publishes the sorted deduplicated union of their signer sets. A claim
-//! of either scheme is a `(pubkey, message)` pair; a leanXMSS signature carries its own
-//! leaf index, which the statement does not record. Coverage is what carries the
-//! security claim: a write-once slot per declared claim, written once by each raw
-//! signature and each child claim, plus a final count, so every declared claim is
-//! backed by a real signature or a verified child.
+//! signatures and `n_children` sub-proofs **of this same bytecode**, and commits to
+//! the claims in the shape of that recursion ([`ClaimTree`]): its signer commitment
+//! hashes each child's commitment, then its own raw claim lists. A claim of either
+//! scheme is a `(pubkey, message)` pair; a leanXMSS signature carries its own leaf
+//! index, which the statement does not record. A child's claims never enter the
+//! parent's tables: the parent hashes the child's commitment, which the child's
+//! statement pins, and verifies the child's proof against that statement. The native
+//! verifier rebuilds the commitment from the tree and exposes the flattened, sorted,
+//! deduplicated set.
+//! Coverage carries the security claim for the raw claims a node checks itself: a
+//! write-once slot per declared claim, written once by each raw signature, plus a
+//! final count, so every declared raw claim is backed by a real signature.
 //!
 //! Those slots are one contiguous region per scheme, so the one range check a write
 //! already needs also keeps a signature off the other scheme's declared claims: that
-//! is what makes the published split mean which scheme verified which claim, at
-//! every level of the tree.
+//! is what makes the published split mean which scheme verified which claim.
 //!
-//! A duplicate slot sits outside the prefix the digest hashes, so a claim in one is
+//! A duplicate slot sits outside the prefix the digest hashes, so a raw claim in one is
 //! covered and not published. `aggregate`'s `declare` rests on that. A slot holds
 //! four cells, the pubkey and its message, so the guest reads each signature's message
 //! out of the slot it verifies.
@@ -54,7 +58,7 @@ mod tests;
 pub use error::{AggregateVerifyError, AggregationError, SnarkProveError, SnarkVerifyError};
 pub use guest::{unified_guest, warm_up};
 pub use node::{aggregate, aggregate_with_stats};
-pub use proof::{EthereumClaims, EthereumProof};
+pub use proof::{ClaimTree, EthereumClaims, EthereumProof};
 use signatures::lean_sphincs::LeanSphincsPublicKey;
 use signatures::lean_xmss::LeanXmssPublicKey;
 use signatures::{lean_sphincs, lean_xmss};

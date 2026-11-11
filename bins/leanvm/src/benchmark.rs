@@ -5,7 +5,7 @@
 use bench::{Plan, Timing};
 use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use rec_aggregation::{EthereumClaims, EthereumProof, aggregate, aggregate_with_stats, signers_cache};
+use rec_aggregation::{ClaimTree, EthereumClaims, EthereumProof, aggregate, aggregate_with_stats, signers_cache};
 use signatures::lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use signatures::{lean_sphincs, lean_xmss};
 
@@ -347,7 +347,14 @@ fn leaves_from_subprocess(n: usize) -> Vec<EthereumProof> {
     while !file.0.is_empty() {
         let claims = file.claims();
         let len = file.count();
-        leaves.push(EthereumProof::from_proof_bytes(file.take(len), claims).expect("a leaf proof"));
+        // A leaf's claim tree is one node with no children.
+        let tree = ClaimTree {
+            children: vec![],
+            lean_xmss: claims.lean_xmss,
+            lean_sphincs: claims.lean_sphincs,
+        };
+        let leaf = EthereumProof::from_proof_bytes(file.take(len), tree, claims.da_commitment);
+        leaves.push(leaf.expect("a leaf proof"));
     }
     assert_eq!(leaves.len(), n, "one proof per leaf");
     leaves

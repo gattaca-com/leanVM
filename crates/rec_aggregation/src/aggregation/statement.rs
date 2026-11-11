@@ -3,6 +3,7 @@
 use super::cells::{cell_bytes, count, pack_16_bytes};
 use super::deferred::DeferredClaim;
 use super::guest::unified_guest;
+use super::proof::ClaimTree;
 use super::{LeanSphincsClaim, LeanXmssClaim};
 use fiat_shamir::merkle::hash_to_scalars;
 use primitives::field::F128;
@@ -55,12 +56,43 @@ pub(super) fn lean_sphincs_claim_cells((pk, message): &LeanSphincsClaim) -> [F12
     claim_cells(&pk.to_bytes(), message)
 }
 
-/// The statement's fixed header, ahead of the deferred cells: the seed, the two
-/// claim-list digests (leanXMSS then leanSPHINCS), and the DA digest ([`verifier::da::digest`]).
+/// The first cell of a node commitment's preimage: the guest's `NODE_TAG`, one canonical cell.
+const NODE_TAG: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// A node's signer commitment: the plain hash of [`NODE_TAG`], each child's commitment in
+/// order, then the node's leanXMSS and leanSPHINCS raw list digests (`node_commitment` in
+/// the guest). The preimage length binds the child count, each list digest binds its
+/// own length through the hash's padding, and a leaf is the same preimage with no
+/// children, so one format covers every node.
+pub(super) fn node_commitment(
+    kids: &[[u8; 32]],
+    xmss: &[LeanXmssClaim],
+    lean_sphincs: &[LeanSphincsClaim],
+) -> [u8; 32] {
+    let xmss = claim_list_digest(xmss.iter().map(lean_xmss_claim_cells));
+    let lean_sphincs = claim_list_digest(lean_sphincs.iter().map(lean_sphincs_claim_cells));
+    let mut hasher = primitives::hash::Hasher::new();
+    hasher.update(&NODE_TAG);
+    for kid in kids {
+        hasher.update(kid);
+    }
+    hasher
+        .update(&cell_bytes(xmss.into_iter().chain(lean_sphincs)))
+        .finalize()
+}
+
+/// The commitment of `tree`, rebuilt from every claim under it.
+pub(super) fn tree_commitment(tree: &ClaimTree) -> [u8; 32] {
+    let kids: Vec<[u8; 32]> = tree.children.iter().map(tree_commitment).collect();
+    node_commitment(&kids, &tree.lean_xmss, &tree.lean_sphincs)
+}
+
+/// The statement's fixed header, ahead of the deferred cells: the seed, the signer
+/// commitment ([`node_commitment`]), and the DA digest ([`verifier::da::digest`]).
 /// Fed to the guest as `STMT_HEADER`, which pins where its deferred cells start;
 /// the header cells themselves are written out again there, and only the
 /// end-to-end statement check holds the two spellings together.
-pub(super) const STATEMENT_HEADER: usize = 8;
+pub(super) const STATEMENT_HEADER: usize = 6;
 
 /// A plain hash over cells: what the guest gets from `keccak_cells` over the same cells.
 fn cell_hash(cells: impl IntoIterator<Item = F128>) -> [F128; 2] {
@@ -70,33 +102,18 @@ fn cell_hash(cells: impl IntoIterator<Item = F128>) -> [F128; 2] {
 /// A node's public statement, hashed to the two words the VM publishes. The
 /// guest's `statement_digest` computes exactly this, both for itself and when it
 /// rebuilds a child's, which is what forces a whole tree onto one bytecode and
-/// each child's claims, bound by the two list digests, onto its parent's lists.
+/// each child's claims, bound by its signer commitment, under its parent's.
 ///
 /// Fixed-length preimage, so a plain hash, with no domain tag of its own: every
 /// field has a fixed width, and the header leads with the environment digest, which
 /// binds this bytecode and the proof system's version and so already separates the
 /// preimage from every other use of the hash here. The header cells, then the
-/// deferred cells, each hashed as its two lanes. Each claim list's digest binds its
-/// own length through the hash's padding, so the pair binds both lists whole.
-pub(super) fn statement_digest(
-    xmss_signers: &[LeanXmssClaim],
-    lean_sphincs_signers: &[LeanSphincsClaim],
-    da_digest: [u8; 32],
-    defer: &DeferredClaim,
-) -> [F128; 2] {
+/// deferred cells, each hashed as its two lanes. The signer commitment binds both
+/// claim lists and every child's commitment whole.
+pub(super) fn statement_digest(signers: [u8; 32], da_digest: [u8; 32], defer: &DeferredClaim) -> [F128; 2] {
     let seed = leanvm_core::cpu::fs_seed(unified_guest());
-    let xmss_digest = claim_list_digest(xmss_signers.iter().map(lean_xmss_claim_cells));
-    let lean_sphincs_digest = claim_list_digest(lean_sphincs_signers.iter().map(lean_sphincs_claim_cells));
+    let signers = hash_to_scalars(&signers);
     let da_digest = hash_to_scalars(&da_digest);
-    let header: [F128; STATEMENT_HEADER] = [
-        seed[0],
-        seed[1],
-        xmss_digest[0],
-        xmss_digest[1],
-        lean_sphincs_digest[0],
-        lean_sphincs_digest[1],
-        da_digest[0],
-        da_digest[1],
-    ];
+    let header: [F128; STATEMENT_HEADER] = [seed[0], seed[1], signers[0], signers[1], da_digest[0], da_digest[1]];
     cell_hash(header.into_iter().chain(defer.cells()))
 }

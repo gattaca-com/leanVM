@@ -1050,6 +1050,7 @@ fn signature_placeholders(ps: &mut impl FnMut(&str, String)) {
     ps("CLAIM_GROUP", CLAIM_GROUP.to_string());
     ps("BIG_GROUPS", BIG_GROUPS.to_string());
     ps("MAX_RECURSIONS", MAX_RECURSIONS.to_string());
+    ps("CHILD_COUNTS", (MAX_RECURSIONS + 1).to_string());
 
     // The leanSPHINCS instance: its shape, each address type as A1, the address's
     // second cell, holds it, and the cell bit each address field's low bytes start at.

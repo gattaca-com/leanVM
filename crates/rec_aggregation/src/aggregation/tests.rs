@@ -6,7 +6,7 @@ use super::hints::{FORGE, Forgery, Hints, lean_xmss_hints};
 use super::node::aggregate;
 use super::placeholders::placeholder_map;
 use super::proof::{EthereumClaims, EthereumProof, decode, encode};
-use super::statement::{CLAIM_GROUP, claim_list_digest, list_split};
+use super::statement::CLAIM_GROUP;
 use super::*;
 use fiat_shamir::merkle::hash_to_scalars;
 use lean_compiler::{compile, parse_with_replacements};
@@ -337,6 +337,43 @@ fn aggregate_two_to_one() {
     assert_eq!(node.claims.lean_xmss.len(), SMALL_LEAF_SIZE + big);
 }
 
+/// A claim changed anywhere in the tree changes the commitment, so the statement no
+/// longer matches the proof: the verifier rejects it, on the wire too. A forged child
+/// commitment hint fails in the guest, whose rebuilt child statement matches no proof.
+#[test]
+fn tampered_claim_tree_is_rejected() {
+    parallel::init();
+    let signers = get_signers(SMALL_LEAF_SIZE + 1);
+    let children = [
+        prove_leaf(&signers[..SMALL_LEAF_SIZE]),
+        prove_leaf(&signers[SMALL_LEAF_SIZE..]),
+    ];
+    let node = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
+    node.verify().expect("node verifies");
+    // A message swapped under a verified key, inside a child's list.
+    let mut forged = node.clone();
+    forged.tree.children[0].lean_xmss[0].1 = message_for(7);
+    assert!(matches!(forged.verify(), Err(AggregateVerifyError::Snark(_))));
+    let received = EthereumProof::from_proof_bytes(&forged.proof_bytes(), forged.tree.clone(), None).expect("parses");
+    assert!(matches!(received.verify(), Err(AggregateVerifyError::Snark(_))));
+    // A child's claims presented as the node's own raw claims: same set, other tree.
+    let mut flattened = node.clone();
+    let child = flattened.tree.children.remove(0);
+    flattened.tree.lean_xmss = child.lean_xmss;
+    assert!(matches!(flattened.verify(), Err(AggregateVerifyError::Snark(_))));
+    // A forged child commitment hint: the child's proof is of another statement.
+    FORGE.with(|forge| {
+        *forge.borrow_mut() = Some(Box::new(|hints: &mut Hints| {
+            hints.entry_mut("child_signers", 1)[0] += F128::ONE;
+        }))
+    });
+    let result = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE);
+    assert!(
+        matches!(result, Err(AggregationError::ProofError(_))),
+        "a forged commitment is rejected"
+    );
+}
+
 fn da_rows(n_rows: usize, seed: u64) -> Vec<u64> {
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
     (0..n_rows * (1 << DA_LOG_K))
@@ -364,31 +401,24 @@ fn aggregate_with_a_da_payload() {
     );
     // The receiver supplies the claims it expects: those verify, any others fail.
     let bytes = node.proof_bytes();
-    let expected = EthereumClaims {
-        da_commitment: Some(commitment),
-        ..EthereumClaims::default()
-    };
-    EthereumProof::from_proof_bytes(&bytes, expected.clone())
+    let expected = ClaimTree::default();
+    EthereumProof::from_proof_bytes(&bytes, expected.clone(), Some(commitment))
         .unwrap()
         .verify()
         .unwrap();
-    let other = EthereumClaims {
-        da_commitment: Some([0; 32]),
-        ..EthereumClaims::default()
-    };
-    let wrong = EthereumProof::from_proof_bytes(&bytes, other).unwrap();
+    let wrong = EthereumProof::from_proof_bytes(&bytes, expected.clone(), Some([0; 32])).unwrap();
     assert!(matches!(wrong.verify(), Err(AggregateVerifyError::Snark(_))));
     let claim = (
         LeanXmssPublicKey::from_bytes(&[0; lean_xmss::PUB_KEY_SIZE]),
         [0; lean_xmss::MESSAGE_LEN],
     );
-    let unsorted = EthereumClaims {
+    let unsorted = ClaimTree {
         lean_xmss: vec![claim, claim],
         ..expected.clone()
     };
-    let malformed = EthereumProof::from_proof_bytes(&bytes, unsorted);
+    let malformed = EthereumProof::from_proof_bytes(&bytes, unsorted, Some(commitment));
     assert!(matches!(malformed, Err(AggregateVerifyError::MalformedSignerSet)));
-    let trailing = EthereumProof::from_proof_bytes(&[&bytes[..], &[0]].concat(), expected);
+    let trailing = EthereumProof::from_proof_bytes(&[&bytes[..], &[0]].concat(), expected, Some(commitment));
     assert!(matches!(trailing, Err(AggregateVerifyError::MalformedEncoding)));
 }
 
@@ -432,10 +462,10 @@ fn a_node_passes_on_one_childs_da_root() {
     );
     assert_ne!(first, second);
     let pass_on = |selected: Option<Option<[u8; 32]>>, blobs: &[u64]| {
+        // A node publishes its children's claims whole; `declare` names its own raw ones.
         let declare = selected.map(|da_commitment| EthereumClaims {
-            lean_xmss: children[0].claims.lean_xmss.clone(),
-            lean_sphincs: vec![],
             da_commitment,
+            ..EthereumClaims::default()
         });
         let node = aggregate(&children, vec![], vec![], blobs, declare.as_ref(), LOG_INV_RATE).unwrap();
         node.verify().unwrap();
@@ -668,8 +698,9 @@ fn no_payload_publishes_no_root() {
     assert_eq!(node.claims.da_commitment, None);
 }
 
-/// Claims left undeclared take duplicate slots. The first narrowing drops every
-/// claim on one message, the second all but one claim.
+/// Raw claims left undeclared take duplicate slots. The first narrowing drops every
+/// claim on one message, the second all but one claim. A child's claims cannot be
+/// narrowed: the node's commitment hashes the child's whole.
 #[test]
 fn a_node_may_publish_less_than_it_covers() {
     parallel::init();
@@ -677,19 +708,12 @@ fn a_node_may_publish_less_than_it_covers() {
     let at_b = get_signers_for(2, MESSAGE_B);
     let mut raw = at_a.clone();
     raw.extend_from_slice(&at_b);
-    let wide = aggregate(&[], raw, vec![], &[], None, LOG_INV_RATE).expect("the wide leaf aggregates");
+    let wide = aggregate(&[], raw.clone(), vec![], &[], None, LOG_INV_RATE).expect("the wide leaf aggregates");
     wide.verify().expect("the wide leaf verifies");
     assert_eq!(wide.claims.lean_xmss.len(), 5);
 
-    let narrowed = |wide: &EthereumProof, declare: &EthereumClaims| {
-        aggregate(
-            std::slice::from_ref(wide),
-            vec![],
-            vec![],
-            &[],
-            Some(declare),
-            LOG_INV_RATE,
-        )
+    let narrowed = |_wide: &EthereumProof, declare: &EthereumClaims| {
+        aggregate(&[], raw.clone(), vec![], &[], Some(declare), LOG_INV_RATE)
     };
     let only = |lean_xmss: Vec<LeanXmssClaim>| EthereumClaims {
         lean_xmss,
@@ -726,6 +750,19 @@ fn a_node_may_publish_less_than_it_covers() {
     // A covered pubkey, against a message nobody signed.
     assert_eq!(
         narrowed(&wide, &only(vec![(at_a[0].0, message_for(MESSAGE_B + 1))])).err(),
+        Some(AggregationError::NotCovered)
+    );
+    // A child's claim, declared at the parent: the parent covers no raw claim.
+    assert_eq!(
+        aggregate(
+            std::slice::from_ref(&wide),
+            vec![],
+            vec![],
+            &[],
+            Some(&only(on_b)),
+            LOG_INV_RATE
+        )
+        .err(),
         Some(AggregationError::NotCovered)
     );
 }
@@ -815,53 +852,6 @@ fn aggregate_overlapping_signers() {
     assert!(node.claims.lean_xmss.windows(2).all(|w| w[0] < w[1]));
 }
 
-/// A child list walked by gaps (`child_claim_list_mono`) moves strictly forward. A
-/// child may declare a claim twice, and a gap of `g^-1` would walk the copy back onto
-/// the slot it just covered, with the same coverage mark, so write-once memory alone
-/// would not see it: only the gap's `assert_gpow` does.
-#[test]
-fn a_child_walk_cannot_step_back() {
-    let (helpers, _) = include_str!("../../guests/lean_ethereum.py")
-        .split_once("\ndef main():")
-        .unwrap();
-    let source = format!(
-        r#"{helpers}
-def main():
-    n_c = hint_witness("n")
-    table = HeapBuf(GEN ** 8)
-    hint_witness(table[0:8], "claims")
-    cover = HeapBuf(GEN ** 2)
-    d0, d1 = child_claim_list_digest(table, cover, GEN ** 3, GEN ** 2, n_c)
-    public = GEN ** 0
-    assert public[1] == d0
-    assert public[GEN] == d1
-    return
-"#
-    );
-    let guest = compile(&parse_with_replacements(&source, &placeholder_map(20)).unwrap());
-    let claim = |i: u64| [1, 2, 3, 4].map(|k| F128::new(i * 7919 + k, k));
-    let table: Vec<F128> = [claim(0), claim(1)].concat();
-    let run = |child: &[[F128; 4]], gaps: &[F128]| {
-        let mut hints = Hints::default();
-        hints.push("n", vec![count(child.len())]);
-        hints.push("claims", table.clone());
-        hints.push("signers_split", list_split(child.len()));
-        hints.push("child_mono", vec![count(1)]);
-        for &gap in gaps {
-            hints.push("child_claim_gap", vec![gap]);
-        }
-        let mut program = guest.clone();
-        hints.install(&mut program);
-        program.execute(claim_list_digest(child.iter().copied()))
-    };
-    assert!(run(&[claim(0), claim(1)], &[count(0), count(0)]).is_ok());
-    let back = F128::from(g_pow(1).inv());
-    assert!(
-        run(&[claim(0), claim(0)], &[count(0), back]).is_err(),
-        "a walk revisited a slot"
-    );
-}
-
 /// Three levels, both schemes. The leanSPHINCS claims are rebuilt twice over, once
 /// into each node and again into the root, and the two nodes share one claim,
 /// so the root needs a leanSPHINCS duplicate slot for a claim it never saw
@@ -929,7 +919,8 @@ fn aggregate_round_trips_through_the_wire() {
     .expect("node");
     node.verify().expect("the honest node verifies");
 
-    let received = EthereumProof::from_proof_bytes(&node.proof_bytes(), node.claims.clone()).expect("round trip");
+    let received = EthereumProof::from_proof_bytes(&node.proof_bytes(), node.tree.clone(), node.claims.da_commitment)
+        .expect("round trip");
     assert_eq!(
         received.proof_bytes(),
         node.proof_bytes(),

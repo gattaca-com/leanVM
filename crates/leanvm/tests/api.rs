@@ -45,7 +45,8 @@ fn public_api_end_to_end() {
         2,
     )
     .unwrap();
-    let left = EthereumProof::from_proof_bytes(&left.proof_bytes(), left.claims().clone()).unwrap();
+    let left_claims = left.claims().da_commitment;
+    let left = EthereumProof::from_proof_bytes(&left.proof_bytes(), left.claim_tree().clone(), left_claims).unwrap();
     left.verify().unwrap();
     assert_eq!(left.claims().da_commitment, Some(commitment));
     let other_blobs: Vec<_> = blobs.iter().map(|x| x ^ 42).collect();
@@ -65,10 +66,11 @@ fn public_api_end_to_end() {
     assert_eq!(root.claims().num_signature_claims(), 11);
     assert_eq!(root.claims().da_commitment, Some(commitment));
 
-    // 4. Onto the wire, which carries no claims: the receiver supplies the claims it expects, and
+    // 4. Onto the wire, which carries no claims: the receiver supplies the claim tree it expects, and
     //    verifying says exactly these pubkeys signed exactly these messages.
     let bytes = root.proof_bytes();
-    let received = EthereumProof::from_proof_bytes(&bytes, root.claims().clone()).unwrap();
+    let received =
+        EthereumProof::from_proof_bytes(&bytes, root.claim_tree().clone(), root.claims().da_commitment).unwrap();
     received.verify().unwrap();
     let on = |message| {
         received
@@ -79,15 +81,32 @@ fn public_api_end_to_end() {
             .count()
     };
     assert_eq!((on(MSG_0), on(MSG_1), on(MSG_2)), (3, 4, 1));
-    // Claims the proof does not prove fail, here one signature claim short.
-    let mut fewer = root.claims().clone();
+    // A tree the proof does not prove fails, here one signature claim short.
+    let mut fewer = root.claim_tree().clone();
     fewer.lean_xmss.pop();
-    let wrong = EthereumProof::from_proof_bytes(&bytes, fewer).unwrap();
+    let wrong = EthereumProof::from_proof_bytes(&bytes, fewer, root.claims().da_commitment).unwrap();
     assert!(matches!(wrong.verify(), Err(AggregateVerifyError::Snark(_))));
 
-    // 5. Removing some signatures from the aggregate: `declare` is what we keep. Here every claim on MSG_1 goes,
-    //    and one leanSPHINCS claim.
-    let retained = EthereumClaims {
+    // 5. Selecting what to publish: a node publishes its children's claims whole, since its
+    //    commitment hashes each child's. `declare` selects the node's own raw signatures and
+    //    the DA root. Here every claim and the DA root stay.
+    let keep_root = EthereumClaims {
+        da_commitment: Some(commitment),
+        ..Default::default()
+    };
+    let narrowed = aggregate(
+        std::slice::from_ref(&received),
+        vec![],
+        vec![],
+        &[],
+        Some(&keep_root),
+        2,
+    )
+    .unwrap();
+    narrowed.verify().unwrap();
+    assert_eq!(narrowed.claims(), received.claims());
+    // Naming a child's claim as the node's own is refused: nothing at this node covers it.
+    let subset = EthereumClaims {
         lean_xmss: received
             .claims()
             .lean_xmss
@@ -95,20 +114,8 @@ fn public_api_end_to_end() {
             .filter(|(_, m)| *m != MSG_1)
             .cloned()
             .collect(),
-        lean_sphincs: received.claims().lean_sphincs[1..].to_vec(),
-        da_commitment: Some(commitment),
+        ..Default::default()
     };
-    let narrowed = aggregate(&[received], vec![], vec![], &[], Some(&retained), 2).unwrap();
-    narrowed.verify().unwrap();
-    assert_eq!(narrowed.claims(), &retained);
-    assert_eq!(narrowed.claims().num_signature_claims(), 11 - 4 - 1);
-
-    // And the blob claim.
-    let without_blobs = EthereumClaims {
-        da_commitment: None,
-        ..retained
-    };
-    let dropped = aggregate(&[narrowed], vec![], vec![], &[], Some(&without_blobs), 2).unwrap();
-    dropped.verify().unwrap();
-    assert_eq!(dropped.claims(), &without_blobs);
+    let refused = aggregate(&[received], vec![], vec![], &[], Some(&subset), 2);
+    assert!(matches!(refused, Err(AggregationError::NotCovered)));
 }

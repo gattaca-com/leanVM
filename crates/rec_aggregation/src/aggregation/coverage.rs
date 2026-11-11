@@ -1,12 +1,12 @@
-//! The coverage table: which slot each raw signature and child claim writes.
+//! The coverage table: which slot each raw signature writes.
 
 use super::error::AggregationError;
-use super::proof::{EthereumClaims, EthereumProof};
+use super::proof::EthereumClaims;
 use super::{LeanSphincsClaim, LeanXmssClaim};
 use std::collections::BTreeSet;
 
-/// The coverage slot each write in the guest's coverage walk targets, in walk
-/// order: the raw signatures first, then each child's claim lists.
+/// The coverage slot each raw signature's write in the guest's coverage walk targets.
+/// A child's claims never enter the table: the node's commitment hashes the child's.
 ///
 /// The table is one contiguous region per scheme, each its declared claims followed
 /// by its own duplicate slots:
@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 /// fresh duplicate slot in the same region, so the walk hits every one of the
 /// `n_total` slots exactly once. That bijection, enforced in-circuit by write-once
 /// memory plus the final count, is what makes every declared claim covered by a real
-/// signature or a verified child.
+/// signature.
 ///
 /// Keeping each region contiguous is what binds the scheme: the guest addresses
 /// every writer as an offset into one region, bounded by that region's size, one
@@ -39,25 +39,12 @@ pub(super) struct Region<K> {
     pub(super) dups: Vec<K>,
     /// The slot of each raw signature, in the order given.
     pub(super) raw: Vec<usize>,
-    /// Per child, the slot of each of its claims.
-    pub(super) children: Vec<Vec<usize>>,
 }
 
 impl<K: Ord + Clone> Region<K> {
-    /// Declares the union of the raw claims and the children's, or exactly
-    /// `declare`, which they must cover.
-    fn plan<'a>(
-        raw: &[K],
-        children: impl Iterator<Item = &'a [K]> + Clone,
-        declare: Option<&[K]>,
-    ) -> Result<Self, AggregationError>
-    where
-        K: 'a,
-    {
+    /// Declares the raw claims, or exactly `declare`, which they must cover.
+    fn plan(raw: &[K], declare: Option<&[K]>) -> Result<Self, AggregationError> {
         let mut signers = raw.to_vec();
-        for child in children.clone() {
-            signers.extend_from_slice(child);
-        }
         signers.sort();
         signers.dedup();
         if let Some(declare) = declare {
@@ -73,20 +60,7 @@ impl<K: Ord + Clone> Region<K> {
             .iter()
             .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
             .collect();
-        let children = children
-            .map(|child| {
-                child
-                    .iter()
-                    .map(|claim| take_slot(&signers, &mut claimed, &mut dups, claim))
-                    .collect()
-            })
-            .collect();
-        Ok(Self {
-            signers,
-            dups,
-            raw,
-            children,
-        })
+        Ok(Self { signers, dups, raw })
     }
 }
 
@@ -108,20 +82,11 @@ fn take_slot<K: Ord + Clone>(claims: &[K], claimed: &mut [bool], duplicates: &mu
 pub(super) fn plan_coverage(
     raw_lean_xmss: &[LeanXmssClaim],
     raw_lean_sphincs: &[LeanSphincsClaim],
-    children: &[EthereumProof],
     declare: Option<&EthereumClaims>,
 ) -> Result<Coverage, AggregationError> {
     let cover = Coverage {
-        lean_xmss: Region::plan(
-            raw_lean_xmss,
-            children.iter().map(|child| child.claims.lean_xmss.as_slice()),
-            declare.map(|claims| claims.lean_xmss.as_slice()),
-        )?,
-        lean_sphincs: Region::plan(
-            raw_lean_sphincs,
-            children.iter().map(|child| child.claims.lean_sphincs.as_slice()),
-            declare.map(|claims| claims.lean_sphincs.as_slice()),
-        )?,
+        lean_xmss: Region::plan(raw_lean_xmss, declare.map(|claims| claims.lean_xmss.as_slice()))?,
+        lean_sphincs: Region::plan(raw_lean_sphincs, declare.map(|claims| claims.lean_sphincs.as_slice()))?,
     };
     Ok(cover)
 }

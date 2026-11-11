@@ -9,8 +9,10 @@ use super::guest::unified_guest;
 #[cfg(test)]
 use super::hints::FORGE;
 use super::hints::{Hints, lean_sphincs_hints, lean_xmss_hints};
-use super::proof::{EthereumClaims, EthereumProof, check_signer_set};
-use super::statement::{lean_sphincs_claim_cells, lean_xmss_claim_cells, list_split, statement_digest};
+use super::proof::{ClaimTree, EthereumClaims, EthereumProof, check_claim_tree, flatten_claims};
+use super::statement::{
+    lean_sphincs_claim_cells, lean_xmss_claim_cells, list_split, node_commitment, statement_digest, tree_commitment,
+};
 use super::{LeanSphincsClaim, LeanXmssClaim, MAX_RECURSIONS};
 use fiat_shamir::merkle::hash_to_scalars;
 use lean_da::{BLOB_SYMBOLS, CELL_SYMBOLS, CELLS_PER_ROW, CODEWORD_SYMBOLS};
@@ -29,10 +31,11 @@ use signatures::{lean_sphincs, lean_xmss};
 /// - `blobs`: concatenated blobs, each containing [`BLOB_SYMBOLS`] little-endian `u64` symbols;
 ///   at most [`lean_da::DA_MAX_ROWS`] blobs. A node with blobs publishes their matrix's root, and none
 ///   of its children's.
-/// - `declare`: `None` keeps all signature claims and publishes the blob matrix's root, or else
-///   the first child's that has one; `Some` specifies exactly the signatures and DA root to
+/// - `declare`: `None` keeps all raw signature claims and publishes the blob matrix's root, or else
+///   the first child's that has one; `Some` specifies exactly the raw signatures and DA root to
 ///   publish, which must be the blob matrix's if there are blobs. Every declared claim must be
-///   covered by the inputs above.
+///   covered by the raw signatures above. A child's claims are always published whole: naming
+///   one here is [`AggregationError::NotCovered`].
 /// - `log_inv_rate`: PCS code rate `2^-log_inv_rate`, higher `log_inv_rate` means a smaller proof
 ///   but slower proving; in [`MIN_LOG_INV_RATE`](pcs::whir::MIN_LOG_INV_RATE)..=[`MAX_LOG_INV_RATE`](pcs::whir::MAX_LOG_INV_RATE).
 ///
@@ -121,23 +124,29 @@ pub fn aggregate_with_stats(
     // the true evaluation, refusing a false one, and the root discharges the one
     // claim they reduce to.
     let _span = tracing::info_span!("Replay children").entered();
-    let mut public_inputs = Vec::with_capacity(children.len());
     let child_da: Vec<[u8; 32]> = children
         .iter()
         .map(|child| verifier::da::digest(child.claims.da_commitment))
         .collect();
     for child in children {
-        check_signer_set(&child.claims).map_err(AggregationError::InvalidChild)?;
-        public_inputs.push(child.vm_public_input());
+        check_claim_tree(&child.tree).map_err(AggregationError::InvalidChild)?;
     }
     // One single-threaded replay per worker: nothing inside dispatches.
     let bytecode = scalar_bytecode();
     let summaries = parallel::map_collect(children.len(), |i| {
-        let public_input = public_input_bytes(&public_inputs[i]);
-        verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof))
+        let commit = tree_commitment(&children[i].tree);
+        let pi = statement_digest(commit, child_da[i], &children[i].defer);
+        let public_input = public_input_bytes(&pi);
+        (
+            commit,
+            pi,
+            verifier::replay_unchecked(bytecode, &public_input, &scalar_proof(&children[i].proof)),
+        )
     });
     let mut replayed = Vec::with_capacity(children.len());
-    for (pi, summary) in public_inputs.into_iter().zip(summaries) {
+    let mut commits: Vec<[u8; 32]> = Vec::with_capacity(children.len());
+    for (commit, pi, summary) in summaries {
+        commits.push(commit);
         let summary =
             summary.map_err(|e| AggregationError::InvalidChild(AggregateVerifyError::Snark(SnarkVerifyError(e))))?;
         replayed.push((pi, summary));
@@ -151,7 +160,7 @@ pub fn aggregate_with_stats(
         .iter()
         .map(|(pk, message, _)| (*pk, *message))
         .collect();
-    let cover = plan_coverage(&raw_xmss_claims, &raw_lean_sphincs_claims, children, declare)?;
+    let cover = plan_coverage(&raw_xmss_claims, &raw_lean_sphincs_claims, declare)?;
 
     let mut hints = Hints::default();
     hints.push(
@@ -233,33 +242,7 @@ pub fn aggregate_with_stats(
     let mut subs = Vec::with_capacity(children.len());
     let mut carried = Vec::with_capacity(children.len());
     for (i, (child, verified)) in children.iter().zip(verified).enumerate() {
-        hints.push(
-            "child_meta",
-            vec![
-                count(child.claims.lean_xmss.len()),
-                count(child.claims.lean_sphincs.len()),
-            ],
-        );
-        for offsets in [&cover.lean_xmss.children[i], &cover.lean_sphincs.children[i]] {
-            if offsets.is_empty() {
-                continue;
-            }
-            hints.push("signers_split", list_split(offsets.len()));
-            // Strictly increasing slots go as gaps (`child_claim_list_mono`).
-            if offsets.is_sorted_by(|a, b| a < b) {
-                hints.push("child_mono", vec![count(1)]);
-                let mut next = 0;
-                for &offset in offsets {
-                    hints.push("child_claim_gap", vec![count(offset - next)]);
-                    next = offset + 1;
-                }
-            } else {
-                hints.push("child_mono", vec![count(0)]);
-                for &offset in offsets {
-                    hints.push("child_claim_index", vec![count(offset)]);
-                }
-            }
-        }
+        hints.push("child_signers", hash_to_scalars(&commits[i]).to_vec());
         hints.push("child_defer", child.defer.cells());
         hints.push("child_da", hash_to_scalars(&child_da[i]).to_vec());
         let (sub_hints, defer) = verified?;
@@ -314,11 +297,22 @@ pub fn aggregate_with_stats(
         }
     }
     hints.push("da_pick", vec![count(da_pick)]);
-    if cover.lean_xmss.signers.is_empty() && cover.lean_sphincs.signers.is_empty() && da_root.is_none() {
+    if cover.lean_xmss.signers.is_empty()
+        && cover.lean_sphincs.signers.is_empty()
+        && da_root.is_none()
+        && children.is_empty()
+    {
         return Err(AggregationError::Empty);
     }
 
-    let public_input = statement_digest(&cover.lean_xmss.signers, &cover.lean_sphincs.signers, da, &defer);
+    let tree = ClaimTree {
+        children: children.iter().map(|child| child.tree.clone()).collect(),
+        lean_xmss: cover.lean_xmss.signers,
+        lean_sphincs: cover.lean_sphincs.signers,
+    };
+    let own = node_commitment(&commits, &tree.lean_xmss, &tree.lean_sphincs);
+    let (lean_xmss, lean_sphincs) = flatten_claims(&tree);
+    let public_input = statement_digest(own, da, &defer);
     let mut program = guest.clone();
     program.truncate = true;
     #[cfg(test)]
@@ -330,9 +324,10 @@ pub fn aggregate_with_stats(
         prove(&program, public_input, log_inv_rate).map_err(|e| AggregationError::ProofError(SnarkProveError(e)))?;
     Ok((
         EthereumProof {
+            tree,
             claims: EthereumClaims {
-                lean_xmss: cover.lean_xmss.signers,
-                lean_sphincs: cover.lean_sphincs.signers,
+                lean_xmss,
+                lean_sphincs,
                 da_commitment: da_root,
             },
             defer,
