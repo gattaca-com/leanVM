@@ -23,7 +23,7 @@ use primitives::field::{F64, F192};
 use primitives::hash::STATE_LANES;
 
 /// Rounds between two committed states.
-pub const DEPTH: usize = 12;
+pub const DEPTH: usize = 6;
 /// The reduction's shape at its fewest steps.
 const MIN_SHAPE: Shape = shape(0);
 /// `log2` of the slots the committed column holds per step: one per lane of each state but the

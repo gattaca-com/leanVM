@@ -33,7 +33,7 @@ pub const fn permutations(len: usize) -> usize {
 /// Lanes in the state.
 pub const STATE_LANES: usize = 25;
 /// Rounds per permutation.
-pub const ROUNDS: usize = 24;
+pub const ROUNDS: usize = 12;
 
 /// The first bit of Keccak's `10*1` padding, as the byte XORed right after the
 /// message. It is the only difference from FIPS 202's 256-bit hash, whose suffix makes it `0x06`.
@@ -43,18 +43,6 @@ pub const PAD_LAST: u8 = 0x80;
 
 /// The ι round constants.
 pub const RC: [u64; ROUNDS] = [
-    0x0000_0000_0000_0001,
-    0x0000_0000_0000_8082,
-    0x8000_0000_0000_808A,
-    0x8000_0000_8000_8000,
-    0x0000_0000_0000_808B,
-    0x0000_0000_8000_0001,
-    0x8000_0000_8000_8081,
-    0x8000_0000_0000_8009,
-    0x0000_0000_0000_008A,
-    0x0000_0000_0000_0088,
-    0x0000_0000_8000_8009,
-    0x0000_0000_8000_000A,
     0x0000_0000_8000_808B,
     0x8000_0000_0000_008B,
     0x8000_0000_0000_8089,
@@ -792,6 +780,7 @@ mod tests {
 
     /// A known answer from OpenSSL's `keccak-256`.
     #[test]
+    #[ignore = "what-if: 12-round permutation, real Keccak-256 vectors no longer match"]
     fn matches_reference_vector() {
         assert_eq!(
             hex(&hash(b"abc")),
@@ -802,6 +791,7 @@ mod tests {
     /// Ethereum's `keccak256`, as an independent implementation computes it, across both sides of
     /// every block boundary up to five blocks.
     #[test]
+    #[ignore = "what-if: 12-round permutation, real Keccak-256 vectors no longer match"]
     fn matches_ethereum_keccak256() {
         use sha3::Digest;
         for n in (0..700).chain([1023, 1024, 1025, 4096]) {

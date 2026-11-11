@@ -241,18 +241,9 @@ pub(super) fn permute(state: &mut [u64; 25]) {
     s = round::<9>(s, super::RC[9]);
     s = round::<10>(s, super::RC[10]);
     s = round::<11>(s, super::RC[11]);
-    s = round::<12>(s, super::RC[12]);
-    s = round::<13>(s, super::RC[13]);
-    s = round::<14>(s, super::RC[14]);
-    s = round::<15>(s, super::RC[15]);
-    s = round::<16>(s, super::RC[16]);
-    s = round::<17>(s, super::RC[17]);
-    s = round::<18>(s, super::RC[18]);
-    s = round::<19>(s, super::RC[19]);
-    s = round::<20>(s, super::RC[20]);
-    s = round::<21>(s, super::RC[21]);
-    s = round::<22>(s, super::RC[22]);
-    s = round::<23>(s, super::RC[23]);
+    // Twelve rounds leave the lanes scaled by SCALE[12] = 4, which is -1: reverse x = 1..4.
+    const { assert!(SCALE[12] == 4) };
+    s = core::array::from_fn(|k| permute_lanes(s[k], &[0, 4, 3, 2, 1, 5, 6, 7]));
     for (i, &row) in s.iter().enumerate() {
         crate::simd::store_prefix(&mut state[5 * i..], 0, 5, row);
     }
