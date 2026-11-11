@@ -66,6 +66,15 @@ impl Hints {
         }
     }
 
+    /// How many entries stream `name` holds, for a test to forge.
+    #[cfg(test)]
+    pub(super) fn entries(&self, name: &str) -> usize {
+        self.0
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or(0, |(_, entries)| entries.len())
+    }
+
     /// Entry `i` of stream `name`, for a test to forge.
     #[cfg(test)]
     pub(super) fn entry_mut(&mut self, name: &str, i: usize) -> &mut Vec<F128> {

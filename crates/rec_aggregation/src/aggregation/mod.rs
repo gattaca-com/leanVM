@@ -83,4 +83,3 @@ pub const MAX_TREE_DEPTH: usize = 32;
 /// The most nodes a [`ClaimTree`] may have in all. A tree of 4096 leaves under one root is 4352
 /// nodes, so this is generous, and it bounds the hashing and flattening a hostile tree can force.
 pub const MAX_TREE_NODES: usize = 1 << 16;
-

@@ -5,8 +5,8 @@ use super::guest::{compile_guest, unified_guest};
 use super::hints::{FORGE, Forgery, Hints, lean_xmss_hints};
 use super::node::aggregate;
 use super::placeholders::placeholder_map;
-use super::proof::{EthereumClaims, EthereumProof, decode, encode};
-use super::statement::CLAIM_GROUP;
+use super::proof::{EthereumClaims, EthereumProof, check_claim_tree, decode, encode};
+use super::statement::{CLAIM_GROUP, lean_xmss_claim_cells, list_split};
 use super::*;
 use fiat_shamir::merkle::hash_to_scalars;
 use lean_compiler::{compile, parse_with_replacements};
@@ -1058,4 +1058,286 @@ fn malformed_raw_lean_sphincs_signature_is_an_error() {
         aggregate(&[], vec![], raw, &[], None, LOG_INV_RATE).err(),
         Some(AggregationError::MalformedRawSignature)
     );
+}
+
+fn forge_hints(forgery: Forgery) {
+    FORGE.with(|forge| *forge.borrow_mut() = Some(forgery));
+}
+
+/// Every other tree over the same proof is rejected: order, arity, wrapping, flattening,
+/// a claim moved between children or schemes, or repeated at the root. Directly and on the wire.
+#[test]
+fn other_claim_trees_are_rejected() {
+    parallel::init();
+    let signers = get_signers(5);
+    let children = [prove_leaf(&signers[..3]), prove_leaf(&signers[3..])];
+    let node = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
+    node.verify().expect("node verifies");
+    let honest = node.tree.clone();
+    type Edit = Box<dyn Fn(&mut ClaimTree)>;
+    let edits: Vec<(&str, Edit)> = vec![
+        ("children swapped", Box::new(|t| t.children.swap(0, 1))),
+        (
+            "a claim moved to the other child",
+            Box::new(|t| {
+                let claim = t.children[0].lean_xmss.pop().unwrap();
+                t.children[1].lean_xmss.push(claim);
+                t.children[1].lean_xmss.sort();
+            }),
+        ),
+        ("a child dropped", Box::new(|t| drop(t.children.pop()))),
+        (
+            "an empty child added",
+            Box::new(|t| t.children.push(ClaimTree::default())),
+        ),
+        (
+            "an empty child first",
+            Box::new(|t| t.children.insert(0, ClaimTree::default())),
+        ),
+        (
+            "wrapped in a one-child node",
+            Box::new(|t| {
+                let inner = std::mem::take(t);
+                t.children.push(inner);
+            }),
+        ),
+        (
+            "flattened to a leaf",
+            Box::new(|t| {
+                let mut all: Vec<LeanXmssClaim> = t.children.iter().flat_map(|c| c.lean_xmss.clone()).collect();
+                all.sort();
+                *t = ClaimTree {
+                    children: vec![],
+                    lean_xmss: all,
+                    lean_sphincs: vec![],
+                };
+            }),
+        ),
+        (
+            "a child's claim repeated at the root",
+            Box::new(|t| t.lean_xmss.push(t.children[0].lean_xmss[0])),
+        ),
+        (
+            "a child's list moved to the other scheme",
+            Box::new(|t| {
+                let moved: Vec<LeanSphincsClaim> = t.children[0]
+                    .lean_xmss
+                    .drain(..)
+                    .map(|(pk, m)| (LeanSphincsPublicKey::from_bytes(&pk.to_bytes()), m))
+                    .collect();
+                t.children[0].lean_sphincs = moved;
+                t.children[0].lean_sphincs.sort();
+            }),
+        ),
+        (
+            "a claim removed",
+            Box::new(|t| {
+                t.children[0].lean_xmss.pop();
+            }),
+        ),
+        ("a child repeated", Box::new(|t| t.children[1] = t.children[0].clone())),
+        (
+            "one child's claims split over two children",
+            Box::new(|t| {
+                let tail = t.children[0].lean_xmss.split_off(1);
+                t.children.insert(
+                    1,
+                    ClaimTree {
+                        children: vec![],
+                        lean_xmss: tail,
+                        lean_sphincs: vec![],
+                    },
+                );
+            }),
+        ),
+    ];
+    for (name, edit) in edits {
+        let mut forged = node.clone();
+        edit(&mut forged.tree);
+        assert_ne!(forged.tree, honest, "{name}");
+        let direct = forged.verify();
+        let wire = EthereumProof::from_proof_bytes(&node.proof_bytes(), forged.tree.clone(), None)
+            .and_then(|received| received.verify());
+        assert!(
+            matches!(direct, Err(AggregateVerifyError::Snark(_))),
+            "{name}: {direct:?}"
+        );
+        assert!(matches!(wire, Err(AggregateVerifyError::Snark(_))), "{name}: {wire:?}");
+    }
+    // The honest tree still verifies over the wire, and a wrong DA root does not.
+    EthereumProof::from_proof_bytes(&node.proof_bytes(), honest.clone(), None)
+        .expect("parses")
+        .verify()
+        .expect("the honest tree verifies");
+    let with_da = EthereumProof::from_proof_bytes(&node.proof_bytes(), honest, Some([7; 32])).expect("parses");
+    assert!(matches!(with_da.verify(), Err(AggregateVerifyError::Snark(_))));
+}
+
+/// Swapped child commitment hints: each child's proof is then of another statement.
+#[test]
+fn swapped_child_commitments_fail_the_guest() {
+    parallel::init();
+    let signers = get_signers(5);
+    let children = [prove_leaf(&signers[..3]), prove_leaf(&signers[3..])];
+    forge_hints(Box::new(|hints: &mut Hints| {
+        let first = hints.entry_mut("child_signers", 0).clone();
+        let second = std::mem::replace(hints.entry_mut("child_signers", 1), first);
+        *hints.entry_mut("child_signers", 0) = second;
+    }));
+    let result = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE);
+    assert!(matches!(result, Err(AggregationError::ProofError(_))));
+}
+
+/// A node declares a raw claim no signature covers: with children only, through a duplicate
+/// slot, and in a leaf; and a leaf whose two signatures write one slot.
+#[test]
+fn uncovered_raw_claims_fail_the_guest() {
+    parallel::init();
+    let signers = get_signers(5);
+    let children = [prove_leaf(&signers[..3]), prove_leaf(&signers[3..])];
+    let stolen = lean_xmss_claim_cells(&(signers[0].0, message()));
+    forge_hints(Box::new(move |hints: &mut Hints| {
+        hints.entry_mut("meta", 0)[0] *= count(1);
+        hints.push("signers_split", list_split(1));
+        hints.push("claims", stolen.to_vec());
+    }));
+    let result = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE);
+    assert!(
+        matches!(result, Err(AggregationError::ProofError(_))),
+        "a node declares one uncovered claim"
+    );
+    forge_hints(Box::new(move |hints: &mut Hints| {
+        hints.entry_mut("meta", 0)[1] *= count(1);
+        hints.push("dup_claims", stolen.to_vec());
+    }));
+    let result = aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE);
+    assert!(
+        matches!(result, Err(AggregationError::ProofError(_))),
+        "a node declares one uncovered duplicate"
+    );
+    let extra = lean_xmss_claim_cells(&(signers[4].0, message()));
+    forge_hints(Box::new(move |hints: &mut Hints| {
+        hints.entry_mut("meta", 0)[0] *= count(1);
+        *hints.entry_mut("signers_split", 0) = list_split(3);
+        hints.push("claims", extra.to_vec());
+    }));
+    let result = aggregate(&[], signers[..2].to_vec(), vec![], &[], None, LOG_INV_RATE);
+    assert!(
+        matches!(result, Err(AggregationError::ProofError(_))),
+        "a leaf of two signatures declares a third claim"
+    );
+    forge_hints(Box::new(move |hints: &mut Hints| {
+        let first = hints.entry_mut("raw_index", 0).clone();
+        *hints.entry_mut("raw_index", 1) = first;
+    }));
+    let result = aggregate(&[], signers[..2].to_vec(), vec![], &[], None, LOG_INV_RATE);
+    assert!(
+        matches!(result, Err(AggregationError::ProofError(_))),
+        "two signatures write the first slot"
+    );
+}
+
+/// One child, three children, a node with children and raw claims of both schemes, a node over
+/// a node: each verifies, directly and over the wire with its tree.
+#[test]
+fn arities_and_mixed_nodes_verify() {
+    parallel::init();
+    let signers = get_signers(8);
+    let sphincs = get_lean_sphincs_signers(2);
+    let leaf = |range: std::ops::Range<usize>| prove_leaf(&signers[range]);
+    let check = |proof: &EthereumProof, name: &str| {
+        proof.verify().unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        EthereumProof::from_proof_bytes(&proof.proof_bytes(), proof.tree.clone(), None)
+            .expect("parses")
+            .verify()
+            .unwrap_or_else(|e| panic!("{name} over the wire: {e:?}"));
+    };
+    let one = aggregate(&[leaf(0..2)], vec![], vec![], &[], None, LOG_INV_RATE).expect("one child");
+    check(&one, "one child");
+    let three = aggregate(
+        &[leaf(0..2), leaf(2..3), leaf(3..5)],
+        vec![],
+        vec![],
+        &[],
+        None,
+        LOG_INV_RATE,
+    )
+    .expect("three children");
+    check(&three, "three children");
+    let mixed = aggregate(
+        &[one.clone(), leaf(5..6)],
+        signers[6..8].to_vec(),
+        sphincs.clone(),
+        &[],
+        None,
+        LOG_INV_RATE,
+    )
+    .expect("children and raw claims");
+    check(&mixed, "children and raw claims");
+    assert_eq!(mixed.tree.children.len(), 2);
+    assert_eq!(mixed.tree.children[0].children.len(), 1);
+    assert_eq!((mixed.tree.lean_xmss.len(), mixed.tree.lean_sphincs.len()), (2, 2));
+    // The inner node's tree is not interchangeable with its flattening.
+    let mut forged = mixed.clone();
+    let inner = forged.tree.children[0].children.remove(0);
+    forged.tree.children[0].lean_xmss = inner.lean_xmss;
+    assert!(matches!(forged.verify(), Err(AggregateVerifyError::Snark(_))));
+}
+
+/// What the tree no longer excludes: one claim in two subtrees and again raw at the root, and
+/// one child proof used twice. The flattened set holds each claim once.
+#[test]
+fn repeated_claims_are_accepted_and_flattened() {
+    parallel::init();
+    let signers = get_signers(4);
+    let left = prove_leaf(&signers[..3]);
+    let right = prove_leaf(&signers[1..]);
+    let node = aggregate(
+        &[left.clone(), right, left.clone()],
+        signers[..1].to_vec(),
+        vec![],
+        &[],
+        None,
+        LOG_INV_RATE,
+    )
+    .expect("node aggregates");
+    node.verify().expect("node verifies");
+    fn count_claims(tree: &ClaimTree) -> usize {
+        tree.lean_xmss.len() + tree.lean_sphincs.len() + tree.children.iter().map(count_claims).sum::<usize>()
+    }
+    assert_eq!(count_claims(&node.tree), 10);
+    assert_eq!(node.claims.num_signature_claims(), 4);
+}
+
+/// Forged leaf-row hints of a child's WHIR opening fail the guest's run.
+#[test]
+fn forged_leaf_cells_fail_the_guest() {
+    parallel::init();
+    let signers = get_signers(3);
+    let child = [prove_leaf(&signers)];
+    type Edit = fn(&mut F128);
+    let edits: [(&str, usize, Edit); 5] = [
+        ("a high lane on the first cell", 0, |cell| cell.c1 = 1),
+        ("the first cell's lanes swapped", 0, |cell| {
+            std::mem::swap(&mut cell.c0, &mut cell.c1)
+        }),
+        ("the first cell's low lane changed", 0, |cell| cell.c0 ^= 1),
+        ("a deeper level's high lane changed", usize::MAX, |cell| cell.c1 ^= 1),
+        ("a deeper level's low lane changed", usize::MAX, |cell| cell.c0 ^= 1),
+    ];
+    for (name, entry, edit) in edits {
+        forge_hints(Box::new(move |hints: &mut Hints| {
+            let n = hints.entries("merkle_leaf_rows");
+            let entry = if entry == usize::MAX { n - 1 } else { entry };
+            let cells = hints.entry_mut("merkle_leaf_rows", entry);
+            let last = cells.len() - 1;
+            if entry == 0 {
+                // Level 0's rows are K lanes, each a cell with a zero high lane.
+                assert!(cells.iter().all(|cell| cell.c1 == 0));
+            }
+            edit(&mut cells[last]);
+        }));
+        let result = aggregate(&child, vec![], vec![], &[], None, LOG_INV_RATE);
+        assert!(matches!(result, Err(AggregationError::ProofError(_))), "{name}");
+    }
 }
