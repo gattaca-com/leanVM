@@ -5040,7 +5040,7 @@ def main():
     # One hash over the node tag, every child's commitment in order, then this node's
     # two raw list digests: a leaf is the same preimage with no children. Its length
     # binds the child count, and the tag separates it from every other preimage here.
-    # The outer verifier rebuilds it from the claim tree the proof carries.
+    # The outer verifier rebuilds it from the claim tree its receiver supplies: the proof does not carry the tree.
     c_0, c_1 = match(log(n_children_g), range(0, CHILD_COUNTS), lambda k: node_commitment(kids, xd_0, xd_1, sd_0, sd_1, k))
 
     # The published DA digest: a child's or the node's own, its own if it has blobs.

@@ -7,7 +7,11 @@ An aggregate proof certifies signature claims and the correct encoding of blob d
 
 A signature claim identifies what was signed and by whom. For both leanXMSS, two layers of XMSS~\cite{rfc8391}, and SPHINCS+~\cite{sphincs}, it is a $(\text{public key},\text{message})$ pair. Each leanXMSS signature carries the leaf index it was made at, so its Merkle path is its own, and the guest derives that signature's addresses from the index's bits; the claim does not record it.
 
-A node publishes its claims in the shape of its recursion: each verified child's claims, whole, then the raw claims it verified itself, of which it may publish any subset. The final verifier flattens this tree into the sorted, deduplicated set. The essential condition is coverage: every published claim must be justified, either directly at this node or recursively through a child.
+A node publishes its claims in the shape of its recursion: each verified child's claims, whole, then the raw claims it verified itself, of which it may publish any subset. The final verifier flattens this tree into the sorted set, deduplicated on the whole $(\text{public key},\text{message})$ pair.
+
+A verified proof guarantees that each $(\text{public key},\text{message})$ in a node's lists has a verified signature in that node. It does not guarantee distinct signers, uniqueness across nodes, or a bound on the total: the same claim may appear in several nodes, and one public key under several messages. A consumer that applies a threshold must count distinct public keys over the flattened set, and must not sum per-child counts. The tree has at most $32$ levels and $2^{16}$ nodes, which the receiver checks before hashing it.
+
+The essential condition is coverage: every published claim must be justified, either directly at this node or recursively through a child.
 
 The DA claim is at most one LeanDA root $\daroot$, paired with the challenge $\dachal$ of its membership test (\S\ref{sec:da-membership}). A node that checks blobs publishes their root; otherwise it may pass on one child's root, or none.
 

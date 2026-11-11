@@ -31,6 +31,12 @@ pub struct EthereumClaims {
 /// the node verified them, then the raw claims the node verified itself, each list strictly
 /// sorted. A node publishes everything it verified; [`EthereumProof::claims`] is the sorted,
 /// deduplicated flattening of the tree.
+///
+/// A verified proof guarantees that each `(pubkey, message)` in a node's lists has a verified
+/// signature in that node. It does NOT guarantee distinct signers, uniqueness across nodes, or
+/// any bound on the total: the same claim may repeat in several nodes. A consumer applying a
+/// threshold must count distinct public keys over [`EthereumProof::claims`], and must not sum
+/// per-child counts. The tree is at most [`MAX_TREE_DEPTH`] levels and [`MAX_TREE_NODES`] nodes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClaimTree {
     pub children: Vec<ClaimTree>,
@@ -151,12 +157,19 @@ impl EthereumProof {
     }
 
     /// What this aggregate claims, which [`Self::verify`] checks: the sorted, deduplicated
-    /// flattening of [`Self::claim_tree`].
+    /// flattening of [`Self::claim_tree`], deduplicated on the whole `(pubkey, message)` pair.
+    ///
+    /// Each claim has a verified signature in some node of the tree. The lists count claims, not
+    /// signers: a threshold has to count distinct public keys over them itself.
     pub fn claims(&self) -> &EthereumClaims {
         &self.claims
     }
 
     /// The claims in the shape of the recursion that verified them, which the statement commits to.
+    ///
+    /// Each `(pubkey, message)` in a node's lists has a verified signature in that node. Distinct
+    /// signers, uniqueness across nodes and a bound on the total are NOT guaranteed, so a consumer
+    /// must not sum per-child counts: it counts distinct public keys over [`Self::claims`].
     pub fn claim_tree(&self) -> &ClaimTree {
         &self.tree
     }
