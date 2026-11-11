@@ -371,6 +371,54 @@ fn tampered_claim_tree_is_rejected() {
     );
 }
 
+/// A one-child chain of `levels` empty nodes, built without recursion.
+fn chain(levels: usize) -> ClaimTree {
+    let mut tree = ClaimTree::default();
+    for _ in 1..levels {
+        tree = ClaimTree {
+            children: vec![tree],
+            ..ClaimTree::default()
+        };
+    }
+    tree
+}
+
+/// A tree over the depth cap is rejected before any hashing or flattening, without
+/// overflowing the stack in the check, the constructor or the drop.
+#[test]
+fn deep_claim_trees_are_rejected() {
+    assert_eq!(check_claim_tree(&chain(MAX_TREE_DEPTH)), Ok(()));
+    let bytes = encode(&[], &[]);
+    for levels in [MAX_TREE_DEPTH + 1, 100_000] {
+        let tree = chain(levels);
+        assert_eq!(check_claim_tree(&tree), Err(AggregateVerifyError::MalformedSignerSet));
+        let result = EthereumProof::from_proof_bytes(&bytes, tree, None);
+        assert_eq!(result.err(), Some(AggregateVerifyError::MalformedSignerSet));
+    }
+}
+
+/// A shallow tree of more than the node cap is rejected: 16-ary, four levels deep is 4369 nodes,
+/// so five levels at 16 children each (69905 nodes) is over.
+#[test]
+fn wide_claim_trees_are_rejected() {
+    fn full(levels: usize) -> ClaimTree {
+        let children = if levels == 1 {
+            vec![]
+        } else {
+            (0..MAX_RECURSIONS).map(|_| full(levels - 1)).collect()
+        };
+        ClaimTree {
+            children,
+            ..ClaimTree::default()
+        }
+    }
+    assert_eq!(check_claim_tree(&full(4)), Ok(()));
+    assert_eq!(
+        check_claim_tree(&full(5)),
+        Err(AggregateVerifyError::MalformedSignerSet)
+    );
+}
+
 fn da_rows(n_rows: usize, seed: u64) -> Vec<u64> {
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
     (0..n_rows * (1 << DA_LOG_K))

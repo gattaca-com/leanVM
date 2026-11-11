@@ -310,6 +310,8 @@ pub fn aggregate_with_stats(
         lean_xmss: cover.lean_xmss.signers,
         lean_sphincs: cover.lean_sphincs.signers,
     };
+    // This node is one level over its deepest child, and adds its own to the node count.
+    check_claim_tree(&tree).map_err(|_| AggregationError::TooLarge)?;
     let own = node_commitment(&commits, &tree.lean_xmss, &tree.lean_sphincs);
     let (lean_xmss, lean_sphincs) = flatten_claims(&tree);
     let public_input = statement_digest(own, da, &defer);

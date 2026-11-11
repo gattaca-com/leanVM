@@ -8,5 +8,6 @@ pub mod signers_cache;
 
 pub use aggregation::{
     AggregateVerifyError, AggregationError, ClaimTree, EthereumClaims, EthereumProof, LeanSphincsClaim, LeanXmssClaim,
-    MAX_RECURSIONS, SnarkProveError, SnarkVerifyError, aggregate, aggregate_with_stats, warm_up,
+    MAX_RECURSIONS, MAX_TREE_DEPTH, MAX_TREE_NODES, SnarkProveError, SnarkVerifyError, aggregate,
+    aggregate_with_stats, warm_up,
 };

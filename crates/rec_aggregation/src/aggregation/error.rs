@@ -52,7 +52,7 @@ pub enum AggregationError {
     /// A raw signature's randomness does not decode to a target-sum encoding,
     /// so there is no witness to build for it.
     MalformedRawSignature,
-    /// More than [`MAX_RECURSIONS`](super::MAX_RECURSIONS) children.
+    /// Too many children, tree levels, or tree nodes.
     TooLarge,
     /// The payload has a partial row or exceeds [`DA_MAX_ROWS`].
     InvalidBlobSize { symbols: usize },

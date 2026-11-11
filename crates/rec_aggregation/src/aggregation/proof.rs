@@ -3,7 +3,7 @@
 use super::deferred::{DeferredClaim, scalar_bytecode};
 use super::error::{AggregateVerifyError, SnarkVerifyError};
 use super::statement::{statement_digest, tree_commitment};
-use super::{LeanSphincsClaim, LeanXmssClaim, MAX_RECURSIONS};
+use super::{LeanSphincsClaim, LeanXmssClaim, MAX_RECURSIONS, MAX_TREE_DEPTH, MAX_TREE_NODES};
 use leanvm_core::cpu::{public_input_bytes, scalar_proof};
 use primitives::field::F128;
 
@@ -36,6 +36,14 @@ pub struct ClaimTree {
     pub children: Vec<ClaimTree>,
     pub lean_xmss: Vec<LeanXmssClaim>,
     pub lean_sphincs: Vec<LeanSphincsClaim>,
+}
+
+/// Drop a rejected tree of any depth without recursion: the derived drop recurses once a level.
+fn drop_flat(mut tree: ClaimTree) {
+    let mut stack = std::mem::take(&mut tree.children);
+    while let Some(mut node) = stack.pop() {
+        stack.append(&mut node.children);
+    }
 }
 
 /// A proof of its [`ClaimTree`], established directly or carried from verified child proofs.
@@ -83,15 +91,26 @@ pub(super) fn decode(bytes: &[u8]) -> Option<(Vec<F128>, &[u8])> {
     Some((point, proof))
 }
 
-/// Reject unsupported arities and raw lists that are not strictly sorted.
+/// Bound arity, depth, and node count before hashing the tree, and require strictly sorted raw lists.
 pub(super) fn check_claim_tree(tree: &ClaimTree) -> Result<(), AggregateVerifyError> {
-    if tree.children.len() > MAX_RECURSIONS
-        || !tree.lean_xmss.windows(2).all(|w| w[0] < w[1])
-        || !tree.lean_sphincs.windows(2).all(|w| w[0] < w[1])
-    {
-        return Err(AggregateVerifyError::MalformedSignerSet);
+    // An explicit stack, not recursion: a hostile tree must not reach the native stack. Depth and
+    // node count are bounded before a node's children are pushed, so the stack holds at most
+    // `MAX_TREE_NODES` entries. Every recursion over a tree that passes is at most `MAX_TREE_DEPTH` deep.
+    let mut nodes = 1;
+    let mut stack = vec![(tree, 1)];
+    while let Some((node, depth)) = stack.pop() {
+        nodes += node.children.len();
+        if depth > MAX_TREE_DEPTH
+            || nodes > MAX_TREE_NODES
+            || node.children.len() > MAX_RECURSIONS
+            || !node.lean_xmss.windows(2).all(|w| w[0] < w[1])
+            || !node.lean_sphincs.windows(2).all(|w| w[0] < w[1])
+        {
+            return Err(AggregateVerifyError::MalformedSignerSet);
+        }
+        stack.extend(node.children.iter().map(|child| (child, depth + 1)));
     }
-    tree.children.iter().try_for_each(check_claim_tree)
+    Ok(())
 }
 
 /// Every claim under `tree`, sorted and deduplicated per scheme.
@@ -159,11 +178,17 @@ impl EthereumProof {
         tree: ClaimTree,
         da_commitment: Option<[u8; 32]>,
     ) -> Result<Self, AggregateVerifyError> {
-        let (bytecode_point, proof) = decode(bytes).ok_or(AggregateVerifyError::MalformedEncoding)?;
         // Cheap rejections first. `recompute_scalar` below is a pass over the whole stacked
         // bytecode, on a point a peer chose, so anything decidable without it has to be
         // decided before it.
-        check_claim_tree(&tree)?;
+        // The tree is the caller's, so a deep one is built before this call. It is torn down here
+        // on rejection, and `Clone`, `Debug` and `==` on such a tree remain the caller's risk.
+        // The check comes first so that no later error path drops an unchecked tree.
+        if let Err(e) = check_claim_tree(&tree) {
+            drop_flat(tree);
+            return Err(e);
+        }
+        let (bytecode_point, proof) = decode(bytes).ok_or(AggregateVerifyError::MalformedEncoding)?;
         let proof = leanvm_core::cpu::Proof::from_bytes(proof).ok_or(AggregateVerifyError::MalformedEncoding)?;
         let (lean_xmss, lean_sphincs) = flatten_claims(&tree);
         Ok(Self {

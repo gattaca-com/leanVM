@@ -73,3 +73,14 @@ pub type LeanSphincsClaim = (LeanSphincsPublicKey, lean_sphincs::Message);
 /// The most earlier aggregates one [`aggregate`] call can take, so the arity of
 /// an aggregation tree.
 pub const MAX_RECURSIONS: usize = 16;
+
+/// The most levels a [`ClaimTree`] may have, the root being level 1.
+///
+/// An aggregation tree is a few levels deep: leaves, a node over them, a root. 32 leaves room
+/// for any realistic pipeline, and keeps every recursion over a checked tree far from a stack limit.
+pub const MAX_TREE_DEPTH: usize = 32;
+
+/// The most nodes a [`ClaimTree`] may have in all. A tree of 4096 leaves under one root is 4352
+/// nodes, so this is generous, and it bounds the hashing and flattening a hostile tree can force.
+pub const MAX_TREE_NODES: usize = 1 << 16;
+
