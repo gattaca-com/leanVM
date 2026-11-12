@@ -13,6 +13,8 @@ first to print the previous values at `5e3ade21`); the drivers live in the port'
 the repository. The line citations are to `crates/verifier/src/` at `40f877dc`. Compiled checks
 (`#guard`): `E` multiplication does not reduce in the kernel from module files.
 
+The Keccak and transcript pins below are recomputed from this branch's twelve-round Rust verifier.
+
 Covered: `powers`, `eq_kernel`, `multilinear_eval` (on `E` and on lifted `K` tables), `eq_eval`,
 `dot`, `index_mle`, `poly_eval`, `gpow`, `padding_weight`, `log2_ceil`, `log2_strict`,
 `selector_point`; `subspace_roots`, `induced_weight`, `ext_row`, the enforced sum of a WHIR
@@ -807,7 +809,7 @@ def refConfigs : List (ℕ × ℕ × List ℕ × List ℕ × List ℕ) :=
      (0x0, 0x5)]
 
 #guard (keccakConstants) =
-    [12, 2, 1, 6, 9, 1600, 11, 5, 64, 16, 24, 47, 6, 4, 16, 30]
+    [6, 2, 1, 6, 9, 1600, 11, 5, 64, 16, 24, 47, 6, 4, 16, 30]
 
 #guard (ringMapShifts) =
     [32, 16, 8, 4, 2, 1]
@@ -815,10 +817,9 @@ def refConfigs : List (ℕ × ℕ × List ℕ × List ℕ × List ℕ) :=
 /-! ## Keccak-f, Keccak-256 and the sponge (`hash.rs:6-99`, `transcript.rs:17-75`) -/
 
 #guard (keccakRC) =
-    [0x1, 0x8082, 0x800000000000808a, 0x8000000080008000, 0x808b, 0x80000001, 0x8000000080008081,
-     0x8000000000008009, 0x8a, 0x88, 0x80008009, 0x8000000a, 0x8000808b, 0x800000000000008b,
-     0x8000000000008089, 0x8000000000008003, 0x8000000000008002, 0x8000000000000080, 0x800a,
-     0x800000008000000a, 0x8000000080008081, 0x8000000000008080, 0x80000001, 0x8000000080008008]
+    [0x8000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003, 0x8000000000008002,
+     0x8000000000000080, 0x800a, 0x800000008000000a, 0x8000000080008081, 0x8000000000008080, 0x80000001,
+     0x8000000080008008]
 
 #guard (keccakRho) =
     [0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14]
@@ -827,78 +828,71 @@ def refConfigs : List (ℕ × ℕ × List ℕ × List ℕ × List ℕ) :=
     [0, 10, 20, 5, 15, 16, 1, 11, 21, 6, 7, 17, 2, 12, 22, 23, 8, 18, 3, 13, 14, 24, 9, 19, 4]
 
 #guard ((keccakF1600 (Vector.replicate 25 0)).toList) =
-    [0xf1258f7940e1dde7, 0x84d5ccf933c0478a, 0xd598261ea65aa9ee, 0xbd1547306f80494d,
-     0x8b284e056253d057, 0xff97a42d7f8e6fd4, 0x90fee5a0a44647c4, 0x8c5bda0cd6192e76,
-     0xad30a6f71b19059c, 0x30935ab7d08ffc64, 0xeb5aa93f2317d635, 0xa9a6e6260d712103,
-     0x81a57c16dbcf555f, 0x43b831cd0347c826, 0x1f22f1a11a5569f, 0x5e5635a21d9ae61,
-     0x64befef28cc970f2, 0x613670957bc46611, 0xb87c5a554fd00ecb, 0x8c3ee88a1ccf32c8,
-     0x940c7922ae3a2614, 0x1841f924a2c509e4, 0x16f53526e70465c2, 0x75f644e97f30a13b,
-     0xeaf1ff7b5ceca249]
+    [0x8e5e5438b9a78617, 0xd9cd6a50f259d01e, 0x87b8e7c652a91f35, 0x1093e067cde4e0c5, 0xb033ab90f2d95a45,
+     0xe0a72f72a8dd1a45, 0xc53780aa14672f9c, 0x3edd47f50051071d, 0xb3a31d310c178acc, 0x79b586a59257aaa0,
+     0xbc4a7c3db3b1f99b, 0x68874063e68a6793, 0x5c6c03332e0e2566, 0x9caa1202b9f030da, 0x5f3b9a782bcf7a9f,
+     0xe536c1e061ae7923, 0x6de9b618b73c87ec, 0x2abed1f170918ac2, 0x6aabbd53daed24b7, 0xbfc1416a2c2ee15a,
+     0xc6cfe036b90952af, 0x45503617dc7060d7, 0x625611b2c29f7ae4, 0xd43671db2c30647a, 0xcffd0d76222ca01c]
 
 #guard ((keccakF1600 sampleState).toList) =
-    [0xbbe1405ddfd4d06, 0x7f37a0e9b1a487eb, 0x195143c6ce53241d, 0xb8a443fd55d7d522,
-     0x89514f07bdba7312, 0xca68843d05b5aac6, 0x802928c9e382be60, 0xe4bb1d37351316a2,
-     0xed82178ba36c6c44, 0x668e7096d504c916, 0xb1ac7a0875df7f9b, 0x3e479b5291050c73,
-     0xb1573b6dd3be8144, 0x74420236af80cfa3, 0x2769a953a41029d6, 0x1f86b6fbc1404d8e,
-     0xccbe7b0f314596d9, 0xfe2296c7376aa897, 0xb16409a354083080, 0xcd78dd9c6eeca6bd,
-     0xf02b5b250b1d4ac0, 0x6b047a98a5cb1964, 0x2bcbc7b0dfad862a, 0x9e0ba50e8f8fae6f,
-     0xe7d070bfdd49fed4]
+    [0x7a6bcb3543c63cf2, 0x5c865f20e227846d, 0x5e0fe9067c99e021, 0x6d1c2bf1231d7c1, 0xcb27ee646dba7bd3,
+     0xdb3b4650ec191b3d, 0xd913d92e7b9e5ee4, 0xbeb222617893db1f, 0x23a4074872ebf1c6, 0xad8941c1403bf478,
+     0x76f1ed9d9ba2d63, 0x42d623b1725fb8f9, 0xb40b644e69f2993, 0xabf41e1a7f095999, 0xc75216c3a9a02510,
+     0x6cebdfbc49b67934, 0xe69c54a2e6adc7ac, 0x95f9a8f569d3805c, 0xe38abf8c72db5c97, 0x9104ee2dc00f0a41,
+     0xcb954c30ac3c095, 0x7f650b1e24f9bbda, 0x99ae534516150f86, 0xa54642a1d434097a, 0xa0cec1ca5ab3b503]
 
 #guard ((keccak256 (sampleBytes 0)).toList) =
-    [0x3c23f7860146d2c5, 0xc003c7dcb27d7e92, 0x3b2782ca53b600e5, 0x70a4855d04d8fa7b]
+    [0x6dde3b94f02ddde3, 0x5cf35960c39ee382, 0x6bcc38dfe22067d7, 0x4a3aaafcdd9fb610]
 
 #guard ((keccak256 (sampleBytes 1)).toList) =
-    [0x6b6b97284816509f, 0x748c719ca39e47aa, 0xfd7db621250dbc5b, 0x571071c9bd4c47e8]
+    [0x42dac62a0fcea04f, 0xd02c3116f9e011a4, 0xe9ce399598d27186, 0x7bfb3e3670b844c3]
 
 #guard ((keccak256 (sampleBytes 135)).toList) =
-    [0x4c3a6cdb4861e7b4, 0x8e3fb7d478522d60, 0xd0abd178b425d805, 0xf6683088fdcbb3bf]
+    [0xb2d3f728b0bf7d9c, 0xe2909e3a4e4f7dac, 0x7eb388b814e7198, 0xc6ebecac8245475f]
 
 #guard ((keccak256 (sampleBytes 136)).toList) =
-    [0x2459abe9e2ad4dc9, 0xcc4da5f34f87f824, 0xf5a2b9fc81c9e5ec, 0x722aa2b67cb704de]
+    [0x4610a67dad6e8422, 0x2bed2fdf0bdbe065, 0x757bb473420342e2, 0xe6605238e022132]
 
 #guard ((keccak256 (sampleBytes 137)).toList) =
-    [0xb8195730b3e8b689, 0x1913cb375b2aeda0, 0x7ee5d01df31a5914, 0xe16d946a453d8461]
+    [0x20c4148028cdbcce, 0xdd4b7db9bc821988, 0xd3409eecbcde92f1, 0x9a8b705bc4b02235]
 
 #guard ((keccak256 (sampleBytes 300)).toList) =
-    [0xf25b66e14591a877, 0x90835b86e8868d1, 0xbc3230d92c88bc08, 0x7aeb3db2a1ec8e09]
+    [0x4da46d1c2e0238d1, 0xa61d0dd2292f0487, 0xb204225b95037ead, 0x3a4ef5710ffbe4c8]
 
 /- `Sponge::duplex` from `sampleState`, and `sample`'s challenge -/
 #guard (duplexProbe []) =
-    ([0xd85b3e2fd2e1eb4f, 0xd3d1d5831bc8efcd, 0xa4056d0625b721fd, 0xddd7a11d7b68e7fe,
-      0x9c33be148cdcabe2, 0x6c3a5f7fef476758, 0x1ab2897d42fb581f, 0xeb832fbbd7f4b214,
-      0x141607deb5d4b3fa, 0x8844798c929486fe, 0x39555ca203fd1aa6, 0x5de5afd0072b7e9c,
-      0x35e50f807d9e647b, 0x1f806ab5f98c1db7, 0x9d3e256d10db6635, 0x3f030c8a70795ae6,
-      0xb236683aae5f33ca, 0xe3b607cb1d995ac1, 0xfd8ef7d66bf2cef9, 0x337a8960ca3f21fa,
-      0xeef74e55ee09f48d, 0x87c2c8cfa1a748a9, 0x8184d72c67c99ec0, 0x39e027c8d413076,
-      0x163dcd923875c144], (e 0xd85b3e2fd2e1eb4f 0xd3d1d5831bc8efcd 0xa4056d0625b721fd))
+    ([0x108d09169002cf8c, 0x30f3e4dfaaca8f55, 0x11398df5f52e665, 0x1a7ff87b930ae94b, 0xc5ce99e7a8b66ce,
+     0xf8935e938d5ef37, 0x97f7af8058c6d4f4, 0x62fb1e6e00c40caa, 0x126e35f1c92b6b57, 0x4da52b4a8828fb96,
+     0x68abdadc16faeb0e, 0x91ae4fccfbbf5404, 0xff12b3888409d192, 0x668d42e3a9ba449b, 0x723aac9d2782f350,
+     0xfd8fd92aa9346287, 0x23ca46bbc00fc5df, 0x80fe5ecc642b80f3, 0x487b8fe5d533ba2a, 0x9f7722cc20c71d88,
+     0x28f73f535d8c5bf4, 0x1839fcd6dafb756a, 0xcae43f8f5b5f0202, 0xf87120987ec258f3, 0x3d9381fdc918324a], (e
+     0x108d09169002cf8c 0x30f3e4dfaaca8f55 0x11398df5f52e665))
 
 #guard (duplexProbe [(fe 800, 1), (fe 801, 4), (fe 802, 1)]) =
-    ([0x5c65f06a8c48e5d3, 0xff98d475e0ca11de, 0x888cb567449790e7, 0xc26fc20e304badc6,
-      0xfbcca4fdafb56689, 0xad71ffb0d635248f, 0x1c03491988471785, 0x8045e33617757193,
-      0xc34c4ef70674131d, 0xd7d7f87d41b52f94, 0xc6a681c2b319e6f9, 0x6e88eff078527160,
-      0x4424be1e66f80f08, 0xb129d190df13c0c9, 0xe0eb32fac77fc508, 0x27f09328b09c2a10,
-      0xec26a77f057643d6, 0x9aa83a127f5c1c1c, 0x5299d3d57892f07f, 0xa4efda258e20c562,
-      0xe13a109ff887969, 0xe3199f10eedfe092, 0xdd3fa52d85b383f3, 0xee14430390d231b4,
-      0xa4f3f800c9b0f4f3], (e 0x5c65f06a8c48e5d3 0xff98d475e0ca11de 0x888cb567449790e7))
+    ([0xad2ffeda9ee0febf, 0x1793f85f8cd7f56c, 0x705076c00d2eea34, 0xd9009d5682df957f, 0x110b17c17d486109,
+     0x5582fe1807a15a65, 0x7389d76d70ad0957, 0x47f71cb58b528f70, 0x6bc14ebf40790460, 0xacf2bc36a6c2a72b,
+     0xbfddedfdb259be1d, 0xd1e0389411fa3a3e, 0xb154820809f35e43, 0xa06482aebf417c5c, 0x5aa99d3bc05a7acd,
+     0xd8e7b99b24f8185f, 0xd5dfacc6f638cc75, 0x88a3ac7c3de5831d, 0x508dc52e3057e6c8, 0xd87076f24b4fd67a,
+     0xb42f7a08c49db4a7, 0x782bf77d1539ce6f, 0x4d2c94dd38cd79cd, 0x991ec3a34aba5f43, 0x649f0b7730e4b00c], (e
+     0xad2ffeda9ee0febf 0x1793f85f8cd7f56c 0x705076c00d2eea34))
 
 #guard (duplexProbe [(fe 803, 1), (fe 804, 1), (fe 805, 4), (fe 806, 1)]) =
-    ([0x64dc67f1e0409331, 0x2bbdabde4d11810f, 0x5f84b465ed2dc183, 0x47597d7327c5f9df,
-      0xb023c216dd9aed4e, 0x3b0209d2863f6875, 0xac5249717127864e, 0xea4b63efef6a7362,
-      0x56e1e947403c0534, 0x876fac31329f0048, 0x89e1c37ead2e965a, 0x906e6d8b2cfe8182,
-      0xe55326f9923f04ab, 0x949494d9c721c805, 0xfd1ebfedd92744a8, 0xe367df91e05da0f1,
-      0x7b1f895158f02429, 0x18a4a56f3336a459, 0xc200fd5d1f7ff09, 0xb4821d1e596ee97d,
-      0xc423cd04d2d6b248, 0x2e89040fcc61f189, 0x75c84d5504e01c28, 0xbf54aece417c3beb,
-      0x4d44fe1a93147d07], (e 0x64dc67f1e0409331 0x2bbdabde4d11810f 0x5f84b465ed2dc183))
+    ([0x5bb625d63ad8d625, 0x7c25bb2a1a5dc6f5, 0xf3840f29da7f69bf, 0x1e76f2bd5bfcce74, 0x4e9021436538371c,
+     0xe32d3c6090c6a825, 0x7280266e8f1a1c1c, 0x8eb1a3553b7ff8e1, 0x8d6d453938bcd972, 0xf122b20c7d3e94c,
+     0xeb749e46ad879570, 0x5931f6253cfae0d1, 0x3e1ee8e857018805, 0xa43f51b6c0db33e0, 0x6f889e0716c2f176,
+     0x6f95311035efe7c9, 0x65de664610f4d7b1, 0xb3527f28ed53eab8, 0xfc15e65d200865f0, 0xe9fdd3ed0cca5c1c,
+     0xe45609413ace0e6c, 0xc66b88d2cb72ee7b, 0x3d061665fcbb321a, 0xdff40eb09b1ee070, 0x6fce3dd9f0f5420], (e
+     0x5bb625d63ad8d625 0x7c25bb2a1a5dc6f5 0xf3840f29da7f69bf))
 
 /-! ## The tag, the IV and the seed (`layout.rs:68`, `bytecode.rs:46-53`, `transcript.rs:33-46`) -/
 
 #guard (versionTag) = [108, 101, 97, 110, 118, 109, 45, 118, 49]
 
 #guard ((keccak256 (sampleBytecode.flatMap K.toBytes)).toList) =
-    [0x5ee1b7ed85bd7f40, 0xe30f235e90f241ba, 0x2c5175ed6d0af92b, 0x99aaaff5bf8937b8]
+    [0xeaf4a0c4747d0a15, 0xf911ff2de945bf19, 0x341f0c9e51a7eccf, 0x303f1bd4476aa97f]
 
 #guard ((fiatShamirIv sampleBytecode).toList) =
-    [0x388a48ed64bdc88, 0xc56fdc9a5bbfc60b, 0x9177eb91e2b31ac9, 0x60b15bff515ffc9a]
+    [0x6d721778f66e6403, 0x26fc756874958aa6, 0x94e32737534a3a2f, 0x29bbd84d1727a49e]
 
 #guard (samplePublicInput.toList) =
     [0xdfcab5a08b76614c, 0x87725d48331e09f4, 0x2f1a05f0dbc6b19c, 0xd7c2ad98836e5944]
@@ -907,12 +901,10 @@ def refConfigs : List (ℕ × ℕ × List ℕ × List ℕ × List ℕ) :=
     [(e 0xdfcab5a08b76614c 0x87725d48331e09f4 0x0), (e 0x2f1a05f0dbc6b19c 0xd7c2ad98836e5944 0x0)]
 
 #guard ((seed sampleBytecode samplePublicInput).toList) =
-    [0x9d7d4eb7cc97e374, 0xb724b7ba8b1c3421, 0x14d14d64d9182a28, 0x1c1a4bc2a316a26c,
-     0xe410600d8d0706c8, 0x4dd78f280a2db761, 0x50dc9d77b0f34b74, 0x2d2743bc3e4da033,
-     0xf266f7f60648d489, 0xa55b889e0f5c5da7, 0x2f671d6a94b8c6aa, 0xcda35ca721ea79e1,
-     0xbbcb869a8f7e0386, 0xa00ae0785cf727df, 0xd9b984d1efc0d523, 0x354259a0706ebaeb,
-     0x7fa694082e9b86c0, 0xe22eb021ce923a65, 0x43dc097da59a77b9, 0xa5084af5f4153506,
-     0xb1ced25d740086b4, 0x26aaa2d4102a5604, 0x60ee864b6821e0aa, 0x8f239df976d3a9ef,
-     0x6d5f9ca9bf33253e]
+    [0xdc9398448325f766, 0xa677895b1d3355be, 0x3c392b0312556407, 0x2875e8ea0d6be3f0, 0x42ec0e7d78cc1dea,
+     0xfc1a95a40ccda188, 0x47a4499af6881fc8, 0xee7ac5478d060ae5, 0x64b20d83fe03ca4d, 0xb5b880e961d30b96,
+     0xff63ec7bee269d43, 0xc1b02f6754d889bc, 0x6420ffdb081d4fef, 0xa633d7e6d7da4b76, 0xa16aa96a077c0b35,
+     0x82b42f1cf673a1b2, 0xf859129fdc83f749, 0x68cfc1e34b95260f, 0x1b1849d3c57aaed7, 0xe2424be842d25825,
+     0x596a833e328a2809, 0xf4d80415d128c2f0, 0x1b79713c2b2464f6, 0x24811e78dce92f5d, 0x93fb99b7e539ac0f]
 
 end LeanVMTests.Protocol.Verifier.Helpers

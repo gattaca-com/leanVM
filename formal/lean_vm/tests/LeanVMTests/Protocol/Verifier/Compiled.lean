@@ -15,7 +15,7 @@ halves, then `n` scalars `fe(10 + k)`.
   and five challenges, in the compiled reading, give the challenges and the sponge state the
   verifier's `Transcript` gives on the same stream after `next_scalars(8)`, `Digest::from_halves`
   of `next_scalars(2)` and `samples(5)` (the verifier at leanVM
-  `990b935263dc7f793f280914f262ca7955ddc3e0`, a driver of the port's scratch). This binds the IV's
+  this branch's twelve-round Rust verifier). This binds the IV's
   preimage (the version tag, then the bytecode), the seed permutation of the IV and the public
   input, the duplex absorbs with their domain tags, the squeezes, the order of the reads, and the
   stack root's shape.
@@ -69,20 +69,17 @@ def prefixRun (s : List E) : Option (List E × VerifierProgramState) :=
 /-! ## The sponge agrees with the pinned verifier's -/
 
 #guard ((prefixRun (stream 4 0)).map (·.1)) =
-    some [(e 0x76cab5c46908a6e3 0x9f181ecbe76275b1 0xa299f132fa7fe5e1),
-     (e 0xf9194a2a1e2d0d6c 0x7bbc1deff5f4dc6d 0xad36a57c0987b12a),
-     (e 0xfb6dc5c12b3900be 0xb2092b8150b236f5 0x92e08d928c2e528b),
-     (e 0x73259fba69ae5358 0x11bfca90fb00349b 0x11a90a9b4f271b5),
-     (e 0x9b3200d078d47019 0x62b965389bbb4e49 0xf57085b9e4651c61)]
+    some [(e 0xb2d5680ab5cca42a 0x6cba1af4bd3536bd 0xebd0f21a934c8aaf), (e 0x74fed2383b1a8469
+     0x8aa5fabac8933325 0x10db3a5c7e2f1376), (e 0xf70bcdc6dd99b1d6 0x63d0dede4d0a81dc 0x4524bf8af25e58d3), (e
+     0x47f98b9d54fbcc13 0x42cf3ee6bb7e90c2 0x242953ae207d5a8d), (e 0xea09c3cc94d1d1db 0xce86fd975a0ef70c
+     0xdaaa5d7876b9942d)]
 
 #guard ((prefixRun (stream 4 0)).map fun r ↦ (r.2.sponge.state.toList, r.2.sponge.pending.length)) =
-    some ([0x9b3200d078d47019, 0x62b965389bbb4e49, 0xf57085b9e4651c61, 0xb1484e8bde27e39d,
-      0x44efeab650789cde, 0x4e27247d2d610549, 0xd92c47fef3c79ed, 0xc9d261e57715fe8b,
-      0x42ee445bb8e2f3a6, 0xf3fa10fa300924da, 0xb0b97f2d3e92fdb4, 0xf7639b34004e4baf,
-      0xf3859d8e9a8fe3db, 0x34f02e7a301daeee, 0x80ee193a1c62fd5, 0x515009f201dd757c,
-      0xe622fa19cca68986, 0xf79fd1193220fca4, 0x7e46e300dc243e6c, 0x8acc56faa906dbee,
-      0xb7008d591670d327, 0x6130e0da364e4521, 0x31b93326d2b0ddcc, 0x8d2b0d0b07870a40,
-      0xbfc73c4740cd253e], 0)
+    some ([0xea09c3cc94d1d1db, 0xce86fd975a0ef70c, 0xdaaa5d7876b9942d, 0x9a5ad54814cb776, 0x81fb709c6988d63b,
+     0xa44772348e9fe4a8, 0x74d6eeeedc8743c4, 0x95c02e6c42ce0939, 0xe8c1ca0b05c2898d, 0xc37fbb1a45b63aea,
+     0xceffab1a8fed6e59, 0x11bb007a46450d76, 0x9e3ba86e9841189d, 0xc9138e77a4cab1f4, 0x7d945594647dbd28,
+     0xa59f057531d6e005, 0xab4f87fbd8af2f67, 0x4ca220ff1aa77f99, 0x8578d2ef7266f1b9, 0x3442da09c96f6155,
+     0x7983d8785702dba7, 0xc52cee168f2566a3, 0x1b0c609c21463c03, 0xbcaaa20542bea95b, 0xf09a3a59c20ff8b7], 0)
 
 /- The stack root is commitment `0`, of `2^(19 - 6 + 4)` leaves of `2^6` words. -/
 #guard ((prefixRun (stream 4 0)).map fun r ↦ r.2.roots.map fun c ↦ (c.2.1, c.2.2)) =
