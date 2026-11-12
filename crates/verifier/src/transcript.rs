@@ -2,7 +2,7 @@
 
 use crate::field::{E, K, ZERO};
 use crate::hash::{Digest, STATE_LANES, keccak_f};
-use crate::merkle::MerklePath;
+use crate::merkle::{MerklePath, roots_match};
 use crate::multilinear::{log2_strict, poly_eval};
 use crate::{VerifierError, require};
 
@@ -205,7 +205,7 @@ impl<'a> Transcript<'a> {
             VerifierError::MerkleOpeningPosition,
         )?;
         require(
-            !self.checked || paths.iter().all(|path| path.root() == root),
+            !self.checked || roots_match(paths, root),
             VerifierError::MerkleRootMismatch,
         )?;
         Ok(paths.iter().map(|path| &path.leaf[..]).collect())
