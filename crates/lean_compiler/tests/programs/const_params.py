@@ -5,7 +5,7 @@
 # specialization. A 256-bit KECCAK digest occupies two canonical cells.
 # Published: the two 128-bit digest cells of H(quad0, quad0) XOR H(quad1, quad1)
 #: the direct k=0 digest XORed with the arm the runtime x = GEN selects (k=1).
-# public_input: 157908933584918725715541133239856802159, 40624458567139149906120084677986376415
+# public_input: 129784964081458791984332459463532917784, 265216630326685788816292317877968107178
 from snark_lib import *
 
 

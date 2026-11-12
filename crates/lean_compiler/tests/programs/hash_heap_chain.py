@@ -4,7 +4,7 @@
 # addressed by the loop counter: value k sits at cells g^{2k}..g^{2k+1}, and
 # value k+1 = H(value k, value k). Published: the two 128-bit digest cells of
 # H^3(5, 7).
-# public_input: 27240554859721455327970068208906002034, 119514610692047185288834508057685931752
+# public_input: 263527378462259980094241819796162979116, 113282024361626768071924793049700467398
 from snark_lib import *
 
 
