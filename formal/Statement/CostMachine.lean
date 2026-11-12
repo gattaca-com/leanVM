@@ -41,8 +41,8 @@ ARMv8's PMULL; on more limbs, a constant number per limb or pair of limbs.
 **The extractor a program computes** (`LeanVM.extractorComputedBy P`, at the end): `P` run on the
 encoded statement, transcript and proof within its size bound and budget, its output parsed as an
 execution (`decodeExecution`, a linear parse). `Statement.Theorems` takes `P` as a parameter. What
-excludes a vacuous statement: `P` is a program (no classical choice), its size bound leaves no room
-for a useful table of witnesses beside the compiled extractor, its only runtime data is its input,
+excludes a vacuous statement: `P` is a program (no classical choice), its size bound limits literals
+beside the compiled extractor, its only runtime data is its input,
 and its budget is a closed formula, polylogarithmic per query. The guest decoder is a program of the
 same machine (`GuestKnowledgeSoundness`, `LeanVmGuest.lean`).
 -/
@@ -454,10 +454,8 @@ open Common
 @[expose] public section
 
 /-- **The bound on the extractor program's size** (`MachineProgram.size`): `14640`, the compiled
-extractor's size (`14365`: its `700` compiled bodies and the entry, at `713` indices, `12` of
-them holes, a literal `0` each) and a slack of `275`, less than one leanXMSS signature's encoding
-(`309`: two layers of `153`, each a randomizer, `58` chain values and a path of `16`, digests of
-two limbs), so the compiled extractor could carry no useful table of witnesses beside its code. -/
+extractor's size (`14329`: its `700` compiled bodies and the entry, at `713` indices, `12` of
+them holes, a literal `0` each) and a slack of `311`. -/
 def leanVmKnowledgeExtractorSizeBound : ℕ := 14640
 
 /-- **The extractor a program computes**: the program, of size at most
