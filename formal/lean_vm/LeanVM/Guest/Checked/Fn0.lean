@@ -14,9 +14,10 @@ public import LeanVM.Guest.Checked.F8_0
 public import LeanVM.Guest.Checked.F12_3
 public import LeanVM.Guest.Checked.F12_3
 public import LeanVM.Guest.Checked.F13_2
-public import LeanVM.Guest.Checked.F18_0
-public import LeanVM.Guest.Checked.F18_0
-public import LeanVM.Guest.Checked.F18_0
+public import LeanVM.Guest.Checked.F13_2
+public import LeanVM.Guest.Checked.F18_1
+public import LeanVM.Guest.Checked.F18_1
+public import LeanVM.Guest.Checked.F18_1
 public import LeanVM.Guest.Checked.F20_2
 public import LeanVM.Guest.Checked.F20_7
 public import LeanVM.Guest.Checked.F20_12
@@ -122,7 +123,7 @@ theorem plain12 : Plain 12 := by
   decide +kernel
 
 theorem ok13 : CheckOk 13 := fun i hi ↦ by
-  have h : (certOf 13).cuts.length = 5 := by decide +kernel
+  have h : (certOf 13).cuts.length = 4 := by decide +kernel
   rw [h] at hi
   interval_cases i
   · exact w13_0
@@ -130,7 +131,6 @@ theorem ok13 : CheckOk 13 := fun i hi ↦ by
   · exact w13_2
   · exact w13_3
   · exact w13_4
-  · exact w13_5
 
 theorem plain13 : Plain 13 := by
   unfold Plain

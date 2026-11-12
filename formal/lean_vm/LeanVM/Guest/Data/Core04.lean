@@ -8484,11 +8484,11 @@ noncomputable def body : List Core.Stmt := (
   .atom (.hint (.witness "bc_star_hint" (.stack [.n 6]))) ::
   .atom (.hint (.allocDyn (.n 7) (.n 0))) ::
   .atom (.hint (.allocDyn (.n 8) (.n 0))) ::
-  .atom (.const (.n 9) (word 1562680967124014521 0 0)) ::
-  .atom (.const (.n 10) (word 7666384441264927334 11925545048015809408 0)) ::
-  .atom (.const (.n 11) (word 14528471851986820829 15194020773630548750 0)) ::
-  .atom (.const (.n 12) (word 6704907289165917069 10885225211858021658 0)) ::
-  .atom (.const (.n 13) (word 10587785389206534793 159208925504336485 0)) ::
+  .atom (.const (.n 9) (word 5809815977160987393 0 0)) ::
+  .atom (.const (.n 10) (word 7584368478700930856 8842225458955243668 0)) ::
+  .atom (.const (.n 11) (word 2574316089242637222 8009504894323071766 0)) ::
+  .atom (.const (.n 12) (word 3075439050930966178 16802640550241062735 0)) ::
+  .atom (.const (.n 13) (word 13921879046025191513 17682358122322480425 0)) ::
   .atom (.hint (.limbs (.n 0) [.n 14, .n 15, .n 16])) ::
   .atom (.const (.n 17) (word 1 0 0)) ::
   .atom (.assertInK (.n 16) (.n 17)) ::

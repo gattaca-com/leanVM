@@ -11,7 +11,6 @@ public import LeanVM.Cost.DecoderSize.Rows2
 public import LeanVM.Cost.DecoderSize.Rows3
 public import LeanVM.Cost.DecoderSize.Rows4
 public import LeanVM.Cost.DecoderSize.Names0
-public import LeanVM.Cost.DecoderSize.Names1
 
 /-! The size of the guest's frame cells, the chunks' sizes summed (`DecoderSize/Rows*.lean`,
 `Names*.lean`): every row's encoding's size, the table's literal less its array and `Term.literal`
@@ -23,7 +22,7 @@ namespace LeanVM.Cost.Decoder
 
 set_option maxRecDepth 100000 in
 /-- **The rows' sizes**, summed. -/
-theorem guestLocsList_rowSize : (guestLocsList.map rowSize).sum = 415544 := by
+theorem guestLocsList_rowSize : (guestLocsList.map rowSize).sum = 361958 := by
   have hl : guestLocsList.length = 1536 := by decide +kernel
   have hn : guestLocsRow37.length = 41 := by decide +kernel
   rw [sum_rowSize_eq_rowsSize, hl]
@@ -43,10 +42,8 @@ theorem guestLocsList_rowSize : (guestLocsList.map rowSize).sum = 415544 := by
   have r := rowsSize_one (a := 37) (by omega)
   rw [g] at r
   rw [rowSize_flatten, hn] at r
-  have t0 := namesSize_split guestLocsRow37 0 23 18 23 41 rfl rfl
-  have d0 := namesSize_0_23
-  have t1 := namesSize_split guestLocsRow37 23 18 0 41 18 rfl rfl
-  have d1 := namesSize_23_18
+  have t0 := namesSize_split guestLocsRow37 0 41 0 41 41 rfl rfl
+  have d0 := namesSize_0_41
   have f := namesSize_zero guestLocsRow37 41
   omega
 
