@@ -205,11 +205,11 @@ def batchWeights (p : List E) (beta : E) : List E :=
   (List.range keccakBits).map fun j ↦
     e.getD j 0 + beta * (e.getD (keccakAlong j 4) 0 + beta * e.getD (keccakAlong j 3) 0)
 
-/-- **The honest prover of layer `d`** on the column `col` (the states `11 - d` rounds into each
+/-- **The honest prover of layer `d`** on the column `col` (the states `5 - d` rounds into each
 segment), from `claim`: `G`'s coefficients, the pack rounds, the position rounds, `t`, and the
 next claim. -/
 def layerProve (col : ℕ → K) (P d : ℕ) (claim : KeccakClaim) : Script KeccakClaim :=
-  let masks := layerMasks col P (11 - d)
+  let masks := layerMasks col P (5 - d)
   (Script.sendList (gCoeffs P masks claim.point claim.weights)).bind fun _ ↦
   Script.sampleE.bind fun s ↦
   let mu := keccakInstanceWeights s

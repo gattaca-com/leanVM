@@ -419,7 +419,7 @@ theorem soundnessRpm_le_bits {Q : ℕ} (hQ : Q ≤ 2 ^ 120) :
     _ ≤ (Q + 2 ^ 14) * 2 ^ 129 * 2 ^ 252 := by
         gcongr
         calc (Q + 12228) * (2 ^ 128 + 2 ^ 128) + 12228 + 1
-            = Q * 2 ^ 129 + (12228 * 2 ^ 129 + 12675) := by ring
+            = Q * 2 ^ 129 + (12228 * 2 ^ 129 + 12229) := by ring
           _ ≤ Q * 2 ^ 129 + 2 ^ 14 * 2 ^ 129 := Nat.add_le_add_left (by norm_num) _
           _ = (Q + 2 ^ 14) * 2 ^ 129 := by ring
     _ = (Q + 2 ^ 14) * 2 ^ 381 := by rw [mul_assoc, ← pow_add]

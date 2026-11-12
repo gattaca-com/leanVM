@@ -198,20 +198,20 @@ theorem gPack_getD (w : Array E) (S : Array ℕ) {c : ℕ} (hc : c < 47) :
   rw [testBit_packBits, decide_eq_true ht', Bool.true_and, array_getD_ofFn_lt _ (by omega)]
 
 /-- **`G`'s coefficients.** -/
-theorem gCoeffs_eq {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col) {d : ℕ} (hd : d < 12)
+theorem gCoeffs_eq {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col) {d : ℕ} (hd : d < 6)
     {point : List E} (hpt : point.length = P + 1) (w : List E) :
-    gCoeffs P (layerMasks col' P (11 - d)) point w =
+    gCoeffs P (layerMasks col' P (5 - d)) point w =
       gList (Gpoly (statesAt (P + 4) col (d + 1)) P point w) := by
   let T := statesAt (P + 4) col (d + 1)
   have hG : ∀ c < 47, ((List.range (2 ^ (P + 1))).foldl (fun G z ↦
       let gz := gPack (weightTabs w.toArray)
-        (((layerMasks col' P (11 - d)).getD z #[]).map embedMask)
+        (((layerMasks col' P (5 - d)).getD z #[]).map embedMask)
       let e := (eqTable point).getD z 0
       Array.ofFn (n := 47) fun c ↦ G.getD c.val 0 + e * gz.getD c.val 0)
       (Array.replicate 47 0)).getD c 0 = (Gpoly T P point w).coeff c := by
     intro c hc
     rw [foldl_rows 47 (fun z c ↦ (eqTable point).getD z 0 * (gPack (weightTabs w.toArray)
-      (((layerMasks col' P (11 - d)).getD z #[]).map embedMask)).getD c 0) _ (fun _ _ ↦ rfl)
+      (((layerMasks col' P (5 - d)).getD z #[]).map embedMask)).getD c 0) _ (fun _ _ ↦ rfl)
       _ c hc]
     simp only [Gpoly, finsetSum_coeff, coeff_C_mul]
     refine Finset.sum_congr rfl fun z hz ↦ ?_
@@ -220,10 +220,10 @@ theorem gCoeffs_eq {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col)
     refine congrArg (eqAt point z * ·) ?_
     refine Finset.sum_congr rfl fun j hj ↦ ?_
     have hj' := Finset.mem_range.1 hj
-    have hrow : ((layerMasks col' P (11 - d)).getD z #[]).size = 1600 := by
+    have hrow : ((layerMasks col' P (5 - d)).getD z #[]).size = 1600 := by
       rw [layerMasks, array_getD_ofFn_lt _ hz', packMasks_size]
-    have hS : ∀ j' < 1600, (((layerMasks col' P (11 - d)).getD z #[]).map embedMask).getD j' 0 =
-        embedMask (((layerMasks col' P (11 - d)).getD z #[]).getD j' 0) :=
+    have hS : ∀ j' < 1600, (((layerMasks col' P (5 - d)).getD z #[]).map embedMask).getD j' 0 =
+        embedMask (((layerMasks col' P (5 - d)).getD z #[]).getD j' 0) :=
       fun j' hj'' ↦ array_getD_map _ _ (by rw [hrow]; exact hj'') 0
     rw [hS j hj', hS _ (keccakAlong_lt 1 hj'), hS _ (keccakAlong_lt 2 hj'), ite_bitE,
       array_getD_toArray, coeff_Gterm (T := T)

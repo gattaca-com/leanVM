@@ -205,7 +205,7 @@ theorem isWeightBound_proverNZ {X : OracleComp KeccakCalls Proof} (prog : LeanIs
         rw [← verifierRZ_eq_comp] at this
         exact this
     refine h.mono ?_
-    have : leanVmCost / 4 = 12672 := by decide
+    have : leanVmCost / 4 = 12226 := by decide
     simp only [leanVmSeed, List.length_cons, List.length_nil, this]
     omega
   exact isWeightBound_of_isTotalQueryBound hashBlocks (2 ^ 30) hN

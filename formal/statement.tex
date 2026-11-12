@@ -229,7 +229,8 @@ the transfer to the RPM, which pays for those calls, and the verifier's own $122
 
 \paragraph{Completeness} (\lean{LeanVM.Completeness}). The statement names its honest prover,
 \lean{LeanVM.leanVmHonestProver}: the executable \lean{LeanVM.Prover.prove}
-(\lean{Statement/Prover/}), its Keccak-256 and Keccak-f[1600] calls answered here from $\pi$; with
+(\lean{Statement/Prover/}), whose six Keccak layers read masks $5-d$ rounds into each segment at layer $d$;
+its Keccak-256 and Keccak-f[1600] calls answered here from $\pi$; with
 the deployed Keccak it is \texttt{lake exe leanvm-prove}. It runs the execution once to obtain the
 witness, then plays the honest moves against the verifier's own program. Its only search is the
 proof-of-work nonce search within its fuel, and it sees hash answers only as the challenges the

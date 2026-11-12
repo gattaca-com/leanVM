@@ -11,8 +11,8 @@ public import LeanVM.Prover.Keccak.Tables
 /-!
 # The bits entering χ
 
-`packMasks col' P (11 - d) z` lists, per position `j`, the sixteen instances' bits of `L` of the
-states `11 - d` rounds into the segment: bit `i` of entry `j` is `Lb (stAt T P z i) j` for
+`packMasks col' P (5 - d) z` lists, per position `j`, the sixteen instances' bits of `L` of the
+states `5 - d` rounds into the segment: bit `i` of entry `j` is `Lb (stAt T P z i) j` for
 `T = statesAt (P + 4) col (d + 1)`, the states layer `d` of the specification reads
 (`testBit_layerMasks`), when the column `col'` agrees with `col` on the words the states read.
 -/
@@ -51,8 +51,8 @@ theorem bitOf_linearOf (a : KeccakState) {j : ℕ} (hj : j < 1600) :
 
 /-- **The masks are the bits entering χ.** -/
 theorem testBit_packMasks {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col) {d z i j : ℕ}
-    (hd : d < 12) (hz : z < 2 ^ (P + 1)) (hi : i < 16) (hj : j < 1600) :
-    ((packMasks col' P (11 - d) z).getD j 0).testBit i =
+    (hd : d < 6) (hz : z < 2 ^ (P + 1)) (hi : i < 16) (hj : j < 1600) :
+    ((packMasks col' P (5 - d) z).getD j 0).testBit i =
       Lb (stAt (statesAt (P + 4) col (d + 1)) P z i) j := by
   have hm : z / 2 ^ P < 2 := by
     rw [Nat.div_lt_iff_lt_mul (by positivity)]
@@ -65,12 +65,12 @@ theorem testBit_packMasks {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P co
   rw [packMasks, array_getD_ofFn_lt _ hj, testBit_packBits, decide_eq_true hi, Bool.true_and,
     array_getD_ofFn_lt _ hi, bitOf_linearOf _ hj, inStateOf_eq hcol hm hx, stAt]
   unfold statesAt
-  rw [show 12 - (d + 1) = 11 - d by omega]
+  rw [show 6 - (d + 1) = 5 - d by omega]
   rfl
 
 theorem testBit_layerMasks {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col) {d z i j : ℕ}
-    (hd : d < 12) (hz : z < 2 ^ (P + 1)) (hi : i < 16) (hj : j < 1600) :
-    (((layerMasks col' P (11 - d)).getD z #[]).getD j 0).testBit i =
+    (hd : d < 6) (hz : z < 2 ^ (P + 1)) (hi : i < 16) (hj : j < 1600) :
+    (((layerMasks col' P (5 - d)).getD z #[]).getD j 0).testBit i =
       Lb (stAt (statesAt (P + 4) col (d + 1)) P z i) j := by
   rw [layerMasks, array_getD_ofFn_lt _ hz]
   exact testBit_packMasks hcol hd hz hi hj
