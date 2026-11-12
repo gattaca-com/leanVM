@@ -20,7 +20,7 @@ The sections, in order:
   squeezed (`sqZeroT`); the committed outputs' value read;
 * the first claim's record: `KC_KAPPA`, `KC_POINT`, the instance weights (`eqtreeT`, `muCopyT`),
   the lanes (`eqtreeT`), the segment weights (`eqtreeT`), the value (`dotLoadsT`);
-* twelve steps (`stepT`): the claim's segment weights (`eqfLevel0T`), its `ι` term (`flipsT`,
+* six steps (`stepT`): the claim's segment weights (`eqfLevel0T`), its `ι` term (`flipsT`,
   `iotaSegT`), and `keccak_layer` (`stepTailT`);
 * the committed outputs: `keccak_plain_rounds` over the slot, the word, the slot's lane weights
   (`slotLanesT`), their check; the pack coordinates copied (`__loop11`);
@@ -94,7 +94,7 @@ def addChainV (vs : List ℕ) (b : ℕ) : ℕ := if vs.length ≤ 1 then vs.getD
 
 /-- The bits `i` whose positions `2^i - 1` of the round constant segment `m` of step `s` uses. -/
 def iotaIdx (s m : ℕ) : List ℕ :=
-  (List.range 7).filter fun i ↦ (keccakRC.getD (12 * (m + 1) - s - 1) 0).toNat.testBit (2 ^ i - 1)
+  (List.range 7).filter fun i ↦ (keccakRC.getD (6 * (m + 1) - s - 1) 0).toNat.testBit (2 ^ i - 1)
 
 /-- The bits either segment uses. -/
 def iotaUsed (s : ℕ) : List ℕ :=
@@ -243,7 +243,7 @@ def vkHeadT : List Stmt :=
 
 /-- **The first claim's record.** -/
 def vkFirstT : List Stmt :=
-  [.atom (.hint (.alloc (.n 203) 286)), .atom (.const (.n 204) (word 1 0 0)),
+  [.atom (.hint (.alloc (.n 203) 154)), .atom (.const (.n 204) (word 1 0 0)),
     .atom (.load (.n 204) (.n 203) 1), .atom (.load (.n 60) (.n 203) 2),
     .atom (.hint (.alloc (.n 205) 30))] ++
   eqtreeT (.n 9) (.n 205) 0 206 4 ++ copyWordsT (.n 205) (.n 203) 14 6 260 16 ++
@@ -343,72 +343,66 @@ def foldT (src : ℕ → ℕ) (b : ℕ) (a : V) : List Stmt :=
 
 /-! ## The template -/
 
-/-- The twelve steps. -/
+/-- The six steps. -/
 def vkStepsT : List Stmt :=
   stepT 0 490 [181, 182, 183, 184, 185] 0 203 0 ++
-  stepT 1 531 [525, 526, 527, 528, 529] 530 203 524 ++
-  stepT 2 566 [560, 561, 562, 563, 564] 565 524 559 ++
-  stepT 3 600 [594, 595, 596, 597, 598] 599 559 593 ++
-  stepT 4 643 [637, 638, 639, 640, 641] 642 593 636 ++
-  stepT 5 684 [678, 679, 680, 681, 682] 683 636 677 ++
-  stepT 6 727 [721, 722, 723, 724, 725] 726 677 720 ++
-  stepT 7 760 [754, 755, 756, 757, 758] 759 720 753 ++
-  stepT 8 801 [795, 796, 797, 798, 799] 800 753 794 ++
-  stepT 9 839 [833, 834, 835, 836, 837] 838 794 832 ++
-  stepT 10 882 [876, 877, 878, 879, 880] 881 832 875 ++
-  stepT 11 923 [917, 918, 919, 920, 921] 922 875 916
+  stepT 1 530 [524, 525, 526, 527, 528] 529 203 523 ++
+  stepT 2 566 [560, 561, 562, 563, 564] 565 523 559 ++
+  stepT 3 604 [598, 599, 600, 601, 602] 603 559 597 ++
+  stepT 4 647 [641, 642, 643, 644, 645] 646 597 640 ++
+  stepT 5 689 [683, 684, 685, 686, 687] 688 640 682
 
 /-- The committed outputs' opening (G:2860-2873). -/
 def vkOutT : List Stmt :=
-  [.atom (.mul (.n 963) (.n 9) (.n 6)), .atom (.const (.n 964) (word 0 0 0)),
-    .atom (.const (.n 965) (word 0 0 0)),
-    .call "keccak_plain_rounds__L6_L0" [.n 957, .n 958, .n 959, .n 960, .n 961, .n 964,
-      .n 965, .n 962, .n 193, .n 963] ((List.range 7).map fun j ↦ .n (966 + j))] ++
-  fsNextT (.n 971) 0 973 ++ [.atom (.mul (.n 983) (.n 60) (.n 17))] ++
-  slotLanesT 963 983 984 1 1 ++ dotLoadsT ((List.range 25).map (slotLaneV 984 1)) (.n 276) 30 1167 ++
-  [.atom (.mul (.n 1241) (.n 1240) (.n 973)), .atom (.assertEq (.n 1241) (.n 972)),
-    .atom (.const (.n 1242) (word 1 0 0)), .atom (.add (.n 1243) (.n 1242) (.n 17)),
-    .atom (.const (.n 1244) (word 1 0 0)), .atom (.const (.n 1245) (word 16 0 0)),
-    .atom (.mul (.n 1246) (.n 9) (.n 1245)),
-    .callIf (.n 1243) "__loop11" [.n 1244, .n 17, .n 1246, .n 60]]
+  [.atom (.mul (.n 731) (.n 9) (.n 6)), .atom (.const (.n 732) (word 0 0 0)),
+    .atom (.const (.n 733) (word 0 0 0)),
+    .call "keccak_plain_rounds__L6_L0" [.n 725, .n 726, .n 727, .n 728, .n 729, .n 732,
+      .n 733, .n 730, .n 193, .n 731] ((List.range 7).map fun j ↦ .n (734 + j))] ++
+  fsNextT (.n 739) 0 741 ++ [.atom (.mul (.n 751) (.n 60) (.n 17))] ++
+  slotLanesT 731 751 752 1 1 ++ dotLoadsT ((List.range 25).map (slotLaneV 752 1)) (.n 276) 30 935 ++
+  [.atom (.mul (.n 1009) (.n 1008) (.n 741)), .atom (.assertEq (.n 1009) (.n 740)),
+    .atom (.const (.n 1010) (word 1 0 0)), .atom (.add (.n 1011) (.n 1010) (.n 17)),
+    .atom (.const (.n 1012) (word 1 0 0)), .atom (.const (.n 1013) (word 16 0 0)),
+    .atom (.mul (.n 1014) (.n 9) (.n 1013)),
+    .callIf (.n 1011) "__loop11" [.n 1012, .n 17, .n 1014, .n 60]]
 
 /-- The inputs' opening up to the slices and the ring map's first challenge (G:2875-2927). -/
 def vkInT : List Stmt :=
-  [.atom (.const (.n 1247) (word 2 0 0)), .atom (.mul (.n 1248) (.n 971) (.n 1247)),
-    .atom (.load (.n 1249) (.n 203) 264), .atom (.const (.n 1250) (word 549755813888 0 0)),
-    .atom (.mul (.n 1251) (.n 9) (.n 1250)),
-    .call "keccak_plain_rounds__L4_L1" [.n 966, .n 967, .n 968, .n 969, .n 970, .n 980,
-      .n 982, .n 1248, .n 1249, .n 1251] ((List.range 7).map fun j ↦ .n (1252 + j)),
-    .atom (.hint (.alloc (.n 1259) 30))] ++
-  eqtreeT (.n 9) (.n 1259) 39 1260 4 ++ pairsDotT (.n 1259) (.n 203) (consecOffs 14 270 16) 1314 ++
-  [.atom (.const (.n 1377) (word 549755813888 0 0)), .atom (.mul (.n 1378) (.n 9) (.n 1377)),
-    .atom (.mul (.n 1379) (.n 1378) (.n 6)), .atom (.const (.n 1380) (word 0 0 0)),
-    .atom (.const (.n 1381) (word 0 0 0)),
-    .call "keccak_plain_rounds__L6_L0" [.n 1252, .n 1253, .n 1254, .n 1255, .n 1256, .n 1380,
-      .n 1381, .n 1257, .n 1258, .n 1379] ((List.range 7).map fun j ↦ .n (1382 + j))] ++
-  (List.range 5).map (fun j ↦ .atom (.copy (.n (1389 + j)) (.n (1382 + j)))) ++
-  slicesT (.n 1387) 1389 1394
+  [.atom (.const (.n 1015) (word 2 0 0)), .atom (.mul (.n 1016) (.n 739) (.n 1015)),
+    .atom (.load (.n 1017) (.n 203) 132), .atom (.const (.n 1018) (word 549755813888 0 0)),
+    .atom (.mul (.n 1019) (.n 9) (.n 1018)),
+    .call "keccak_plain_rounds__L4_L1" [.n 734, .n 735, .n 736, .n 737, .n 738, .n 748,
+      .n 750, .n 1016, .n 1017, .n 1019] ((List.range 7).map fun j ↦ .n (1020 + j)),
+    .atom (.hint (.alloc (.n 1027) 30))] ++
+  eqtreeT (.n 9) (.n 1027) 39 1028 4 ++ pairsDotT (.n 1027) (.n 203) (consecOffs 14 138 16) 1082 ++
+  [.atom (.const (.n 1145) (word 549755813888 0 0)), .atom (.mul (.n 1146) (.n 9) (.n 1145)),
+    .atom (.mul (.n 1147) (.n 1146) (.n 6)), .atom (.const (.n 1148) (word 0 0 0)),
+    .atom (.const (.n 1149) (word 0 0 0)),
+    .call "keccak_plain_rounds__L6_L0" [.n 1020, .n 1021, .n 1022, .n 1023, .n 1024, .n 1148,
+      .n 1149, .n 1025, .n 1026, .n 1147] ((List.range 7).map fun j ↦ .n (1150 + j))] ++
+  (List.range 5).map (fun j ↦ .atom (.copy (.n (1157 + j)) (.n (1150 + j)))) ++
+  slicesT (.n 1155) 1157 1162
 
 /-- The shifts of the slices' values. -/
-def vkSh (r : ℕ) : ℕ := foldVal (fun j ↦ 2485 + j) 2549 6 r
+def vkSh (r : ℕ) : ℕ := foldVal (fun j ↦ 2253 + j) 2317 6 r
 
 /-- The inputs' check, the copy of their pack coordinates, the return (G:3073-3085). -/
 def vkFinT : List Stmt :=
-  [.atom (.load (.n 2249) (.n 203) 266), .atom (.mul (.n 2250) (.n 2249) (.n 17))] ++
-  slotLanesT 1379 2250 2251 0 2 ++ [.atom (.load (.n 2484) (.n 203) 268)] ++
-  (List.range 64).map (fun z ↦ .atom (.load (.n (2485 + z)) (.n 10) z)) ++
-  foldT (fun j ↦ 2485 + j) 2549 (.n 2484) ++ [.atom (.load (.n 3647) (.n 203) 267)] ++
-  (formAll (.n 3647) vkSh (slotLaneV 2251 2) 3648).1 ++
-  [.atom (.mul (.n 3862) (.n 1376) (.n (formAll (.n 3647) vkSh (slotLaneV 2251 2) 3648).2.2)),
-    .atom (.assertEq (.n 3862) (.n 1388)), .atom (.const (.n 3863) (word 1 0 0)),
-    .atom (.add (.n 3864) (.n 3863) (.n 17)), .atom (.const (.n 3865) (word 1 0 0)),
-    .atom (.const (.n 3866) (word 16 0 0)), .atom (.mul (.n 3867) (.n 1251) (.n 3866)),
-    .callIf (.n 3864) "__loop12" [.n 3865, .n 17, .n 3867, .n 2249]] ++
-  (List.range 5).map (fun j ↦ .atom (.copy (.n (3868 + j)) (.n (2237 + j)))) ++
-  [.atom (.const (.n 3873) (word 27 0 0)), .atom (.mul (.n 3874) (.n 1387) (.n 3873)),
-    .atom (.copy (.n 3875) (.n 3874)), .atom (.copy (.n 3876) (.n 973)),
-    .atom (.copy (.n 3877) (.n 2248)),
-    .ret [.n 3868, .n 3869, .n 3870, .n 3871, .n 3872, .n 3875, .n 3876, .n 3877]]
+  [.atom (.load (.n 2017) (.n 203) 134), .atom (.mul (.n 2018) (.n 2017) (.n 17))] ++
+  slotLanesT 1147 2018 2019 0 2 ++ [.atom (.load (.n 2252) (.n 203) 136)] ++
+  (List.range 64).map (fun z ↦ .atom (.load (.n (2253 + z)) (.n 10) z)) ++
+  foldT (fun j ↦ 2253 + j) 2317 (.n 2252) ++ [.atom (.load (.n 3415) (.n 203) 135)] ++
+  (formAll (.n 3415) vkSh (slotLaneV 2019 2) 3416).1 ++
+  [.atom (.mul (.n 3630) (.n 1144) (.n (formAll (.n 3415) vkSh (slotLaneV 2019 2) 3416).2.2)),
+    .atom (.assertEq (.n 3630) (.n 1156)), .atom (.const (.n 3631) (word 1 0 0)),
+    .atom (.add (.n 3632) (.n 3631) (.n 17)), .atom (.const (.n 3633) (word 1 0 0)),
+    .atom (.const (.n 3634) (word 16 0 0)), .atom (.mul (.n 3635) (.n 1019) (.n 3634)),
+    .callIf (.n 3632) "__loop12" [.n 3633, .n 17, .n 3635, .n 2017]] ++
+  (List.range 5).map (fun j ↦ .atom (.copy (.n (3636 + j)) (.n (2005 + j)))) ++
+  [.atom (.const (.n 3641) (word 27 0 0)), .atom (.mul (.n 3642) (.n 1155) (.n 3641)),
+    .atom (.copy (.n 3643) (.n 3642)), .atom (.copy (.n 3644) (.n 741)),
+    .atom (.copy (.n 3645) (.n 2016)),
+    .ret [.n 3636, .n 3637, .n 3638, .n 3639, .n 3640, .n 3643, .n 3644, .n 3645]]
 
 /-- **`verify_keccak`'s body.** -/
 def vkT : List Stmt := vkHeadT ++ vkFirstT ++ vkStepsT ++ vkOutT ++ vkInT ++ vkFinT

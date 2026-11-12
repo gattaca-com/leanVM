@@ -25,67 +25,67 @@ theorem word_2p39 : word 549755813888 0 0 = gen ^ 39 := by
 
 /-- **The inputs' opening up to the slices** (G:3050-3069). -/
 theorem vkInT_holds {τ : ℕ} (h6 : σ (.n 6) = gen ^ τ)
-    {c : KeccakClaim} (hc : ClaimRec rd ((0 : ℕ) = 1) (σ (.n 203) * gen ^ (22 * 12)) c (τ - 3))
-    (hw : FsPackOk σ (.n 973) (973 + 1) dsObserve)
+    {c : KeccakClaim} (hc : ClaimRec rd ((0 : ℕ) = 1) (σ (.n 203) * gen ^ (22 * 6)) c (τ - 3))
+    (hw : FsPackOk σ (.n 741) (741 + 1) dsObserve)
     {next : Prop} {kret : List E → Prop}
     (h : Stmt.HoldsList (coreProgram.Rel rd) rd σ vkInT next kret) :
     ∃ (mI mS : List (E × E)) (low slotI : List E), mI.length = 4 ∧
-      ReadsAt rd (σ (.n 971) * gen) (mI.flatMap fun c ↦ [c.1, c.2]) ∧
+      ReadsAt rd (σ (.n 739) * gen) (mI.flatMap fun c ↦ [c.1, c.2]) ∧
       plainRun mI c.value
-        ((⟨[σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)], []⟩ : Fs).absorb
-          (σ (.n 973)) dsObserve) =
-        (low, σ (.n 1258), ⟨[σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)], []⟩) ∧
-      ReadsAt rd (σ (.n 9) * gen ^ 39) low ∧ σ (.n 1257) = σ (.n 971) * gen * gen ^ 8 ∧
-      σ (.n 1376) = multilinearEval c.mu low ∧
-      mS.length = 6 ∧ ReadsAt rd (σ (.n 1257)) (mS.flatMap fun c ↦ [c.1, c.2]) ∧
-      plainRun mS (σ (.n 1258))
-        ⟨[σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)], []⟩ =
-        (slotI, σ (.n 1388),
-          ⟨[σ (.n 1382), σ (.n 1383), σ (.n 1384), σ (.n 1385), σ (.n 1386)], []⟩) ∧
-      ReadsAt rd (σ (.n 1379)) slotI ∧ σ (.n 1379) = σ (.n 9) * gen ^ 39 * gen ^ τ ∧
-      σ (.n 1387) = σ (.n 1257) * gen ^ 12 ∧
-      ReadsAt rd (σ (.n 1387)) ((List.range 64).map fun z ↦ σ (.n (slB 1394 z))) ∧
-      (∀ z < 64, LoadHolds rd (σ (.n 10)) z (σ (.n (slB 1394 z)))) ∧
-      ((⟨[σ (.n 1382), σ (.n 1383), σ (.n 1384), σ (.n 1385), σ (.n 1386)], []⟩ : Fs).absorbAll
-        ((List.range 64).map fun z ↦ σ (.n (slB 1394 z))) dsObserve).squeeze =
-        (σ (.n 2248), ⟨[σ (.n 2237), σ (.n 2238), σ (.n 2239), σ (.n 2240), σ (.n 2241)], []⟩) ∧
-      σ (.n 1251) = σ (.n 9) * gen ^ 39 ∧ next := by
+        ((⟨[σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)], []⟩ : Fs).absorb
+          (σ (.n 741)) dsObserve) =
+        (low, σ (.n 1026), ⟨[σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)], []⟩) ∧
+      ReadsAt rd (σ (.n 9) * gen ^ 39) low ∧ σ (.n 1025) = σ (.n 739) * gen * gen ^ 8 ∧
+      σ (.n 1144) = multilinearEval c.mu low ∧
+      mS.length = 6 ∧ ReadsAt rd (σ (.n 1025)) (mS.flatMap fun c ↦ [c.1, c.2]) ∧
+      plainRun mS (σ (.n 1026))
+        ⟨[σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)], []⟩ =
+        (slotI, σ (.n 1156),
+          ⟨[σ (.n 1150), σ (.n 1151), σ (.n 1152), σ (.n 1153), σ (.n 1154)], []⟩) ∧
+      ReadsAt rd (σ (.n 1147)) slotI ∧ σ (.n 1147) = σ (.n 9) * gen ^ 39 * gen ^ τ ∧
+      σ (.n 1155) = σ (.n 1025) * gen ^ 12 ∧
+      ReadsAt rd (σ (.n 1155)) ((List.range 64).map fun z ↦ σ (.n (slB 1162 z))) ∧
+      (∀ z < 64, LoadHolds rd (σ (.n 10)) z (σ (.n (slB 1162 z)))) ∧
+      ((⟨[σ (.n 1150), σ (.n 1151), σ (.n 1152), σ (.n 1153), σ (.n 1154)], []⟩ : Fs).absorbAll
+        ((List.range 64).map fun z ↦ σ (.n (slB 1162 z))) dsObserve).squeeze =
+        (σ (.n 2016), ⟨[σ (.n 2005), σ (.n 2006), σ (.n 2007), σ (.n 2008), σ (.n 2009)], []⟩) ∧
+      σ (.n 1019) = σ (.n 9) * gen ^ 39 ∧ next := by
   obtain ⟨hmuL, hptL, hval, -, hmus, -⟩ := hc
   rw [vkInT] at h
-  generalize hEQ : eqtreeT (.n 9) (.n 1259) 39 1260 4 = EQ at h
-  generalize hPD : pairsDotT (.n 1259) (.n 203) (consecOffs 14 270 16) 1314 = PD at h
-  generalize hSL : slicesT (.n 1387) 1389 1394 = SL at h
-  generalize hCP : (List.range 5).map (fun j ↦ Stmt.atom (.copy (.n (1389 + j)) (.n (1382 + j)))) = CP at h
+  generalize hEQ : eqtreeT (.n 9) (.n 1027) 39 1028 4 = EQ at h
+  generalize hPD : pairsDotT (.n 1027) (.n 203) (consecOffs 14 138 16) 1082 = PD at h
+  generalize hSL : slicesT (.n 1155) 1157 1162 = SL at h
+  generalize hCP : (List.range 5).map (fun j ↦ Stmt.atom (.copy (.n (1157 + j)) (.n (1150 + j)))) = CP at h
   simp only [holdsList_append, Stmt.HoldsList, Stmt.Holds, Atom.Holds, List.map_cons,
     List.map_nil] at h
   obtain ⟨e75, e76, l77, e78, e79, hcall1, -, h⟩ := h
   -- the pack's rounds
   obtain ⟨mI, hmL, hmR, hrun⟩ := plain_call (k0 := 1) (n := 4) (by omega) rfl
-    (cap := [σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)]) rfl
+    (cap := [σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)]) rfl
     (by simpa [List.range_succ, plainName] using hcall1)
-  obtain ⟨hpt1, hrets1⟩ := hrun (σ (.n 973)) (fun _ hc ↦ fsPackT_cells hw hc)
+  obtain ⟨hpt1, hrets1⟩ := hrun (σ (.n 741)) (fun _ hc ↦ fsPackT_cells hw hc)
   simp only [plainStart, ↓reduceIte] at hpt1 hrets1
-  have hval' : σ (.n 1249) = c.value := by
+  have hval' : σ (.n 1017) = c.value := by
     have := (loadHolds_mul_gen_pow rd _ _ _ _).1 hval
     exact loadHolds_unique l77 (by simpa using this)
   rw [hval'] at hpt1 hrets1
   have hpend1 := plainRun_pend mI c.value
-    ⟨[σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)], [(σ (.n 973), dsObserve)]⟩
+    ⟨[σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)], [(σ (.n 741), dsObserve)]⟩
     (by rintro rfl; simp at hmL)
   set R1 := plainRun mI c.value
-    ⟨[σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)], [(σ (.n 973), dsObserve)]⟩
+    ⟨[σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)], [(σ (.n 741), dsObserve)]⟩
     with hR1
-  rw [show [σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256), σ (.n 1257),
-      σ (.n 1258)] = [σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)] ++
-      [σ (.n 1257), σ (.n 1258)] from rfl] at hrets1
+  rw [show [σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024), σ (.n 1025),
+      σ (.n 1026)] = [σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)] ++
+      [σ (.n 1025), σ (.n 1026)] from rfl] at hrets1
   obtain ⟨hcap1, hlast1⟩ := List.append_inj' hrets1 rfl
   simp only [List.cons.injEq, and_true] at hlast1
   obtain ⟨h3985, h3986⟩ := hlast1
-  have hR1s : R1 = (R1.1, σ (.n 1258),
-      ⟨[σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)], []⟩) := by
+  have hR1s : R1 = (R1.1, σ (.n 1026),
+      ⟨[σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)], []⟩) := by
     rw [h3986, hcap1, ← hpend1]
   have hlowL : R1.1.length = 4 := by rw [hR1, plainRun_length, hmL]
-  have h3979 : σ (.n 1251) = σ (.n 9) * gen ^ 39 := by rw [e79, e78, word_2p39]
+  have h3979 : σ (.n 1019) = σ (.n 9) * gen ^ 39 := by rw [e79, e78, word_2p39]
   -- the low tree and μ at the low point
   rw [← hEQ] at h
   obtain ⟨hlt, h⟩ := eqtreeT_last (rs := R1.1) (n := 4) (by omega) hlowL (fun t ht ↦ by
@@ -109,11 +109,11 @@ theorem vkInT_holds {τ : ℕ} (h6 : σ (.n 6) = gen ^ τ)
       have := (loadHolds_mul_gen_pow rd _ _ _ _).1 (hmus k (by simp [pack]; omega))
       exact loadHolds_unique hv (by
         rw [List.getD_eq_getElem?_getD] at this ⊢
-        simpa [show 22 * 12 + (6 + k) = 270 + k by omega] using this))
+        simpa [show 22 * 6 + (6 + k) = 138 + k by omega] using this))
     (by simp [consecOffs]) h
   simp only [consecOffs, List.length_map, List.length_range, pairsDotV] at hmu
-  have hmle : σ (.n 1376) = multilinearEval c.mu R1.1 := by
-    rw [show (1376 : ℕ) = 1314 + 4 * (16 - 1) + 2 from rfl, hmu,
+  have hmle : σ (.n 1144) = multilinearEval c.mu R1.1 := by
+    rw [show (1144 : ℕ) = 1082 + 4 * (16 - 1) + 2 from rfl, hmu,
       multilinearEval_eqAt c.mu R1.1 (by simpa [pack] using hmuL) hlowL]
     refine Finset.sum_congr rfl fun i hi ↦ ?_
     have hi' : i < 16 := Finset.mem_range.1 hi
@@ -122,23 +122,23 @@ theorem vkInT_holds {τ : ℕ} (h6 : σ (.n 6) = gen ^ τ)
   -- the slot's rounds
   obtain ⟨e05, e06, e07, -, -, hcall2, h⟩ := h
   obtain ⟨mS, hsL, hsR, hrun2⟩ := plain_call (k0 := 0) (n := 6) (by omega) rfl
-    (cap := [σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)]) rfl
+    (cap := [σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)]) rfl
     (by simpa [List.range_succ, plainName] using hcall2)
   obtain ⟨hpt2, hrets2⟩ := hrun2 0 (fun h ↦ absurd h (by decide))
   simp only [plainStart, show ¬ ((0 : ℕ) = 1) by decide, ↓reduceIte] at hpt2 hrets2
-  have hpend2 := plainRun_pend mS (σ (.n 1258))
-    ⟨[σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)], []⟩
+  have hpend2 := plainRun_pend mS (σ (.n 1026))
+    ⟨[σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)], []⟩
     (by rintro rfl; simp at hsL)
-  set R2 := plainRun mS (σ (.n 1258))
-    ⟨[σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)], []⟩ with hR2
-  rw [show [σ (.n 1382), σ (.n 1383), σ (.n 1384), σ (.n 1385), σ (.n 1386), σ (.n 1387),
-      σ (.n 1388)] = [σ (.n 1382), σ (.n 1383), σ (.n 1384), σ (.n 1385), σ (.n 1386)] ++
-      [σ (.n 1387), σ (.n 1388)] from rfl] at hrets2
+  set R2 := plainRun mS (σ (.n 1026))
+    ⟨[σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)], []⟩ with hR2
+  rw [show [σ (.n 1150), σ (.n 1151), σ (.n 1152), σ (.n 1153), σ (.n 1154), σ (.n 1155),
+      σ (.n 1156)] = [σ (.n 1150), σ (.n 1151), σ (.n 1152), σ (.n 1153), σ (.n 1154)] ++
+      [σ (.n 1155), σ (.n 1156)] from rfl] at hrets2
   obtain ⟨hcap2, hlast2⟩ := List.append_inj' hrets2 rfl
   simp only [List.cons.injEq, and_true] at hlast2
   obtain ⟨h4115, h4116⟩ := hlast2
-  have hR2s : R2 = (R2.1, σ (.n 1388),
-      ⟨[σ (.n 1382), σ (.n 1383), σ (.n 1384), σ (.n 1385), σ (.n 1386)], []⟩) := by
+  have hR2s : R2 = (R2.1, σ (.n 1156),
+      ⟨[σ (.n 1150), σ (.n 1151), σ (.n 1152), σ (.n 1153), σ (.n 1154)], []⟩) := by
     rw [h4116, hcap2, ← hpend2]
   -- the copies and the slices
   rw [← hCP, holdsList_map_atoms] at h
@@ -146,16 +146,16 @@ theorem vkInT_holds {τ : ℕ} (h6 : σ (.n 6) = gen ^ τ)
   simp only [Atom.Holds] at hcp
   rw [← hSL] at h
   obtain ⟨hrs, hst, hsq, hn⟩ := slicesT_holds h
-  have hc5 : (cap5 1389).map σ = [σ (.n 1382), σ (.n 1383), σ (.n 1384), σ (.n 1385), σ (.n 1386)] := by
+  have hc5 : (cap5 1157).map σ = [σ (.n 1150), σ (.n 1151), σ (.n 1152), σ (.n 1153), σ (.n 1154)] := by
     simp only [cap5, List.map_cons, List.map_nil]
     rw [hcp 0 (by omega), hcp 1 (by omega), hcp 2 (by omega), hcp 3 (by omega), hcp 4 (by omega)]
-  rw [hc5, show (1394 : ℕ) + 854 = 2248 from rfl, show (1394 : ℕ) + 843 = 2237 from rfl] at hsq
+  rw [hc5, show (1162 : ℕ) + 854 = 2016 from rfl, show (1162 : ℕ) + 843 = 2005 from rfl] at hsq
   refine ⟨mI, mS, R1.1, R2.1, hmL, ?_, ?_, ?_, ?_, hmle, hsL, ?_, hR2s, hpt2, ?_, h4115.trans
     (by norm_num), hrs, hst, by simpa [cap5] using hsq, h3979, hn⟩
   · rw [e76, e75, word_gen] at hmR; exact hmR
-  · rw [show (⟨[σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)], []⟩ : Fs).absorb
-      (σ (.n 973)) dsObserve = ⟨[σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)],
-        [(σ (.n 973), dsObserve)]⟩ from rfl]
+  · rw [show (⟨[σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)], []⟩ : Fs).absorb
+      (σ (.n 741)) dsObserve = ⟨[σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)],
+        [(σ (.n 741), dsObserve)]⟩ from rfl]
     exact hR1s
   · rw [← h3979]; exact hpt1
   · rw [h3985, e76, e75, word_gen]

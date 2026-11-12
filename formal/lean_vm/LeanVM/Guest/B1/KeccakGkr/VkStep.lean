@@ -23,13 +23,13 @@ variable {C : CallRel} {rd : Reader} {σ : Val}
 /-! ## The tables -/
 
 /-- The round constant bits of a step's segment are the positions `2^i - 1` of `iotaIdx`. -/
-theorem iota_bits : ∀ s < 12, ∀ m < 2,
-    (List.range 64).filter (fun z ↦ (keccakRC.getD (12 * (m + 1) - s - 1) 0).toNat.testBit z) =
+theorem iota_bits : ∀ s < 6, ∀ m < 2,
+    (List.range 64).filter (fun z ↦ (keccakRC.getD (6 * (m + 1) - s - 1) 0).toNat.testBit z) =
       (iotaIdx s m).map (fun i ↦ 2 ^ i - 1) := by decide +kernel
 
-theorem iotaIdx_ne : ∀ s < 12, ∀ m < 2, iotaIdx s m ≠ [] := by decide +kernel
+theorem iotaIdx_ne : ∀ s < 6, ∀ m < 2, iotaIdx s m ≠ [] := by decide +kernel
 
-theorem iotaIdx_sub : ∀ s < 12, ∀ m < 2, ∀ i ∈ iotaIdx s m, i ∈ iotaUsed s ∧ i < 7 := by
+theorem iotaIdx_sub : ∀ s < 6, ∀ m < 2, ∀ i ∈ iotaIdx s m, i ∈ iotaUsed s ∧ i < 7 := by
   decide +kernel
 
 /-- The word of `g^22`, a claim record's size (`KC_SIZE`). -/
@@ -52,7 +52,7 @@ def vkGw : ℕ → ℕ
   | _ => 0
 
 /-- The words of `g^(22 s)`. -/
-theorem vkGw_eq : ∀ s, 1 ≤ s → s < 12 → word (vkGw s) 0 0 = gen ^ (22 * s) := by
+theorem vkGw_eq : ∀ s, 1 ≤ s → s < 6 → word (vkGw s) 0 0 = gen ^ (22 * s) := by
   intro s h1 h2
   rw [word_eOfNat, gen_pow_eq_ofK, ← gpowK_eq (by unfold u128Bound; omega)]
   show ofK (K.ofBits (vkGw s)) = ofK (gpowK (22 * s))
@@ -103,7 +103,7 @@ theorem addChainT_holds {vs : List ℕ} (hne : vs ≠ []) {b : ℕ} {next : Prop
 
 /-- **The `ι` term** (G:3021-3026): per segment the flips of its bits summed, times the segment's
 weight (the values `w0`, `w1`). -/
-theorem iotaSegT_holds {s b c w0 w1 : ℕ} (hs : s < 12) {F : ℕ → E} {g0 g1 : E}
+theorem iotaSegT_holds {s b c w0 w1 : ℕ} (hs : s < 6) {F : ℕ → E} {g0 g1 : E}
     (hF : ∀ i ∈ iotaUsed s, σ (.n (flipOf s b i)) = F i)
     (hg0 : σ (.n w0) = g0) (hg1 : σ (.n w1) = g1) {next : Prop} {kret : List E → Prop}
     (h : Stmt.HoldsList C rd σ (iotaSegT s b c w0 w1) next kret) :
@@ -139,7 +139,7 @@ theorem filterMap_ite_eq {p : ℕ → Bool} (f : ℕ → E) (l : List ℕ) :
   | cons a l ih => by_cases h : p a <;> simp [h, ih]
 
 /-- **`keccakIota`** (V:1990-1995) through the bit positions `2^i - 1` of the round constants. -/
-theorem keccakIota_eq {τ s : ℕ} (hs : s < 12) (hτ : 4 ≤ τ) {c : KeccakClaim}
+theorem keccakIota_eq {τ s : ℕ} (hs : s < 6) (hτ : 4 ≤ τ) {c : KeccakClaim}
     (hpt : c.point.length = τ - 3) :
     keccakIota τ s c = (eqKernel [c.point.getD (τ - 4) 0]).getD 0 0 *
         ((iotaIdx s 0).map fun i ↦ c.weights.getD (2 ^ i - 1) 0).sum +
@@ -153,7 +153,7 @@ theorem keccakIota_eq {τ s : ℕ} (hs : s < 12) (hτ : 4 ≤ τ) {c : KeccakCla
         some (c.weights.getD z 0) else none) =
       ((iotaIdx s m).map fun i ↦ c.weights.getD (2 ^ i - 1) 0).sum := by
     intro m hm
-    rw [filterMap_ite_eq, show keccakDepth = 12 from rfl, iota_bits s hs m hm, List.map_map,
+    rw [filterMap_ite_eq, show keccakDepth = 6 from rfl, iota_bits s hs m hm, List.map_map,
       LeanVM.Protocol.KeccakGkr.sumE_eq_sum]
     rfl
   simp only [keccakIota, keccakSegments_eq, hd]
@@ -253,7 +253,7 @@ theorem stepSeg_holds {b off : ℕ} {pp : E} {pt : List E} {τ : ℕ} (hτ : 4 �
 /-- **Step `s ≥ 1`** (G:3000-3030): the claim at `claims·g^(22 s)` (`cb·g^22`), its `ι` term, and
 `keccak_layer` on it, writing the next claim at `claims·g^(22 (s + 1))` (`pn·g^22`, the value
 `stepEnd s b - 7`). -/
-theorem stepT_holdsL {s b : ℕ} (hs1 : 1 ≤ s) (hs : s < 12) {c0 c1 c2 c3 c4 cur cb pn : ℕ}
+theorem stepT_holdsL {s b : ℕ} (hs1 : 1 ≤ s) (hs : s < 6) {c0 c1 c2 c3 c4 cur cb pn : ℕ}
     {τ : ℕ} (hτ1 : 9 ≤ τ) (hτ2 : τ ≤ 28) (h17 : σ (.n 17) = gen ^ (τ - 4))
     (h33 : σ (.n 33) = gen ^ ((τ - 3) / krStep)) (h47 : σ (.n 47) = gen ^ ((τ - 3) % krStep))
     (hcb : σ (.n cb) = σ (.n 203) * gen ^ (22 * (s - 1)))

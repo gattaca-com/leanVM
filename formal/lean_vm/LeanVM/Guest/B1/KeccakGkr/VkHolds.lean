@@ -97,7 +97,7 @@ theorem verify_keccak_holds : verify_keccak_Spec := by
   obtain ⟨mO, slotO, hmOL, hmOR, hO, hslotO, h3699, ⟨l3701, p3701⟩, hchk, hcpO, hb⟩ := hb
   have hslotOL : slotO.length = 6 := by
     have := plainRun_length mO (σ (.n 193))
-      ⟨[σ (.n 957), σ (.n 958), σ (.n 959), σ (.n 960), σ (.n 961)], []⟩
+      ⟨[σ (.n 725), σ (.n 726), σ (.n 727), σ (.n 728), σ (.n 729)], []⟩
     rw [hO, hmOL] at this; exact this
   -- the inputs
   replace hb := vkInT_holds htg hcr' p3701 hb
@@ -105,21 +105,21 @@ theorem verify_keccak_holds : verify_keccak_Spec := by
     h4115, hslR, hslL, hm, h1251, hb⟩ := hb
   have hlowL : low.length = 4 := by
     have := plainRun_length mI c'.value
-      ((⟨[σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)], []⟩ : Fs).absorb
-        (σ (.n 973)) dsObserve)
+      ((⟨[σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)], []⟩ : Fs).absorb
+        (σ (.n 741)) dsObserve)
     rw [hI, hmIL] at this; exact this
   have hslotIL : slotI.length = 6 := by
-    have := plainRun_length mS (σ (.n 1258))
-      ⟨[σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)], []⟩
+    have := plainRun_length mS (σ (.n 1026))
+      ⟨[σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)], []⟩
     rw [hS, hmSL] at this; exact this
   -- the final check
   replace hb := vkFinT_holds hτ1 hτ2 h17 hcr' hslotIL hslotI hslL h1251 hb
   obtain ⟨lanes, loc, -, hlocL, hw, hform, hF, hSh, hpoint, hret⟩ := hb
-  generalize hslE : (List.range 64).map (fun z ↦ σ (.n (slB 1394 z))) = slices at hslR hm
+  generalize hslE : (List.range 64).map (fun z ↦ σ (.n (slB 1162 z))) = slices at hslR hm
   have hslices : slices.length = 64 := by rw [← hslE]; simp
   have hptL : c'.point.length = τ - 3 := hcr'.2.1
   have hfin : multilinearEval c'.mu low *
-      dot ((foldAll slotI (keccakSlotWeights τ c' 0 2)).headD []) slices = σ (.n 1388) := by
+      dot ((foldAll slotI (keccakSlotWeights τ c' 0 2)).headD []) slices = σ (.n 1156) := by
     rw [← h4104]
     refine vk_in_check (by omega) hptL hlocL hw hslotIL hslices hF (fun r hr ↦ ?_) hform
     rw [hSh r hr]
@@ -173,7 +173,7 @@ theorem verify_keccak_holds : verify_keccak_Spec := by
       rw [loadHolds_unique hpp hpp'] at hv
       rw [List.getElem_take, ← loadHolds_unique hv (hppR j (by omega)), mul_assoc, ← pow_add]
       exact h9
-    · have e : σ (.n 9) * gen ^ qkeccakVarsCap * gen ^ (4 + (τ - 4)) = σ (.n 1379) := by
+    · have e : σ (.n 9) * gen ^ qkeccakVarsCap * gen ^ (4 + (τ - 4)) = σ (.n 1147) := by
         rw [h4107, show 4 + (τ - 4) = τ by omega]
       rw [e]; exact hslotI
   · -- the slices
