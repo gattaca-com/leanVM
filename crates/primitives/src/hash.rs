@@ -137,7 +137,7 @@ trait Lanes64: Copy {
     }
 }
 
-/// The 24 rounds, over any lane type. Straight-line, so every rotation is an
+/// The `ROUNDS` rounds, over any lane type. Straight-line, so every rotation is an
 /// immediate and every lane index a register.
 ///
 /// ρ and π are written by output row, χ takes the rows in turn, and the next round's column
@@ -776,8 +776,28 @@ mod tests {
 
     /// Ethereum's `keccak256`, as an independent implementation computes it, across both sides of
     /// every block boundary up to five blocks.
+    /// The permutation is Keccak-p[1600, 12], as the `keccak` crate computes it.
     #[test]
-    #[ignore = "what-if: 12-round permutation, real Keccak-256 vectors no longer match"]
+    fn permutation_matches_keccak_p_1600_12() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        for case in 0..64 {
+            let mut state: [u64; STATE_LANES] = std::array::from_fn(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if case == 0 { 0 } else { seed }
+            });
+            let mut expected = state;
+            keccak::Keccak::new().with_p1600::<{ ROUNDS }>(|f| f(&mut expected));
+            let mut scalar = state;
+            permute(&mut scalar);
+            keccak_f(&mut state);
+            assert_eq!(scalar, expected, "portable, case {case}");
+            assert_eq!(state, expected, "keccak_f, case {case}");
+        }
+    }
+
+    #[test]
     fn matches_ethereum_keccak256() {
         use sha3::Digest;
         for n in (0..700).chain([1023, 1024, 1025, 4096]) {
