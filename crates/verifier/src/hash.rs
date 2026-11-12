@@ -47,6 +47,195 @@ pub const KECCAK_PI: [usize; STATE_LANES] = {
     pi
 };
 pub fn keccak_f(a: &mut [u64; STATE_LANES]) {
+    let mut aba = a[0];
+    let mut abe = a[1];
+    let mut abi = a[2];
+    let mut abo = a[3];
+    let mut abu = a[4];
+    let mut aga = a[5];
+    let mut age = a[6];
+    let mut agi = a[7];
+    let mut ago = a[8];
+    let mut agu = a[9];
+    let mut aka = a[10];
+    let mut ake = a[11];
+    let mut aki = a[12];
+    let mut ako = a[13];
+    let mut aku = a[14];
+    let mut ama = a[15];
+    let mut ame = a[16];
+    let mut ami = a[17];
+    let mut amo = a[18];
+    let mut amu = a[19];
+    let mut asa = a[20];
+    let mut ase = a[21];
+    let mut asi = a[22];
+    let mut aso = a[23];
+    let mut asu = a[24];
+
+    for round in 0..ROUNDS / 2 {
+        let ca = aba ^ aga ^ aka ^ ama ^ asa;
+        let ce = abe ^ age ^ ake ^ ame ^ ase;
+        let ci = abi ^ agi ^ aki ^ ami ^ asi;
+        let co = abo ^ ago ^ ako ^ amo ^ aso;
+        let cu = abu ^ agu ^ aku ^ amu ^ asu;
+        let d_a = cu ^ ce.rotate_left(1);
+        let d_e = ca ^ ci.rotate_left(1);
+        let d_i = ce ^ co.rotate_left(1);
+        let d_o = ci ^ cu.rotate_left(1);
+        let d_u = co ^ ca.rotate_left(1);
+
+        let ba = aba ^ d_a;
+        let be = (age ^ d_e).rotate_left(44);
+        let bi = (aki ^ d_i).rotate_left(43);
+        let bo = (amo ^ d_o).rotate_left(21);
+        let bu = (asu ^ d_u).rotate_left(14);
+        let eba = ba ^ (!be & bi) ^ KECCAK_RC[2 * round];
+        let ebe = be ^ (!bi & bo);
+        let ebi = bi ^ (!bo & bu);
+        let ebo = bo ^ (!bu & ba);
+        let ebu = bu ^ (!ba & be);
+
+        let ba = (abo ^ d_o).rotate_left(28);
+        let be = (agu ^ d_u).rotate_left(20);
+        let bi = (aka ^ d_a).rotate_left(3);
+        let bo = (ame ^ d_e).rotate_left(45);
+        let bu = (asi ^ d_i).rotate_left(61);
+        let ega = ba ^ (!be & bi);
+        let ege = be ^ (!bi & bo);
+        let egi = bi ^ (!bo & bu);
+        let ego = bo ^ (!bu & ba);
+        let egu = bu ^ (!ba & be);
+
+        let ba = (abe ^ d_e).rotate_left(1);
+        let be = (agi ^ d_i).rotate_left(6);
+        let bi = (ako ^ d_o).rotate_left(25);
+        let bo = (amu ^ d_u).rotate_left(8);
+        let bu = (asa ^ d_a).rotate_left(18);
+        let eka = ba ^ (!be & bi);
+        let eke = be ^ (!bi & bo);
+        let eki = bi ^ (!bo & bu);
+        let eko = bo ^ (!bu & ba);
+        let eku = bu ^ (!ba & be);
+
+        let ba = (abu ^ d_u).rotate_left(27);
+        let be = (aga ^ d_a).rotate_left(36);
+        let bi = (ake ^ d_e).rotate_left(10);
+        let bo = (ami ^ d_i).rotate_left(15);
+        let bu = (aso ^ d_o).rotate_left(56);
+        let ema = ba ^ (!be & bi);
+        let eme = be ^ (!bi & bo);
+        let emi = bi ^ (!bo & bu);
+        let emo = bo ^ (!bu & ba);
+        let emu = bu ^ (!ba & be);
+
+        let ba = (abi ^ d_i).rotate_left(62);
+        let be = (ago ^ d_o).rotate_left(55);
+        let bi = (aku ^ d_u).rotate_left(39);
+        let bo = (ama ^ d_a).rotate_left(41);
+        let bu = (ase ^ d_e).rotate_left(2);
+        let esa = ba ^ (!be & bi);
+        let ese = be ^ (!bi & bo);
+        let esi = bi ^ (!bo & bu);
+        let eso = bo ^ (!bu & ba);
+        let esu = bu ^ (!ba & be);
+
+        let ca = eba ^ ega ^ eka ^ ema ^ esa;
+        let ce = ebe ^ ege ^ eke ^ eme ^ ese;
+        let ci = ebi ^ egi ^ eki ^ emi ^ esi;
+        let co = ebo ^ ego ^ eko ^ emo ^ eso;
+        let cu = ebu ^ egu ^ eku ^ emu ^ esu;
+        let d_a = cu ^ ce.rotate_left(1);
+        let d_e = ca ^ ci.rotate_left(1);
+        let d_i = ce ^ co.rotate_left(1);
+        let d_o = ci ^ cu.rotate_left(1);
+        let d_u = co ^ ca.rotate_left(1);
+
+        let ba = eba ^ d_a;
+        let be = (ege ^ d_e).rotate_left(44);
+        let bi = (eki ^ d_i).rotate_left(43);
+        let bo = (emo ^ d_o).rotate_left(21);
+        let bu = (esu ^ d_u).rotate_left(14);
+        aba = ba ^ (!be & bi) ^ KECCAK_RC[2 * round + 1];
+        abe = be ^ (!bi & bo);
+        abi = bi ^ (!bo & bu);
+        abo = bo ^ (!bu & ba);
+        abu = bu ^ (!ba & be);
+
+        let ba = (ebo ^ d_o).rotate_left(28);
+        let be = (egu ^ d_u).rotate_left(20);
+        let bi = (eka ^ d_a).rotate_left(3);
+        let bo = (eme ^ d_e).rotate_left(45);
+        let bu = (esi ^ d_i).rotate_left(61);
+        aga = ba ^ (!be & bi);
+        age = be ^ (!bi & bo);
+        agi = bi ^ (!bo & bu);
+        ago = bo ^ (!bu & ba);
+        agu = bu ^ (!ba & be);
+
+        let ba = (ebe ^ d_e).rotate_left(1);
+        let be = (egi ^ d_i).rotate_left(6);
+        let bi = (eko ^ d_o).rotate_left(25);
+        let bo = (emu ^ d_u).rotate_left(8);
+        let bu = (esa ^ d_a).rotate_left(18);
+        aka = ba ^ (!be & bi);
+        ake = be ^ (!bi & bo);
+        aki = bi ^ (!bo & bu);
+        ako = bo ^ (!bu & ba);
+        aku = bu ^ (!ba & be);
+
+        let ba = (ebu ^ d_u).rotate_left(27);
+        let be = (ega ^ d_a).rotate_left(36);
+        let bi = (eke ^ d_e).rotate_left(10);
+        let bo = (emi ^ d_i).rotate_left(15);
+        let bu = (eso ^ d_o).rotate_left(56);
+        ama = ba ^ (!be & bi);
+        ame = be ^ (!bi & bo);
+        ami = bi ^ (!bo & bu);
+        amo = bo ^ (!bu & ba);
+        amu = bu ^ (!ba & be);
+
+        let ba = (ebi ^ d_i).rotate_left(62);
+        let be = (ego ^ d_o).rotate_left(55);
+        let bi = (eku ^ d_u).rotate_left(39);
+        let bo = (ema ^ d_a).rotate_left(41);
+        let bu = (ese ^ d_e).rotate_left(2);
+        asa = ba ^ (!be & bi);
+        ase = be ^ (!bi & bo);
+        asi = bi ^ (!bo & bu);
+        aso = bo ^ (!bu & ba);
+        asu = bu ^ (!ba & be);
+    }
+
+    a[0] = aba;
+    a[1] = abe;
+    a[2] = abi;
+    a[3] = abo;
+    a[4] = abu;
+    a[5] = aga;
+    a[6] = age;
+    a[7] = agi;
+    a[8] = ago;
+    a[9] = agu;
+    a[10] = aka;
+    a[11] = ake;
+    a[12] = aki;
+    a[13] = ako;
+    a[14] = aku;
+    a[15] = ama;
+    a[16] = ame;
+    a[17] = ami;
+    a[18] = amo;
+    a[19] = amu;
+    a[20] = asa;
+    a[21] = ase;
+    a[22] = asi;
+    a[23] = aso;
+    a[24] = asu;
+}
+
+#[cfg(test)]
+fn reference_keccak_f(a: &mut [u64; STATE_LANES]) {
     for rc in KECCAK_RC {
         // Row by row, so every index is a constant: an index computed per lane vectorizes to gathers.
         let c: [u64; 5] = std::array::from_fn(|x| a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]);
@@ -128,6 +317,61 @@ impl Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permutation_matches_reference() {
+        let mut seed = 0xD1B54A32D192ED03u64;
+        for _ in 0..4096 {
+            let mut state = std::array::from_fn(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            });
+            let mut expected = state;
+            reference_keccak_f(&mut expected);
+            keccak_f(&mut state);
+            assert_eq!(state, expected);
+        }
+    }
+
+    #[test]
+    fn permutation_of_zero() {
+        // The full zero-state output, generated with reference_keccak_f.
+        let expected = [
+            0xF1258F7940E1DDE7,
+            0x84D5CCF933C0478A,
+            0xD598261EA65AA9EE,
+            0xBD1547306F80494D,
+            0x8B284E056253D057,
+            0xFF97A42D7F8E6FD4,
+            0x90FEE5A0A44647C4,
+            0x8C5BDA0CD6192E76,
+            0xAD30A6F71B19059C,
+            0x30935AB7D08FFC64,
+            0xEB5AA93F2317D635,
+            0xA9A6E6260D712103,
+            0x81A57C16DBCF555F,
+            0x43B831CD0347C826,
+            0x01F22F1A11A5569F,
+            0x05E5635A21D9AE61,
+            0x64BEFEF28CC970F2,
+            0x613670957BC46611,
+            0xB87C5A554FD00ECB,
+            0x8C3EE88A1CCF32C8,
+            0x940C7922AE3A2614,
+            0x1841F924A2C509E4,
+            0x16F53526E70465C2,
+            0x75F644E97F30A13B,
+            0xEAF1FF7B5CECA249,
+        ];
+        let mut reference = [0; STATE_LANES];
+        reference_keccak_f(&mut reference);
+        assert_eq!(reference, expected);
+        let mut state = [0; STATE_LANES];
+        keccak_f(&mut state);
+        assert_eq!(state, expected);
+    }
 
     /// Keccak-256 of the bytes `00 01 ..` (mod 256), from the `sha3` crate's `Keccak256`, on each side of a block
     /// boundary.
