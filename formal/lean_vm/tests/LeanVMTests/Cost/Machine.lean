@@ -6,8 +6,8 @@ import LeanVM.Cost.Encoding
 * each primitive on sample values, with its price;
 * misuse fails: a primitive on the wrong kind of value, a variable or a field that does not exist,
   a call of a missing function, too little fuel;
-* Keccak-f[1600] written in the language (one function per round, a recursive loop over the 24
-  round constants) equals the statement's `keccakF1600`, at `26648 ≈ 2^14.7` per permutation.
+* Keccak-f[1600] written in the language (one function per round, a recursive loop over the 12
+  round constants) equals the statement's `keccakF1600`.
 -/
 
 namespace LeanVMTests.Cost
@@ -137,7 +137,7 @@ def roundB : B :=
 `2` one round. -/
 def keccakProgram : LeanVM.Cost.MachineProgram := #[
   .call 1 [.position 0, .literal (.nat 0)],
-  .case (.primitive .lessThan [.position 1, .literal (.nat 24)]) [
+  .case (.primitive .lessThan [.position 1, .literal (.nat 12)]) [
     .position 0,
     .call 1 [.call 2 [.position 0, .primitive .arrayGet [.literal (.array (keccakRC.toArray.map (.nat ·.toNat))), .position 1,
       .literal (.nat 0)]], .primitive .add [.position 1, .literal (.nat 1)]]],
@@ -149,8 +149,8 @@ def stateA : KeccakState := Vector.ofFn fun i ↦ (i.val * 0x9E3779B97F4A7C15 + 
     (·.1) ==
   some (MachineEncoding.encodeValue (keccakF1600 0))
 #guard (runMachineProgram keccakProgram 100 (MachineEncoding.encodeValue stateA)).map (·.1) == some (MachineEncoding.encodeValue (keccakF1600 stateA))
--- The price of one permutation: `26648`, between `2^14` and `2^15`.
+-- The price of one permutation.
 #guard (runMachineProgram keccakProgram 100 (MachineEncoding.encodeValue stateA)).map
-    (·.2) == some 26648
+    (·.2) == some 13328
 
 end LeanVMTests.Cost
