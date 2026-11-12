@@ -1,17 +1,40 @@
 //! Merkle openings: one full path per query.
 
 use crate::field::K;
-use crate::hash::{Digest, keccak_hash};
+use crate::hash::{Digest, PAD_FIRST, RATE, STATE_LANES, keccak_f};
 
 pub fn hash_pair(left: &[u8], right: &[u8]) -> Digest {
-    let mut pair = [0u8; 64];
-    pair[..32].copy_from_slice(left);
-    pair[32..].copy_from_slice(right);
-    keccak_hash(&pair)
+    let left: &[u8; 32] = left.try_into().unwrap();
+    let right: &[u8; 32] = right.try_into().unwrap();
+    let mut state = [0u64; STATE_LANES];
+    for (lane, word) in state[..4].iter_mut().zip(left.as_chunks::<8>().0) {
+        *lane = u64::from_le_bytes(*word);
+    }
+    for (lane, word) in state[4..8].iter_mut().zip(right.as_chunks::<8>().0) {
+        *lane = u64::from_le_bytes(*word);
+    }
+    state[8] = u64::from(PAD_FIRST);
+    state[RATE / 8 - 1] = 1 << 63;
+    keccak_f(&mut state);
+    Digest::from_state(&state)
 }
 
 fn hash_leaf(image: &[K]) -> Digest {
-    keccak_hash(&image.iter().flat_map(|word| word.to_bytes()).collect::<Vec<u8>>())
+    let mut state = [0u64; STATE_LANES];
+    let (blocks, tail) = image.as_chunks::<{ RATE / 8 }>();
+    for block in blocks {
+        for (lane, word) in state.iter_mut().zip(block) {
+            *lane ^= word.0;
+        }
+        keccak_f(&mut state);
+    }
+    for (lane, word) in state.iter_mut().zip(tail) {
+        *lane ^= word.0;
+    }
+    state[tail.len()] ^= u64::from(PAD_FIRST);
+    state[RATE / 8 - 1] ^= 1 << 63;
+    keccak_f(&mut state);
+    Digest::from_state(&state)
 }
 
 /// One query's own opening, the form the Rust and Lean verifiers read.
@@ -86,6 +109,7 @@ pub(crate) fn roots_match(paths: &[MerklePath], root: Digest) -> bool {
 mod tests {
     use super::*;
     use crate::VerifierError;
+    use crate::hash::keccak_hash;
     use crate::transcript::{Proof, Transcript};
 
     fn random(seed: &mut u64) -> u64 {
@@ -93,6 +117,27 @@ mod tests {
         *seed ^= *seed >> 7;
         *seed ^= *seed << 17;
         *seed
+    }
+
+    #[test]
+    fn leaf_hash_matches_bytes() {
+        let mut seed = 0xD1B54A32D192ED03;
+        for words in 0..=4 * RATE / 8 + 1 {
+            for _ in 0..16 {
+                let leaf: Vec<_> = (0..words).map(|_| K(random(&mut seed))).collect();
+                let bytes: Vec<_> = leaf.iter().flat_map(|word| word.to_bytes()).collect();
+                assert_eq!(hash_leaf(&leaf), keccak_hash(&bytes), "{words} words");
+            }
+        }
+    }
+
+    #[test]
+    fn pair_hash_matches_bytes() {
+        let mut seed = 0x94D049BB133111EB;
+        for _ in 0..4096 {
+            let bytes: [u8; 64] = std::array::from_fn(|_| random(&mut seed) as u8);
+            assert_eq!(hash_pair(&bytes[..32], &bytes[32..]), keccak_hash(&bytes));
+        }
     }
 
     fn tree(seed: &mut u64, height: usize, leaf_words: usize) -> (Digest, Vec<MerklePath>) {

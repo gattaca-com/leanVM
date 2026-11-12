@@ -4,7 +4,8 @@ use crate::field::E;
 
 pub const STATE_LANES: usize = 25;
 /// The sponge rate in bytes.
-const RATE: usize = 136;
+pub(crate) const RATE: usize = 136;
+pub(crate) const PAD_FIRST: u8 = 0x01;
 pub const ROUNDS: usize = 24;
 
 pub const KECCAK_RC: [u64; ROUNDS] = [
@@ -273,15 +274,11 @@ pub fn keccak_hash(data: &[u8]) -> Digest {
     }
     let mut block = [0u8; RATE];
     block[..tail.len()].copy_from_slice(tail);
-    block[tail.len()] ^= 0x01;
+    block[tail.len()] ^= PAD_FIRST;
     block[RATE - 1] ^= 0x80;
     xor_block(&mut state, &block);
     keccak_f(&mut state);
-    let mut value = [0u8; 32];
-    for (bytes, lane) in value.as_chunks_mut().0.iter_mut().zip(state) {
-        *bytes = lane.to_le_bytes();
-    }
-    Digest(value)
+    Digest::from_state(&state)
 }
 
 /// 256 bits
@@ -289,6 +286,15 @@ pub fn keccak_hash(data: &[u8]) -> Digest {
 pub struct Digest(pub [u8; 32]);
 
 impl Digest {
+    /// The first 32 bytes of a Keccak state, little-endian within each lane.
+    pub(crate) fn from_state(state: &[u64; STATE_LANES]) -> Self {
+        let mut value = [0u8; 32];
+        for (bytes, lane) in value.as_chunks_mut().0.iter_mut().zip(state) {
+            *bytes = lane.to_le_bytes();
+        }
+        Self(value)
+    }
+
     /// Its four 64-bit words, the form a seed takes in the sponge's lanes.
     pub fn words(&self) -> [u64; 4] {
         std::array::from_fn(|i| u64::from_le_bytes(self.0.as_chunks().0[i]))
