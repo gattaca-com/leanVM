@@ -72,7 +72,7 @@ def prog_const_params : TestProgram where
         .mk 29 (.call "keccak" [(.slice (.var "buf") (.mul (.var "k") (.lit 2)) (.add (.mul (.var "k") (.lit 2)) (.lit 2))), (.slice (.var "buf") (.mul (.var "k") (.lit 2)) (.add (.mul (.var "k") (.lit 2)) (.lit 2))), (.var "h")]),
         .mk 30 (.ret [(.index (.var "h") (.lit 0)), (.index (.var "h") (.lit 1))])] }],
     []⟩
-  publicInput := [(8419436658373306735, 8560260442381905814, 0), (16553279757884611295, 2202256311726981445, 0)]
+  publicInput := [(6415486785464874008, 7035657000653539136, 0), (11325254708148893354, 14377422338973882589, 0)]
   streams := []
 
 /-- `fibonacci.py`. -/
@@ -116,7 +116,7 @@ def prog_hash_heap_chain : TestProgram where
         .mk 20 (.store (.var "p") .gen (.index (.var "buf") (.gpow 7))),
         .mk 21 (.ret [])] }],
     []⟩
-  publicInput := [(9965072543559310962, 1476713437931028367, 0), (15038022416799512296, 6478900027803842741, 0)]
+  publicInput := [(11659342795095385388, 14285847811909600058, 0), (16446375979840012998, 6141030845821579025, 0)]
   streams := []
 
 /-- `hash_slices.py`. -/
@@ -143,7 +143,7 @@ def prog_hash_slices : TestProgram where
         .mk 26 (.store (.var "p") .gen (.index (.var "hb") (.gpow 3))),
         .mk 27 (.ret [])] }],
     []⟩
-  publicInput := [(13374056479446869119, 1165808885054174911, 0), (10395465580989337593, 17035173510591191626, 0)]
+  publicInput := [(1102868252777805221, 3051385316789319612, 0), (15951579895270939530, 8607655488397841762, 0)]
   streams := []
 
 /-- `heapbuf_dyn.py`. -/
@@ -375,7 +375,7 @@ def prog_unroll : TestProgram where
           .mk 30 (.call "keccak" [(.slice (.var "buf") (.mul (.var "i") (.lit 2)) (.add (.mul (.var "i") (.lit 2)) (.lit 2))), (.slice (.var "buf") (.mul (.var "i") (.lit 2)) (.add (.mul (.var "i") (.lit 2)) (.lit 2))), (.slice (.var "buf") (.add (.mul (.var "i") (.lit 2)) (.lit 2)) (.add (.mul (.var "i") (.lit 2)) (.lit 4)))])]),
         .mk 31 (.ret [])] }],
     []⟩
-  publicInput := [(9965072543559310962, 1476713437931028367, 0), (15038022416799512296, 6478900027803842741, 0)]
+  publicInput := [(11659342795095385388, 14285847811909600058, 0), (16446375979840012998, 6141030845821579025, 0)]
   streams := []
 
 /-- `wots_walk.py`. -/
@@ -410,7 +410,7 @@ def prog_wots_walk : TestProgram where
           .mk 37 (.let_ "p" (.mul (.mul (.var "p") .gen) .gen))]),
         .mk 38 (.ret [(.index (.var "buf") (.var "p")), (.index (.var "buf") (.mul (.var "p") .gen))])] }],
     []⟩
-  publicInput := [(5424567347477364969, 11320273246001258297, 0), (13399249004939818843, 6414592463089217630, 0)]
+  publicInput := [(14831646986243935459, 6907265569596172555, 0), (8960160522017078831, 17896698548984999625, 0)]
   streams := []
 
 /-- Every test program. -/
