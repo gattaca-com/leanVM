@@ -1,5 +1,7 @@
-import Statement.Field
-import Mathlib.Tactic.Ring
+module
+
+public import Statement.Field
+public import Mathlib.Tactic.Ring
 
 /-!
 # Products in `E` on machine words
@@ -16,6 +18,8 @@ converts its six limbs once, computes the nine coefficient products and the redu
 (`LeanVM.Prover.Fast.Copy`) call them where the statement's prover multiplies in `E`, and they
 compile as the word-level computations.
 -/
+
+@[expose] public section
 
 namespace LeanVM.Prover.Fast
 
