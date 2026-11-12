@@ -46,10 +46,10 @@ theorem coreProgram_fresh : coreProgram.Fresh := by
   have h0 : FreshOn 0 11 := freshRange_0.on
   have h1 : FreshOn 0 12 :=
     h0.append' (freshRange_11.on) rfl rfl
-  have h2 : FreshOn 0 17 :=
+  have h2 : FreshOn 0 18 :=
     h1.append' (freshRange_12.on) rfl rfl
   have h3 : FreshOn 0 19 :=
-    h2.append' (freshRange_17.on) rfl rfl
+    h2.append' (freshRange_18.on) rfl rfl
   have h4 : FreshOn 0 20 :=
     h3.append' (freshOn_one (j := 19) rfl core19_fresh) rfl rfl
   have h5 : FreshOn 0 30 :=
