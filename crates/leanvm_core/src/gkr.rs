@@ -148,14 +148,14 @@ impl<T> Drop for Mapping<T> {
 /// The leaves cover `len` values, stored as blocks or borrowed from columns, with the identity after.
 ///
 /// `ones` are sorted, disjoint runs of leaves that are the identity. The GKR never reads a whole
-/// block of 64 inside a run, at the leaves or at any level above them (see [`identity_blocks`]),
+/// block of 64 inside a run, at the leaves or at any level above them,
 /// so the builder may leave those blocks of `leaves` and `quads` unwritten.
 ///
 /// A builder that has the quads in hand may also write the levels above them for whole blocks of 64
 /// leaves: `tiers` are levels 4 and 6, of the length the levels have (or empty), and `staged` are
 /// sorted, disjoint runs of blocks. A run holds the level-4 entries of its blocks, and the level-6
 /// entry of each group of eight blocks that starts at a multiple of eight and lies inside the run.
-/// [`build_layers`] computes the entries no run holds.
+/// Layer construction computes the entries no run holds.
 pub struct Leaves<'a, F: TreeField = F128> {
     pub leaves: LeafData<'a, F>,
     pub len: usize,
@@ -297,7 +297,7 @@ pub trait TableBlock: primitives::Plain + Send + Sync {
     const ONE: Self;
 
     /// Adds the first two round polynomials of the blocks `self` and `second`, one pair of blocks,
-    /// weighted by `weight`, to `sum` ([`bivariate_summand`]).
+    /// weighted by `weight`, to `sum`.
     fn bivariate(&self, second: &Self, weight: F128x8, sum: &mut BivariateSum);
 }
 
@@ -846,7 +846,7 @@ impl TableBlock for KBlock {
     }
 
     const ONE: Self = [F64x8::ONE; 8];
-    /// [`bivariate_summand`] with every product in `K`: only the weight is in `E`, and it multiplies
+    /// Accumulate the bivariate coefficients with every product in `K`: only the weight is in `E`, and it multiplies
     /// the 25 values as mixed products.
     #[inline(never)]
     fn bivariate(&self, second: &Self, weight: F128x8, sum: &mut BivariateSum) {

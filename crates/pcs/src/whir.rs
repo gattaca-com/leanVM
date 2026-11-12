@@ -148,7 +148,7 @@ fn defers() -> bool {
 /// never rides the proof.
 ///
 /// `repeats` tags the message's blocks of `2^EQUAL_BLOCK_LOG` words that equal their predecessor, or is empty.
-/// A lane block all zero by it is left out of the encode too, see [`data_blocks`].
+/// A lane block identified as all zero is left out of the encode too.
 /// Its codeword lane is zero, so the leaf images, the root and the opened rows are the same.
 pub fn commit(
     message: &[F64],
