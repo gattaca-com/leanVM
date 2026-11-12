@@ -34,7 +34,7 @@ import sys
 LANES = 6  # log2 of the 2^6 lanes
 LIST = 12  # log2 of the candidates (`candidates_ncard_le`) and the pruning survivors
            # (`pruneUpTo_length_le`)
-KECCAK = 12  # log2 of Keccak-f[1600]'s word operations, 24 rounds of about 170
+KECCAK = 11  # log2 of Keccak-p[1600, 12]'s word operations, 12 rounds of about 170
 
 
 def lg(x):

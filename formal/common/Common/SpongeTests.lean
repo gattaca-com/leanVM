@@ -1,24 +1,25 @@
 import Common.Sponge
 
-/-! Keccak-256 of `Common/Sponge.lean` on the test vectors of leanVM's `hash.rs`, evaluated: a file
+/-! The twelve-round sponge of `Common/Sponge.lean` on vectors from leanVM's `hash.rs`, evaluated: a file
 of its own, outside the module system, since a module cannot evaluate its own definitions. -/
 
 namespace Common
 
-/-! The test vectors of `hash.rs` (from the `sha3` crate's `Keccak256`), on each side of a block
-boundary. -/
+/-! Vectors from `primitives::hash::hash` over `Keccak-p[1600, 12]`, on each side of a block
+boundary. Each input is the byte ramp `i mod 256`; each digest was independently cross-checked
+by absorbing its padded blocks with the `keccak` crate's `with_p1600::<12>`. -/
 
 #guard hexOfBytes (keccak256 (countingBytes 0)).toList ==
-  "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+  "e3dd2df0943bde6d82e39ec36059f35cd76720e2df38cc6b10b69fddfcaa3a4a"
 #guard hexOfBytes (keccak256 (countingBytes 1)).toList ==
-  "bc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a"
+  "73ebf1d543d855a3c5e4be6322f75604c254f70394b396884b6010fcca694722"
 #guard hexOfBytes (keccak256 (countingBytes 135)).toList ==
-  "cbdfd9dee5faad3818d6b06f95a219fd290b0e1706f6a82e5a595b9ce9faca62"
+  "1d293c78401fd0d2d748e1e001aa9b8f63e6b5448361525727ce6fd1934c3015"
 #guard hexOfBytes (keccak256 (countingBytes 136)).toList ==
-  "7ce759f1ab7f9ce437719970c26b0a66ff11fe3e38e17df89cf5d29c7d7f807e"
+  "7312c13db895e18f65174d26a0adf8e3fdcf4983069751aea26a55d4d355549a"
 #guard hexOfBytes (keccak256 (countingBytes 137)).toList ==
-  "ac73d4fae68b8453f764007c1a20ce95994187861f0c3227a3a8e99a73a3b1db"
+  "3bb0daeba2195cc89de7b33ea0ec50136c5ad7aa2b117a4f2b6ac1a853040fd1"
 #guard hexOfBytes (keccak256 (countingBytes 272)).toList ==
-  "fdf2ec49e749960d3c8521a0219af8d03e30e2b3bf19bd16150ee0eaf133d66e"
+  "19ac667ee9333b746bdd231f429bb2a029c83f926db5147129116e4755f1ef3d"
 
 end Common
