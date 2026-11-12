@@ -1,7 +1,7 @@
 /-
   LeanVM.Protocol.Keccak.OpenIn
 
-  Opening the committed inputs: the claim at depth `12` as a sum over the instances, then over
+  Opening the committed inputs: the claim at depth `6` as a sum over the instances, then over
   the slots and slices of `q_keccak`, down to the `64` bit-slice claims.
 -/
 
@@ -12,7 +12,7 @@ public import LeanVM.Protocol.Keccak.OpenOut
 /-!
 # The inputs' opening
 
-The claim at depth `12` is on the committed inputs, slot `25m + ℓ` of `q_keccak` holding lane
+The claim at depth `6` is on the committed inputs, slot `25m + ℓ` of `q_keccak` holding lane
 `ℓ` of segment `m`'s input (`doc/leanvm` eq. `keccak:eq:in` with §`keccak:segments`). With
 `Φ(i)` the claim's sum restricted to instance `i`:
 
@@ -36,10 +36,10 @@ open scoped ENNReal
 
 variable (P : ℕ)
 
-/-- The claim at depth `12` restricted to instance `i`. -/
+/-- The claim at depth `6` restricted to instance `i`. -/
 noncomputable def PhiI (col : ℕ → K) (claim : KeccakClaim) (i : ℕ) : E :=
   ∑ z ∈ range (2 ^ (P + 1)), eqAt claim.point z *
-    ∑ j ∈ range 1600, claim.weights.getD j 0 * bitE (stAt (statesAt (P + 4) col 12) P z i j)
+    ∑ j ∈ range 1600, claim.weights.getD j 0 * bitE (stAt (statesAt (P + 4) col 6) P z i j)
 
 /-- The instance weights, extended over the four instance bits. -/
 noncomputable def MuT (mu pt : List E) : E := ∑ i ∈ range (2 ^ 4), eqAt pt i * mu.getD i 0
@@ -58,7 +58,7 @@ theorem Fl_plainFamily {β : Type} (qk : β → ℕ → K) (claim : KeccakClaim)
     fun _ pre post ↦ polyLE_mle_mul _ _ _ _ pre post
 
 theorem Fl_nil (col : ℕ → K) (claim : KeccakClaim) :
-    Fl P col claim [] = claimSum (statesAt (P + 4) col 12) P claim.point claim.mu claim.weights := by
+    Fl P col claim [] = claimSum (statesAt (P + 4) col 6) P claim.point claim.mu claim.weights := by
   rw [Fl, cubeSum_nil]
   have hu : ∀ u ∈ range (2 ^ 4), MuT claim.mu (bitsE u 4) * PhiT P col claim (bitsE u 4) =
       claim.mu.getD u 0 * PhiI P col claim u := by
@@ -74,7 +74,7 @@ theorem Fl_nil (col : ℕ → K) (claim : KeccakClaim) :
 noncomputable def sliceMle (col : ℕ → K) (a : List E) (o z : ℕ) : E :=
   ∑ x ∈ range (2 ^ (P + 4)), eqAt a x * bitE ((col (x + 2 ^ (P + 4) * o)).toBitVec.getLsbD z)
 
-/-- The slot weights of the claim at depth `12`, slice `z`, extended over the slot bits. -/
+/-- The slot weights of the claim at depth `6`, slice `z`, extended over the slot bits. -/
 noncomputable def Ws (claim : KeccakClaim) (z : ℕ) (pt : List E) : E :=
   ∑ o ∈ range (2 ^ 6), eqAt pt o * slotW (eqKernel (claim.point.drop P)) claim.weights 0 2 o z
 
@@ -94,14 +94,14 @@ theorem Fs_plainFamily {β : Type} (qk : β → ℕ → K) (claim : KeccakClaim)
     fun _ pre post ↦ PolyLE.const_mul (PolyLE.sum _ fun _ _ ↦
       polyLE_mle_mul _ _ _ _ pre post) _
 
-/-- The states at depth `12` are the committed inputs' bits. -/
+/-- The states at depth `6` are the committed inputs' bits. -/
 theorem statesAt_12 (col : ℕ → K) (m x : ℕ) {j : ℕ} (hj : j < 1600) :
-    statesAt (P + 4) col 12 m x j =
+    statesAt (P + 4) col 6 m x j =
       (col (x + 2 ^ (P + 4) * (25 * m + j / 64))).toBitVec.getLsbD (j % 64) := by
   rw [statesAt, Nat.sub_self, segState, roundsFrom_zero, sbit, lane_inState _ _ _ _ (by omega)]
   rfl
 
-/-- The claim at depth `12` on segment `m` and step `x`. -/
+/-- The claim at depth `6` on segment `m` and step `x`. -/
 noncomputable def Gin (col : ℕ → K) (claim : KeccakClaim) (m x : ℕ) : E :=
   ∑ j ∈ range 1600, claim.weights.getD j 0 *
     bitE ((col (x + 2 ^ (P + 4) * (25 * m + j / 64))).toBitVec.getLsbD (j % 64))
@@ -124,7 +124,7 @@ theorem phi_eq (col : ℕ → K) (claim : KeccakClaim) (hshape : ClaimShape P cl
   have hb : (claim.point.take P).length = P := by simp [hshape.2.1]
   have hsd : (claim.point.drop P).length = 1 := by simp [hshape.2.1]
   have hX : ∀ z i, ∑ j ∈ range 1600, claim.weights.getD j 0 *
-      bitE (stAt (statesAt (P + 4) col 12) P z i j) =
+      bitE (stAt (statesAt (P + 4) col 6) P z i j) =
         Gin P col claim (z / 2 ^ P) (i + 16 * (z % 2 ^ P)) := fun z i ↦
     Finset.sum_congr rfl fun j hj ↦ by
       rw [stAt, statesAt_12 P col _ _ (Finset.mem_range.1 hj)]

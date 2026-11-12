@@ -423,7 +423,7 @@ theorem keccakF_cost (hP : Includes P Auto.LeanVM.Cost.Extractor.executeWithShar
       rw [Auto.LeanVM.Cost.Extractor.executeWithShared.c260.lam5.lam0.lam0.costEq P hP]
       have := keccakRound_cost P (by includes) acc rc
       omega⟩)
-  have hl : keccakRC.length = 24 := rfl
+  have hl : keccakRC.length = 12 := rfl
   rw [hl] at this
   omega
 

@@ -13,7 +13,7 @@ public import LeanVM.Protocol.Keccak.CompleteLayer
 # The honest Keccak prover
 
 For a column `col` whose output-lane claims hold against the committed middle state
-(`outClaimsTrueMid`) and whose middle state agrees with twelve rounds of the input at `inst`
+(`outClaimsTrueMid`) and whose middle state agrees with six rounds of the input at `inst`
 (`midAgree`; both follow from `RegionValid` and the claims against `keccakF`,
 `outClaims_of_regionValid`), the honest prover `hKeccak` sends
 
@@ -45,13 +45,13 @@ noncomputable def hLayers (col : ℕ → K) : List ℕ → KeccakClaim → Scrip
   | d :: ds, claim => hLayer (statesAt (P + 4) col (d + 1)) P claim >>= fun c ↦ hLayers col ds c
 
 theorem follows_layers (col : ℕ → K) (cs : Commits) :
-    ∀ (n d : ℕ), d + n = 12 → ∀ claim, ClaimShape P claim →
+    ∀ (n d : ℕ), d + n = 6 → ∀ claim, ClaimShape P claim →
       ClaimTrue (statesAt (P + 4) col d) P claim →
       Follows (fun cs' a c ↦ cs' = cs ∧ a = c ∧ ClaimShape P c ∧
-          ClaimTrue (statesAt (P + 4) col 12) P c)
+          ClaimTrue (statesAt (P + 4) col 6) P c)
         (hLayers P col (List.range' d n) claim) (keccakLayers (P + 4) (List.range' d n) claim) cs
   | 0, d, hd, claim, hs, ht => by
-    rw [show d = 12 by omega] at ht
+    rw [show d = 6 by omega] at ht
     exact ⟨rfl, rfl, hs, ht⟩
   | n + 1, d, hd, claim, hs, ht => by
     show Follows _ (hLayer (statesAt (P + 4) col (d + 1)) P claim >>= fun c ↦
@@ -140,7 +140,7 @@ noncomputable def hInput (col : ℕ → K) (claim : KeccakClaim) (outs : List Co
   Script.ret (outs, y.1 ++ claim.point.take P ++ x.1, slicesOf P col (y.1 ++ claim.point.take P) x.1)
 
 theorem follows_input (col : ℕ → K) (claim : KeccakClaim) (hshape : ClaimShape P claim)
-    (htrue : ClaimTrue (statesAt (P + 4) col 12) P claim) (outs : List ColumnClaim)
+    (htrue : ClaimTrue (statesAt (P + 4) col 6) P claim) (outs : List ColumnClaim)
     (cs : Commits) :
     Follows (fun cs' a res ↦ cs' = cs ∧ a = res ∧ res.1 = outs ∧
         slicesTrue (P + 4) col res.2.1 res.2.2)
@@ -194,7 +194,7 @@ noncomputable def hKeccak (col : ℕ → K) (inst output : List E) :
   Script.sampleN 1 >>= fun segment ↦
   Script.sampleN 5 >>= fun lanesPt ↦
   Script.sendE (committedOf P col inst segment lanesPt) >>= fun _ ↦
-  hLayers P col (List.range' 0 12)
+  hLayers P col (List.range' 0 6)
     (firstClaim inst segment lanesPt output (committedOf P col inst segment lanesPt)) >>= fun claim ↦
   hOpen (Fo (P + 4) col inst segment lanesPt) >>= fun x ↦
   Script.sendE (Qo (P + 4) col inst x.1) >>= fun _ ↦
@@ -203,7 +203,7 @@ noncomputable def hKeccak (col : ℕ → K) (inst output : List E) :
     ColumnClaim)]
 
 /-- **Completeness of the Keccak reduction.** For a column whose output-lane claims hold
-against the committed middle state and whose middle state agrees with twelve rounds of the
+against the committed middle state and whose middle state agrees with six rounds of the
 input at `inst`, the honest prover follows `verifyKeccak` (every check passes, for every
 challenge), and the verifier returns true column claims and `64` true slice claims. -/
 theorem follows_keccak (col : ℕ → K) {inst output : List E} (hi : inst.length = P + 4)
@@ -220,8 +220,8 @@ theorem follows_keccak (col : ℕ → K) {inst output : List E} (hi : inst.lengt
   obtain ⟨rfl, rfl, hl⟩ := h₂
   refine Follows.bind_of (Follows.sendE_readE _ cs₂) fun cs₃ _ c h₃ ↦ ?_
   obtain ⟨rfl, rfl⟩ := h₃
-  rw [show List.range keccakDepth = List.range' 0 12 from List.range_eq_range']
-  refine Follows.bind_of (follows_layers P col cs₃ 12 0 rfl _ (firstClaim_shape _ hi hs)
+  rw [show List.range keccakDepth = List.range' 0 6 from List.range_eq_range']
+  refine Follows.bind_of (follows_layers P col cs₃ 6 0 rfl _ (firstClaim_shape _ hi hs)
     (first_true P col hi hs hl ho hmid hagree)) fun cs₄ claim claim' h₄ ↦ ?_
   obtain ⟨rfl, rfl, hshape, htrue⟩ := h₄
   refine Follows.bind_of (follows_open (Fo (P + 4) col inst seg lanes) (P + 4) _ 1

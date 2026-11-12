@@ -27,10 +27,10 @@ adversary, the verifier rejects with probability at most (`Rom.romComplete`)
 
   `completenessError fuel = Q · (1 - 2^-17)^fuel`,
 
-`Q = (1 + 1) + 50689 · (2^29 + 2·fuel + 2) + 12674` the queries of the prover and the verifier
-together (`completenessQueries`): the seed's hash and permutation, `leanVmCost = 50689`
+`Q = (1 + 1) + 48907 · (2^29 + 2·fuel + 2) + 12228` the queries of the prover and the verifier
+together (`completenessQueries`): the seed's hash and permutation, `leanVmCost = 48907`
 moves of the program each costing the prover at most `proverFactor costHeight fuel =
-2^29 + 2·fuel + 2` queries, and the verifier's `leanVmQueryBound = 12674`
+2^29 + 2·fuel + 2` queries, and the verifier's `leanVmQueryBound = 12228`
 (`romComplete_leanVm`); every proof of work asks for at most `maxGrindingBits = 17` bits, the
 query grinding's `17` (`Sound.grind_bits_ok`). At `fuel = 2^25`, it is
 below `2^-257` (`completenessError_le`): `Q ≤ 2^47`, and a proof of work of at most seventeen bits

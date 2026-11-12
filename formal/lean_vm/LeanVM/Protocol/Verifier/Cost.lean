@@ -36,16 +36,16 @@ window:
   `159` columns read once);
 * the public input: `4`, its challenge (the prover sends nothing);
 * `KECCAK`'s reduction (`keccakPhase`, `verifyKeccak`) at a point of at most `30` coordinates:
-  `keccakCost 27`, `12` layers of `135 + 6 · 27`;
+  `keccakCost 27`, `6` layers of `135 + 6 · 27`;
 * ring switching: `6` challenges, `24`;
 * the stacked opening: `6` plus the WHIR levels (`whirCost`), at most `whirBound` over the 60
   admissible ladders (`ladder_cost`, decided), every commitment of height at most
   `costHeight = 28`.
 
-In total `leanVmCost = 50689` quarters (`costLE_leanVmProgram`). The seed of `spongeSeedWith` is one
+In total `leanVmCost = 48907` quarters (`costLE_leanVmProgram`). The seed of `spongeSeedWith` is one
 hash and one permutation (`leanVmSeed`, `seedRun_leanVmSeed`), so the compiled verifier makes at
 most
-`leanVmQueryBound = 1 + 1 + leanVmCost / 4 = 12674` queries on every proof
+`leanVmQueryBound = 1 + 1 + leanVmCost / 4 = 12228` queries on every proof
 (`isTotalQueryBound_leanVm`). The bound is crude where a tight one would cost proof without
 changing the soundness bound, in which it enters linearly: the bus depth, the table heights and
 the Keccak point are bounded by the announced sizes' window (`30`), not by the stack's size, and
@@ -941,9 +941,9 @@ program's cost in quarters. -/
 def leanVmQueryBound : ℕ := 1 + 1 + leanVmCost / 4
 
 /-- The bound, evaluated. -/
-theorem leanVmQueryBound_eq : leanVmQueryBound = 12674 := by decide
+theorem leanVmQueryBound_eq : leanVmQueryBound = 12228 := by decide
 
-/-- **The compiled leanVM verifier makes at most `leanVmQueryBound = 12674` queries** to the random
+/-- **The compiled leanVM verifier makes at most `leanVmQueryBound = 12228` queries** to the random
 oracles on every proof, for every bytecode and public input: the hypothesis `hV` of `romSound`
 at the leanVM program and seed. -/
 theorem isTotalQueryBound_leanVm (bytecode : List K) (publicInput : Digest) (π : Proof) :

@@ -132,10 +132,10 @@ theorem canonicalKeccak_of_keccakCells {input output : Fin 13 → E} {inOdd outO
 
 /-! ## Segments of the permutation -/
 
-/-- Segment `m` of Keccak-f[1600]: its rounds `12m` to `12m + 11` (the Keccak reduction's
-`KECCAK_DEPTH = 12`, `crates/verifier/src/layout.rs:83`). -/
+/-- Segment `m` of the permutation: its rounds `6m` to `6m + 5` (the Keccak reduction's
+`KECCAK_DEPTH = 6`, `crates/verifier/src/layout.rs:83`). -/
 def keccakSegment (m : ℕ) (a : KeccakState) : KeccakState :=
-  ((keccakRC.drop (12 * m)).take 12).foldl Keccak.round a
+  ((keccakRC.drop (6 * m)).take 6).foldl Keccak.round a
 
 /-- **Keccak-f[1600] is its two segments.** -/
 theorem keccakF_eq_segments (a : KeccakState) : keccakF1600 a = keccakSegment 1 (keccakSegment 0 a) := by

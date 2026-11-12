@@ -276,7 +276,7 @@ of the committed middle state `q_keccak` holds at step `x`. -/
 theorem outCol_getD (q : Column (verifierLayout prog s).stackLog) (l : Fin 25) {x : ℕ}
     (hx : x < 2 ^ s.τ 5) :
     ((leanIsaInstance prog s).column (toI prog s q) (outCol l)).values.getD x 0 =
-      KeccakGkr.laneWord (KeccakGkr.roundsFrom 12 12
+      KeccakGkr.laneWord (KeccakGkr.roundsFrom 6 6
         (KeccakGkr.inState (s.τ 5) (qkOf (verifierLayout prog s) q) 1 x)) l := by
   have h := column_outCol prog s (toI prog s q) l ⟨x, hx⟩
   rw [show (25 : ℕ) = 25 * 1 from rfl, state_eq_inState prog s q 1 (by norm_num)] at h
@@ -295,7 +295,7 @@ is the claimed value. -/
 theorem laneHolds_iff (q : Column (verifierLayout prog s).stackLog) (l : Fin 25) (inst : List E)
     (hi : inst.length = s.τ 5) (v : E) :
     WireHolds prog s ⟨113 + l.val, inst, v⟩ q ↔
-      KeccakGkr.stepMle (s.τ 5) inst (fun x ↦ KeccakGkr.laneWord (KeccakGkr.roundsFrom 12 12
+      KeccakGkr.stepMle (s.τ 5) inst (fun x ↦ KeccakGkr.laneWord (KeccakGkr.roundsFrom 6 6
         (KeccakGkr.inState (s.τ 5) (qkOf (verifierLayout prog s) q) 1 x)) l) = v := by
   let z : Vector E (s.τ 5) := ⟨inst.toArray, by simpa using hi⟩
   have hz : z.toList = inst := by simp [z]
@@ -304,7 +304,7 @@ theorem laneHolds_iff (q : Column (verifierLayout prog s).stackLog) (l : Fin 25)
   refine (show WireHolds prog s ⟨113 + l.val, inst, v⟩ q ↔ _ from h).trans ?_
   have hs : ∀ x ∈ range (2 ^ s.τ 5), KeccakGkr.eqAt inst x *
       ofK (((leanIsaInstance prog s).column (toI prog s q) (outCol l)).values.getD x 0) =
-      KeccakGkr.eqAt inst x * ofK (KeccakGkr.laneWord (KeccakGkr.roundsFrom 12 12
+      KeccakGkr.eqAt inst x * ofK (KeccakGkr.laneWord (KeccakGkr.roundsFrom 6 6
         (KeccakGkr.inState (s.τ 5) (qkOf (verifierLayout prog s) q) 1 x)) l) :=
     fun x hx ↦ by rw [outCol_getD prog s q l (Finset.mem_range.1 hx)]
   have hsum := (eval₂Mle_eq_sum_eqAt
@@ -324,7 +324,7 @@ theorem delta_eq (q : Column (verifierLayout prog s).stackLog) (l : Fin 25) {w :
     (hw : w < 2 ^ s.τ 5) :
     (keccakRegion prog s).delta ((leanIsaInstance prog s).keccakColumn (keccakRegion prog s)
         (toI prog s q)) l w =
-      ofK (KeccakGkr.laneWord (KeccakGkr.roundsFrom 0 12
+      ofK (KeccakGkr.laneWord (KeccakGkr.roundsFrom 0 6
           (KeccakGkr.inState (s.τ 5) (qkOf (verifierLayout prog s) q) 0 w)) l) -
         ofK (qkOf (verifierLayout prog s) q (w + 2 ^ s.τ 5 * (25 + l.val))) := by
   unfold KeccakRegion.delta

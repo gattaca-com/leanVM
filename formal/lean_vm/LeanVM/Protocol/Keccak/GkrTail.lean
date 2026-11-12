@@ -2,7 +2,7 @@
   LeanVM.Protocol.Keccak.GkrTail
 
   The end of `verifyKeccak` as a specification: the instance and slot sumchecks on the claim at
-  depth `12`, the `64` slices, and the final check.
+  depth `6`, the `64` slices, and the final check.
 -/
 
 module
@@ -14,7 +14,7 @@ public import LeanVM.Protocol.Keccak.OpenIn
 
 `inputTail` is the end of `verify_keccak` (`crates/verifier/src/keccak.rs:279-293`): the instance
 rounds, the slot rounds (`keccakOpen` with `first = 0, count = 2`), the `64` slices and the check
-`μ̃(λ)·⟨W̃(ρ), s⟩ = value`. `inputSpec`: from doom of "the claim at depth `12` holds of the
+`μ̃(λ)·⟨W̃(ρ), s⟩ = value`. `inputSpec`: from doom of "the claim at depth `6` holds of the
 committed inputs" to doom of "the `64` slice claims hold at `(λ, r_pack, ρ)`", each of the ten
 challenges escaping at `L₀·2/|E|`; the carried predicate `R` rides along.
 -/
@@ -65,7 +65,7 @@ noncomputable def inputSpec (hst : Stable C) (hcard : ∀ h, (C h).ncard ≤ L�
     (qk : β → ℕ → K) (P : ℕ) (claim : KeccakClaim) (hshape : ClaimShape P claim)
     (outs : List ColumnClaim) (hT : T ≤ εmax) (h2 : (L₀ : ℝ≥0∞) * errE 2 ≤ εmax) :
     Spec (inputTail (P + 4) claim outs)
-      (Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 12) P claim ∧ R q))
+      (Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 6) P claim ∧ R q))
       (fun res h ↦ res.1 = outs ∧
         Doomed C (fun q ↦ slicesTrue (P + 4) (qk q) res.2.1 res.2.2 ∧ R q) h) εmax 0 T :=
   have h0 : (0 : ℝ≥0∞) ≤ εmax := zero_le

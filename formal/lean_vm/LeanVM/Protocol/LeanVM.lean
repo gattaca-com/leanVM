@@ -68,7 +68,7 @@ noncomputable def honestProver (prog : LeanIsaProgram) (input : PublicInput) (t 
   Complete.honestProverRom prog input t ρ fuel
 
 /-- The statement's completeness error is the random-oracle theorem's,
-`(12676 + 50689 · (2^29 + 2·fuel + 2)) · (1 - 2^-17)^fuel`. -/
+`(12230 + 48907 · (2^29 + 2·fuel + 2)) · (1 - 2^-17)^fuel`. -/
 theorem completenessError_eq (fuel : ℕ) :
     completenessError fuel = Complete.completenessError fuel :=
   Complete.completenessError_eq fuel
@@ -91,26 +91,26 @@ theorem completenessError_le : completenessError (2 ^ 25) ≤ (2 : ℝ≥0∞)�
 /-! ## Knowledge soundness in bits -/
 
 /-- **The soundness bound in bits**: for `Q ≤ 2^120`, the soundness error is at most
-`(Q + 2^14) · 2^-127`. With `N = Q + 12674`, `5N ≤ 2^128`, so the error is at most
-`(2N · 2^128 + 12674) / 2^256`, and `2N + 1 ≤ 2(Q + 2^14)`. -/
+`(Q + 2^14) · 2^-127`. With `N = Q + 12228`, `5N ≤ 2^128`, so the error is at most
+`(2N · 2^128 + 12228) / 2^256`, and `2N + 1 ≤ 2(Q + 2^14)`. -/
 theorem soundnessError_le_bits {Q : ℕ} (hQ : Q ≤ 2 ^ 120) :
     soundnessError Q ≤ (Q + 2 ^ 14 : ℝ≥0∞) * (2 : ℝ≥0∞)⁻¹ ^ 127 := by
   have h2 : ((2 ^ 256 : ℕ) : ℝ≥0∞) = (2 : ℝ≥0∞) ^ 256 := by rw [Nat.cast_pow, Nat.cast_ofNat]
-  have hV : (verifierQueries : ℝ≥0∞) = ((12674 : ℕ) : ℝ≥0∞) := rfl
+  have hV : (verifierQueries : ℝ≥0∞) = ((12228 : ℕ) : ℝ≥0∞) := rfl
   have hQ' : (Q + 2 ^ 14 : ℝ≥0∞) = ((Q + 2 ^ 14 : ℕ) : ℝ≥0∞) := by norm_cast
-  rw [soundnessError, hV, show verifierQueries = 12674 from rfl,
+  rw [soundnessError, hV, show verifierQueries = 12228 from rfl,
     Sound.inv_pow_eq_div 128 256 (by norm_num), ← h2,
     ENNReal.div_add_div_same, ← mul_div_assoc, ← Nat.cast_add, ← Nat.cast_mul,
     ENNReal.div_add_div_same, ← Nat.cast_add, Sound.inv_pow_eq_div 127 256 (by norm_num), hQ',
     ← mul_div_assoc, ← Nat.cast_mul]
   refine ENNReal.div_le_div_right (Nat.cast_le.2 ?_) _
   rw [show 256 - 128 = 128 from rfl, show 256 - 127 = 129 from rfl]
-  have h5 : 5 * (Q + 12674) ≤ 2 ^ 128 :=
-    calc 5 * (Q + 12674) ≤ 5 * (2 ^ 120 + 12674) := by gcongr
+  have h5 : 5 * (Q + 12228) ≤ 2 ^ 128 :=
+    calc 5 * (Q + 12228) ≤ 5 * (2 ^ 120 + 12228) := by gcongr
       _ ≤ 2 ^ 128 := by norm_num
-  calc (Q + 12674) * (2 ^ 128 + 5 * (Q + 12674)) + 12674
-      ≤ (Q + 12674) * (2 ^ 128 + 2 ^ 128) + 12674 := by gcongr
-    _ = Q * 2 ^ 129 + (12674 * 2 ^ 129 + 12674) := by ring
+  calc (Q + 12228) * (2 ^ 128 + 5 * (Q + 12228)) + 12228
+      ≤ (Q + 12228) * (2 ^ 128 + 2 ^ 128) + 12228 := by gcongr
+    _ = Q * 2 ^ 129 + (12228 * 2 ^ 129 + 12228) := by ring
     _ ≤ Q * 2 ^ 129 + 2 ^ 14 * 2 ^ 129 := Nat.add_le_add_left (by norm_num) _
     _ = (Q + 2 ^ 14) * 2 ^ 129 := by ring
 

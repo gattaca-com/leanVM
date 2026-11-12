@@ -130,7 +130,7 @@ theorem firstClaim_sum (P : ℕ) (hP : h = P + 4) (col : ℕ → K) {inst segmen
         (firstClaim inst segment lanesPt output committed).mu
         (firstClaim inst segment lanesPt output committed).weights =
       ∑ m ∈ range 2, eqAt segment m * ∑ l ∈ range 25, eqAt lanesPt l *
-        stepMle h inst (fun x ↦ laneWord (segState h col m 12 x) l) := by
+        stepMle h inst (fun x ↦ laneWord (segState h col m 6 x) l) := by
   subst hP
   have ha : (inst.take 4).length = 4 := by simp [hi]
   have hb : (inst.drop 4).length = P := by simp [hi]
@@ -142,14 +142,14 @@ theorem firstClaim_sum (P : ℕ) (hP : h = P + 4) (col : ℕ → K) {inst segmen
   have e : ∀ z, ∑ i ∈ range 16, (eqKernel (inst.take 4)).getD i 0 * ∑ j ∈ range 1600,
       (firstWeights lanesPt).getD j 0 * bitE (statesAt (P + 4) col 0 (z / 2 ^ P) (i + 16 * (z % 2 ^ P)) j) =
       ∑ i ∈ range 16, eqAt (inst.take 4) i * (fun m x ↦ ∑ l ∈ range 25, eqAt lanesPt l *
-        ofK (laneWord (segState (P + 4) col m 12 x) l)) (z / 2 ^ P) (i + 16 * (z % 2 ^ P)) := by
+        ofK (laneWord (segState (P + 4) col m 6 x) l)) (z / 2 ^ P) (i + 16 * (z % 2 ^ P)) := by
     intro z
     refine Finset.sum_congr rfl fun i hi' ↦ ?_
     rw [hmu i hi']
     exact congrArg _ (sum_firstWeights hl _)
   simp only [e]
   rw [sum_split ha hb (fun m x ↦ ∑ l ∈ range 25, eqAt lanesPt l *
-    ofK (laneWord (segState (P + 4) col m 12 x) l)), List.take_append_drop]
+    ofK (laneWord (segState (P + 4) col m 6 x) l)), List.take_append_drop]
   refine Finset.sum_congr rfl fun m _ ↦ congrArg _ ?_
   simp only [stepMle, Finset.mul_sum]
   rw [Finset.sum_comm]
@@ -164,9 +164,9 @@ def midMle (col : ℕ → K) (inst : List E) (l : ℕ) : E := stepMle h inst (fu
 state, segment `1`'s output against the claimed `output`. -/
 def startDelta (col : ℕ → K) (inst output : List E) (u : ℕ) : E :=
   if u / 2 < 25 then
-    (if u % 2 = 0 then stepMle h inst (fun x ↦ laneWord (segState h col 0 12 x) (u / 2)) +
+    (if u % 2 = 0 then stepMle h inst (fun x ↦ laneWord (segState h col 0 6 x) (u / 2)) +
         midMle h col inst (u / 2)
-      else stepMle h inst (fun x ↦ laneWord (segState h col 1 12 x) (u / 2)) +
+      else stepMle h inst (fun x ↦ laneWord (segState h col 1 6 x) (u / 2)) +
         output.getD (u / 2) 0)
   else 0
 
@@ -236,7 +236,7 @@ theorem zeroOn_of_first (P : ℕ) (hP : h = P + 4) (col : ℕ → K) {inst segme
       rw [startDelta, ite_eq_right (by omega), mul_zero]
   have hm0 : ∑ l ∈ range 32, eqAt lanesPt l * startDelta h col inst output (2 * l + 0) =
       ∑ l ∈ range 25, eqAt lanesPt l *
-        stepMle h inst (fun x ↦ laneWord (segState h col 0 12 x) l) +
+        stepMle h inst (fun x ↦ laneWord (segState h col 0 6 x) l) +
       ∑ l ∈ range 25, eqAt lanesPt l * midMle h col inst l := by
     rw [show 32 = 25 + 7 from rfl, Finset.sum_range_add, hzero 0 (by norm_num), add_zero,
       ← Finset.sum_add_distrib]
@@ -246,7 +246,7 @@ theorem zeroOn_of_first (P : ℕ) (hP : h = P + 4) (col : ℕ → K) {inst segme
       show (2 * l + 0) / 2 = l by omega, mul_add]
   have hm1 : ∑ l ∈ range 32, eqAt lanesPt l * startDelta h col inst output (2 * l + 1) =
       ∑ l ∈ range 25, eqAt lanesPt l *
-        stepMle h inst (fun x ↦ laneWord (segState h col 1 12 x) l) +
+        stepMle h inst (fun x ↦ laneWord (segState h col 1 6 x) l) +
       ∑ l ∈ range 25, eqAt lanesPt l * output.getD l 0 := by
     rw [show 32 = 25 + 7 from rfl, Finset.sum_range_add, hzero 1 (by norm_num), add_zero,
       ← Finset.sum_add_distrib]
