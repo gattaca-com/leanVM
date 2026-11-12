@@ -132,8 +132,8 @@ theorem l20_block {x N roots nb : E}
   rw [← e.1] at h0
   rw [← e.2] at h1
   refine ⟨Val.ofArgs [x, N, roots, nb, nb * nb, roots * (nb * nb), x * x,
-    roots * (nb * nb) * (x * x), word 8002054802297438051 4108169256045952147 0,
-    word 12830724869163462953 1721925254677230945 0, word 2 0 0, x * word 2 0 0,
+    roots * (nb * nb) * (x * x), word 17635339603416681651 5630583628039031207 0,
+    word 11942528933372280140 15641231512148347094 0, word 2 0 0, x * word 2 0 0,
     x * word 2 0 0 + N, word 2 0 0, x * word 2 0 0], by rw [params_of_shape hs hl]; rfl, ?_⟩
   rw [loopPre_of_body dv_loops_body.2.2.1 (by decide)]
   intro st hst

@@ -52,19 +52,19 @@ def vtPushPadData : List (ℕ × ℕ × ℕ × List (ℕ × ℕ)) :=
     (33, 5, 1214, [(0, 2)]), (34, 5, 1223, [(0, 2)]), (35, 5, 1232, [(0, 2)]),
     (36, 5, 1241, [(0, 2)]), (37, 5, 1250, [(0, 2)]), (38, 5, 1259, [(0, 2)]),
     (39, 5, 1268, [(0, 2)]), (40, 5, 1277, [(0, 2)]),
-    (41, 5, 1286, [(0, 2), (3, 17376452488221285863), (4, 9571781953733019530)]),
-    (42, 5, 1295, [(0, 2), (3, 15391093639620504046), (4, 13624874521033984333)]),
-    (43, 5, 1304, [(0, 2), (3, 10027350355371872343), (4, 18417369716475457492)]),
-    (44, 5, 1313, [(0, 2), (3, 10448040663659726788), (4, 10113917136857017974)]),
-    (45, 5, 1322, [(0, 2), (3, 12479658147685402012), (4, 3500241080921619556)]),
-    (46, 5, 1331, [(0, 2), (3, 16959053435453822517), (4, 12224711289652453635)]),
-    (47, 5, 1340, [(0, 2), (3, 9342009439668884831), (4, 4879704952849025062)]),
-    (48, 5, 1349, [(0, 2), (3, 140226327413610143), (4, 424854978622500449)]),
-    (49, 5, 1358, [(0, 2), (3, 7259519967065370866)]),
-    (50, 5, 1367, [(0, 2), (3, 7004910057750291985), (4, 13293599522548616907)]),
-    (51, 5, 1376, [(0, 2), (3, 10105770293752443592), (4, 10668034807192757780)]),
-    (52, 5, 1385, [(0, 2), (3, 1747952066141424100), (4, 1654286879329379778)]),
-    (53, 5, 1394, [(0, 2), (3, 8500057116360352059), (4, 16929593379567477321)])]
+    (41, 5, 1286, [(0, 2), (3, 10258729603806234135), (4, 15694317172351946782)]),
+    (42, 5, 1295, [(0, 2), (3, 9779821429811388213), (4, 1194545062623895749)]),
+    (43, 5, 1304, [(0, 2), (3, 12696680413525531205), (4, 16187959555112376901)]),
+    (44, 5, 1313, [(0, 2), (3, 14210968617165991836), (4, 4529855917802456861)]),
+    (45, 5, 1322, [(0, 2), (3, 12944221850486409932), (4, 8770063895056853664)]),
+    (46, 5, 1331, [(0, 2), (3, 13567793431856675227), (4, 7532059699614214035)]),
+    (47, 5, 1340, [(0, 2), (3, 6659701467325015398), (4, 11288855218876330202)]),
+    (48, 5, 1349, [(0, 2), (3, 6862248298150853279), (4, 16516601852883532067)]),
+    (49, 5, 1358, [(0, 2), (3, 7920061636977395692)]),
+    (50, 5, 1367, [(0, 2), (3, 3080130030073907906), (4, 7686445356890793143)]),
+    (51, 5, 1376, [(0, 2), (3, 13817397056013001050), (4, 14325915465326088879)]),
+    (52, 5, 1385, [(0, 2), (3, 4994551462864380119), (4, 7085870523181136612)]),
+    (53, 5, 1394, [(0, 2), (3, 15291534770936243322), (4, 14987149935989530652)])]
 
 set_option maxRecDepth 100000 in
 /-- **The push side's total.** -/
@@ -318,11 +318,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3727 := h.atomAt 1676 (.mul (.n 1638) (.n 1636) (.n 1637)) (by decide +kernel)
   have a3728 := h.atomAt 1677 (.add (.n 1639) (.n 783) (.n 1638)) (by decide +kernel)
   have a3729 := h.atomAt 1678 (.load (.n 1640) (.n 13) 3) (by decide +kernel)
-  have a3730 := h.atomAt 1679 (.const (.n 1641) (word 17376452488221285863 0 0)) (by decide +kernel)
+  have a3730 := h.atomAt 1679 (.const (.n 1641) (word 10258729603806234135 0 0)) (by decide +kernel)
   have a3731 := h.atomAt 1680 (.mul (.n 1642) (.n 1640) (.n 1641)) (by decide +kernel)
   have a3732 := h.atomAt 1681 (.add (.n 1643) (.n 1639) (.n 1642)) (by decide +kernel)
   have a3733 := h.atomAt 1682 (.load (.n 1644) (.n 13) 4) (by decide +kernel)
-  have a3734 := h.atomAt 1683 (.const (.n 1645) (word 9571781953733019530 0 0)) (by decide +kernel)
+  have a3734 := h.atomAt 1683 (.const (.n 1645) (word 15694317172351946782 0 0)) (by decide +kernel)
   have a3735 := h.atomAt 1684 (.mul (.n 1646) (.n 1644) (.n 1645)) (by decide +kernel)
   have a3736 := h.atomAt 1685 (.add (.n 1647) (.n 1643) (.n 1646)) (by decide +kernel)
   have a3737 := h.atomAt 1686 (.mul (.n 1648) (.n 1286) (.n 1647)) (by decide +kernel)
@@ -332,11 +332,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3741 := h.atomAt 1690 (.mul (.n 1652) (.n 1650) (.n 1651)) (by decide +kernel)
   have a3742 := h.atomAt 1691 (.add (.n 1653) (.n 783) (.n 1652)) (by decide +kernel)
   have a3743 := h.atomAt 1692 (.load (.n 1654) (.n 13) 3) (by decide +kernel)
-  have a3744 := h.atomAt 1693 (.const (.n 1655) (word 15391093639620504046 0 0)) (by decide +kernel)
+  have a3744 := h.atomAt 1693 (.const (.n 1655) (word 9779821429811388213 0 0)) (by decide +kernel)
   have a3745 := h.atomAt 1694 (.mul (.n 1656) (.n 1654) (.n 1655)) (by decide +kernel)
   have a3746 := h.atomAt 1695 (.add (.n 1657) (.n 1653) (.n 1656)) (by decide +kernel)
   have a3747 := h.atomAt 1696 (.load (.n 1658) (.n 13) 4) (by decide +kernel)
-  have a3748 := h.atomAt 1697 (.const (.n 1659) (word 13624874521033984333 0 0)) (by decide +kernel)
+  have a3748 := h.atomAt 1697 (.const (.n 1659) (word 1194545062623895749 0 0)) (by decide +kernel)
   have a3749 := h.atomAt 1698 (.mul (.n 1660) (.n 1658) (.n 1659)) (by decide +kernel)
   have a3750 := h.atomAt 1699 (.add (.n 1661) (.n 1657) (.n 1660)) (by decide +kernel)
   have a3751 := h.atomAt 1700 (.mul (.n 1662) (.n 1295) (.n 1661)) (by decide +kernel)
@@ -346,11 +346,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3755 := h.atomAt 1704 (.mul (.n 1666) (.n 1664) (.n 1665)) (by decide +kernel)
   have a3756 := h.atomAt 1705 (.add (.n 1667) (.n 783) (.n 1666)) (by decide +kernel)
   have a3757 := h.atomAt 1706 (.load (.n 1668) (.n 13) 3) (by decide +kernel)
-  have a3758 := h.atomAt 1707 (.const (.n 1669) (word 10027350355371872343 0 0)) (by decide +kernel)
+  have a3758 := h.atomAt 1707 (.const (.n 1669) (word 12696680413525531205 0 0)) (by decide +kernel)
   have a3759 := h.atomAt 1708 (.mul (.n 1670) (.n 1668) (.n 1669)) (by decide +kernel)
   have a3760 := h.atomAt 1709 (.add (.n 1671) (.n 1667) (.n 1670)) (by decide +kernel)
   have a3761 := h.atomAt 1710 (.load (.n 1672) (.n 13) 4) (by decide +kernel)
-  have a3762 := h.atomAt 1711 (.const (.n 1673) (word 18417369716475457492 0 0)) (by decide +kernel)
+  have a3762 := h.atomAt 1711 (.const (.n 1673) (word 16187959555112376901 0 0)) (by decide +kernel)
   have a3763 := h.atomAt 1712 (.mul (.n 1674) (.n 1672) (.n 1673)) (by decide +kernel)
   have a3764 := h.atomAt 1713 (.add (.n 1675) (.n 1671) (.n 1674)) (by decide +kernel)
   have a3765 := h.atomAt 1714 (.mul (.n 1676) (.n 1304) (.n 1675)) (by decide +kernel)
@@ -360,11 +360,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3769 := h.atomAt 1718 (.mul (.n 1680) (.n 1678) (.n 1679)) (by decide +kernel)
   have a3770 := h.atomAt 1719 (.add (.n 1681) (.n 783) (.n 1680)) (by decide +kernel)
   have a3771 := h.atomAt 1720 (.load (.n 1682) (.n 13) 3) (by decide +kernel)
-  have a3772 := h.atomAt 1721 (.const (.n 1683) (word 10448040663659726788 0 0)) (by decide +kernel)
+  have a3772 := h.atomAt 1721 (.const (.n 1683) (word 14210968617165991836 0 0)) (by decide +kernel)
   have a3773 := h.atomAt 1722 (.mul (.n 1684) (.n 1682) (.n 1683)) (by decide +kernel)
   have a3774 := h.atomAt 1723 (.add (.n 1685) (.n 1681) (.n 1684)) (by decide +kernel)
   have a3775 := h.atomAt 1724 (.load (.n 1686) (.n 13) 4) (by decide +kernel)
-  have a3776 := h.atomAt 1725 (.const (.n 1687) (word 10113917136857017974 0 0)) (by decide +kernel)
+  have a3776 := h.atomAt 1725 (.const (.n 1687) (word 4529855917802456861 0 0)) (by decide +kernel)
   have a3777 := h.atomAt 1726 (.mul (.n 1688) (.n 1686) (.n 1687)) (by decide +kernel)
   have a3778 := h.atomAt 1727 (.add (.n 1689) (.n 1685) (.n 1688)) (by decide +kernel)
   have a3779 := h.atomAt 1728 (.mul (.n 1690) (.n 1313) (.n 1689)) (by decide +kernel)
@@ -374,11 +374,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3783 := h.atomAt 1732 (.mul (.n 1694) (.n 1692) (.n 1693)) (by decide +kernel)
   have a3784 := h.atomAt 1733 (.add (.n 1695) (.n 783) (.n 1694)) (by decide +kernel)
   have a3785 := h.atomAt 1734 (.load (.n 1696) (.n 13) 3) (by decide +kernel)
-  have a3786 := h.atomAt 1735 (.const (.n 1697) (word 12479658147685402012 0 0)) (by decide +kernel)
+  have a3786 := h.atomAt 1735 (.const (.n 1697) (word 12944221850486409932 0 0)) (by decide +kernel)
   have a3787 := h.atomAt 1736 (.mul (.n 1698) (.n 1696) (.n 1697)) (by decide +kernel)
   have a3788 := h.atomAt 1737 (.add (.n 1699) (.n 1695) (.n 1698)) (by decide +kernel)
   have a3789 := h.atomAt 1738 (.load (.n 1700) (.n 13) 4) (by decide +kernel)
-  have a3790 := h.atomAt 1739 (.const (.n 1701) (word 3500241080921619556 0 0)) (by decide +kernel)
+  have a3790 := h.atomAt 1739 (.const (.n 1701) (word 8770063895056853664 0 0)) (by decide +kernel)
   have a3791 := h.atomAt 1740 (.mul (.n 1702) (.n 1700) (.n 1701)) (by decide +kernel)
   have a3792 := h.atomAt 1741 (.add (.n 1703) (.n 1699) (.n 1702)) (by decide +kernel)
   have a3793 := h.atomAt 1742 (.mul (.n 1704) (.n 1322) (.n 1703)) (by decide +kernel)
@@ -388,11 +388,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3797 := h.atomAt 1746 (.mul (.n 1708) (.n 1706) (.n 1707)) (by decide +kernel)
   have a3798 := h.atomAt 1747 (.add (.n 1709) (.n 783) (.n 1708)) (by decide +kernel)
   have a3799 := h.atomAt 1748 (.load (.n 1710) (.n 13) 3) (by decide +kernel)
-  have a3800 := h.atomAt 1749 (.const (.n 1711) (word 16959053435453822517 0 0)) (by decide +kernel)
+  have a3800 := h.atomAt 1749 (.const (.n 1711) (word 13567793431856675227 0 0)) (by decide +kernel)
   have a3801 := h.atomAt 1750 (.mul (.n 1712) (.n 1710) (.n 1711)) (by decide +kernel)
   have a3802 := h.atomAt 1751 (.add (.n 1713) (.n 1709) (.n 1712)) (by decide +kernel)
   have a3803 := h.atomAt 1752 (.load (.n 1714) (.n 13) 4) (by decide +kernel)
-  have a3804 := h.atomAt 1753 (.const (.n 1715) (word 12224711289652453635 0 0)) (by decide +kernel)
+  have a3804 := h.atomAt 1753 (.const (.n 1715) (word 7532059699614214035 0 0)) (by decide +kernel)
   have a3805 := h.atomAt 1754 (.mul (.n 1716) (.n 1714) (.n 1715)) (by decide +kernel)
   have a3806 := h.atomAt 1755 (.add (.n 1717) (.n 1713) (.n 1716)) (by decide +kernel)
   have a3807 := h.atomAt 1756 (.mul (.n 1718) (.n 1331) (.n 1717)) (by decide +kernel)
@@ -402,11 +402,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3811 := h.atomAt 1760 (.mul (.n 1722) (.n 1720) (.n 1721)) (by decide +kernel)
   have a3812 := h.atomAt 1761 (.add (.n 1723) (.n 783) (.n 1722)) (by decide +kernel)
   have a3813 := h.atomAt 1762 (.load (.n 1724) (.n 13) 3) (by decide +kernel)
-  have a3814 := h.atomAt 1763 (.const (.n 1725) (word 9342009439668884831 0 0)) (by decide +kernel)
+  have a3814 := h.atomAt 1763 (.const (.n 1725) (word 6659701467325015398 0 0)) (by decide +kernel)
   have a3815 := h.atomAt 1764 (.mul (.n 1726) (.n 1724) (.n 1725)) (by decide +kernel)
   have a3816 := h.atomAt 1765 (.add (.n 1727) (.n 1723) (.n 1726)) (by decide +kernel)
   have a3817 := h.atomAt 1766 (.load (.n 1728) (.n 13) 4) (by decide +kernel)
-  have a3818 := h.atomAt 1767 (.const (.n 1729) (word 4879704952849025062 0 0)) (by decide +kernel)
+  have a3818 := h.atomAt 1767 (.const (.n 1729) (word 11288855218876330202 0 0)) (by decide +kernel)
   have a3819 := h.atomAt 1768 (.mul (.n 1730) (.n 1728) (.n 1729)) (by decide +kernel)
   have a3820 := h.atomAt 1769 (.add (.n 1731) (.n 1727) (.n 1730)) (by decide +kernel)
   have a3821 := h.atomAt 1770 (.mul (.n 1732) (.n 1340) (.n 1731)) (by decide +kernel)
@@ -416,11 +416,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3825 := h.atomAt 1774 (.mul (.n 1736) (.n 1734) (.n 1735)) (by decide +kernel)
   have a3826 := h.atomAt 1775 (.add (.n 1737) (.n 783) (.n 1736)) (by decide +kernel)
   have a3827 := h.atomAt 1776 (.load (.n 1738) (.n 13) 3) (by decide +kernel)
-  have a3828 := h.atomAt 1777 (.const (.n 1739) (word 140226327413610143 0 0)) (by decide +kernel)
+  have a3828 := h.atomAt 1777 (.const (.n 1739) (word 6862248298150853279 0 0)) (by decide +kernel)
   have a3829 := h.atomAt 1778 (.mul (.n 1740) (.n 1738) (.n 1739)) (by decide +kernel)
   have a3830 := h.atomAt 1779 (.add (.n 1741) (.n 1737) (.n 1740)) (by decide +kernel)
   have a3831 := h.atomAt 1780 (.load (.n 1742) (.n 13) 4) (by decide +kernel)
-  have a3832 := h.atomAt 1781 (.const (.n 1743) (word 424854978622500449 0 0)) (by decide +kernel)
+  have a3832 := h.atomAt 1781 (.const (.n 1743) (word 16516601852883532067 0 0)) (by decide +kernel)
   have a3833 := h.atomAt 1782 (.mul (.n 1744) (.n 1742) (.n 1743)) (by decide +kernel)
   have a3834 := h.atomAt 1783 (.add (.n 1745) (.n 1741) (.n 1744)) (by decide +kernel)
   have a3835 := h.atomAt 1784 (.mul (.n 1746) (.n 1349) (.n 1745)) (by decide +kernel)
@@ -430,7 +430,7 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3839 := h.atomAt 1788 (.mul (.n 1750) (.n 1748) (.n 1749)) (by decide +kernel)
   have a3840 := h.atomAt 1789 (.add (.n 1751) (.n 783) (.n 1750)) (by decide +kernel)
   have a3841 := h.atomAt 1790 (.load (.n 1752) (.n 13) 3) (by decide +kernel)
-  have a3842 := h.atomAt 1791 (.const (.n 1753) (word 7259519967065370866 0 0)) (by decide +kernel)
+  have a3842 := h.atomAt 1791 (.const (.n 1753) (word 7920061636977395692 0 0)) (by decide +kernel)
   have a3843 := h.atomAt 1792 (.mul (.n 1754) (.n 1752) (.n 1753)) (by decide +kernel)
   have a3844 := h.atomAt 1793 (.add (.n 1755) (.n 1751) (.n 1754)) (by decide +kernel)
   have a3845 := h.atomAt 1794 (.mul (.n 1756) (.n 1358) (.n 1755)) (by decide +kernel)
@@ -440,11 +440,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3849 := h.atomAt 1798 (.mul (.n 1760) (.n 1758) (.n 1759)) (by decide +kernel)
   have a3850 := h.atomAt 1799 (.add (.n 1761) (.n 783) (.n 1760)) (by decide +kernel)
   have a3851 := h.atomAt 1800 (.load (.n 1762) (.n 13) 3) (by decide +kernel)
-  have a3852 := h.atomAt 1801 (.const (.n 1763) (word 7004910057750291985 0 0)) (by decide +kernel)
+  have a3852 := h.atomAt 1801 (.const (.n 1763) (word 3080130030073907906 0 0)) (by decide +kernel)
   have a3853 := h.atomAt 1802 (.mul (.n 1764) (.n 1762) (.n 1763)) (by decide +kernel)
   have a3854 := h.atomAt 1803 (.add (.n 1765) (.n 1761) (.n 1764)) (by decide +kernel)
   have a3855 := h.atomAt 1804 (.load (.n 1766) (.n 13) 4) (by decide +kernel)
-  have a3856 := h.atomAt 1805 (.const (.n 1767) (word 13293599522548616907 0 0)) (by decide +kernel)
+  have a3856 := h.atomAt 1805 (.const (.n 1767) (word 7686445356890793143 0 0)) (by decide +kernel)
   have a3857 := h.atomAt 1806 (.mul (.n 1768) (.n 1766) (.n 1767)) (by decide +kernel)
   have a3858 := h.atomAt 1807 (.add (.n 1769) (.n 1765) (.n 1768)) (by decide +kernel)
   have a3859 := h.atomAt 1808 (.mul (.n 1770) (.n 1367) (.n 1769)) (by decide +kernel)
@@ -454,11 +454,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3863 := h.atomAt 1812 (.mul (.n 1774) (.n 1772) (.n 1773)) (by decide +kernel)
   have a3864 := h.atomAt 1813 (.add (.n 1775) (.n 783) (.n 1774)) (by decide +kernel)
   have a3865 := h.atomAt 1814 (.load (.n 1776) (.n 13) 3) (by decide +kernel)
-  have a3866 := h.atomAt 1815 (.const (.n 1777) (word 10105770293752443592 0 0)) (by decide +kernel)
+  have a3866 := h.atomAt 1815 (.const (.n 1777) (word 13817397056013001050 0 0)) (by decide +kernel)
   have a3867 := h.atomAt 1816 (.mul (.n 1778) (.n 1776) (.n 1777)) (by decide +kernel)
   have a3868 := h.atomAt 1817 (.add (.n 1779) (.n 1775) (.n 1778)) (by decide +kernel)
   have a3869 := h.atomAt 1818 (.load (.n 1780) (.n 13) 4) (by decide +kernel)
-  have a3870 := h.atomAt 1819 (.const (.n 1781) (word 10668034807192757780 0 0)) (by decide +kernel)
+  have a3870 := h.atomAt 1819 (.const (.n 1781) (word 14325915465326088879 0 0)) (by decide +kernel)
   have a3871 := h.atomAt 1820 (.mul (.n 1782) (.n 1780) (.n 1781)) (by decide +kernel)
   have a3872 := h.atomAt 1821 (.add (.n 1783) (.n 1779) (.n 1782)) (by decide +kernel)
   have a3873 := h.atomAt 1822 (.mul (.n 1784) (.n 1376) (.n 1783)) (by decide +kernel)
@@ -468,11 +468,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3877 := h.atomAt 1826 (.mul (.n 1788) (.n 1786) (.n 1787)) (by decide +kernel)
   have a3878 := h.atomAt 1827 (.add (.n 1789) (.n 783) (.n 1788)) (by decide +kernel)
   have a3879 := h.atomAt 1828 (.load (.n 1790) (.n 13) 3) (by decide +kernel)
-  have a3880 := h.atomAt 1829 (.const (.n 1791) (word 1747952066141424100 0 0)) (by decide +kernel)
+  have a3880 := h.atomAt 1829 (.const (.n 1791) (word 4994551462864380119 0 0)) (by decide +kernel)
   have a3881 := h.atomAt 1830 (.mul (.n 1792) (.n 1790) (.n 1791)) (by decide +kernel)
   have a3882 := h.atomAt 1831 (.add (.n 1793) (.n 1789) (.n 1792)) (by decide +kernel)
   have a3883 := h.atomAt 1832 (.load (.n 1794) (.n 13) 4) (by decide +kernel)
-  have a3884 := h.atomAt 1833 (.const (.n 1795) (word 1654286879329379778 0 0)) (by decide +kernel)
+  have a3884 := h.atomAt 1833 (.const (.n 1795) (word 7085870523181136612 0 0)) (by decide +kernel)
   have a3885 := h.atomAt 1834 (.mul (.n 1796) (.n 1794) (.n 1795)) (by decide +kernel)
   have a3886 := h.atomAt 1835 (.add (.n 1797) (.n 1793) (.n 1796)) (by decide +kernel)
   have a3887 := h.atomAt 1836 (.mul (.n 1798) (.n 1385) (.n 1797)) (by decide +kernel)
@@ -482,11 +482,11 @@ theorem vt_push_total {rd : Reader} {σ : Val} (h : VtH rd σ) {W : ℕ → E}
   have a3891 := h.atomAt 1840 (.mul (.n 1802) (.n 1800) (.n 1801)) (by decide +kernel)
   have a3892 := h.atomAt 1841 (.add (.n 1803) (.n 783) (.n 1802)) (by decide +kernel)
   have a3893 := h.atomAt 1842 (.load (.n 1804) (.n 13) 3) (by decide +kernel)
-  have a3894 := h.atomAt 1843 (.const (.n 1805) (word 8500057116360352059 0 0)) (by decide +kernel)
+  have a3894 := h.atomAt 1843 (.const (.n 1805) (word 15291534770936243322 0 0)) (by decide +kernel)
   have a3895 := h.atomAt 1844 (.mul (.n 1806) (.n 1804) (.n 1805)) (by decide +kernel)
   have a3896 := h.atomAt 1845 (.add (.n 1807) (.n 1803) (.n 1806)) (by decide +kernel)
   have a3897 := h.atomAt 1846 (.load (.n 1808) (.n 13) 4) (by decide +kernel)
-  have a3898 := h.atomAt 1847 (.const (.n 1809) (word 16929593379567477321 0 0)) (by decide +kernel)
+  have a3898 := h.atomAt 1847 (.const (.n 1809) (word 14987149935989530652 0 0)) (by decide +kernel)
   have a3899 := h.atomAt 1848 (.mul (.n 1810) (.n 1808) (.n 1809)) (by decide +kernel)
   have a3900 := h.atomAt 1849 (.add (.n 1811) (.n 1807) (.n 1810)) (by decide +kernel)
   have a3901 := h.atomAt 1850 (.mul (.n 1812) (.n 1394) (.n 1811)) (by decide +kernel)

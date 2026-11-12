@@ -29,7 +29,8 @@ import LeanVMTests.Spec.NodeVectors
   statement's digest at `990b935263dc7f793f280914f262ca7955ddc3e0`, its one DA digest at
   `93ebecc5f87ed7b1248a9772c392f9a41b6ac8d0`, the batching's one challenge and its powers at
   `c445e3d51a5a85031df47240595698f3b24897bf`) over the pinned verifier's Keccak and field
-  arithmetic. The batching's hints are the transcription's honest sumcheck messages; Lean's
+  arithmetic. The fixed-input pins and batching hints now use this branch's twelve-round Rust
+  permutation and field arithmetic. The batching's hints are the transcription's honest sumcheck messages; Lean's
   transcript must squeeze the same challenges for the claim to close at the transcription's point,
   which is a true claim on the table.
   Mutations: a wrong final value, or a child's false claim, and the batching rejects.
@@ -132,47 +133,45 @@ def defer0 : DeferredClaim :=
   ⟨[e 1 2 3, e 4 5 6, e 7 8 9, e 10 11 12, e 0xffffffffffffffff 0 1], e 13 14 15⟩
 
 #guard claimListDigest xmssPublicKeyBytes xmss =
-  #v[0x414fd0b2c209e3b8, 0x6538b0954fa462a9, 0xe56f9cc0c9d4fdc7, 0xa490bc2e93724856]
+  #v[0xa4ec226585891c3d, 0xa85b86133b887198, 0xa41bc1142d412ba, 0x3c1b43782ff2091d]
 
 #guard claimListDigest Sphincs.PublicKey.toBytes sphincs =
-  #v[0xe8d78086d65bb925, 0x7ace3a6c82dbaf4e, 0xbf24729b60a19887, 0xc1ffa4b8c5dee59e]
+  #v[0xe7e247b70a882189, 0xdb03bad3b98d1589, 0x8309c511a3c41d31, 0x943ad6332bd6dc5d]
 
 /- An empty list hashes the empty string. -/
 #guard claimListDigest xmssPublicKeyBytes [] =
-  #v[0x3c23f7860146d2c5, 0xc003c7dcb27d7e92, 0x3b2782ca53b600e5, 0x70a4855d04d8fa7b]
+  #v[0x6dde3b94f02ddde3, 0x5cf35960c39ee382, 0x6bcc38dfe22067d7, 0x4a3aaafcdd9fb610]
 
 /- The DA claim's digest: Keccak-256 of the root, the challenge's three limbs and a zero word
 (computed independently by another Keccak-256). -/
 #guard daClaimDigest daClaim =
-  #v[0x54e5caaf0b9df436, 0xe9801627f87d2cbd, 0x008b308358001569, 0xac0e2d12ab54f275]
+  #v[0x8d761eabbf3e05a0, 0x2a30029d7471b868, 0x9b6bb3665dcbafff, 0x763f971bd0dce805]
 
 #guard statementDigest seed0 ⟨⟨xmss, sphincs, da⟩, defer0⟩ =
-  #v[0x390bb57c95a72731, 0xc6a7438398ab72ee, 0x42095a68d163c568, 0x172ac4a032779c05]
+  #v[0xfb415dd67e08a5e6, 0x206539780ead98d8, 0xf556a1f87cee1558, 0xed15719bf5e13b43]
 
 /- The same claim one coordinate short: five cells, paired with a zero cell. -/
 #guard statementDigest seed0 ⟨⟨xmss, sphincs, da⟩, { defer0 with
     bytecodePoint := defer0.bytecodePoint.take 4 }⟩ =
-  #v[0xdc54bf3336f25e78, 0xf384991b0b6165bf, 0xe7e52156413534f3, 0xe8b99f1696b9f4d7]
+  #v[0x7c8f9a9b823d113, 0xf2864140a9fec5d5, 0xef892254c963d114, 0x3a7a501c67e1ac31]
 
 -- Mutation: other signature lists give another digest.
 #guard statementDigest seed0 ⟨⟨[], [], da⟩, defer0⟩ =
-  #v[0xa592644862762952, 0x09567e10b4b0d8c3, 0x3cb6feed0116cea8, 0x412ab1045c7507e5]
+  #v[0x5e9429b319e7017c, 0x8761878f0f88d1ce, 0xa7954139fbc8d1e2, 0xcd4ba2e12249c8eb]
 
 -- Mutation: no DA claim, the zero digest in its place.
 #guard statementDigest seed0 ⟨⟨xmss, sphincs, zeroDigest⟩, defer0⟩ =
-  #v[0xa065f9975aeba2b2, 0xdf0f15d80b8f94e2, 0x3d8fcd509b505190, 0xa750b8b1977f11ee]
+  #v[0x4d1aac84f2339ab9, 0x1c559acd93976958, 0xa23f56c298ba543c, 0x175dc8156271c216]
 
 /-! ## The batching: known answers and mutations -/
 
 /- `FiatShamirState::from_label(RECURSION_AGG_LABEL)`'s state, whose lanes `16..25` the guest
 bakes as `AGG_SEED_*`. -/
-#guard batchSeed = #v[0x870d207a806c795a, 0xb4b4ddd8d965e271, 0xf4d25a66d674ca27,
-  0xd58527e821d50d69, 0xe8b3b32bc6b41ca0, 0x1ac6405ae5e1c26c, 0x25100272f63a0add,
-  0xddac48119a39ccbb, 0x2f557d8fdc241fb9, 0xb03075526083a5c6, 0x0ae457bd1e0fd49d,
-  0xa690dfcc98cbc36e, 0xc8bc6a708f4be81f, 0xaf078f39833eded4, 0xfca5d5aea8d67de1,
-  0x160ed37a53dc979a, 0x15afc20f66b0d5b9, 0x6a647807f52d7266, 0xa5800c0973e6ab80,
-  0xc99f802c9aef9edd, 0xd2dc01646a279b0e, 0x5d0c9da7c6a96b8d, 0x971016a864ec6d1a,
-  0x92ef5eb709b9fa89, 0x02359fac99c1f265]
+#guard batchSeed =   #v[0x7b01102c79c5b7be, 0x847cf1f24d9ec34e, 0x2d90d578c3add43, 0x638d5fc17f034837, 0x8908fffd6a3db3c9,
+    0x70e2e123d94ff318, 0x39b5efa3670d3575, 0x7ac4eddee7fa6aae, 0xc962960061cd2f36, 0x385b463db8a8e892,
+    0xab7b8c8359e943ea, 0x14c4b5acebf4dac3, 0x835fad8dcef3a2d, 0xa5faeaf1fdf71df3, 0xb411f0b74a25102e,
+    0x32bdc960d924a99, 0x50a09cd97911d301, 0x694116f29aa38728, 0x7ab5e534f0f15094, 0x23b9ced806e153a6,
+    0x6f277a43e4e11b16, 0x2aae2785bf1acea2, 0xe92ef88e65b14f4f, 0xc134733b28492059, 0xf5645b06f0464d29]
 
 /-- A table of eight words, the claims' polynomial. -/
 def table : List E := (List.range 8).map fun i ↦ ofK (K.ofBits (3 * i + 1))
@@ -194,19 +193,16 @@ def children : List ChildClaims := [child 0, child 1]
 
 /-- The transcription's honest hints. -/
 def hints : BatchingHints :=
-  ⟨[(e 0x79aca609cbc240eb 0x330e9f31986a68a6 0x2f43cb09de086072,
-      e 0x57abf0bf21536352 0x3ff8403a19a4a63c 0x600534b9909e581d),
-    (e 0x7d3effa4172e13e9 0x8b06819b75f551ab 0xf0afa16df931e5e,
-      e 0x216085d8a973a048 0x4cc37560e3af5849 0x2c8fda88d7fb3af9),
-    (e 0xf83368c1d8fa9bca 0xf478bc5c6648a954 0x4beebcc7db2cf34a,
-      e 0x25d6c858a4d23316 0xe119ed795e599cc0 0x480cfbef0b9064fc)],
-    e 0x995dddb79c2b594e 0xcfb3c7bfe92b5a17 0x3316f45eb5224d6f⟩
+  ⟨[((e 0xfed3621cbcaf95ff 0x70b27439e7ad8532 0xfb292ff9cd116741), (e 0x6c316d445b29b15e 0x7e3adf842867a818
+    0xf583bf9075b31d73)), ((e 0xe4d382b230957227 0x89793daa9806c14c 0xbabcb5d4d0be26d5), (e 0xffcfa853569eb034
+    0x6506e48b2b2936ad 0x1275a042a4d6a8a8)), ((e 0x2092062d1c67dbbc 0x67db76905c941594 0xa36545bd756feb26), (e
+    0x67af58d71ceb117f 0x1e907b0d4a41a2b8 0x7b2dd57452916205))], (e 0xb1e34676160bf5be 0xb22502621a139ca9
+    0xed51d0c93c99ee2)⟩
 
 /-- The transcription's batched point. -/
 def batchedPoint : List E :=
-  [e 0x1c3b3515c26e39cd 0xd7cd85ddc12e4340 0x71e5c1b1a9072741,
-    e 0xbc88ed94799e1144 0x6a3d395c0baa4ec 0x15e9d45adcaccac8,
-    e 0xf5e74cc7d330c218 0xb9f65ff472a53d28 0xf002b01726f8c7eb]
+  [(e 0x348b8da705dab3c 0x4a0f07253f23f679 0x8c1921b2319f3ee6), (e 0x192422a82a953dc1 0x9ddf6bd1eef1325b
+    0xd301f1095374cf03), (e 0x2fe66cd913b0274 0x16b48030478bb366 0x5728203ea9402b74)]
 
 #guard (batch children hints).map (·.bytecodePoint) = some batchedPoint
 #guard (batch children hints).map (·.bytecodeValue) = some hints.finalBytecodeValue

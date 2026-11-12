@@ -81,9 +81,9 @@ def l20Ok (fn : Fn) : Bool :=
   loopShapeF fn "__loop24" && decide (fn.params.length = 4) &&
   isMul A (.n 4) (.n 3) (.n 3) && isMul A (.n 5) (.n 2) (.n 4) && isMul A (.n 6) (.n 0) (.n 0) &&
   isMul A (.n 7) (.n 5) (.n 6) &&
-  hasAtom A (.const (.n 8) (word 8002054802297438051 4108169256045952147 0)) &&
+  hasAtom A (.const (.n 8) (word 17635339603416681651 5630583628039031207 0)) &&
   A.any (isLoadAt (.n 8) (.n 7) 0) &&
-  hasAtom A (.const (.n 9) (word 12830724869163462953 1721925254677230945 0)) &&
+  hasAtom A (.const (.n 9) (word 11942528933372280140 15641231512148347094 0)) &&
   A.any (isLoadAt (.n 9) (.n 7) 1)
 
 /-! ## The body -/
