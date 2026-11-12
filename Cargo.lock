@@ -313,6 +313,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "leanvm-sidecar"
+version = "0.1.0"
+dependencies = [
+ "bench",
+ "clap",
+ "leanvm",
+ "leanvm_sidecar_client",
+ "libc",
+ "signatures",
+ "tracing",
+]
+
+[[package]]
 name = "leanvm_core"
 version = "0.1.0"
 dependencies = [
@@ -324,6 +337,13 @@ dependencies = [
  "primitives",
  "tracing",
  "verifier",
+]
+
+[[package]]
+name = "leanvm_sidecar_client"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

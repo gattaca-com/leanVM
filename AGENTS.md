@@ -35,8 +35,9 @@ The root `Cargo.toml` is workspace-only: libraries in `crates/`, the CLI in `bin
 | `verifier`        | the one native verifier (below)                                        |
 | `rec_aggregation` | recursive signature and DA aggregation: the guest and public entry points |
 | `leanvm`          | the public API                                                         |
+| `leanvm_sidecar_client` | client of `bins/leanvm-sidecar`; depends on `libc` alone                 |
 
-`crates/leanvm/src/lib.rs` is the only thing a user imports: every other crate is `publish = false`, so a new user-facing item is a re-export there, and `crates/leanvm/tests/api.rs` is its end-to-end use. Guests are zkDSL under `crates/rec_aggregation/guests/`. The CLI is `bins/leanvm`, run with `cargo leanvm <subcommand>` (`aggregate`, `recursion`, `fibonacci`, `hash`).
+`crates/leanvm/src/lib.rs` is the only thing a user imports: every other crate is `publish = false`, so a new user-facing item is a re-export there, and `crates/leanvm/tests/api.rs` is its end-to-end use. Guests are zkDSL under `crates/rec_aggregation/guests/`. The CLI is `bins/leanvm`, run with `cargo leanvm <subcommand>` (`aggregate`, `recursion`, `fibonacci`, `hash`). `bins/leanvm-sidecar` serves leanXMSS aggregation, recursion and verification to one client process over a shared-memory file, through the `leanvm` API alone; its `PROTOCOL.md` is the byte-level specification for clients in other languages, so a change to `wire.rs` or the layout in `shm.rs` lands there and in the five clients: `crates/leanvm_sidecar_client` (Rust, which the server's test drives), `bins/leanvm-sidecar/clients/go`, `clients/java`, `clients/typescript` and `clients/nim`, each a `send` and a `try_recv` over raw payload bytes. `bins/leanvm-sidecar/e2e.sh <rust|go|java|ts|nim> <threads>` starts the server and drives sixteen 1500-signature aggregations and their 16-to-1 recursion through that language's client, printing each step's sizes and time.
 
 ## Building and testing
 
@@ -52,11 +53,11 @@ cargo fmt --all                   # max_width = 120
 cargo machete --with-metadata     # unused dependencies, dev ones included
 ```
 
-An x86-only `cfg` arm never compiles on an Apple machine, so type-check the other target before pushing anything `cfg`-gated (needs only `rustup target add x86_64-unknown-linux-gnu`; `bench` and the CLI are left out because jemalloc's build script wants a cross `gcc`):
+An x86-only `cfg` arm never compiles on an Apple machine, so type-check the other target before pushing anything `cfg`-gated (needs only `rustup target add x86_64-unknown-linux-gnu`; `bench` and the binaries are left out because jemalloc's build script wants a cross `gcc`):
 
 ```bash
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+avx512f,+avx512bw,+avx512vl,+avx512vbmi,+vpclmulqdq,+pclmulqdq,+gfni,+avx2,+aes" \
-  cargo check --release --workspace --exclude leanvm-cli --exclude bench --target x86_64-unknown-linux-gnu
+  cargo check --release --workspace --exclude leanvm-cli --exclude leanvm-sidecar --exclude bench --target x86_64-unknown-linux-gnu
 ```
 
 To confirm an arm is reached rather than silently skipped, put a `compile_error!` in it and watch the check fail.
