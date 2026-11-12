@@ -95,13 +95,13 @@ def lname (_D : VkData) (s : ℕ) : String := layerName (firstOf s)
 def lcur (s : ℕ) : ℕ := 1 + s * (47 + 2 * (D.τ - 3) + 36)
 
 /-- The buffers' sizes. -/
-def sizes : List ℕ := [D.τ - 3, 5, 286, 30, 62, 2, 30]
+def sizes : List ℕ := [D.τ - 3, 5, 154, 30, 62, 2, 30]
 
 /-- The claim records' buffer, past the buffers' base. -/
 def o201 : ℕ := D.τ + 2
 
 /-- The lane coordinates' tree, past the buffers' base. -/
-def o274 : ℕ := D.τ + 318
+def o274 : ℕ := D.τ + 186
 
 /-- Layer `s`'s next claim's record, pointing into its buffers at `ls s`. -/
 def outWs (ls : ℕ → ℕ) (s : ℕ) : List E :=
@@ -113,7 +113,7 @@ def cw0 (B : ℕ) : List E :=
   [D.c0.value, 1, ptr B, ptr (B + D.o274 + 30), 0, 0] ++ D.c0.mu
 
 /-- The claim records. -/
-def claims (B : ℕ) (ls : ℕ → ℕ) : List E := D.cw0 B ++ (List.range 12).flatMap (D.outWs ls)
+def claims (B : ℕ) (ls : ℕ → ℕ) : List E := D.cw0 B ++ (List.range 6).flatMap (D.outWs ls)
 
 /-- **Where claim `s`'s record and buffers are.** -/
 def CL (B : ℕ) (ls : ℕ → ℕ) : ℕ → ClaimLay
@@ -128,8 +128,8 @@ def own (B : ℕ) (ls : ℕ → ℕ) : List (List E) :=
     eqLevels D.I.1 4]
 
 theorem bases_eq (B : ℕ) (h : 3 ≤ D.τ) :
-    bases B D.sizes = [B, B + (D.τ - 3), B + D.o201, B + D.τ + 288, B + D.o274, B + D.τ + 380,
-      B + D.τ + 382] := by
+    bases B D.sizes = [B, B + (D.τ - 3), B + D.o201, B + D.τ + 156, B + D.o274, B + D.τ + 248,
+      B + D.τ + 250] := by
   simp only [sizes, o201, o274, bases]
   simp only [List.cons.injEq, and_true, true_and]
   repeat' apply And.intro

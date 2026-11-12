@@ -14,7 +14,7 @@ public import LeanVM.Guest.B1.KeccakGkr.VkKidsBW
 
 `VkCompleteAtBK fs cert κ Bvk`: `VkCompleteAtK` by trees of at most `Bvk` words.
 `verify_keccak_completeAtB_fs`: it holds at the deployed frame sizes `B2C.fs` with
-`vkBound = B2C.fs "verify_keccak" + 440 + 61728`: the frame, the seven buffers (`τ + 412`
+`vkBound = B2C.fs "verify_keccak" + 440 + 61728`: the frame, the seven buffers (`τ + 280`
 words, `τ ≤ 28`) and the callees (`kidsB_fs_le`), by `completeAt_flatGB` on the same
 obligations as the unbounded form (`vk_obl`).
 -/
@@ -46,7 +46,7 @@ def VkCompleteAtBK (fs : String → ℕ) (cert : String → V → ℕ) (κ Bvk :
 /-- `verify_keccak`'s words at `B2C.fs`. -/
 noncomputable def vkBound : ℕ := LeanVM.Guest.B2C.fs "verify_keccak" + 440 + 61728
 
-theorem VkData.sizes_sum {D : VkData} (h : D.Ok) : D.sizes.sum = D.τ + 412 := by
+theorem VkData.sizes_sum {D : VkData} (h : D.Ok) : D.sizes.sum = D.τ + 280 := by
   have := h.1
   simp [VkData.sizes]
   omega

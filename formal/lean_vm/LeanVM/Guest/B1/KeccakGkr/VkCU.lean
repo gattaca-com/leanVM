@@ -11,7 +11,7 @@ public import LeanVM.Guest.B1.KeccakGkr.VkCT
 /-!
 # The frames
 
-`calls_match`: on the layout, the eighteen frames the body sets up are the callees `D.kids` at
+`calls_match`: on the layout, the twelve frames the body sets up are the callees `D.kids` at
 the frame pointers `fps`: their names, whether entered, their arguments, and their returns are
 what the callees return.
 -/
@@ -36,7 +36,7 @@ theorem gen_ne (h : D.Ok) : 1 + gen ^ (D.τ - 4) ≠ 0 :=
 
 /-- **Layer `s`'s frame matches its callee.** -/
 theorem layer_match (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs fps)) {σ : Val}
-    (hσd : σ = D.val rd B curE chiE olE zvE slE) {s : ℕ} (hs : s < 12)
+    (hσd : σ = D.val rd B curE chiE olE zvE slE) {s : ℕ} (hs : s < 6)
     {o : List E × Main.Layout}
     (ho : (D.layKid fs B curE s).Out ([] ++ fps.take (s + 1 + 1)) o.1 o.2) :
     (Main.mkCall σ (stepCall s)).f = (D.layKid fs B curE s).f ∧
@@ -57,7 +57,7 @@ theorem layer_match (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs
 set_option maxRecDepth 20000 in
 /-- **The frames match the callees.** -/
 theorem calls_match (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs fps))
-    {σ : Val} (hσd : σ = D.val rd B curE chiE olE zvE slE) (hfl : fps.length = 18)
+    {σ : Val} (hσd : σ = D.val rd B curE chiE olE zvE slE) (hfl : fps.length = 12)
     {outs : List (List E × Main.Layout)}
     (hout : OutsOk (atAllG [] (D.kids fs B curE chiE olE zvE slE) fps) outs) :
     CallsMatch σ ((vkPre.filterMap (Stmt.callSF σ)).map (Main.mkCall σ))
@@ -66,24 +66,24 @@ theorem calls_match (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs
     a274, -, -⟩ := head_first h hm hσd
   obtain ⟨eL, e3690, e3691, e3692, e3693, eO, -, cellsW, e3971, e3972, e3974, -⟩ :=
     out_on h hm hσd p6 p9 h17 a58 a274
-  have e3699 : σ (.n 971) = ptr (curE + D.lcur 12 + 12) := by
+  have e3699 : σ (.n 739) = ptr (curE + D.lcur 6 + 12) := by
     have := eO 5 (by norm_num)
     rw [this, oRets, List.getD_append_right _ _ _ _ (by rw [(O_ok h).2.1]), (O_ok h).2.1]
     simp [cL, ptr_mul_gen]
   obtain ⟨e3976, e3977, e3979, eI, e4104, e4107, e4108, e4109, eS, -, -⟩ :=
     in_on h hm hσd p6 p9 p10 a201 e3699
-  have e4116 : σ (.n 1388) = D.S.2.1 := by
-    rw [show (1388 : ℕ) = 1382 + 6 from rfl, eS 6 (by norm_num), sRets,
+  have e4116 : σ (.n 1156) = D.S.2.1 := by
+    rw [show (1156 : ℕ) = 1150 + 6 from rfl, eS 6 (by norm_num), sRets,
       List.getD_append_right _ _ _ _ (by rw [(S_ok h).2.1]; norm_num), (S_ok h).2.1]
     rfl
   obtain ⟨e4977, e6580, e6581, e6583, -⟩ :=
     fin_on h hm hσd p9 p10 h17 a201 e4104 e4107 e4116 e3979
   rw [vkPre_callSF]
   obtain ⟨hol, hoi⟩ := outsOk_getElem hout
-  have hk : (D.kids fs B curE chiE olE zvE slE).length = 18 := kids_length
-  have hlen : (atAllG [] (D.kids fs B curE chiE olE zvE slE) fps).length = 18 := by
+  have hk : (D.kids fs B curE chiE olE zvE slE).length = 12 := kids_length
+  have hlen : (atAllG [] (D.kids fs B curE chiE olE zvE slE) fps).length = 12 := by
     rw [atAllG_length, hk, hfl]; rfl
-  have hoi2 : ∀ i (hi : i < 18) (ho : i < outs.length),
+  have hoi2 : ∀ i (hi : i < 12) (ho : i < outs.length),
       ((D.kids fs B curE chiE olE zvE slE)[i]'(by omega)).taken = true →
       ((D.kids fs B curE chiE olE zvE slE)[i]'(by omega)).Out ([] ++ fps.take (i + 1))
         (outs[i]'ho).1 (outs[i]'ho).2 := by
@@ -98,9 +98,9 @@ theorem calls_match (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs
     simp only [List.length_map, List.length_range] at h1
     simp only [List.getElem_map, List.getElem_range]
     rw [hj j h1, List.getD_eq_getElem _ _ h2]
-  have hoc : ∀ j < 5, σ (.n (966 + j)) = D.O.2.2.cap.getD j 0 := fun j hj ↦ by
+  have hoc : ∀ j < 5, σ (.n (734 + j)) = D.O.2.2.cap.getD j 0 := fun j hj ↦ by
     rw [eO j (by omega), oRets, List.getD_append _ _ _ _ (by rw [(O_ok h).2.1]; exact hj)]
-  have hic : ∀ j < 5, σ (.n (1252 + j)) = D.I.2.2.cap.getD j 0 := fun j hj ↦ by
+  have hic : ∀ j < 5, σ (.n (1020 + j)) = D.I.2.2.cap.getD j 0 := fun j hj ↦ by
     rw [eI j (by omega), iRets, List.getD_append _ _ _ _ (by rw [(I_ok h).2.1]; exact hj)]
   apply callsMatch_ofI (by rw [hlen]; simp [vkCalls]) hol (fun i hi hc ho ↦ ?_)
   rw [hlen] at hi
@@ -118,39 +118,33 @@ theorem calls_match (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs
   · exact layer_match h hm hσd (s := 3) (by norm_num) (hoi2 4 (by omega) ho rfl)
   · exact layer_match h hm hσd (s := 4) (by norm_num) (hoi2 5 (by omega) ho rfl)
   · exact layer_match h hm hσd (s := 5) (by norm_num) (hoi2 6 (by omega) ho rfl)
-  · exact layer_match h hm hσd (s := 6) (by norm_num) (hoi2 7 (by omega) ho rfl)
-  · exact layer_match h hm hσd (s := 7) (by norm_num) (hoi2 8 (by omega) ho rfl)
-  · exact layer_match h hm hσd (s := 8) (by norm_num) (hoi2 9 (by omega) ho rfl)
-  · exact layer_match h hm hσd (s := 9) (by norm_num) (hoi2 10 (by omega) ho rfl)
-  · exact layer_match h hm hσd (s := 10) (by norm_num) (hoi2 11 (by omega) ho rfl)
-  · exact layer_match h hm hσd (s := 11) (by norm_num) (hoi2 12 (by omega) ho rfl)
   · refine ⟨rfl, rfl, fun _ ↦ ⟨?_, ?_⟩⟩
-    · show [σ (.n 957), σ (.n 958), σ (.n 959), σ (.n 960), σ (.n 961), σ (.n 964),
-        σ (.n 965), σ (.n 962), σ (.n 193), σ (.n 963)] = D.oArgs curE zvE
+    · show [σ (.n 725), σ (.n 726), σ (.n 727), σ (.n 728), σ (.n 729), σ (.n 732),
+        σ (.n 733), σ (.n 730), σ (.n 193), σ (.n 731)] = D.oArgs curE zvE
       rw [oArgs, ← eL, e3692, e3693, e3690, e191, e3691]; rfl
-    · rw [(hoi2 13 (by norm_num) ho rfl).1]
+    · rw [(hoi2 7 (by norm_num) ho rfl).1]
       exact mr (by simp [oRets, (O_ok h).2.1]) eO
   · refine ⟨rfl, ?_, fun _ ↦ ⟨?_, ?_⟩⟩
-    · show decide (σ (.n 1243) ≠ 0) = true
+    · show decide (σ (.n 1011) ≠ 0) = true
       rw [e3971]; exact decide_eq_true (gen_ne h)
-    · show [σ (.n 1244), σ (.n 17), σ (.n 1246), σ (.n 60)] =
+    · show [σ (.n 1012), σ (.n 17), σ (.n 1014), σ (.n 60)] =
         [1, gen ^ (D.τ - 4), ptr zvE * gen ^ 4, ptr B]
       rw [e3972, h17, e3974, a58]
-    · exact ((hoi2 14 (by norm_num) ho rfl).1).symm
+    · exact ((hoi2 8 (by norm_num) ho rfl).1).symm
   · refine ⟨rfl, rfl, fun _ ↦ ⟨?_, ?_⟩⟩
-    · show [σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970), σ (.n 980),
-        σ (.n 982), σ (.n 1248), σ (.n 1249), σ (.n 1251)] = D.iArgs curE zvE
-      have hc5 : [σ (.n 966), σ (.n 967), σ (.n 968), σ (.n 969), σ (.n 970)] = D.O.2.2.cap :=
-        mr (b := 966) (n := 5) (O_ok h).2.1 hoc
+    · show [σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738), σ (.n 748),
+        σ (.n 750), σ (.n 1016), σ (.n 1017), σ (.n 1019)] = D.iArgs curE zvE
+      have hc5 : [σ (.n 734), σ (.n 735), σ (.n 736), σ (.n 737), σ (.n 738)] = D.O.2.2.cap :=
+        mr (b := 734) (n := 5) (O_ok h).2.1 hoc
       rw [iArgs, ← hc5, ← cellsW, e3976, e3977, e3979, cL]
       simp only [ptr_mul_gen, ptr_mul_gen1, List.cons_append, List.nil_append]
-    · rw [(hoi2 15 (by norm_num) ho rfl).1]
+    · rw [(hoi2 9 (by norm_num) ho rfl).1]
       exact mr (by simp [iRets, (I_ok h).2.1]) eI
   · refine ⟨rfl, rfl, fun _ ↦ ⟨?_, ?_⟩⟩
-    · show [σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256), σ (.n 1380),
-        σ (.n 1381), σ (.n 1257), σ (.n 1258), σ (.n 1379)] = D.sArgs curE zvE
-      have hc5 : [σ (.n 1252), σ (.n 1253), σ (.n 1254), σ (.n 1255), σ (.n 1256)] = D.I.2.2.cap :=
-        mr (b := 1252) (n := 5) (I_ok h).2.1 hic
+    · show [σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024), σ (.n 1148),
+        σ (.n 1149), σ (.n 1025), σ (.n 1026), σ (.n 1147)] = D.sArgs curE zvE
+      have hc5 : [σ (.n 1020), σ (.n 1021), σ (.n 1022), σ (.n 1023), σ (.n 1024)] = D.I.2.2.cap :=
+        mr (b := 1020) (n := 5) (I_ok h).2.1 hic
       have e5 := eI 5 (by norm_num)
       have e6 := eI 6 (by norm_num)
       rw [iRets, List.getD_append_right _ _ _ _ (by rw [(I_ok h).2.1]), (I_ok h).2.1] at e5
@@ -159,15 +153,15 @@ theorem calls_match (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs
       simp only [Nat.reduceAdd] at e5 e6
       rw [e5, e6]
       rfl
-    · rw [(hoi2 16 (by norm_num) ho rfl).1]
+    · rw [(hoi2 10 (by norm_num) ho rfl).1]
       exact mr (by simp [sRets, (S_ok h).2.1]) eS
   · refine ⟨rfl, ?_, fun _ ↦ ⟨?_, ?_⟩⟩
-    · show decide (σ (.n 3864) ≠ 0) = true
+    · show decide (σ (.n 3632) ≠ 0) = true
       rw [e6580]; exact decide_eq_true (gen_ne h)
-    · show [σ (.n 3865), σ (.n 17), σ (.n 3867), σ (.n 2249)] =
-        [1, gen ^ (D.τ - 4), ptr zvE * gen ^ 43, ptr (D.lsOf fs ([] ++ fps.take 17) 11)]
+    · show [σ (.n 3633), σ (.n 17), σ (.n 3635), σ (.n 2017)] =
+        [1, gen ^ (D.τ - 4), ptr zvE * gen ^ 43, ptr (D.lsOf fs ([] ++ fps.take 11) 5)]
       rw [e6581, h17, e6583, e4977, List.nil_append, lsOf_take fs fps (by norm_num)]
-    · exact ((hoi2 17 (by norm_num) ho rfl).1).symm
+    · exact ((hoi2 11 (by norm_num) ho rfl).1).symm
 
 end VkData
 

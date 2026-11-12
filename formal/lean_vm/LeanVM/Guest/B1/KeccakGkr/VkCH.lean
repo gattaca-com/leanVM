@@ -62,13 +62,13 @@ variable {D : VkData}
 
 theorem layer_xs (s : ℕ) : (D.layer s).xs = ltXs (D.T s) := rfl
 
-theorem ltXs_length (h : D.Ok) {s : ℕ} (hs : s < 12) :
+theorem ltXs_length (h : D.Ok) {s : ℕ} (hs : s < 6) :
     (ltXs (D.T s)).length = 47 + 2 * (D.τ - 3) + 36 := by
   rw [← layer_xs]
   obtain ⟨hpl, hpm, hlm, -, -⟩ := D.layer_facts h hs
   rw [LayerData.xs_length hpl hpm hlm, D.layer_y h (by omega)]
 
-theorem xs_eq (h : D.Ok) : D.xs = [D.committed] ++ (List.range 12).flatMap (fun s ↦ ltXs (D.T s)) ++
+theorem xs_eq (h : D.Ok) : D.xs = [D.committed] ++ (List.range 6).flatMap (fun s ↦ ltXs (D.T s)) ++
     (D.mO.flatMap (fun m ↦ [m.1, m.2]) ++ [D.word] ++ D.mI.flatMap (fun m ↦ [m.1, m.2]) ++
       D.mS.flatMap (fun m ↦ [m.1, m.2]) ++ D.slices) := by
   rw [xs, flatMap_eq_range D.Ts ltXs, ok_Ts h]
@@ -78,14 +78,14 @@ theorem xs_eq (h : D.Ok) : D.xs = [D.committed] ++ (List.range 12).flatMap (fun 
 /-- **The stream, split.** -/
 theorem xs_reads (h : D.Ok) {rd : Reader} {curE : ℕ} (hr : ReadsAt rd (ptr curE) D.xs) :
     LoadHolds rd (ptr curE) 0 D.committed ∧
-      (∀ s < 12, ReadsAt rd (ptr (curE + D.lcur s)) (ltXs (D.T s))) ∧
-      ReadsAt rd (ptr (curE + D.lcur 12)) (D.mO.flatMap fun m ↦ [m.1, m.2]) ∧
-      LoadHolds rd (ptr (curE + D.lcur 12 + 12)) 0 D.word ∧
-      ReadsAt rd (ptr (curE + D.lcur 12 + 13)) (D.mI.flatMap fun m ↦ [m.1, m.2]) ∧
-      ReadsAt rd (ptr (curE + D.lcur 12 + 21)) (D.mS.flatMap fun m ↦ [m.1, m.2]) ∧
-      ReadsAt rd (ptr (curE + D.lcur 12 + 33)) D.slices := by
+      (∀ s < 6, ReadsAt rd (ptr (curE + D.lcur s)) (ltXs (D.T s))) ∧
+      ReadsAt rd (ptr (curE + D.lcur 6)) (D.mO.flatMap fun m ↦ [m.1, m.2]) ∧
+      LoadHolds rd (ptr (curE + D.lcur 6 + 12)) 0 D.word ∧
+      ReadsAt rd (ptr (curE + D.lcur 6 + 13)) (D.mI.flatMap fun m ↦ [m.1, m.2]) ∧
+      ReadsAt rd (ptr (curE + D.lcur 6 + 21)) (D.mS.flatMap fun m ↦ [m.1, m.2]) ∧
+      ReadsAt rd (ptr (curE + D.lcur 6 + 33)) D.slices := by
   obtain ⟨-, -, -, -, -, -, -, hmO, hmI, hmS, -, -, -⟩ := id h
-  have hc : ∀ k < 12, (ltXs (D.T k)).length = 47 + 2 * (D.τ - 3) + 36 :=
+  have hc : ∀ k < 6, (ltXs (D.T k)).length = 47 + 2 * (D.τ - 3) + 36 :=
     fun k hk ↦ ltXs_length h hk
   rw [xs_eq h] at hr
   refine ⟨?_, fun s hs ↦ ?_, ?_⟩
@@ -99,7 +99,7 @@ theorem xs_reads (h : D.Ok) {rd : Reader} {curE : ℕ} (hr : ReadsAt rd (ptr cur
   · have h1 := (readsAt_append.1 hr).2
     rw [ptr_mul_gen, List.length_append, flatMap_range_length _ hc] at h1
     simp only [List.length_singleton] at h1
-    rw [show curE + (1 + 12 * (47 + 2 * (D.τ - 3) + 36)) = curE + D.lcur 12 by simp [lcur]]
+    rw [show curE + (1 + 6 * (47 + 2 * (D.τ - 3) + 36)) = curE + D.lcur 6 by simp [lcur]]
       at h1
     simp only [readsAt_append, flatMap_pairs_length, hmO, hmI, List.length_append,
       List.length_singleton, ptr_mul_gen] at h1
@@ -123,13 +123,13 @@ theorem inst4 (h : D.Ok) : (D.inst.take 4).length = 4 := by
 theorem c0_mu (h : D.Ok) : D.c0.mu.length = 16 := by
   simp only [c0, vkFirst, eqKernel_length, inst4 h]; rfl
 
-theorem locPt_length (h : D.Ok) {s : ℕ} (hs : s < 12) :
+theorem locPt_length (h : D.Ok) {s : ℕ} (hs : s < 6) :
     ((D.layer s).locPt (firstOf s)).length = 11 := by
   obtain ⟨-, -, hlm, -, -⟩ := D.layer_facts h hs
   rw [LayerData.locPt, LayerData.loc, layerLocal, localRunF_length, hlm]
 
 /-- **Claim `s`'s record and buffers hold what `ClaimLay.Ok` asks.** -/
-theorem CL_ok (h : D.Ok) (B : ℕ) (ls : ℕ → ℕ) {s : ℕ} (hs : s ≤ 12) :
+theorem CL_ok (h : D.Ok) (B : ℕ) (ls : ℕ → ℕ) {s : ℕ} (hs : s ≤ 6) :
     (D.CL B ls s).Ok (firstOf s) (D.layer s).c (D.layer s).y := by
   rcases s with _ | k
   · have hmu := c0_mu h
@@ -142,7 +142,7 @@ theorem CL_ok (h : D.Ok) (B : ℕ) (ls : ℕ → ℕ) {s : ℕ} (hs : s ≤ 12) 
       have : j / 64 < 25 := by
         have := List.mem_range.1 hj; simp only [keccakBits] at this; omega
       simp [List.getD_eq_getElem?_getD, this]
-  · have hk : k < 12 := by omega
+  · have hk : k < 6 := by omega
     have hsucc := D.layer_succ h hk
     have hc : (D.layer (k + 1)).c = (D.layer k).next (firstOf k) := by
       show (D.chain (k + 1)).1 = _
@@ -180,12 +180,12 @@ theorem plainRun_ok (ms : List (E × E)) (v : E) (s : Fs) (h : ms ≠ []) :
   obtain ⟨t, ht⟩ := plainRun_sq ms v s h
   rw [ht]; exact sq_ok t
 
-theorem L_eq (h : D.Ok) : D.L = D.chain 12 := by
+theorem L_eq (h : D.Ok) : D.L = D.chain 6 := by
   simp only [chain, L, keccakDepth]
   rw [List.take_of_length_le (by simp), List.take_of_length_le (by rw [ok_Ts h])]
 
 theorem L_ok (h : D.Ok) : D.L.2 = ⟨D.L.2.cap, []⟩ ∧ D.L.2.cap.length = 5 ∧ AllCanonical D.L.2.cap := by
-  rw [L_eq h, D.layer_succ h (by norm_num : 11 < 12)]
+  rw [L_eq h, D.layer_succ h (by norm_num : 5 < 6)]
   exact sq_ok _
 
 theorem O_ok (h : D.Ok) : D.O.2.2 = ⟨D.O.2.2.cap, []⟩ ∧ D.O.2.2.cap.length = 5 ∧

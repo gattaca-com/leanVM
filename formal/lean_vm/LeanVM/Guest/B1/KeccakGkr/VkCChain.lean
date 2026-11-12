@@ -1,7 +1,7 @@
 /-
   LeanVM.Guest.B1.KeccakGkr.VkCChain
 
-  `verify_keccak`'s twelve layers, honestly: each one's data, its checks, and how it starts from
+  `verify_keccak`'s six layers, honestly: each one's data, its checks, and how it starts from
   the previous one's end.
 -/
 
@@ -101,9 +101,9 @@ namespace VkData
 
 variable {D : VkData}
 
-theorem ok_Ts (h : D.Ok) : D.Ts.length = 12 := chainOk_length h.2.2.2.2.2.2.1
+theorem ok_Ts (h : D.Ok) : D.Ts.length = 6 := chainOk_length h.2.2.2.2.2.2.1
 
-theorem chain_at (h : D.Ok) {k : ℕ} (hk : k < 12) :
+theorem chain_at (h : D.Ok) {k : ℕ} (hk : k < 6) :
     let T := D.T k
     T.1.length = productBits ∧ T.2.1.length = (D.chain k).1.point.length ∧
       T.2.2.1.length = keccakLocalBits ∧
@@ -129,7 +129,7 @@ theorem c0_point (h : D.Ok) : D.c0.point.length = D.τ - 3 := by
 /-- The specialization layer `k` runs: the first, or a later one. -/
 def firstOf (k : ℕ) : ℕ := if k = 0 then 1 else 0
 
-theorem chain_s0 (h : D.Ok) {k : ℕ} (hk : k < 12) :
+theorem chain_s0 (h : D.Ok) {k : ℕ} (hk : k < 6) :
     (D.chain k).2 = (D.layer k).s0 (firstOf k) := by
   rcases Nat.eq_zero_or_pos k with rfl | hk0
   · have hs := (squeezeN_ok 4 D.sq1.2).1
@@ -145,14 +145,14 @@ theorem chain_s0 (h : D.Ok) {k : ℕ} (hk : k < 12) :
     simp only [layerBeta]
     exact squeeze_snd_eq _
 
-theorem chain_point (h : D.Ok) {k : ℕ} (hk : k ≤ 12) : (D.chain k).1.point.length = D.τ - 3 := by
+theorem chain_point (h : D.Ok) {k : ℕ} (hk : k ≤ 6) : (D.chain k).1.point.length = D.τ - 3 := by
   have := chainOk_point h.2.2.2.2.2.2.1 k (by simpa [keccakDepth] using hk)
   rw [chain, this, c0_point h]
 
-theorem layer_y (h : D.Ok) {k : ℕ} (hk : k ≤ 12) : (D.layer k).y = D.τ - 3 :=
+theorem layer_y (h : D.Ok) {k : ℕ} (hk : k ≤ 6) : (D.layer k).y = D.τ - 3 :=
   D.chain_point h hk
 
-theorem layer_cap (h : D.Ok) {k : ℕ} (hk : k < 12) :
+theorem layer_cap (h : D.Ok) {k : ℕ} (hk : k < 6) :
     (D.layer k).cap.length = 5 ∧ AllCanonical (D.layer k).cap := by
   rcases Nat.eq_zero_or_pos k with rfl | hk0
   · have hs := squeezeN_ok 4 D.sq1.2
@@ -166,7 +166,7 @@ theorem layer_cap (h : D.Ok) {k : ℕ} (hk : k < 12) :
     exact ⟨by simp [Fs.squeeze, capOf], squeeze_cap_canonical _⟩
 
 /-- **Layer `k`'s facts**: what `layer_completeAtF` takes of its data. -/
-theorem layer_facts (h : D.Ok) {k : ℕ} (hk : k < 12) :
+theorem layer_facts (h : D.Ok) {k : ℕ} (hk : k < 6) :
     (D.layer k).product.length = 47 ∧ (D.layer k).packMsgs.length = (D.layer k).y ∧
       (D.layer k).localMsgs.length = 11 ∧
       projectedOf (D.layer k).c (D.layer k).product +
@@ -178,7 +178,7 @@ theorem layer_facts (h : D.Ok) {k : ℕ} (hk : k < 12) :
   exact ⟨h1, h2, h3, h4, h5⟩
 
 /-- **The next layer starts where layer `k` ends.** -/
-theorem layer_succ (h : D.Ok) {k : ℕ} (hk : k < 12) :
+theorem layer_succ (h : D.Ok) {k : ℕ} (hk : k < 6) :
     D.chain (k + 1) = ((D.layer k).next (firstOf k), ((D.layer k).beta (firstOf k)).2) := by
   obtain ⟨-, -, -, -, -, he⟩ := D.chain_at h hk
   rw [he, D.chain_s0 h hk]

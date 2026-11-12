@@ -19,13 +19,13 @@ public import LeanVM.Guest.B1.KeccakGkr.LayerCPlacedB
 * the copy loops `__loop10`, `__loop11`, `__loop12` (`τ - 4` words each): `(τ - 4) * KC` and the
   loop's frame, from their runs' words (`TotalLeOn … LoopPre`, at most `KC` per iteration and
   their one phantom frame);
-* the twelve layers: `layerWords fs (firstOf s) (D.layer s).y KP KR` (`layer_completeAtFB`);
+* the six layers: `layerWords fs (firstOf s) (D.layer s).y KP KR` (`layer_completeAtFB`);
 * the committed outputs' and the inputs' opening's rounds (`plainName 0`): `KO`; the inputs'
   rounds (`plainName 1`): `KI` (`TotalLe`).
 
 Every call is entered, so the callees' words (`kidsGBound`) are at most `(D.kidsB …).sum`
 (`kids_boundB`), which is `3 * ((τ - 4) * KC)` and the copy loops' frames, `2 * KO + KI` and
-`Σ_{s < 12} layerWords …` (`kidsB_sum`).
+`Σ_{s < 6} layerWords …` (`kidsB_sum`).
 -/
 
 namespace LeanVM.Guest.B1.VerifySub
@@ -112,11 +112,11 @@ theorem plain_completeB {k0 : ℕ} (hk : k0 < 2) {K : ℕ}
 
 namespace VkData
 
-/-- **The calls' bounds**, in order: `__loop10`, the twelve layers, the committed outputs'
+/-- **The calls' bounds**, in order: `__loop10`, the six layers, the committed outputs'
 rounds, `__loop11`, the inputs' rounds, their opening's rounds, `__loop12`. -/
 def kidsB (D : VkData) (fs : String → ℕ) (KC KP KR KO KI : ℕ) : List ℕ :=
   [(D.τ - 4) * KC + fs "__loop10"] ++
-  (List.range 12).map (fun s ↦ layerWords fs (firstOf s) (D.layer s).y KP KR) ++
+  (List.range 6).map (fun s ↦ layerWords fs (firstOf s) (D.layer s).y KP KR) ++
   [KO, (D.τ - 4) * KC + fs "__loop11", KI, KO, (D.τ - 4) * KC + fs "__loop12"]
 
 variable {D : VkData}
@@ -125,7 +125,7 @@ variable {D : VkData}
 theorem kidsB_sum (D : VkData) (fs : String → ℕ) (KC KP KR KO KI : ℕ) :
     (D.kidsB fs KC KP KR KO KI).sum = 3 * ((D.τ - 4) * KC) +
       (fs "__loop10" + fs "__loop11" + fs "__loop12") + 2 * KO + KI +
-      ((List.range 12).map (fun s ↦ layerWords fs (firstOf s) (D.layer s).y KP KR)).sum := by
+      ((List.range 6).map (fun s ↦ layerWords fs (firstOf s) (D.layer s).y KP KR)).sum := by
   simp only [kidsB, List.sum_append, List.sum_cons, List.sum_nil]
   omega
 
@@ -192,7 +192,7 @@ theorem kids_completeB (h : D.Ok) (κ : ℕ) (B curE chiE olE zvE slE : ℕ) {KC
     refine (plain_completeB (k0 := 0) (by norm_num) hO κ (L := D.lin curE chiE olE zvE slE)
       (fun h0 ↦ absurd h0 (by decide)) (fun rd hm ↦ oMeaning h hm) (fun j hj ↦ ?_)
       (fun j hj ↦ ?_)).toFB
-    · have e : (D.oArgs curE zvE).getD 7 0 = ptr curE * gen ^ D.lcur 12 := by
+    · have e : (D.oArgs curE zvE).getD 7 0 = ptr curE * gen ^ D.lcur 6 := by
         rw [oArgs, hc, ← cL_eq]; rfl
       rw [e]
       exact inR_entry (ws := D.xs) (hlin (by simp))
@@ -215,7 +215,7 @@ theorem kids_completeB (h : D.Ok) (κ : ℕ) (B curE chiE olE zvE slE : ℕ) {KC
     refine (plain_completeB (k0 := 1) (by norm_num) hI κ (L := D.lin curE chiE olE zvE slE)
       (fun _ ↦ ⟨D.word, by rw [iArgs, hc]; rfl⟩) (fun rd hm ↦ iMeaning h hm) (fun j hj ↦ ?_)
       (fun j hj ↦ ?_)).toFB
-    · have e : (D.iArgs curE zvE).getD 7 0 = ptr curE * gen ^ (D.lcur 12 + 13) := by
+    · have e : (D.iArgs curE zvE).getD 7 0 = ptr curE * gen ^ (D.lcur 6 + 13) := by
         rw [iArgs, hc]
         show D.cL curE * gen ^ (2 * 6) * gen = _
         rw [cL, ptr_mul_gen, ptr_mul_gen1, ptr_mul_gen]
@@ -235,7 +235,7 @@ theorem kids_completeB (h : D.Ok) (κ : ℕ) (B curE chiE olE zvE slE : ℕ) {KC
     refine (plain_completeB (k0 := 0) (by norm_num) hO κ (L := D.lin curE chiE olE zvE slE)
       (fun h0 ↦ absurd h0 (by decide)) (fun rd hm ↦ sMeaning h hm) (fun j hj ↦ ?_)
       (fun j hj ↦ ?_)).toFB
-    · have e : (D.sArgs curE zvE).getD 7 0 = ptr curE * gen ^ (D.lcur 12 + 21) := by
+    · have e : (D.sArgs curE zvE).getD 7 0 = ptr curE * gen ^ (D.lcur 6 + 21) := by
         rw [sArgs, hc]
         show D.cL curE * gen ^ (2 * 6) * gen * gen ^ (2 * 4) = _
         rw [cL, ptr_mul_gen, ptr_mul_gen1, ptr_mul_gen, ptr_mul_gen]
@@ -252,18 +252,18 @@ theorem kids_completeB (h : D.Ok) (κ : ℕ) (B curE chiE olE zvE slE : ℕ) {KC
         (by rw [point_length h]; simp [plainCount] at hj; omega)
   · -- `__loop12`
     have hL : (fun p ↦ [(zvE + qkeccakVarsCap, D.point),
-        (D.lsOf fs (ps ++ [p]).dropLast 11, (D.layer 11).chs (firstOf 11))]) =
+        (D.lsOf fs (ps ++ [p]).dropLast 5, (D.layer 5).chs (firstOf 5))]) =
         fun _ ↦ [(zvE + qkeccakVarsCap, D.point),
-          (D.lsOf fs ps 11, (D.layer 11).chs (firstOf 11))] :=
+          (D.lsOf fs ps 5, (D.layer 5).chs (firstOf 5))] :=
       funext fun p ↦ by rw [List.dropLast_concat]
     simp only
     rw [hL]
     refine (loop_completeB find_copyLoop13 copyLoop_body13 rfl (by simp [vkKidS])
       (hC _ (by simp)) κ
-      (L := [(zvE + qkeccakVarsCap, D.point), (D.lsOf fs ps 11, (D.layer 11).chs (firstOf 11))])
-      (dw := D.point) (sw := (D.layer 11).chs (firstOf 11)) (m := D.τ - 4) (by omega) hord
+      (L := [(zvE + qkeccakVarsCap, D.point), (D.lsOf fs ps 5, (D.layer 5).chs (firstOf 5))])
+      (dw := D.point) (sw := (D.layer 5).chs (firstOf 5)) (m := D.τ - 4) (by omega) hord
       (db := zvE + qkeccakVarsCap) (dj := 4)
-      (sb := D.lsOf fs ps 11) (sj := 0) (by simp) (by simp)
+      (sb := D.lsOf fs ps 5) (sj := 0) (by simp) (by simp)
       (by rw [point_length h]; omega) (by rw [← L1_point h, L_point h]; omega)
       (fun j hj ↦ ?_) (by rw [ptr_mul_gen, ptr_mul_gen]) (by simp)).toFB
     rw [zero_add, ← L1_point h, point,

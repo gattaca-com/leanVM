@@ -44,7 +44,7 @@ def val (rd : Reader) (B curE chiE olE zvE slE : ℕ) : Val :=
 structure Mem (rd : Reader) (B curE chiE olE zvE slE : ℕ) (ls : ℕ → ℕ) : Prop where
   own : MemL rd (bufL B D.sizes (D.own B ls))
   lin : MemL rd (D.lin curE chiE olE zvE slE)
-  lay : ∀ s < 12, MemL rd (layerBufs (D.layer s) (firstOf s) (ptr (curE + D.lcur s)) (ls s))
+  lay : ∀ s < 6, MemL rd (layerBufs (D.layer s) (firstOf s) (ptr (curE + D.lcur s)) (ls s))
 
 variable {D}
 

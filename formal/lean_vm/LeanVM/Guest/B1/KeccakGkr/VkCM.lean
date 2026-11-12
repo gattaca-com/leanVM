@@ -43,8 +43,8 @@ theorem head_first (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE ls) {σ : V
     σ (.n 66) = ptr B * gen ^ (D.τ - 4) ∧ σ (.n 91) = D.seg.getD 0 0 ∧
     σ (.n 92) = ptr (B + (D.τ - 3)) ∧ (cap5 181).map σ = (D.layer 0).cap ∧
     σ (.n 193) = D.committed ∧ (σ (.n 200), σ (.n 202)) = D.cells 0 ∧
-    σ (.n 203) = ptr (B + D.o201) ∧ σ (.n 205) = ptr (B + D.τ + 288) ∧
-    σ (.n 276) = ptr (B + D.o274) ∧ σ (.n 384) = ptr (B + D.τ + 380) ∧
+    σ (.n 203) = ptr (B + D.o201) ∧ σ (.n 205) = ptr (B + D.τ + 156) ∧
+    σ (.n 276) = ptr (B + D.o274) ∧ σ (.n 384) = ptr (B + D.τ + 248) ∧
     ∀ {next : Prop} {kret : List E → Prop}, next →
       Stmt.HoldsList (fun _ _ _ ↦ True) rd σ (vkHeadT ++ vkFirstT) next kret := by
   have hσ : ∀ v, σ v = σ (.n v.idx) := by subst hσd; exact (val_good h).1
@@ -74,10 +74,10 @@ theorem head_first (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE ls) {σ : V
   have ha : ∀ x ∈ vkAllocs, σ x.1 = D.w B curE x.1.idx := by subst hσd; exact val_alloc h
   have a58 : σ (.n 60) = ptr B := ha (.n 60, .inr (.n 59)) (by simp [vkAllocs])
   have a90 : σ (.n 92) = ptr (B + (D.τ - 3)) := ha (.n 92, .inl 5) (by simp [vkAllocs])
-  have a201 : σ (.n 203) = ptr (B + D.o201) := ha (.n 203, .inl 286) (by simp [vkAllocs])
-  have a203 : σ (.n 205) = ptr (B + D.τ + 288) := ha (.n 205, .inl 30) (by simp [vkAllocs])
+  have a201 : σ (.n 203) = ptr (B + D.o201) := ha (.n 203, .inl 154) (by simp [vkAllocs])
+  have a203 : σ (.n 205) = ptr (B + D.τ + 156) := ha (.n 205, .inl 30) (by simp [vkAllocs])
   have a274 : σ (.n 276) = ptr (B + D.o274) := ha (.n 276, .inl 62) (by simp [vkAllocs])
-  have a382 : σ (.n 384) = ptr (B + D.τ + 380) := ha (.n 384, .inl 2) (by simp [vkAllocs])
+  have a382 : σ (.n 384) = ptr (B + D.τ + 248) := ha (.n 384, .inl 2) (by simp [vkAllocs])
   -- the memory
   obtain ⟨m58, m90, m201, m203, m274, m382, -⟩ := own_mem (by omega) hm.own
   have mchis := memL_entry hm.lin (b := chiE) (ws := D.chis) (by simp [lin])

@@ -26,18 +26,12 @@ open LeanVM.Guest.B1.Main (MemL RegionL)
 
 @[expose] public section
 
-theorem mem_steps : ∀ s < 12, ∀ st ∈ stepT s (stepB s) (stepCap s) (stepCur s) (stepCb s) (stepPn s),
+theorem mem_steps : ∀ s < 6, ∀ st ∈ stepT s (stepB s) (stepCap s) (stepCur s) (stepCb s) (stepPn s),
     st ∈ vkStepsT := by
   intro s hs st hst
   rw [vkStepsT]
   interval_cases s
-  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ hst)))))))))))
-  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst)))))))))))
-  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst))))))))))
-  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst)))))))))
-  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst))))))))
-  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst)))))))
-  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst))))))
+  · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ hst)))))
   · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst)))))
   · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst))))
   · exact (List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _ hst)))
@@ -54,7 +48,7 @@ theorem outWs_length (s : ℕ) : (D.outWs ls s).length = 22 := by
 theorem cw0_length (h : D.Ok) : (D.cw0 B).length = 22 := by simp [cw0, c0_mu h]
 
 /-- Claim `s + 1`'s record, in the claim records. -/
-theorem claims_slice (h : D.Ok) {k : ℕ} (hk : k < 12)
+theorem claims_slice (h : D.Ok) {k : ℕ} (hk : k < 6)
     (hc : ReadsAt rd (ptr (B + D.o201)) (D.claims B ls)) :
     ReadsAt rd (ptr (B + D.o201 + 22 * (k + 1))) (D.outWs ls k) := by
   rw [claims, flatMap_range_split _ hk] at hc
@@ -82,7 +76,7 @@ theorem lanes_first (ht : ReadsAt rd (ptr (B + D.o274)) (eqLevels D.rl 5)) :
   exact this k (by simp [eqKernel_length, rl_length]; omega)
 
 /-- **Claim `s`'s record and buffers, in memory.** -/
-theorem CL_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE ls) {s : ℕ} (hs : s < 12) :
+theorem CL_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE ls) {s : ℕ} (hs : s < 6) :
     MemL rd ((D.CL B ls s).L (firstOf s) (D.layer s).c) := by
   obtain ⟨m58, -, m201, -, m274, -, -⟩ := own_mem (by have := h.1; omega) hm.own
   rcases s with _ | k
@@ -93,7 +87,7 @@ theorem CL_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE ls) {s : ℕ} (
     · exact claims_first m201
     · exact m58
     · exact lanes_first m274
-  · have hk : k < 12 := by omega
+  · have hk : k < 6 := by omega
     have hL := hm.lay k hk
     rw [layerBufs_eq] at hL
     have hc : (D.layer (k + 1)).c = (D.layer k).next (firstOf k) := by
@@ -113,14 +107,14 @@ theorem CL_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE ls) {s : ℕ} (
       rw [hw.2.2.2]
       exact hL _ (by simp [CL])
 
-theorem step_bounds : ∀ s < 12, 204 ≤ stepT0 s (stepB s) ∧ 17 ≤ stepB s ∧
+theorem step_bounds : ∀ s < 6, 204 ≤ stepT0 s (stepB s) ∧ 17 ≤ stepB s ∧
     stepCb s < stepT0 s (stepB s) ∧ stepPn s < stepT0 s (stepB s) := by decide +kernel
 
 set_option maxRecDepth 20000 in
 /-- **Step `s`, on the layout**: from the claim records' pointers it reads (`cb`: claim `s`'s,
 `pn`: claim `s + 1`'s, as the step before computed them). -/
 theorem step_on (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE ls) {σ : Val}
-    (hσd : σ = D.val rd B curE chiE olE zvE slE) {s : ℕ} (hs : s < 12)
+    (hσd : σ = D.val rd B curE chiE olE zvE slE) {s : ℕ} (hs : s < 6)
     (h17 : σ (.n 17) = gen ^ (D.τ - 4))
     (h201 : σ (.n 203) = ptr (B + D.o201)) (h274 : σ (.n 276) = ptr (B + D.o274))
     (hcb : 1 ≤ s → σ (.n (stepCb s)) = σ (.n 203) * gen ^ (22 * (s - 1)))

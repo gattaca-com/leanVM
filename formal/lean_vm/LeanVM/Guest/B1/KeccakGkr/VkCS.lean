@@ -60,7 +60,7 @@ theorem take_last {s : ℕ} (hl : s + 2 ≤ fps.length) :
 
 /-- **Layer `s`'s words, in memory.** -/
 theorem layKid_lin_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs fps))
-    {s : ℕ} (hs : s < 12) (hl : s + 2 ≤ fps.length) :
+    {s : ℕ} (hs : s < 6) (hl : s + 2 ≤ fps.length) :
     MemL rd ((D.layKid fs B curE s).Lin (fps.take (s + 2))) := by
   have hdl : (fps.take (s + 2)).dropLast = fps.take (s + 1) := by
     rw [List.dropLast_eq_take, List.take_take, List.length_take]
@@ -81,7 +81,7 @@ theorem layKid_lin_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf
 
 /-- **Layer `s`'s words lie in the caller's words, the buffers or the previous layer's
 buffers.** -/
-theorem layKid_lin_region (h : D.Ok) {s : ℕ} (hs : s < 12) (hl : s + 2 ≤ fps.length)
+theorem layKid_lin_region (h : D.Ok) {s : ℕ} (hs : s < 6) (hl : s + 2 ≤ fps.length)
     {T : ℕ → Prop} (hLin : ∀ i, RegionL (D.lin curE chiE olE zvE slE) i → T i)
     (hOwn : ∀ i, RegionL (bufL B D.sizes (D.own B (D.lsOf fs fps))) i → T i)
     (hPrev : ∀ k, k + 1 = s → ∀ i, RegionL (layerBufs (D.layer k) (firstOf k)
@@ -122,7 +122,7 @@ theorem layKid_lin_region (h : D.Ok) {s : ℕ} (hs : s < 12) (hl : s + 2 ≤ fps
       · exact own (b := B + D.o274) (ws := eqLevels D.rl 5) (by rw [hO]; simp) (by omega)
           (by rw [eqLevels_length (by rw [rl_length])]; simp [eqKernel_length, rl_length])
           x hx'
-    · have hk : k < 12 := by omega
+    · have hk : k < 6 := by omega
       have hL := hPrev k rfl
       have lay : ∀ {b ws}, (b, ws) ∈ layerBufs (D.layer k) (firstOf k) (ptr (curE + D.lcur k))
           (D.lsOf fs fps k) → ∀ {b' ws'}, b ≤ b' → b' + ws'.length ≤ b + ws.length →
@@ -145,18 +145,18 @@ theorem layKid_lin_region (h : D.Ok) {s : ℕ} (hs : s < 12) (hl : s + 2 ≤ fps
             ((D.layer k).beta (firstOf k)).1) (eqKernel (((D.layer k).locPt (firstOf k)).take 6))))
           (by simp [layerBufs_eq]) le_rfl (by simp [flipsOf]) x hx'
 
-theorem kids_length : (D.kids fs B curE chiE olE zvE slE).length = 18 := by simp [kids]
+theorem kids_length : (D.kids fs B curE chiE olE zvE slE).length = 12 := by simp [kids]
 
 /-- **The callees' words, in memory.** -/
 theorem kids_lin_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf fs fps))
-    (hfl : fps.length = 18) :
+    (hfl : fps.length = 12) :
     ∀ i (hi : i < (D.kids fs B curE chiE olE zvE slE).length),
       MemL rd ((D.kids fs B curE chiE olE zvE slE)[i].Lin (fps.take (i + 1))) := by
   intro i hi
   rw [kids_length] at hi
   obtain ⟨m58, -⟩ := own_mem (by have := h.1; omega) hm.own
   have mlin := hm.lin
-  have hL11 := hm.lay 11 (by norm_num)
+  have hL11 := hm.lay 5 (by norm_num)
   rw [layerBufs_eq] at hL11
   interval_cases i
   · intro q hq
@@ -171,12 +171,6 @@ theorem kids_lin_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf f
   · exact layKid_lin_mem h hm (s := 3) (by norm_num) (by omega)
   · exact layKid_lin_mem h hm (s := 4) (by norm_num) (by omega)
   · exact layKid_lin_mem h hm (s := 5) (by norm_num) (by omega)
-  · exact layKid_lin_mem h hm (s := 6) (by norm_num) (by omega)
-  · exact layKid_lin_mem h hm (s := 7) (by norm_num) (by omega)
-  · exact layKid_lin_mem h hm (s := 8) (by norm_num) (by omega)
-  · exact layKid_lin_mem h hm (s := 9) (by norm_num) (by omega)
-  · exact layKid_lin_mem h hm (s := 10) (by norm_num) (by omega)
-  · exact layKid_lin_mem h hm (s := 11) (by norm_num) (by omega)
   · exact mlin
   · show MemL rd [(zvE, D.op), (B, D.c0.point)]
     intro q hq
@@ -187,7 +181,7 @@ theorem kids_lin_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf f
   · exact mlin
   · exact mlin
   · show MemL rd [(zvE + qkeccakVarsCap, D.point),
-      (D.lsOf fs (fps.take 18).dropLast 11, (D.layer 11).chs (firstOf 11))]
+      (D.lsOf fs (fps.take 12).dropLast 5, (D.layer 5).chs (firstOf 5))]
     intro q hq
     simp only [List.mem_cons, List.not_mem_nil, or_false] at hq
     rcases hq with rfl | rfl
@@ -198,10 +192,10 @@ theorem kids_lin_mem (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE (D.lsOf f
 
 /-- **The callees' words lie in the caller's words, the buffers or the earlier layers'
 buffers.** -/
-theorem kids_lin_region (h : D.Ok) (hfl : fps.length = 18) {T : ℕ → ℕ → Prop}
+theorem kids_lin_region (h : D.Ok) (hfl : fps.length = 12) {T : ℕ → ℕ → Prop}
     (hLin : ∀ j x, RegionL (D.lin curE chiE olE zvE slE) x → T j x)
     (hOwn : ∀ j x, RegionL (bufL B D.sizes (D.own B (D.lsOf fs fps))) x → T j x)
-    (hPrev : ∀ k < 12, ∀ j, k + 1 < j → ∀ x, RegionL (layerBufs (D.layer k) (firstOf k)
+    (hPrev : ∀ k < 6, ∀ j, k + 1 < j → ∀ x, RegionL (layerBufs (D.layer k) (firstOf k)
       (ptr (curE + D.lcur k)) (D.lsOf fs fps k)) x → T j x) :
     ∀ i (hi : i < (D.kids fs B curE chiE olE zvE slE).length), ∀ x,
       RegionL ((D.kids fs B curE chiE olE zvE slE)[i].Lin (fps.take (i + 1))) x → T i x := by
@@ -231,39 +225,27 @@ theorem kids_lin_region (h : D.Ok) (hfl : fps.length = 18) {T : ℕ → ℕ → 
       (fun k hk x hx ↦ hPrev k (by omega) 5 (by omega) x hx)
   · exact layKid_lin_region h (s := 5) (by norm_num) (by omega) (hLin 6) (hOwn 6)
       (fun k hk x hx ↦ hPrev k (by omega) 6 (by omega) x hx)
-  · exact layKid_lin_region h (s := 6) (by norm_num) (by omega) (hLin 7) (hOwn 7)
-      (fun k hk x hx ↦ hPrev k (by omega) 7 (by omega) x hx)
-  · exact layKid_lin_region h (s := 7) (by norm_num) (by omega) (hLin 8) (hOwn 8)
-      (fun k hk x hx ↦ hPrev k (by omega) 8 (by omega) x hx)
-  · exact layKid_lin_region h (s := 8) (by norm_num) (by omega) (hLin 9) (hOwn 9)
-      (fun k hk x hx ↦ hPrev k (by omega) 9 (by omega) x hx)
-  · exact layKid_lin_region h (s := 9) (by norm_num) (by omega) (hLin 10) (hOwn 10)
-      (fun k hk x hx ↦ hPrev k (by omega) 10 (by omega) x hx)
-  · exact layKid_lin_region h (s := 10) (by norm_num) (by omega) (hLin 11) (hOwn 11)
-      (fun k hk x hx ↦ hPrev k (by omega) 11 (by omega) x hx)
-  · exact layKid_lin_region h (s := 11) (by norm_num) (by omega) (hLin 12) (hOwn 12)
-      (fun k hk x hx ↦ hPrev k (by omega) 12 (by omega) x hx)
-  · exact hLin 13
-  · show ∀ x, RegionL [(zvE, D.op), (B, D.c0.point)] x → T 14 x
+  · exact hLin 7
+  · show ∀ x, RegionL [(zvE, D.op), (B, D.c0.point)] x → T 8 x
     intro x ⟨q, hq, hx⟩
     have hx' : RegionL [q] x := ⟨q, List.mem_singleton_self _, hx⟩
     simp only [List.mem_cons, List.not_mem_nil, or_false] at hq
     rcases hq with rfl | rfl
-    · exact one (L := D.lin curE chiE olE zvE slE) (by simp [lin]) (hLin 14) x hx'
-    · exact one (L := bufL B D.sizes (D.own B (D.lsOf fs fps))) (by rw [hO]; simp) (hOwn 14) x hx'
-  · exact hLin 15
-  · exact hLin 16
+    · exact one (L := D.lin curE chiE olE zvE slE) (by simp [lin]) (hLin 8) x hx'
+    · exact one (L := bufL B D.sizes (D.own B (D.lsOf fs fps))) (by rw [hO]; simp) (hOwn 8) x hx'
+  · exact hLin 9
+  · exact hLin 10
   · show ∀ x, RegionL [(zvE + qkeccakVarsCap, D.point),
-      (D.lsOf fs (fps.take 18).dropLast 11, (D.layer 11).chs (firstOf 11))] x → T 17 x
+      (D.lsOf fs (fps.take 12).dropLast 5, (D.layer 5).chs (firstOf 5))] x → T 11 x
     intro x ⟨q, hq, hx⟩
     have hx' : RegionL [q] x := ⟨q, List.mem_singleton_self _, hx⟩
     simp only [List.mem_cons, List.not_mem_nil, or_false] at hq
     rcases hq with rfl | rfl
-    · exact one (L := D.lin curE chiE olE zvE slE) (by simp [lin]) (hLin 17) x hx'
+    · exact one (L := D.lin curE chiE olE zvE slE) (by simp [lin]) (hLin 11) x hx'
     · rw [List.dropLast_eq_take, List.length_take, List.take_take, hfl,
         lsOf_take fs fps (by norm_num)] at hx'
-      exact one (L := layerBufs (D.layer 11) (firstOf 11) (ptr (curE + D.lcur 11)) (D.lsOf fs fps 11))
-        (by simp [layerBufs_eq]) (hPrev 11 (by norm_num) 17 (by norm_num)) x hx'
+      exact one (L := layerBufs (D.layer 5) (firstOf 5) (ptr (curE + D.lcur 5)) (D.lsOf fs fps 5))
+        (by simp [layerBufs_eq]) (hPrev 5 (by norm_num) 11 (by norm_num)) x hx'
 
 end VkData
 

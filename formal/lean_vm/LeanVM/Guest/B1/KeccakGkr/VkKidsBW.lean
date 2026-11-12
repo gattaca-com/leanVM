@@ -20,7 +20,7 @@ iteration and their runs' one phantom frame; `keccak_plain_rounds__L6_L0` (core 
 `229`; the layers' eight-round loops `473` per iteration and remainder loops `92`, and their frames
 (`LayerCPlacedBW`). So `verify_keccak`'s callees are complete within
 `D.kidsB B2C.fs 17 473 92 325 229` (`kids_completeB_fs`), whose sum is at most
-`3 * ((τ - 4) * 17) + 51 + 879 + 12 * (2624 + (y + 171) + (473 + y / 8 * 473) + (92 + y % 8 * 92))`
+`3 * ((τ - 4) * 17) + 51 + 879 + 6 * (2624 + (y + 171) + (473 + y / 8 * 473) + (92 + y % 8 * 92))`
 (`y = τ - 3`), at most `61728` words for `τ ≤ 28` (`kidsB_fs_le`).
 -/
 
@@ -75,15 +75,15 @@ openings' rounds `325 + 229 + 325`, each layer (`y = τ - 3`) at most
 largest at `y = 23`). -/
 theorem kidsB_fs_le (h : D.Ok) :
     (D.kidsB LeanVM.Guest.B2C.fs 17 473 92 325 229).sum ≤
-      3 * ((D.τ - 4) * 17) + 51 + 879 + 12 * (2624 + (D.τ - 3 + 171) + (473 + (D.τ - 3) / 8 * 473) +
+      3 * ((D.τ - 4) * 17) + 51 + 879 + 6 * (2624 + (D.τ - 3 + 171) + (473 + (D.τ - 3) / 8 * 473) +
         (92 + (D.τ - 3) % 8 * 92)) ∧
     (D.kidsB LeanVM.Guest.B2C.fs 17 473 92 325 229).sum ≤ 61728 := by
   have hτ := h.2.1
   have hτ1 := h.1
-  have hL : ((List.range 12).map (fun s ↦ layerWords LeanVM.Guest.B2C.fs (firstOf s)
+  have hL : ((List.range 6).map (fun s ↦ layerWords LeanVM.Guest.B2C.fs (firstOf s)
       (D.layer s).y 473 92)).sum ≤
-      12 * (2624 + (D.τ - 3 + 171) + (473 + (D.τ - 3) / 8 * 473) + (92 + (D.τ - 3) % 8 * 92)) := by
-    have := List.sum_le_length_nsmul ((List.range 12).map (fun s ↦ layerWords
+      6 * (2624 + (D.τ - 3 + 171) + (473 + (D.τ - 3) / 8 * 473) + (92 + (D.τ - 3) % 8 * 92)) := by
+    have := List.sum_le_length_nsmul ((List.range 6).map (fun s ↦ layerWords
       LeanVM.Guest.B2C.fs (firstOf s) (D.layer s).y 473 92))
       (2624 + (D.τ - 3 + 171) + (473 + (D.τ - 3) / 8 * 473) + (92 + (D.τ - 3) % 8 * 92))
       (fun x hx ↦ ?_)
@@ -100,7 +100,7 @@ theorem kidsB_fs_le (h : D.Ok) :
     decide +kernel
   rw [kidsB_sum, hF]
   refine ⟨by omega, ?_⟩
-  refine le_trans (by omega : _ ≤ 3 * ((D.τ - 4) * 17) + 51 + 879 + 12 * (2624 + (D.τ - 3 + 171) +
+  refine le_trans (by omega : _ ≤ 3 * ((D.τ - 4) * 17) + 51 + 879 + 6 * (2624 + (D.τ - 3 + 171) +
     (473 + (D.τ - 3) / 8 * 473) + (92 + (D.τ - 3) % 8 * 92))) ?_
   generalize hT : D.τ = t at hτ hτ1
   interval_cases t <;> norm_num
