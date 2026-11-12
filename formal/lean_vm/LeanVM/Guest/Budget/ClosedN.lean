@@ -45,7 +45,7 @@ elsewhere, where no child of a node within `Limits`, its caps agreeing and no ze
 (`B1.Main.childShape_bounds`). -/
 def deployedBvAt (μ r : ℕ) : ℕ :=
   if 20 ≤ μ ∧ μ ≤ 30 ∧ 1 ≤ r ∧ r ≤ 4 then
-    [413983, 414545, 416763, 419477, 432523, 437771, 446135, 450466, 461748, 463457, 468272].getD (μ - 20) 0
+    [413806, 414368, 416586, 419300, 432346, 437594, 445958, 450289, 461571, 463280, 468095].getD (μ - 20) 0
   else 0
 
 /-- `open_stacked`'s words at the 11 arms (`Count/VsOsAll`). -/
@@ -84,7 +84,7 @@ theorem guest_complete_numeric : GuestCompleteWithin (deployedBudget deployedBvA
       exact (vsBoundAt_eq_deployedBvAt h1 h2 h3 h4).le
 
 /-- The largest child's words: `μ = 30`. -/
-theorem deployedBvAt_le (μ r : ℕ) : deployedBvAt μ r ≤ 468272 := by
+theorem deployedBvAt_le (μ r : ℕ) : deployedBvAt μ r ≤ 468095 := by
   unfold deployedBvAt
   split_ifs with h
   · obtain ⟨h1, h2, -, -⟩ := h
