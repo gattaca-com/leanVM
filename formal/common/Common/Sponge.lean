@@ -245,11 +245,8 @@ def keccak256With {m : Type → Type} [Monad m] (π : KState → m KState) (msg 
 
 /-! ## Keccak-f[1600] -/
 
-/-- The round constants of Keccak-f[1600] (`KECCAK_RC`). -/
+/-- The round constants of the `12` rounds (`KECCAK_RC`), the last `12` of Keccak-f[1600]'s `24`. -/
 def keccakRC : Array UInt64 := #[
-  0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
-  0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-  0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
   0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
   0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
   0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008]
@@ -279,7 +276,7 @@ def keccakRound (a : Array UInt64) (rc : UInt64) : Array UInt64 := Id.run do
     b[i.1]! ^^^ ((~~~ b[r + (i.1 % 5 + 1) % 5]!) &&& b[r + (i.1 % 5 + 2) % 5]!)
   return a.set! 0 (a[0]! ^^^ rc)
 
-/-- Keccak-f[1600] on the 25 lanes: 24 rounds. -/
+/-- Keccak-p[1600, 12] on the 25 lanes: 12 rounds. -/
 def keccakFLanes (a : Array UInt64) : Array UInt64 := keccakRC.foldl keccakRound a
 
 /-- The 25 little-endian lanes of 200 bytes. -/

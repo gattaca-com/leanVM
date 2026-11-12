@@ -48,7 +48,7 @@ into the segment: per position `j`, the sixteen instances' bits as a mask. -/
 def packMasks (col : ℕ → K) (P e z : ℕ) : Array ℕ :=
   let m := z / 2 ^ P
   let ls : Array KeccakState := Array.ofFn (n := 16) fun i ↦
-    linearOf (roundsOf (12 * m) e (inStateOf col (P + 4) m (i.val + 16 * (z % 2 ^ P))))
+    linearOf (roundsOf (6 * m) e (inStateOf col (P + 4) m (i.val + 16 * (z % 2 ^ P))))
   Array.ofFn (n := 1600) fun j ↦ packBits (fun i ↦ bitOf (ls.getD i default) j.val) 16
 
 /-- The masks of every pack. -/

@@ -543,12 +543,12 @@ def qkeccak : ℕ := 5
 /-- `K_BITS`: a `K` word's bits (`layout.rs:79`). -/
 def kBits : ℕ := 64
 
-/-- `KECCAK_DEPTH`: the reduction commits a step's state every `12` rounds (`layout.rs:83`). -/
-def keccakDepth : ℕ := 12
+/-- `KECCAK_DEPTH`: the reduction commits a step's state every `6` rounds (`layout.rs:83`). -/
+def keccakDepth : ℕ := 6
 
-/-- `KeccakShape::segments`, `ROUNDS / depth` at `depth = KECCAK_DEPTH`, `ROUNDS = 24`
+/-- `KeccakShape::segments`, `ROUNDS / depth` at `depth = KECCAK_DEPTH`, `ROUNDS = 12`
 (`keccak.rs:56-58`). -/
-def keccakSegments : ℕ := 24 / keccakDepth
+def keccakSegments : ℕ := keccakRC.length / keccakDepth
 
 /-- The bits of a segment index, `log2_ceil(shape.segments())` (`keccak.rs:247`). -/
 def keccakSegmentBits : ℕ := log2Ceil keccakSegments

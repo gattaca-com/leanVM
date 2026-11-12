@@ -7,7 +7,7 @@ public import Statement.Prover.KeccakLayer
 
 The honest prover of `verifyKeccak` (`verify_keccak`, `crates/verifier/src/keccak.rs:235-294`) and
 of the Keccak phase of `verify_execution` (`keccakPhase`): the column's `64` slots at the steps'
-point (`slotWords`), the twelve layers (`KeccakLayer.lean`), and the openings' sumchecks, sums over
+point (`slotWords`), the six layers (`KeccakLayer.lean`), and the openings' sumchecks, sums over
 the remaining cube of products of two folded tables (`openRound`, `openFold`).
 -/
 
@@ -56,7 +56,7 @@ def slotWeightOf (segments : List E) (w : Array E) (first count o z : ℕ) : E :
 
 /-! ## The inputs' opening -/
 
-/-- The claim at depth `12` restricted to each instance `i < 16`:
+/-- The claim at depth `6` restricted to each instance `i < 16`:
 `Σ_z eq(point, z) Σ_j w_j·[bit j of instance i's committed input]`, the words read by byte
 tables of the weights. -/
 def phiTable (col : ℕ → K) (P : ℕ) (claim : KeccakClaim) : Array E :=
@@ -103,7 +103,7 @@ def keccakProve (col : ℕ → K) (P : ℕ) (inst output : List E) : Script Unit
   let eL := eqKernel lanesPt
   let committed := eS.getD 0 0 * sumRange 25 fun l ↦ eL.getD l 0 * V.getD (25 + l) 0
   (Script.sendE committed).bind fun _ ↦
-  (layersProve col P (List.range' 0 12)
+  (layersProve col P (List.range' 0 6)
       (keccakFirstClaim inst segment lanesPt output committed)).bind fun claim ↦
   let wo : Array E := Array.ofFn (n := 64) fun o ↦
     if 25 ≤ o.val ∧ o.val < 50 then eS.getD 0 0 * eL.getD (o.val - 25) 0 else 0
