@@ -7,7 +7,7 @@
 # already-written StackBuf pair, so write-once turns the hash into a digest
 # assertion; the dead `if` branch holds an impossible assert that must never
 # execute. Published: the two 128-bit digest cells of H^2(5, 7).
-# public_input: 208822183413446500621413149391147122921, 118328345503752981047975230716482008923
+# public_input: 127416560211486226544311288205059034339, 330135817897455373383833294790695222831
 from snark_lib import *
 
 
