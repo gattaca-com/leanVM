@@ -207,7 +207,7 @@ theorem keccakColumn_eq :
   rfl
 
 /-- **The output lanes are the second segment of the committed middle state**: cell `x` of
-output lane `l` is lane `l` of the last twelve rounds of Keccak-f[1600] of the state the region's
+output lane `l` is lane `l` of the last six rounds of Keccak-f[1600] of the state the region's
 slots `25 … 49` hold at step `x`. -/
 theorem column_outCol (l : Fin 25) (x : Fin (2 ^ s.τ 5)) :
     ((leanIsaInstance prog s).column q (outCol l)).values.get x =

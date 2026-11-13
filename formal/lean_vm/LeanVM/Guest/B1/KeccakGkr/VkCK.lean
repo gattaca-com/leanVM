@@ -31,9 +31,9 @@ open LeanVM.Guest.B1.Main (MemL RegionL)
 
 /-- Where step `s` ends. -/
 def stepE (s : ℕ) : ℕ :=
-  [489, 524, 558, 601, 642, 685, 718, 759, 797, 840, 881, 921].getD s 0
+  [488, 524, 562, 605, 647, 689, 718, 759, 797, 840, 881, 689].getD s 0
 
-theorem stepE_eq : ∀ s < 12, stepT0 s (stepB s) + stepTailSz s = stepE s := by decide +kernel
+theorem stepE_eq : ∀ s < 6, stepT0 s (stepB s) + stepTailSz s = stepE s := by decide +kernel
 
 namespace VkData
 
@@ -45,14 +45,14 @@ def w (B curE : ℕ) (i : ℕ) : E :=
   else if i = 61 then ptr B
   else if i = 87 then ptr (B + (D.τ - 3))
   else if i = 161 then ptr (B + D.o201)
-  else if i = 163 then ptr (B + D.τ + 288)
+  else if i = 163 then ptr (B + D.τ + 156)
   else if i = 234 then ptr (B + D.o274)
-  else if i = 342 then ptr (B + D.τ + 380)
-  else if i = 1210 then ptr (B + D.τ + 382)
-  else if 924 ≤ i ∧ i < 931 then (D.oRets curE).getD (i - 924) 0
-  else if 1203 ≤ i ∧ i < 1210 then (D.iRets curE).getD (i - 1203) 0
-  else if 1333 ≤ i ∧ i < 1340 then (D.sRets curE).getD (i - 1333) 0
-  else match (List.range 12).find? (fun s ↦ stepE s - 6 ≤ i && i < stepE s) with
+  else if i = 342 then ptr (B + D.τ + 248)
+  else if i = 978 then ptr (B + D.τ + 250)
+  else if 692 ≤ i ∧ i < 699 then (D.oRets curE).getD (i - 692) 0
+  else if 971 ≤ i ∧ i < 978 then (D.iRets curE).getD (i - 971) 0
+  else if 1101 ≤ i ∧ i < 1108 then (D.sRets curE).getD (i - 1101) 0
+  else match (List.range 6).find? (fun s ↦ stepE s - 6 ≤ i && i < stepE s) with
     | some s => ((D.layer s).rets (firstOf s) (ptr (curE + D.lcur s))).getD (i - (stepE s - 6)) 0
     | none => 0
 
@@ -63,16 +63,16 @@ theorem w_bits {j : ℕ} (hj : j < 5) : D.w B curE (21 + j) = Value.bitE ((D.τ 
     Nat.add_sub_cancel_left]
 
 
-theorem w_o {j : ℕ} (hj : j < 7) : D.w B curE (924 + j) = (D.oRets curE).getD j 0 := by
+theorem w_o {j : ℕ} (hj : j < 7) : D.w B curE (692 + j) = (D.oRets curE).getD j 0 := by
   interval_cases j <;> rfl
 
-theorem w_i {j : ℕ} (hj : j < 7) : D.w B curE (1203 + j) = (D.iRets curE).getD j 0 := by
+theorem w_i {j : ℕ} (hj : j < 7) : D.w B curE (971 + j) = (D.iRets curE).getD j 0 := by
   interval_cases j <;> rfl
 
-theorem w_s {j : ℕ} (hj : j < 7) : D.w B curE (1333 + j) = (D.sRets curE).getD j 0 := by
+theorem w_s {j : ℕ} (hj : j < 7) : D.w B curE (1101 + j) = (D.sRets curE).getD j 0 := by
   interval_cases j <;> rfl
 
-theorem w_layer {s : ℕ} (hs : s < 12) {j : ℕ} (hj : j < 6) :
+theorem w_layer {s : ℕ} (hs : s < 6) {j : ℕ} (hj : j < 6) :
     D.w B curE (stepE s - 6 + j) =
       ((D.layer s).rets (firstOf s) (ptr (curE + D.lcur s))).getD j 0 := by
   interval_cases s <;> interval_cases j <;> rfl
@@ -80,8 +80,8 @@ theorem w_layer {s : ℕ} (hs : s < 12) {j : ℕ} (hj : j < 6) :
 theorem bufL_eq (h3 : 3 ≤ D.τ) (B : ℕ) (ls : ℕ → ℕ) :
     bufL B D.sizes (D.own B ls) =
       [(B, D.c0.point), (B + (D.τ - 3), D.rl), (B + D.o201, D.claims B ls),
-        (B + D.τ + 288, eqLevels (D.chis.take 4) 4), (B + D.o274, eqLevels D.rl 5),
-        (B + D.τ + 380, eqKernel D.seg), (B + D.τ + 382, eqLevels D.I.1 4)] := by
+        (B + D.τ + 156, eqLevels (D.chis.take 4) 4), (B + D.o274, eqLevels D.rl 5),
+        (B + D.τ + 248, eqKernel D.seg), (B + D.τ + 250, eqLevels D.I.1 4)] := by
   rw [bufL, bases_eq D B h3, own]
   simp
 
@@ -90,10 +90,10 @@ theorem own_mem (h3 : 3 ≤ D.τ) {rd : Reader} {B : ℕ} {ls : ℕ → ℕ}
     (hm : MemL rd (bufL B D.sizes (D.own B ls))) :
     ReadsAt rd (ptr B) D.c0.point ∧ ReadsAt rd (ptr (B + (D.τ - 3))) D.rl ∧
       ReadsAt rd (ptr (B + D.o201)) (D.claims B ls) ∧
-      ReadsAt rd (ptr (B + D.τ + 288)) (eqLevels (D.chis.take 4) 4) ∧
+      ReadsAt rd (ptr (B + D.τ + 156)) (eqLevels (D.chis.take 4) 4) ∧
       ReadsAt rd (ptr (B + D.o274)) (eqLevels D.rl 5) ∧
-      ReadsAt rd (ptr (B + D.τ + 380)) (eqKernel D.seg) ∧
-      ReadsAt rd (ptr (B + D.τ + 382)) (eqLevels D.I.1 4) := by
+      ReadsAt rd (ptr (B + D.τ + 248)) (eqKernel D.seg) ∧
+      ReadsAt rd (ptr (B + D.τ + 250)) (eqLevels D.I.1 4) := by
   rw [bufL_eq h3] at hm
   exact ⟨memL_entry hm (by simp), memL_entry hm (by simp), memL_entry hm (by simp),
     memL_entry hm (by simp), memL_entry hm (by simp), memL_entry hm (by simp),

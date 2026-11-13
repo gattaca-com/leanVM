@@ -108,7 +108,7 @@ theorem keccakWitness_getElem (slot : ℕ) (hslot : slot < 64) (x : ℕ) (hx : x
   simp only [Vector.getElem_ofFn, hd, hm]
 
 /-- **The Keccak region of the stack of a witness holds**: at every step, its slots `25 … 49`
-are the first twelve rounds of its slots `0 … 24`, as the honest `QKECCAK` is built. -/
+are the first six rounds of its slots `0 … 24`, as the honest `QKECCAK` is built. -/
 theorem keccakHolds_stackOf :
     (keccakRegion prog s).Holds
       ((leanIsaInstance prog s).keccakColumn (keccakRegion prog s) (stackOf prog s w)) := by

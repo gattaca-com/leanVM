@@ -138,10 +138,10 @@ theorem corr_pack (hr : r.length = P + 1) : ∀ (rs acc : List E) (st : PackStat
     exact corr_ret ⟨h1, by rw [h2], by simp [h3], by simpa using h4⟩
 
 /-- **The table before the pack rounds**: the packs' states at `s` from the masks. -/
-theorem packInv_start {col' col : ℕ → K} (hcol : ColAgree P col' col) {d : ℕ} (hd : d < 12)
+theorem packInv_start {col' col : ℕ → K} (hcol : ColAgree P col' col) {d : ℕ} (hd : d < 6)
     (s : E) (point : List E) :
     PackInv (statesAt (P + 4) col (d + 1)) P s point []
-      (packStart (layerMasks col' P (11 - d)) (keccakInstanceWeights s) point) := by
+      (packStart (layerMasks col' P (5 - d)) (keccakInstanceWeights s) point) := by
   refine ⟨by simp, by simp [packStart], fun z hz j hj ↦ ?_⟩
   simp only [List.length_nil, Nat.sub_zero, List.nil_append] at hz ⊢
   rw [Shat_bitsE _ _ _ _ hz, Shat0]

@@ -64,11 +64,11 @@ theorem allQ_verifierRZ (prog : LeanIsaProgram) (input : PublicInput) (proof : P
     allQ_runProof _ seed proof (widthsLE_of_refines (Limits.refusingZeroProgram_refines _ _)
       (widthsLE_leanVmProgram _ _))
 
-/-- **A prover of at most `2 + 54825 · (2^29 + 2·fuel + 2)` short queries and the refusing
+/-- **A prover of at most `2 + 51843 · (2^29 + 2·fuel + 2)` short queries and the refusing
 verifier make at most `completenessPermCalls fuel` permutation calls.** -/
 theorem isWeightBound_proverRZ {X : OracleComp KeccakCalls Proof} (prog : LeanIsaProgram)
     (input : PublicInput) {fuel : ℕ}
-    (hX : IsTotalQueryBound X (2 + 54825 * (2 ^ 29 + 2 * fuel + 2)))
+    (hX : IsTotalQueryBound X (2 + 51843 * (2 ^ 29 + 2 * fuel + 2)))
     (hXq : AllQueriesSatisfy X Short) :
     Common.QueryCostAtMost (X >>= fun proof ↦
       Budget.verifierRefusingZeroWithHash callKeccak256 callKeccakF1600 prog input proof)
@@ -85,7 +85,7 @@ theorem isWeightBound_proverRZ {X : OracleComp KeccakCalls Proof} (prog : LeanIs
       rw [← verifierRZ_eq_comp] at this
       exact this
     refine h.mono ?_
-    have : leanVmCost / 4 = 13706 := by decide
+    have : leanVmCost / 4 = 12960 := by decide
     simp only [leanVmSeed, List.length_cons, List.length_nil, this, LeanVM.completenessQueries]
     omega
   exact isWeightBound_of_isTotalQueryBound hashBlocks (2 ^ 30) hN
@@ -125,7 +125,7 @@ theorem rpmChild_at {prog : LeanIsaProgram} {input : PublicInput} {t : Execution
 theorem rpmChild_le :
     childCompletenessError (2 ^ 35) + rpmError (completenessPermCalls (2 ^ 35)) ≤
       (2 : ℝ≥0∞)⁻¹ ^ 100 := by
-  have hc : leanVmCost = 54825 := by decide
+  have hc : leanVmCost = 51843 := by decide
   have hQ : EndToEnd.Complete.completenessQueries (2 ^ 35) = LeanVM.completenessQueries (2 ^ 35) := by
     rw [EndToEnd.Complete.completenessQueries, proverFactor, costHeight, hc, leanVmQueryBound_eq,
       LeanVM.completenessQueries]
@@ -135,7 +135,7 @@ theorem rpmChild_le :
   -- the ideal failure
   have h1 : ((leanVmCost / 4 : ℕ) : ℝ≥0∞) * epsE ≤ (2 : ℝ≥0∞)⁻¹ ^ 102 := by
     rw [hc, epsE_eq]
-    calc ((54825 / 4 : ℕ) : ℝ≥0∞) * (2 : ℝ≥0∞)⁻¹ ^ 128
+    calc ((51843 / 4 : ℕ) : ℝ≥0∞) * (2 : ℝ≥0∞)⁻¹ ^ 128
         ≤ (2 : ℝ≥0∞) ^ 14 * (2 : ℝ≥0∞)⁻¹ ^ (14 + 114) := by
           gcongr
           norm_num

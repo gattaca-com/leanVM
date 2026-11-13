@@ -29,37 +29,37 @@ theorem word_g64 : word 27 0 = gen ^ 64 := by
 
 /-- **The inputs' check and the return** (G:3020-3039). -/
 theorem vkFinT_holds {τ : ℕ} (hτ1 : 9 ≤ τ) (hτ2 : τ ≤ 28) (h17 : σ (.n 18) = gen ^ (τ - 4))
-    {c : KeccakClaim} (hc : ClaimRec rd ((0 : ℕ) = 1) (σ (.n 161) * gen ^ (22 * 12)) c (τ - 3))
-    {slotI : List E} (hsl : slotI.length = 6) (hslR : ReadsAt rd (σ (.n 1330)) slotI)
+    {c : KeccakClaim} (hc : ClaimRec rd ((0 : ℕ) = 1) (σ (.n 161) * gen ^ (22 * 6)) c (τ - 3))
+    {slotI : List E} (hsl : slotI.length = 6) (hslR : ReadsAt rd (σ (.n 1098)) slotI)
     {S : ℕ → E} (hS : ∀ z < 64, LoadHolds rd (σ (.n 10)) z (S z))
-    (h1251 : σ (.n 1202) = σ (.n 9) * gen ^ 39)
+    (h1251 : σ (.n 970) = σ (.n 9) * gen ^ 39)
     {next : Prop} {kret : List E → Prop}
     (h : Stmt.HoldsList (coreProgram.Rel rd) rd σ vkFinT next kret) :
     ∃ (lanes loc : List E), lanes.length = 25 ∧ loc.length = 11 ∧
       c.weights = laterWeights lanes (eqKernel (loc.take 6)) ∧
-      σ (.n 1327) * formVal (fun l ↦ σ (.n (slotLaneV 1747 2 l))) (kLane lanes)
-        (fun r ↦ σ (.n (vkSh r))) = σ (.n 1339) ∧
-      (∀ lane < 25, σ (.n (slotLaneV 1747 2 lane)) = ∑ m ∈ range 2,
+      σ (.n 1095) * formVal (fun l ↦ σ (.n (slotLaneV 1515 2 l))) (kLane lanes)
+        (fun r ↦ σ (.n (vkSh r))) = σ (.n 1107) ∧
+      (∀ lane < 25, σ (.n (slotLaneV 1515 2 lane)) = ∑ m ∈ range 2,
         eqAt [c.point.getD (τ - 4) 0] m * eqAt slotI (25 * (0 + m) + lane)) ∧
       (∀ r ∈ shiftUsed, σ (.n (vkSh r)) = ∑ z ∈ range 64, S z * eqAt (loc.take 6) ((z + r) % 64)) ∧
-      (∀ j < τ - 4, ∃ (pp v : E), LoadHolds rd (σ (.n 161) * gen ^ (22 * 12)) 2 pp ∧
+      (∀ j < τ - 4, ∃ (pp v : E), LoadHolds rd (σ (.n 161) * gen ^ (22 * 6)) 2 pp ∧
         LoadHolds rd pp j v ∧ LoadHolds rd (σ (.n 9) * gen ^ 43) j v) ∧
-      kret [σ (.n 1740), σ (.n 1741), σ (.n 1742), σ (.n 1743), σ (.n 1744),
-        σ (.n 1338) * gen ^ 64, σ (.n 931)] := by
+      kret [σ (.n 1508), σ (.n 1509), σ (.n 1510), σ (.n 1511), σ (.n 1512),
+        σ (.n 1106) * gen ^ 64, σ (.n 699)] := by
   obtain ⟨-, hptL, -, -, -, ⟨pp, hpp, hpt⟩, lp, lanes, hlp, hlen, hlanes, hrest⟩ := hc
   simp only [show ((0 : ℕ) = 1) = False by decide, decide_false, Bool.false_eq_true,
     ↓reduceIte] at hrest
   obtain ⟨lc, sl, loc, hlc, hlocL, hloc, -, -, hw⟩ := hrest
   rw [vkFinT] at h
-  generalize hSLT : slotLanesT 1330 1746 1747 0 2 = SLT at h
-  generalize hLD : (List.range 64).map (fun z ↦ Stmt.atom (.load (.n (1981 + z)) (.n 10) z)) = LD at h
-  generalize hFT : foldT (fun j ↦ 1981 + j) 2045 (.n 1980) = FT at h
-  generalize hFA : formAll (.n 3143) vkSh (slotLaneV 1747 2) 3144 = FA at h
-  generalize hCP : (List.range 5).map (fun j ↦ Stmt.atom (.copy (.n (3364 + j)) (.n (1740 + j)))) = CP at h
+  generalize hSLT : slotLanesT 1098 1514 1515 0 2 = SLT at h
+  generalize hLD : (List.range 64).map (fun z ↦ Stmt.atom (.load (.n (1749 + z)) (.n 10) z)) = LD at h
+  generalize hFT : foldT (fun j ↦ 1749 + j) 1813 (.n 1748) = FT at h
+  generalize hFA : formAll (.n 2911) vkSh (slotLaneV 1515 2) 2912 = FA at h
+  generalize hCP : (List.range 5).map (fun j ↦ Stmt.atom (.copy (.n (3132 + j)) (.n (1508 + j)))) = CP at h
   simp only [holdsList_append, Stmt.HoldsList, Stmt.Holds, Atom.Holds, List.map_cons,
     List.map_nil] at h
   obtain ⟨l4977, e4978, h⟩ := h
-  have epp : σ (.n 1745) = pp := loadHolds_unique l4977 (by
+  have epp : σ (.n 1513) = pp := loadHolds_unique l4977 (by
     have := (loadHolds_mul_gen_pow rd _ _ _ _).1 hpp; simpa using this)
   -- the slot's lane weights
   rw [← hSLT] at h
@@ -74,7 +74,7 @@ theorem vkFinT_holds {τ : ℕ} (hτ1 : 9 ≤ τ) (hτ2 : τ ≤ 28) (h17 : σ (
     exact loadHolds_unique hr (by simpa using hpt (τ - 4) (by omega))
   -- the shifts of the slices
   obtain ⟨l5212, h⟩ := h
-  have elc : σ (.n 1980) = lc := loadHolds_unique l5212 (by
+  have elc : σ (.n 1748) = lc := loadHolds_unique l5212 (by
     have := (loadHolds_mul_gen_pow rd _ _ _ _).1 hlc; simpa using this)
   rw [← hLD, holdsList_map_atoms] at h
   obtain ⟨hld, h⟩ := h
@@ -88,7 +88,7 @@ theorem vkFinT_holds {τ : ℕ} (hτ1 : 9 ≤ τ) (hτ2 : τ ≤ 28) (h17 : σ (
     (fun j hj ↦ loadHolds_unique (hld j hj) (hS j hj)) h
   -- keccak_form
   obtain ⟨l6363, h⟩ := h
-  have elp : σ (.n 3143) = lp := loadHolds_unique l6363 (by
+  have elp : σ (.n 2911) = lp := loadHolds_unique l6363 (by
     have := (loadHolds_mul_gen_pow rd _ _ _ _).1 hlp; simpa using this)
   rw [← elp] at hlanes
   rw [← hFA] at h

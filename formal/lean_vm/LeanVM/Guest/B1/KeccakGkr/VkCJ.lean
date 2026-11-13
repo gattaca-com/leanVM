@@ -32,7 +32,7 @@ open LeanVM.Protocol LeanVM.Protocol.KeccakHash LeanVM.Protocol.Compile LeanVM.P
 def vkFinPre : List Stmt := vkFinT.dropLast
 
 /-- The returned values. -/
-def vkVs : List V := [.n 3364, .n 3365, .n 3366, .n 3367, .n 3368, .n 3371, .n 3372]
+def vkVs : List V := [.n 3132, .n 3133, .n 3134, .n 3135, .n 3136, .n 3139, .n 3140]
 
 /-- The body but its return. -/
 def vkPre : List Stmt := vkHeadT ++ vkFirstT ++ vkStepsT ++ vkOutT ++ vkInT ++ vkFinPre
@@ -44,8 +44,8 @@ theorem vkT_pre : vkT = vkPre ++ [.ret vkVs] := by
 
 /-- The buffers. -/
 def vkAllocs : List (V × (ℕ ⊕ V)) :=
-  [(.n 61, .inr (.n 60)), (.n 87, .inl 5), (.n 161, .inl 286), (.n 163, .inl 30), (.n 234, .inl 62),
-    (.n 342, .inl 2), (.n 1210, .inl 30)]
+  [(.n 61, .inr (.n 60)), (.n 87, .inl 5), (.n 161, .inl 154), (.n 163, .inl 30), (.n 234, .inl 62),
+    (.n 342, .inl 2), (.n 978, .inl 30)]
 
 /-- Not a dispatch. -/
 def vkNoDispB : Stmt → Bool
@@ -65,15 +65,15 @@ def stepCall (s : ℕ) : Option V × String × List V × List V :=
 /-- **The calls.** -/
 def vkCalls : List (Option V × String × List V × List V) :=
   [(some (.n 63), name% «verify_keccak_loop0», [.n 64, .n 18, .n 61, .n 66], [])] ++
-    (List.range 12).map stepCall ++
-    [(none, "keccak_plain_rounds__L6_L0", [.n 915, .n 916, .n 917, .n 918, .n 919, .n 922,
-        .n 923, .n 920, .n 158, .n 921, .n 11], (List.range 7).map fun j ↦ .n (924 + j)),
-      (some (.n 1194), name% «verify_keccak_loop1», [.n 1195, .n 18, .n 1197, .n 61], []),
-      (none, "keccak_plain_rounds__L4_L1", [.n 924, .n 925, .n 926, .n 927, .n 928, .n 932,
-        .n 933, .n 1199, .n 1200, .n 1202, .n 11], (List.range 7).map fun j ↦ .n (1203 + j)),
-      (none, "keccak_plain_rounds__L6_L0", [.n 1203, .n 1204, .n 1205, .n 1206, .n 1207, .n 1331,
-        .n 1332, .n 1208, .n 1209, .n 1330, .n 11], (List.range 7).map fun j ↦ .n (1333 + j)),
-      (some (.n 3360), name% «verify_keccak_loop2», [.n 3361, .n 18, .n 3363, .n 1745], [])]
+    (List.range 6).map stepCall ++
+    [(none, "keccak_plain_rounds__L6_L0", [.n 683, .n 684, .n 685, .n 686, .n 687, .n 690,
+        .n 691, .n 688, .n 158, .n 689, .n 11], (List.range 7).map fun j ↦ .n (692 + j)),
+      (some (.n 962), name% «verify_keccak_loop1», [.n 963, .n 18, .n 965, .n 61], []),
+      (none, "keccak_plain_rounds__L4_L1", [.n 692, .n 693, .n 694, .n 695, .n 696, .n 700,
+        .n 701, .n 967, .n 968, .n 970, .n 11], (List.range 7).map fun j ↦ .n (971 + j)),
+      (none, "keccak_plain_rounds__L6_L0", [.n 971, .n 972, .n 973, .n 974, .n 975, .n 1099,
+        .n 1100, .n 976, .n 977, .n 1098, .n 11], (List.range 7).map fun j ↦ .n (1101 + j)),
+      (some (.n 3128), name% «verify_keccak_loop2», [.n 3129, .n 18, .n 3131, .n 1513], [])]
 
 theorem vkPre_kernel :
     vkPre.all Stmt.flat = true ∧ vkPre.filterMap Main.Stmt.addrS = [] ∧

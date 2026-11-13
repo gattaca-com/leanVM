@@ -50,9 +50,9 @@ def l19Pre : List Stmt :=
 def l20Pre : List Stmt :=
   [.atom (.mul (.n 4) (.n 3) (.n 3)), .atom (.mul (.n 5) (.n 2) (.n 4)),
     .atom (.mul (.n 6) (.n 0) (.n 0)), .atom (.mul (.n 7) (.n 5) (.n 6)),
-    .atom (.const (.n 8) (word 8002054802297438051 4108169256045952147)),
+    .atom (.const (.n 8) (word 17635339603416681651 5630583628039031207)),
     .atom (.load (.n 8) (.n 7) 0),
-    .atom (.const (.n 9) (word 12830724869163462953 1721925254677230945)),
+    .atom (.const (.n 9) (word 11942528933372280140 15641231512148347094)),
     .atom (.load (.n 9) (.n 7) 1)] ++ stepAtC 10
 
 /-- `da_verify_column_loop0`'s block: a blob's cell in column `xb`, its running sum's step and its

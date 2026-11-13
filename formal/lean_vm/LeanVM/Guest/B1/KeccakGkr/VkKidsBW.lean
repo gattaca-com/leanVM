@@ -21,8 +21,8 @@ frames `17`) at most `17` words per iteration and their runs' one phantom frame;
 (core `267`, `plainName 1`) at most `178`; the layers' eight-round loops `374` per iteration and
 remainder loops `77`, and their frames (`LayerCPlacedBW`). So `verify_keccak`'s callees are complete
 within `D.kidsB B2C.fs 17 374 77 250 178` (`kids_completeB_fs`), whose sum is at most
-`3 * ((τ - 4) * 17) + 51 + 678 + 12 * (2241 + (y + 171) + (374 + y / 8 * 374) + (77 + y % 8 * 77) + 60)`
-(`y = τ - 3`), at most `52647` words for `τ ≤ 28` (`kidsB_fs_le`).
+`3 * ((τ - 4) * 17) + 51 + 678 + 6 * (2241 + (y + 171) + (374 + y / 8 * 374) + (77 + y % 8 * 77) + 60)`
+(`y = τ - 3`), at most `27249` words for `τ ≤ 28` (`kidsB_fs_le`).
 -/
 
 namespace LeanVM.Guest.B1.VerifySub
@@ -80,19 +80,19 @@ theorem kids_completeB_fs (h : D.Ok) {κ : ℕ} (hκ : 11 ≤ κ) (B curE chiE o
 
 /-- **The callees' words at `B2C.fs`, in numbers**: the copy loops `(τ - 4) * 17 + 17` each, the
 openings' rounds `250 + 178 + 250`, each layer (`y = τ - 3`) at most
-`2241 + (y + 171) + (374 + y / 8 * 374) + (77 + y % 8 * 77) + 60`; at most `52647` (`τ ≤ 28`, the
+`2241 + (y + 171) + (374 + y / 8 * 374) + (77 + y % 8 * 77) + 60`; at most `27249` (`τ ≤ 28`, the
 largest at `y = 23`). -/
 theorem kidsB_fs_le (h : D.Ok) :
     (D.kidsB LeanVM.Guest.B2C.fs 17 374 77 250 178).sum ≤
-      3 * ((D.τ - 4) * 17) + 51 + 678 + 12 * (2241 + (D.τ - 3 + 171) + (374 + (D.τ - 3) / 8 * 374) +
+      3 * ((D.τ - 4) * 17) + 51 + 678 + 6 * (2241 + (D.τ - 3 + 171) + (374 + (D.τ - 3) / 8 * 374) +
         (77 + (D.τ - 3) % 8 * 77) + 60) ∧
-    (D.kidsB LeanVM.Guest.B2C.fs 17 374 77 250 178).sum ≤ 52647 := by
+    (D.kidsB LeanVM.Guest.B2C.fs 17 374 77 250 178).sum ≤ 27249 := by
   have hτ := h.2.1
   have hτ1 := h.1
-  have hL : ((List.range 12).map (fun s ↦ layerWords LeanVM.Guest.B2C.fs (firstOf s)
+  have hL : ((List.range 6).map (fun s ↦ layerWords LeanVM.Guest.B2C.fs (firstOf s)
       (D.layer s).y 374 77)).sum ≤
-      12 * (2241 + (D.τ - 3 + 171) + (374 + (D.τ - 3) / 8 * 374) + (77 + (D.τ - 3) % 8 * 77) + 60) := by
-    have := List.sum_le_length_nsmul ((List.range 12).map (fun s ↦ layerWords
+      6 * (2241 + (D.τ - 3 + 171) + (374 + (D.τ - 3) / 8 * 374) + (77 + (D.τ - 3) % 8 * 77) + 60) := by
+    have := List.sum_le_length_nsmul ((List.range 6).map (fun s ↦ layerWords
       LeanVM.Guest.B2C.fs (firstOf s) (D.layer s).y 374 77))
       (2241 + (D.τ - 3 + 171) + (374 + (D.τ - 3) / 8 * 374) + (77 + (D.τ - 3) % 8 * 77) + 60)
       (fun x hx ↦ ?_)
@@ -113,7 +113,7 @@ theorem kidsB_fs_le (h : D.Ok) :
     decide +kernel
   rw [kidsB_sum, hF]
   refine ⟨by omega, ?_⟩
-  refine le_trans (by omega : _ ≤ 3 * ((D.τ - 4) * 17) + 51 + 678 + 12 * (2241 + (D.τ - 3 + 171) +
+  refine le_trans (by omega : _ ≤ 3 * ((D.τ - 4) * 17) + 51 + 678 + 6 * (2241 + (D.τ - 3 + 171) +
     (374 + (D.τ - 3) / 8 * 374) + (77 + (D.τ - 3) % 8 * 77) + 60)) ?_
   generalize hT : D.τ = t at hτ hτ1
   interval_cases t <;> norm_num

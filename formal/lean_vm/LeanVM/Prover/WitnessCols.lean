@@ -108,7 +108,7 @@ section Out
 variable {prog : LeanIsaProgram} {κ : ℕ} (w : EnsembleWitness (leanIsaEnsemble prog κ))
   (hp : 0 < (imageOf w.data).1)
 
-/-- **An output lane of the stack**, as an array: the last twelve rounds of the first twelve of
+/-- **An output lane of the stack**, as an array: the last six rounds of the first six of
 each row's input lanes. -/
 theorem column_toArray_out (c : Col) (h : IsOut c) :
     ((leanIsaInstance prog (witnessSizes w hp)).column (stackOf prog (witnessSizes w hp) w)

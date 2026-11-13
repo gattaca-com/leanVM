@@ -60,7 +60,7 @@ read at slot `l` of `QKECCAK`, and its columns `0 … 13` at slots `50 … 63` (
 `Blocks.sliceLayout`; `qkeccak_slot`, `crates/verifier/src/layout.rs:422-432, 559-563`): cell `x`
 of the column at slot `k` is cell `x + k · 2^τ_KECCAK` of the region. The output lanes are *derived*
 (`derived`): lane `l` at row `x` is lane `l` of the
-last twelve rounds of Keccak-f[1600] (`keccakSegment 1`) of the state after twelve rounds that
+last six rounds of Keccak-f[1600] (`keccakSegment 1`) of the state after six rounds that
 `QKECCAK` commits for step `x` (slots `25 … 49`, `midState`), so a stack carries no output lane, as
 the Rust commits none. This is what the Keccak reduction proves of the claims on them: its first
 claim checks the output against the second segment of the committed middle state and the middle
@@ -75,13 +75,13 @@ a reading no one makes, since the instance reads a derived column through `deriv
 itself (`publicInputPhase`).
 
 **The Keccak region** is `QKECCAK`, with `2^τ_KECCAK` steps: `M3Holds` asks of it that every
-step's slots `25 … 49` hold the first twelve rounds of its slots `0 … 24`. Its slots `50 … 63`
+step's slots `25 … 49` hold the first six rounds of its slots `0 … 24`. Its slots `50 … 63`
 are bound only by the table's claims on the columns they carry: the Keccak reduction weighs them
 nothing.
 
 **The maps.** `stackOf s w` stacks the columns a witness `w` carries: the memory and bytecode
 blocks' committed cells, the opcode tables' rows, and, as `QKECCAK`, the `KECCAK` rows' input
-lanes, their states after twelve rounds (padding steps: the zero state) and their cells of the
+lanes, their states after six rounds (padding steps: the zero state) and their cells of the
 spare columns (`keccakWitness`). `witnessOf prog s q`
 reads a witness off any stack `q`, at the memory size `logMem`: the six opcode tables from their
 rows, the memory block from the memory columns and the index `g^i`, the bytecode block from the
@@ -463,13 +463,13 @@ theorem kappa_of_isLane {c : Col} (h : IsLane c) : kappa prog s c = s.τ 5 :=
 /-- The Keccak region: `QKECCAK`, `2 ^ τ_KECCAK` steps. -/
 def keccakRegion : KeccakRegion (shape prog s) := ⟨keccakCol, s.τ 5, rfl⟩
 
-/-- The state after twelve rounds the stack commits at step `x`: slots `25 … 49` of `QKECCAK`. -/
+/-- The state after six rounds the stack commits at step `x`: slots `25 … 49` of `QKECCAK`. -/
 def midState (q : Column (leanIsaμ prog s)) (x : Fin (2 ^ s.τ 5)) : KeccakState :=
   (keccakRegion prog s).state ((layout prog s).read q keccakCol) 25 x
 
-/-- The output column `c`: at row `x`, its lane of the last twelve rounds of Keccak-f[1600] of
-the state after twelve rounds committed at step `x` (`midState`). With the Keccak predicate (the
-committed state is the first twelve rounds of the row's input lanes), this is the lane of
+/-- The output column `c`: at row `x`, its lane of the last six rounds of Keccak-f[1600] of
+the state after six rounds committed at step `x` (`midState`). With the Keccak predicate (the
+committed state is the first six rounds of the row's input lanes), this is the lane of
 Keccak-f[1600] of the input lanes (`keccakF_eq_segments`). -/
 def outColumn (q : Column (leanIsaμ prog s)) (c : Col) (h : IsOut c) : Column (kappa prog s c) :=
   ⟨Vector.ofFn fun x ↦
@@ -918,7 +918,7 @@ theorem qSlot_spare {c : Col} (h : IsSpare c) :
 
 /-- `QKECCAK` of a witness (`crates/leanvm_core/src/keccak.rs`, `cpu/layout.rs:56-111`): slot
 `l < 25` of step `x` is input lane `l` of row `x`, slot `25 + l` lane `l` of its state after
-twelve rounds, and slot `50 + k` the row's cell of the `KECCAK` column `spareColumn k`. -/
+six rounds, and slot `50 + k` the row's cell of the `KECCAK` column `spareColumn k`. -/
 def keccakWitness (w : EnsembleWitness (leanIsaEnsemble prog κ)) : Vector K (2 ^ (s.τ 5 + 6)) :=
   Vector.ofFn fun i ↦
     if h : i.val / 2 ^ s.τ 5 < 25 then inLaneOf prog s w (i.val % 2 ^ s.τ 5) ⟨_, h⟩

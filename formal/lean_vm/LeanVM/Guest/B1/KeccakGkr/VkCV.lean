@@ -67,7 +67,7 @@ theorem own_fit (h : D.Ok) (B : ℕ) (ls : ℕ → ℕ) :
   simp only [own, sizes, List.forall₂_cons, List.Forall₂.nil, and_true]
   simp [c0_point_length h, rl_length, claims_length h, e1, e2, e3, eqKernel_length, seg_length]
 
-theorem kids_lay {fs : String → ℕ} {B curE chiE olE zvE slE tbE : ℕ} {s : ℕ} (hs : s < 12) :
+theorem kids_lay {fs : String → ℕ} {B curE chiE olE zvE slE tbE : ℕ} {s : ℕ} (hs : s < 6) :
     (D.kids fs B curE chiE olE zvE slE tbE)[s + 1]'(by rw [kids_length]; omega) =
       D.layKid fs B curE tbE s := by
   interval_cases s <;> rfl
@@ -113,14 +113,14 @@ theorem vk_obl {D : VkData} (h : D.Ok) (curE chiE olE zvE slE tbE fp : ℕ) (fps
   generalize fp + fs "verify_keccak" = B at hB hout hto hlen ⊢
   have hk := kids_length (D := D) (fs := fs) (B := B) (curE := curE) (chiE := chiE) (olE := olE)
     (zvE := zvE) (slE := slE) (tbE := tbE)
-  have hfl : fps.length = 18 := by rw [hlen, hk]
-  have hlenA : (atAllG [] (D.kids fs B curE chiE olE zvE slE tbE) fps).length = 18 := by
+  have hfl : fps.length = 12 := by rw [hlen, hk]
+  have hlenA : (atAllG [] (D.kids fs B curE chiE olE zvE slE tbE) fps).length = 12 := by
     rw [atAllG_length, hk, hfl]; rfl
   obtain ⟨hol, hoi⟩ := outsOk_getElem hout
   have hto' := memL_takenOuts hto
-  have hol' : outs.length = 18 := by rw [hol, hlenA]
+  have hol' : outs.length = 12 := by rw [hol, hlenA]
   -- the layers' buffers
-  have hlay : ∀ s (hs : s < 12), (outs[s + 1]'(by omega)).2 = layerBufs (D.layer s) (firstOf s)
+  have hlay : ∀ s (hs : s < 6), (outs[s + 1]'(by omega)).2 = layerBufs (D.layer s) (firstOf s)
       (ptr (curE + D.lcur s)) (D.lsOf fs fps s) := by
     intro s hs
     have := hoi (s + 1) (by omega) (by omega) (by rw [atAllG_getElem]; simp [kids_lay hs, layKid])

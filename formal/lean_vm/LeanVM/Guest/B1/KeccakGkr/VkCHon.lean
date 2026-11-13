@@ -2,7 +2,7 @@
   LeanVM.Guest.B1.KeccakGkr.VkCHon
 
   `verify_keccak`'s honest run: its data, read back from the accepting run, and what follows from
-  it (the twelve layers' data, the openings, the results).
+  it (the six layers' data, the openings, the results).
 -/
 
 module

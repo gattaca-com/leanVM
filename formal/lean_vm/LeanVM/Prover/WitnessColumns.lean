@@ -180,7 +180,7 @@ theorem cellAt_eq {R : Array (Array K)} {T : Air.Flat.Table K} (h : R.toList = T
   unfold cellAt cellOf
   rw [← h, Array.getElem?_toList]
 
-/-- The twelve-round states of the pass. -/
+/-- The six-round states of the pass. -/
 theorem midStates_getD (R : Array (Array K)) (h x : ℕ) (hx : x < 2 ^ h) :
     (midStates R h).getD x zeroState =
       keccakSegment 0 (laneState fun l : Fin 25 ↦ cellAt R x (15 + l.val)) := by
@@ -193,7 +193,7 @@ theorem midStates_getD (R : Array (Array K)) (h x : ℕ) (hx : x < 2 ^ h) :
     rw [hz, laneState_zero]
     rfl
 
-/-- The twenty-four-round states of the pass. -/
+/-- The twelve-round states of the pass. -/
 theorem outStates_getD (R : Array (Array K)) (h x : ℕ) (hx : x < 2 ^ h) :
     (outStates R (midStates R h)).getD x zeroState =
       keccakSegment 1 (keccakSegment 0 (laneState fun l : Fin 25 ↦ cellAt R x (15 + l.val))) := by

@@ -2,7 +2,7 @@
   LeanVM.Protocol.Spine.KeccakZero
 
   The Keccak predicate along the table sumcheck's point: the multilinear zero test of the
-  difference between the region's committed states after twelve rounds and the first twelve rounds
+  difference between the region's committed states after six rounds and the first six rounds
   of its input states, with the high coordinates bound first.
 -/
 
@@ -14,7 +14,7 @@ public import LeanVM.Protocol.Spine.Instance
 # The Keccak predicate along a point
 
 `M3Holds` asks of the Keccak region (`KeccakRegion.Holds`) that at every step `x` the state in
-slots `25 … 49` is the first twelve rounds of the state in slots `0 … 24`. The protocol does not
+slots `25 … 49` is the first six rounds of the state in slots `0 … 24`. The protocol does not
 check this with challenges of its own: the Keccak reduction's first claim compares the two at the
 point `inst` of the `KECCAK` table's claims, which the table sumcheck draws. So the predicate is
 carried through the table sumcheck as a zero test that the sumcheck's challenges evaluate one
@@ -182,7 +182,7 @@ namespace KeccakRegion
 
 variable {S : Shape} (r : KeccakRegion S)
 
-/-- Lane `l` of the difference at step `x`: lane `l` of the first twelve rounds of the input
+/-- Lane `l` of the difference at step `x`: lane `l` of the first six rounds of the input
 state, minus the committed word in slot `25 + l`; zero past the steps. -/
 def delta (c : Column (r.logSteps + 6)) (l : Fin 25) (x : ℕ) : E :=
   if hx : x < 2 ^ r.logSteps then

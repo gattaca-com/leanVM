@@ -877,8 +877,17 @@ theorem buildLayoutLite_cost (hP : Includes P buildLayoutLiteC.costDeps) (byteco
           simp only [max_self]
           split_ifs <;> omega)
       have hgk := getD_cost P (by includes) heights opKeccak 0 (by simp [opKeccak])
-      have hb49 := bitLength_cost P (by includes) (25 * keccakSegments - 1)
-        (by simp [keccakSegments, keccakDepth])
+      have hseg : keccakSegments = 2 := by decide +kernel
+      have hrcLen : keccakRC.length = 12 := rfl
+      have hrc := length_cost P (by includes) keccakRC (by rw [hrcLen]; norm_num)
+      rw [hrcLen] at hrc
+      have hb49 : machineCost P bitLengthC.costIdx [encodeValue (25 * keccakSegments - 1)] ≤ 75 := by
+        rw [hseg]
+        change machineCost P bitLengthC.costIdx [encodeValue (49 : ℕ)] ≤ 75
+        rw [bitLengthC.costEq P (by includes)]
+        have hl := log2Rec_cost_word P (by includes) 49 (by norm_num)
+        norm_num [limbCount] at hl ⊢
+        omega
       have hmap := map_cost P (by includes)
         (fun p : ℕ × ℕ ↦ List.replicate p.1 (heights.getD p.2 0))
         (.closure buildLayoutLiteC.lam2.costIdx [encodeValue heights])
@@ -915,13 +924,14 @@ theorem buildLayoutLite_cost (hP : Includes P buildLayoutLiteC.costDeps) (byteco
       rw [ite_eq_left (show 4 ≤ val ∧ 1 ≤ logMemory ∧ logMemory ≤ 30 ∧
         (tableRows.all fun x ↦ decide (x ≤ 2 ^ 30)) = true ∧ val - 4 ≤ 30 ∧ tableRows.length = 6
         from ⟨c1, c2, c3, c4, c5, c6⟩)]
-      simp only [c1, c2, c3, c4, c5, ↓reduceIte, keccakDepth, keccakSegments,
-        limbs_of_lt (by norm_num : (12 : ℕ) < 2 ^ 64), limbs_of_lt (by norm_num : (2 : ℕ) < 2 ^ 64),
+      simp only [c1, c2, c3, c4, c5, ↓reduceIte, keccakDepth, hseg,
+        limbs_of_lt (by norm_num : (6 : ℕ) < 2 ^ 64), limbs_of_lt (by norm_num : (2 : ℕ) < 2 ^ 64),
         limbs_of_lt (by norm_num : (50 : ℕ) < 2 ^ 64),
         limbs_of_lt (by omega : heights.getD opKeccak 0 < 2 ^ 64),
         limbs_of_lt (by omega : qkeccakSlotBits < 2 ^ 64),
         limbs_of_lt (by omega : heights.getD opKeccak 0 + qkeccakSlotBits < 2 ^ 64)] at hb49 ⊢
-      simp only [Nat.reduceDiv, Nat.reduceMul] at hb49 ⊢
+      rw [Auto.LeanVM.Parameters.keccakRC.c295.costEq P (by includes)]
+      simp only [hrcLen, limbs_of_lt (by norm_num : (12 : ℕ) < 2 ^ 64), Nat.reduceMul] at hb49 ⊢
       have hmin : min tableRows.length tableLogFloors.length ≤ 6 := by omega
       simp only [max_self] at ⊢
       omega

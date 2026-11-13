@@ -16,11 +16,11 @@ public import LeanVM.Protocol.Keccak.Layer
 
 A candidate's `q_keccak` column is read as `col : ℕ → K` (word `n`, `0` past the end): word
 `x + 2^h·slot` is lane `slot` of step `x`'s input state (slots `0..24`), or for slot `25 + ℓ`
-lane `ℓ` of the committed state after twelve rounds (`doc/leanvm` §`keccak:segments`).
+lane `ℓ` of the committed state after six rounds (`doc/leanvm` §`keccak:segments`).
 
 * `inState col m x`: segment `m`'s committed input at step `x` (slots `25m .. 25m + 24`);
-  `statesAt col d`: the states `12 - d` rounds into each segment, as bits (depth `d`);
-  `statesAt_round`: depth `d` is the round `12(m + 1) - d - 1` of depth `d + 1`
+  `statesAt col d`: the states `6 - d` rounds into each segment, as bits (depth `d`);
+  `statesAt_round`: depth `d` is the round `6(m + 1) - d - 1` of depth `d + 1`
   (`afterRound`), so a layer's specification applies (`claimTrue_round`).
 * The statements: `outClaimsTrue` (the table's `25` output-lane claims at `inst`, against
   `keccakF` of the inputs), `outClaimsTrueMid` (against the second segment from the committed
@@ -53,21 +53,21 @@ def inState (col : ℕ → K) (m x : ℕ) : KeccakState :=
   Vector.ofFn fun l : Fin 25 ↦ K.lane (col (x + 2 ^ h * (25 * m + l)))
 
 /-- The state `e` rounds into segment `m` at step `x`. -/
-def segState (col : ℕ → K) (m e x : ℕ) : KeccakState := roundsFrom (12 * m) e (inState h col m x)
+def segState (col : ℕ → K) (m e x : ℕ) : KeccakState := roundsFrom (6 * m) e (inState h col m x)
 
-/-- The states at depth `d` (`12 - d` rounds into each segment), as bits. -/
-def statesAt (col : ℕ → K) (d : ℕ) : States := fun m x j ↦ sbit (segState h col m (12 - d) x) j
+/-- The states at depth `d` (`6 - d` rounds into each segment), as bits. -/
+def statesAt (col : ℕ → K) (d : ℕ) : States := fun m x j ↦ sbit (segState h col m (6 - d) x) j
 
-theorem statesAt_round (col : ℕ → K) {d : ℕ} (hd : d < 12) (m x j : ℕ) (hm : m < 2)
+theorem statesAt_round (col : ℕ → K) {d : ℕ} (hd : d < 6) (m x j : ℕ) (hm : m < 2)
     (hj : j < 1600) : statesAt h col d m x j = afterRound (statesAt h col (d + 1)) d m x j := by
-  have e : 12 - d = (12 - (d + 1)) + 1 := by omega
+  have e : 6 - d = (6 - (d + 1)) + 1 := by omega
   rw [statesAt, segState, e, roundsFrom_succ (by omega), sbit_round _ _ hj, afterRound, layerRC]
-  have e2 : keccakDepth * (m + 1) - d - 1 = 12 * m + (12 - (d + 1)) := by
-    rw [show keccakDepth = 12 from rfl]; omega
+  have e2 : keccakDepth * (m + 1) - d - 1 = 6 * m + (6 - (d + 1)) := by
+    rw [show keccakDepth = 6 from rfl]; omega
   rw [e2]
   rfl
 
-theorem claimTrue_round (col : ℕ → K) {d : ℕ} (hd : d < 12) (P : ℕ) (c : KeccakClaim) :
+theorem claimTrue_round (col : ℕ → K) {d : ℕ} (hd : d < 6) (P : ℕ) (c : KeccakClaim) :
     ClaimTrue (statesAt h col d) P c ↔ ClaimTrue (afterRound (statesAt h col (d + 1)) d) P c := by
   unfold ClaimTrue
   rw [claimSum_congr P (fun m x j hm hj ↦ statesAt_round h col hd m x j hm hj)]
@@ -86,17 +86,17 @@ def outClaimsTrue (col : ℕ → K) (inst output : List E) : Prop :=
 
 /-- The output-lane claims against the second segment, from the committed middle state. -/
 def outClaimsTrueMid (col : ℕ → K) (inst output : List E) : Prop :=
-  ∀ l < 25, stepMle h inst (fun x ↦ laneWord (roundsFrom 12 12 (inState h col 1 x)) l) =
+  ∀ l < 25, stepMle h inst (fun x ↦ laneWord (roundsFrom 6 6 (inState h col 1 x)) l) =
     output.getD l 0
 
 /-- The first segment's output and the committed middle state agree at `inst`, lane by lane. -/
 def midAgree (col : ℕ → K) (inst : List E) : Prop :=
-  ∀ l < 25, stepMle h inst (fun x ↦ laneWord (roundsFrom 0 12 (inState h col 0 x)) l) =
+  ∀ l < 25, stepMle h inst (fun x ↦ laneWord (roundsFrom 0 6 (inState h col 0 x)) l) =
     stepMle h inst (fun x ↦ col (x + 2 ^ h * (25 + l)))
 
-/-- **The committed middle state is twelve rounds of the input**, at every step. -/
+/-- **The committed middle state is six rounds of the input**, at every step. -/
 def RegionValid (col : ℕ → K) : Prop :=
-  ∀ x < 2 ^ h, inState h col 1 x = roundsFrom 0 12 (inState h col 0 x)
+  ∀ x < 2 ^ h, inState h col 1 x = roundsFrom 0 6 (inState h col 0 x)
 
 /-- A column claim on `q_keccak` holds: the column's multilinear extension (step bits low, the
 six slot bits high) at the claim's point. -/
@@ -202,7 +202,7 @@ theorem zeroOn_escape (δ : ℕ → E) {n : ℕ} {acc : List E} (hacc : acc.leng
 /-- The `25` tables of the middle state's mismatch: lane `l` of the first segment's output
 minus (plus, in characteristic two) the committed middle state's, at each step. -/
 def midDelta (col : ℕ → K) (l x : ℕ) : E :=
-  ofK (laneWord (roundsFrom 0 12 (inState h col 0 x)) l) + ofK (col (x + 2 ^ h * (25 + l)))
+  ofK (laneWord (roundsFrom 0 6 (inState h col 0 x)) l) + ofK (col (x + 2 ^ h * (25 + l)))
 
 end
 end LeanVM.Protocol.KeccakGkr

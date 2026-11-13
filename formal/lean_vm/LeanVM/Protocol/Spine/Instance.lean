@@ -34,8 +34,8 @@ derived from the stack (`derived`: for leanISA, the `KECCAK` table's output lane
 of its input lanes, which no opening reads; their claims are the Keccak reduction's); the columns
 whose first two cells the public statement fixes (§8.2); and, where the arithmetization has one,
 the region of the stack the Keccak reduction owns, with the predicate it establishes of it (for
-leanISA, that every step's state after twelve rounds, committed in `q_keccak`, is the first
-twelve rounds of its input state; the toy has none). Nothing here knows leanISA: leanISA is one
+leanISA, that every step's state after six rounds, committed in `q_keccak`, is the first
+six rounds of its input state; the toy has none). Nothing here knows leanISA: leanISA is one
 instance, built by the adaptor.
 
 Four kinds of quantity are read off an instance by the protocol's schedule. The *sumcheck
@@ -166,7 +166,7 @@ def bitTable {n : ℕ} (c : Column n) (i : Fin 64) : CMlPolynomialEval E n :=
 
 /-- Where the Keccak reduction's committed column sits: a column of height `2 ^ (h + 6)`, `64`
 slots of `2^h` words, slot `l < 25` lane `l` of each step's input state and slot `25 + l` lane `l`
-of its state after twelve rounds (`QKECCAK`, `crates/verifier/src/layout.rs:77-83`). -/
+of its state after six rounds (`QKECCAK`, `crates/verifier/src/layout.rs:77-83`). -/
 structure KeccakRegion (S : Shape) where
   /-- The column. -/
   col : S.ColumnId
@@ -186,7 +186,7 @@ def KeccakRegion.state {S : Shape} (r : KeccakRegion S) (c : Column (r.logSteps 
   laneState fun l ↦ r.word c (base + l) x
 
 /-- What the Keccak reduction establishes of the region: at every step, the state committed
-after twelve rounds is the first segment of Keccak-f[1600] of the input state. -/
+after six rounds is the first segment of Keccak-f[1600] of the input state. -/
 def KeccakRegion.Holds {S : Shape} (r : KeccakRegion S) (c : Column (r.logSteps + 6)) : Prop :=
   ∀ x, r.state c 25 x = keccakSegment 0 (r.state c 0 x)
 
@@ -399,7 +399,7 @@ def PublicLinesHold (input : I.Stmt) (q : Column I.μ) : Prop :=
       (I.column q l.col).values.get ⟨1, Nat.one_lt_two_pow l.pos.ne'⟩ = l.cell1
 
 /-- The Keccak predicate holds of the Keccak region, if there is one: what the Keccak reduction
-establishes of the committed column (for leanISA, every step's state after twelve rounds is the
+establishes of the committed column (for leanISA, every step's state after six rounds is the
 first segment of its input state's permutation; that the `KECCAK` rows permute is then the
 derived output lanes'). -/
 def aux (q : Column I.μ) : Prop := ∀ r ∈ I.keccak, r.Holds (I.keccakColumn r q)

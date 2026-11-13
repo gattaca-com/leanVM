@@ -20,7 +20,7 @@ off `stackOf` is, cell by cell (`x < 2^τ`):
 * a column of an opcode table that is no `KECCAK` output lane: the table's cells
   (`column_toArray_table`), the `KECCAK` input lanes and spare columns through `QKECCAK`'s slots
   (`keccakWitness_getElem`), a padding row zero;
-* a `KECCAK` output lane: the last twelve rounds of the first twelve of the row's input lanes
+* a `KECCAK` output lane: the last six rounds of the first six of the row's input lanes
   (`column_getElem_out`), as the instance derives it from `QKECCAK`.
 -/
 
@@ -101,7 +101,7 @@ theorem column_getElem_spare (c : Col) (h : IsSpare c) (x : ℕ)
     dite_eq_right (by omega), dite_eq_right (by omega), hcol] at h1
   exact h1
 
-/-- The state after twelve rounds the stack of a witness commits at step `x`: the first twelve
+/-- The state after six rounds the stack of a witness commits at step `x`: the first six
 rounds of the row's input lanes. -/
 theorem state_mid_stackOf (x : Fin (2 ^ (witnessSizes w hp).τ 5)) :
     (keccakRegion prog (witnessSizes w hp)).state
@@ -122,7 +122,7 @@ theorem state_mid_stackOf (x : Fin (2 ^ (witnessSizes w hp).τ 5)) :
   simp only [KeccakRegion.state]
   rw [hmid, laneState_stateLanes]
 
-/-- **Cell `x` of output lane `l` of the stack**: the last twelve rounds of the first twelve of
+/-- **Cell `x` of output lane `l` of the stack**: the last six rounds of the first six of
 the row's input lanes. -/
 theorem column_getElem_out (l : Fin 25) (x : ℕ) (hx : x < 2 ^ (witnessSizes w hp).τ 5) :
     ((leanIsaInstance prog (witnessSizes w hp)).column (stackOf prog (witnessSizes w hp) w)

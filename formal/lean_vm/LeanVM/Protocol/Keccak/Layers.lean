@@ -1,7 +1,7 @@
 /-
   LeanVM.Protocol.Keccak.Layers
 
-  The twelve layers of `verifyKeccak` on a candidate's committed states: from a claim on the
+  The six layers of `verifyKeccak` on a candidate's committed states: from a claim on the
   segments' outputs to one on their committed inputs.
 -/
 
@@ -12,11 +12,11 @@ public import LeanVM.Protocol.Keccak.Start
 /-!
 # The layers
 
-`keccakLayers logSteps (List.range 12)` (`crates/verifier/src/keccak.rs:264-267`) runs
-`verifyKeccakLayer` at steps `0, …, 11`. On a candidate's column `qk q`, the states at depth `d` are
-`statesAt … d` (`12 - d` rounds into each segment), and depth `d` is the round of depth `d + 1`
+`keccakLayers logSteps (List.range 6)` (`crates/verifier/src/keccak.rs:264-267`) runs
+`verifyKeccakLayer` at steps `0, …, 5`. On a candidate's column `qk q`, the states at depth `d` are
+`statesAt … d` (`6 - d` rounds into each segment), and depth `d` is the round of depth `d + 1`
 (`claimTrue_round`), so `layerSpec` chains (`layersSpec`): from doom of the claim at depth `d` to
-doom of the claim at depth `12`, on the committed inputs.
+doom of the claim at depth `6`, on the committed inputs.
 -/
 
 namespace LeanVM.Protocol.KeccakGkr
@@ -36,15 +36,15 @@ noncomputable def layersSpec (hst : Stable C) (hcard : ∀ h, (C h).ncard ≤ L�
     (qk : β → ℕ → K) (P : ℕ)
     (h46 : (2 : ℝ≥0∞)⁻¹ ^ grindingBits (productBits - 1) * ((L₀ : ℝ≥0∞) * errE 46) ≤ εmax)
     (h3 : (L₀ : ℝ≥0∞) * errE 3 ≤ εmax) (hβ : (L₀ : ℝ≥0∞) * errE 2 + T ≤ εmax) :
-    (n d : ℕ) → d + n = 12 → (claim : KeccakClaim) → ClaimShape P claim →
+    (n d : ℕ) → d + n = 6 → (claim : KeccakClaim) → ClaimShape P claim →
       Spec (keccakLayers (P + 4) (List.range' d n) claim)
         (Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) d) P claim ∧ R q))
         (fun c h ↦ ClaimShape P c ∧
-          Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 12) P c ∧ R q) h) εmax T T
+          Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 6) P c ∧ R q) h) εmax T T
   | 0, d, hd, claim, hs =>
     (Spec.ret (Post := fun c h ↦ ClaimShape P c ∧
-        Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 12) P c ∧ R q) h) claim).mono
-      (fun _ h' ↦ ⟨hs, by rw [show d = 12 by omega] at h'; exact h'⟩) (fun _ _ h' ↦ h')
+        Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 6) P c ∧ R q) h) claim).mono
+      (fun _ h' ↦ ⟨hs, by rw [show d = 6 by omega] at h'; exact h'⟩) (fun _ _ h' ↦ h')
       le_rfl le_rfl le_rfl
   | n + 1, d, hd, claim, hs =>
     ((layerSpec (T := T) hst hcard R (fun q ↦ statesAt (P + 4) (qk q) (d + 1)) d P claim hs h46

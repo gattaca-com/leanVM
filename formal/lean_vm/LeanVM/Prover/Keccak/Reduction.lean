@@ -61,7 +61,7 @@ theorem corr_keccak (hcol : ColAgree P col' col) {inst : List E} (hi : inst.leng
   rw [committed_eq hcol hi hs hl, keccakFirstClaim_eq]
   refine corr_sendE rfl ?_
   refine Corr.bind (fun c c' h ↦ ?_) _ _
-    (corr_layers hcol 12 0 rfl _ (firstClaim_shape _ hi hs))
+    (corr_layers hcol 6 0 rfl _ (firstClaim_shape _ hi hs))
   obtain ⟨rfl, hsh⟩ := h
   refine Corr.bind (fun x x' h ↦ ?_) _ _ (corr_openOut hcol hi hs hl)
   obtain ⟨h1, h2, h3, h4⟩ := h

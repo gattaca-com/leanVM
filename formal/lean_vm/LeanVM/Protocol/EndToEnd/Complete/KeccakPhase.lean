@@ -31,7 +31,7 @@ Against the honest prover the claims on the output lanes are the table phase's h
 * the output lanes' claims are the reduction's `outClaimsTrueMid` (`outClaimsTrueMid_honest`):
   an output lane is derived, the second segment of the committed middle state
   (`Front.laneHolds_iff`);
-* the middle state agrees with twelve rounds of the input at the lanes' point
+* the middle state agrees with six rounds of the input at the lanes' point
   (`midAgree_honest`): the honest stack satisfies the instance's Keccak predicate (`M3Holds`), and
   `Front.auxAt_iff_midAgree` reads it at any point;
 * the reduction's column claims (`colTrue`) are true claims on `QKECCAK`

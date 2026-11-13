@@ -30,7 +30,7 @@ theorem mem_stepCoreF {s b : ℕ} {st : Stmt} (h : st ∈ flipsT s (b + 6)) : st
   List.mem_append_left _ (List.mem_append_right _ h)
 
 /-- **A step's core, completely**, given its flips. -/
-theorem stepCore_of_flips {s b : ℕ} (hs : s < 12) (hb : 18 ≤ b) (hσ : ∀ v, σ v = σ (.n v.idx))
+theorem stepCore_of_flips {s b : ℕ} (hs : s < 6) (hb : 18 ≤ b) (hσ : ∀ v, σ v = σ (.n v.idx))
     (hg : ∀ st ∈ stepCore s b, GoodS rd vkSt w σ st) (hk : stepKer s b)
     {τ : ℕ} (hτ1 : 9 ≤ τ) (h17 : σ (.n 18) = gen ^ (τ - 4)) {c : KeccakClaim} {pp : E}
     (hpp : LoadHolds rd (σ (.n 161)) (22 * s + 2) pp) (hpt : ReadsAt rd pp c.point)

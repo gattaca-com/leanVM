@@ -33,7 +33,7 @@ variable {D : VkData} {rd : Reader} {B curE chiE olE zvE slE tbE : ℕ} {ls : �
 
 /-- Word `k` of claim `s`'s record, through the claim records' pointer. -/
 theorem rec_word (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : Val}
-    (h201 : σ (.n 161) = ptr (B + D.o201)) {s : ℕ} (hs : s < 12) {k : ℕ} (hk : k < 22) :
+    (h201 : σ (.n 161) = ptr (B + D.o201)) {s : ℕ} (hs : s < 6) {k : ℕ} (hk : k < 22) :
     LoadHolds rd (σ (.n 161)) (22 * s + k) ((D.CL B ls s).cw.getD k 0) := by
   have hcw := memL_entry (CL_mem h hm hs) (b := (D.CL B ls s).bclaim) (ws := (D.CL B ls s).cw)
     (by simp [ClaimLay.L])
@@ -44,7 +44,7 @@ theorem rec_word (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ :
 
 /-- **Step `s`'s pointers.** -/
 theorem step_ptrs (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : Val}
-    (hσd : σ = D.val rd B curE chiE olE zvE slE tbE) {s : ℕ} (hs : s < 12)
+    (hσd : σ = D.val rd B curE chiE olE zvE slE tbE) {s : ℕ} (hs : s < 6)
     (h17 : σ (.n 18) = gen ^ (D.τ - 4)) (h201 : σ (.n 161) = ptr (B + D.o201)) :
     σ (.n (stepB s + 1)) = ptr (D.CL B ls s).bpp * gen ^ (D.τ - 4) ∧
     (s ≠ 0 → ∀ j < (iotaUsed s).length, σ (.n (stepB s + 6 + 2 * j)) = ptr (D.CL B ls s).bfl) := by
@@ -87,9 +87,9 @@ theorem step_ptrs (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ 
 theorem fin_ptrs (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : Val}
     (hσd : σ = D.val rd B curE chiE olE zvE slE tbE) (h17 : σ (.n 18) = gen ^ (D.τ - 4))
     (h201 : σ (.n 161) = ptr (B + D.o201)) :
-    σ (.n 1746) = ptr (ls 11) * gen ^ (D.τ - 4) ∧
-      σ (.n 1980) = ptr (ls 11 + (D.layer 11).y + 128) ∧
-      σ (.n 3143) = ptr (ls 11 + (D.layer 11).y + 139) := by
+    σ (.n 1514) = ptr (ls 5) * gen ^ (D.τ - 4) ∧
+      σ (.n 1748) = ptr (ls 5 + (D.layer 5).y + 128) ∧
+      σ (.n 2911) = ptr (ls 5 + (D.layer 5).y + 139) := by
   have hg : ∀ st ∈ vkFinT, GoodS rd vkSt (D.w B curE) σ st := fun st hst ↦ by
     subst hσd
     exact val_good' h (List.mem_append_right _ hst)
@@ -97,15 +97,15 @@ theorem fin_ptrs (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ :
   have k1 := vkFin_ker.1
   have hrec := last_rec h hm
   rw [outWs_last h, ← h201] at hrec
-  have e4977 : σ (.n 1745) = ptr (ls 11) :=
-    load_val (gA (.load (.n 1745) (.n 161) 266) (by simp [vkFinT])) (not_mem_of_noneIn k1 _ (by simp))
+  have e4977 : σ (.n 1513) = ptr (ls 5) :=
+    load_val (gA (.load (.n 1513) (.n 161) 134) (by simp [vkFinT])) (not_mem_of_noneIn k1 _ (by simp))
       (by simpa using hrec 2 (by norm_num))
   have m4978 := mulG (by norm_num) (by norm_num)
-    (gA (.mul (.n 1746) (.n 1745) (.n 18)) (by simp [vkFinT]))
+    (gA (.mul (.n 1514) (.n 1513) (.n 18)) (by simp [vkFinT]))
   refine ⟨by rw [m4978, e4977, h17], ?_, ?_⟩
-  · exact load_val (gA (.load (.n 1980) (.n 161) 268) (by simp [vkFinT]))
+  · exact load_val (gA (.load (.n 1748) (.n 161) 136) (by simp [vkFinT]))
       (not_mem_of_noneIn k1 _ (by simp)) (by simpa using hrec 4 (by norm_num))
-  · exact load_val (gA (.load (.n 3143) (.n 161) 267) (by simp [vkFinT]))
+  · exact load_val (gA (.load (.n 2911) (.n 161) 135) (by simp [vkFinT]))
       (not_mem_of_noneIn k1 _ (by simp)) (by simpa using hrec 3 (by norm_num))
 
 end VkData

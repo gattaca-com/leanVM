@@ -33,7 +33,7 @@ The GKR reduction of `verifyKeccak` (`crates/verifier/src/keccak.rs` at leanVM `
   `rhoPiSrc j` of `θ(a)`), `chiB`, `roundB`;
 * the stages of `Keccak.round` as functions (`Stage.theta`, `Stage.rhoPi`, `Stage.chi`,
   `Stage.iota`; `Keccak.round` is their composition by `rfl`) and the bits of each;
-* the rounds of a segment (`roundsFrom`) and `keccakF` as two segments of twelve.
+* the rounds of a segment (`roundsFrom`) and `keccakF` as two segments of six.
 -/
 
 namespace LeanVM.Protocol.KeccakGkr
@@ -327,18 +327,18 @@ def roundsFrom (start e : ℕ) (a : KeccakState) : KeccakState :=
 theorem roundsFrom_zero (start : ℕ) (a : KeccakState) : roundsFrom start 0 a = a := rfl
 
 /-- One more round. -/
-theorem roundsFrom_succ {start e : ℕ} (h : start + e < 24) (a : KeccakState) :
+theorem roundsFrom_succ {start e : ℕ} (h : start + e < 12) (a : KeccakState) :
     roundsFrom start (e + 1) a =
       Keccak.round (roundsFrom start e a) (keccakRC.getD (start + e) 0) := by
-  have hlen : keccakRC.length = 24 := rfl
+  have hlen : keccakRC.length = 12 := rfl
   unfold roundsFrom
   rw [List.take_add_one, List.foldl_append, List.getElem?_drop,
     List.getElem?_eq_getElem (by omega)]
   simp only [Option.toList_some, List.foldl_cons, List.foldl_nil]
   rw [List.getD_eq_getElem?_getD, List.getElem?_eq_getElem (by omega), Option.getD_some]
 
-/-- `keccakF` is twelve rounds, then the twelve others. -/
-theorem keccakF_eq (a : KeccakState) : keccakF1600 a = roundsFrom 12 12 (roundsFrom 0 12 a) := by
+/-- `keccakF` is six rounds, then the six others. -/
+theorem keccakF_eq (a : KeccakState) : keccakF1600 a = roundsFrom 6 6 (roundsFrom 0 6 a) := by
   unfold keccakF1600 roundsFrom
   rw [← List.foldl_append]
   rfl

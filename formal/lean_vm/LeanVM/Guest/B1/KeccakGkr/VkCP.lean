@@ -30,21 +30,21 @@ namespace VkData
 
 variable {D : VkData} {rd : Reader} {B curE chiE olE zvE slE tbE : ℕ} {ls : ℕ → ℕ}
 
-theorem L_next (h : D.Ok) : D.L.1 = (D.layer 11).next (firstOf 11) := by
-  rw [L_eq h, D.layer_succ h (by norm_num : 11 < 12)]
+theorem L_next (h : D.Ok) : D.L.1 = (D.layer 5).next (firstOf 5) := by
+  rw [L_eq h, D.layer_succ h (by norm_num : 5 < 6)]
 
 /-- The last claim's record. -/
-theorem outWs_last (h : D.Ok) : D.outWs ls 11 = [D.L.1.value, sumE D.L.1.mu, ptr (ls 11),
-    ptr (ls 11 + (D.layer 11).y + 139), ptr (ls 11 + (D.layer 11).y + 128),
-    ptr (ls 11 + (D.layer 11).y + 164)] ++ D.L.1.mu := by
+theorem outWs_last (h : D.Ok) : D.outWs ls 5 = [D.L.1.value, sumE D.L.1.mu, ptr (ls 5),
+    ptr (ls 5 + (D.layer 5).y + 139), ptr (ls 5 + (D.layer 5).y + 128),
+    ptr (ls 5 + (D.layer 5).y + 164)] ++ D.L.1.mu := by
   rw [outWs, LayerData.outW, L_next h]
 
 /-- The last claim's record, in memory. -/
 theorem last_rec (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) :
-    ∀ k < 22, LoadHolds rd (ptr (B + D.o201)) (264 + k) ((D.outWs ls 11).getD k 0) := by
+    ∀ k < 22, LoadHolds rd (ptr (B + D.o201)) (132 + k) ((D.outWs ls 5).getD k 0) := by
   intro k hk
   obtain ⟨-, -, m201, -⟩ := own_mem (by have := h.1; omega) hm.own
-  have := claims_slice h (by norm_num : 11 < 12) m201
+  have := claims_slice h (by norm_num : 5 < 6) m201
   rw [← ptr_mul_gen] at this
   have := ClaimLay.getD_load this (k := k) (by rw [outWs_length]; exact hk)
   rwa [loadHolds_mul_gen_pow] at this
@@ -63,12 +63,12 @@ set_option maxRecDepth 20000 in
 theorem in_on (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : Val}
     (hσd : σ = D.val rd B curE chiE olE zvE slE tbE) (h6 : σ (.n 6) = gen ^ D.τ)
     (h9 : σ (.n 9) = ptr zvE) (h10 : σ (.n 10) = ptr slE) (h201 : σ (.n 161) = ptr (B + D.o201))
-    (h3699 : σ (.n 929) = ptr (curE + D.lcur 12 + 12)) :
-    σ (.n 1199) = ptr (curE + D.lcur 12 + 12) * gen ∧ σ (.n 1200) = D.L.1.value ∧
-      σ (.n 1202) = ptr zvE * gen ^ 39 ∧ (∀ j < 7, σ (.n (1203 + j)) = (D.iRets curE).getD j 0) ∧
-      σ (.n 1327) = multilinearEval D.L.1.mu D.I.1 ∧ σ (.n 1330) = ptr zvE * gen ^ 39 * gen ^ D.τ ∧
-      σ (.n 1331) = 0 ∧ σ (.n 1332) = 0 ∧ (∀ j < 7, σ (.n (1333 + j)) = (D.sRets curE).getD j 0) ∧
-      D.sF.pend.length = rateScalars ∧ capOf D.sF.perm = (cap5 1740).map σ ∧
+    (h3699 : σ (.n 697) = ptr (curE + D.lcur 6 + 12)) :
+    σ (.n 967) = ptr (curE + D.lcur 6 + 12) * gen ∧ σ (.n 968) = D.L.1.value ∧
+      σ (.n 970) = ptr zvE * gen ^ 39 ∧ (∀ j < 7, σ (.n (971 + j)) = (D.iRets curE).getD j 0) ∧
+      σ (.n 1095) = multilinearEval D.L.1.mu D.I.1 ∧ σ (.n 1098) = ptr zvE * gen ^ 39 * gen ^ D.τ ∧
+      σ (.n 1099) = 0 ∧ σ (.n 1100) = 0 ∧ (∀ j < 7, σ (.n (1101 + j)) = (D.sRets curE).getD j 0) ∧
+      D.sF.pend.length = rateScalars ∧ capOf D.sF.perm = (cap5 1508).map σ ∧
       ∀ {next : Prop} {kret : List E → Prop}, next →
         Stmt.HoldsList (fun _ _ _ ↦ True) rd σ vkInT next kret := by
   have hτ1 := h.1
@@ -85,21 +85,21 @@ theorem in_on (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : Va
     (by simp [lin]))
   have msl' := memL_entry hm.lin (b := slE) (ws := D.slices) (by simp [lin])
   have hmuL : D.L.1.mu.length = 16 := by rw [L_next h]; exact keccakInstanceWeights_length _
-  have hv : LoadHolds rd (σ (.n 161)) 264 D.L.1.value := by
+  have hv : LoadHolds rd (σ (.n 161)) 132 D.L.1.value := by
     rw [h201]; simpa using hrec 0 (by norm_num)
-  have hmu : ∀ k < 16, LoadHolds rd (σ (.n 161)) (270 + k) (D.L.1.mu.getD k 0) := by
+  have hmu : ∀ k < 16, LoadHolds rd (σ (.n 161)) (138 + k) (D.L.1.mu.getD k 0) := by
     intro k hk
     have := hrec (6 + k) (by omega)
     rw [List.getD_append_right _ _ _ _ (by simp)] at this
-    rw [h201, show 270 + k = 264 + (6 + k) by omega]
+    rw [h201, show 138 + k = 132 + (6 + k) by omega]
     simpa using this
   have hlow : ∀ t < 4, LoadHolds rd (σ (.n 9)) (39 + t) (D.I.1.getD t 0) := by
     intro t ht
     rw [h9, ← point_low h ht, ← loadHolds_mul_gen_pow, ptr_mul_gen]
     exact ClaimLay.getD_load mpt (by rw [point_length h]; omega)
-  have a3987 : σ (.n 1210) = ptr (B + D.τ + 382) := by
-    subst hσd; exact val_alloc h (.n 1210, .inl 30) (by simp [vkAllocs])
-  have hT : ∀ t, 1 ≤ t → t ≤ 4 → ∀ i < 2 ^ t, LoadHolds rd (σ (.n 1210)) (2 ^ t - 2 + i)
+  have a3987 : σ (.n 978) = ptr (B + D.τ + 250) := by
+    subst hσd; exact val_alloc h (.n 978, .inl 30) (by simp [vkAllocs])
+  have hT : ∀ t, 1 ≤ t → t ≤ 4 → ∀ i < 2 ^ t, LoadHolds rd (σ (.n 978)) (2 ^ t - 2 + i)
       ((eqKernel (D.I.1.take t)).getD i 0) := by
     intro t h1 h2 i hi
     have hl : 4 ≤ D.I.1.length := by rw [I1_length h]
@@ -110,21 +110,21 @@ theorem in_on (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : Va
     omega
   -- the calls' returns
   have hcg := calls_good h hσd
-  have hw : ∀ j < 7, D.w B curE (1333 + j) = (D.sRets curE).getD j 0 := fun j hj ↦ w_s hj
-  have hcur : ReadsAt rd (D.w B curE 1338) D.slices := by
-    rw [show (1338 : ℕ) = 1333 + 5 from rfl, hw 5 (by norm_num), sRets,
+  have hw : ∀ j < 7, D.w B curE (1101 + j) = (D.sRets curE).getD j 0 := fun j hj ↦ w_s hj
+  have hcur : ReadsAt rd (D.w B curE 1106) D.slices := by
+    rw [show (1106 : ℕ) = 1101 + 5 from rfl, hw 5 (by norm_num), sRets,
       List.getD_append_right _ _ _ _ (by rw [(S_ok h).2]), (S_ok h).2]
     simp only [Nat.sub_self, List.getD_cons_zero, cL, ptr_mul_gen, ptr_mul_gen1]
-    rw [show curE + D.lcur 12 + 2 * 6 + 1 + 2 * 4 + 2 * 6 = curE + D.lcur 12 + 33 by omega]
+    rw [show curE + D.lcur 6 + 2 * 6 + 1 + 2 * 4 + 2 * 6 = curE + D.lcur 6 + 33 by omega]
     exact msl
   obtain ⟨e3976, e3977, e3979, e3980, e4104, e4107, e4110, -, hpl, hcp, H⟩ :=
     vkIn_complete hσ hg hv (I1_length h) hlow hT hmuL hmu h.2.2.2.2.2.2.2.2.2.1 hcur
       (by rw [h10]; exact msl')
   have gA : ∀ a, Stmt.atom a ∈ vkInT → Good rd vkSt (D.w B curE) σ a := fun a h ↦ hg _ h
-  have c4108 : σ (.n 1331) = Guest.word 0 0 :=
-    gA (.const (.n 1331) (Guest.word 0 0)) (by simp [vkInT])
-  have c4109 : σ (.n 1332) = Guest.word 0 0 :=
-    gA (.const (.n 1332) (Guest.word 0 0)) (by simp [vkInT])
+  have c4108 : σ (.n 1099) = Guest.word 0 0 :=
+    gA (.const (.n 1099) (Guest.word 0 0)) (by simp [vkInT])
+  have c4109 : σ (.n 1100) = Guest.word 0 0 :=
+    gA (.const (.n 1100) (Guest.word 0 0)) (by simp [vkInT])
   refine ⟨by rw [e3976, h3699], e3977, by rw [e3979, h9], fun j hj ↦ (e3980 j hj).trans (w_i hj),
     e4104, by rw [e4107, h9, h6], by rw [c4108, word_zero], by rw [c4109, word_zero],
     fun j hj ↦ (e4110 j hj).trans (hw j hj), ?_, ?_, H⟩
@@ -139,13 +139,13 @@ set_option maxRecDepth 20000 in
 theorem fin_on (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : Val}
     (hσd : σ = D.val rd B curE chiE olE zvE slE tbE) (h9 : σ (.n 9) = ptr zvE)
     (h10 : σ (.n 10) = ptr slE) (h17 : σ (.n 18) = gen ^ (D.τ - 4)) (h201 : σ (.n 161) = ptr (B + D.o201))
-    (h4104 : σ (.n 1327) = multilinearEval D.L.1.mu D.I.1)
-    (h4107 : σ (.n 1330) = ptr zvE * gen ^ 39 * gen ^ D.τ) (h4116 : σ (.n 1339) = D.S.2.1)
-    (h1251 : σ (.n 1202) = ptr zvE * gen ^ 39) :
-    σ (.n 1745) = ptr (ls 11) ∧ σ (.n 3360) = 1 + gen ^ (D.τ - 4) ∧ σ (.n 3361) = 1 ∧
-      σ (.n 3363) = ptr zvE * gen ^ 43 ∧
-      ∀ {kret : List E → Prop}, kret [σ (.n 1740), σ (.n 1741), σ (.n 1742), σ (.n 1743),
-        σ (.n 1744), σ (.n 1338) * gen ^ 64, σ (.n 931)] →
+    (h4104 : σ (.n 1095) = multilinearEval D.L.1.mu D.I.1)
+    (h4107 : σ (.n 1098) = ptr zvE * gen ^ 39 * gen ^ D.τ) (h4116 : σ (.n 1107) = D.S.2.1)
+    (h1251 : σ (.n 970) = ptr zvE * gen ^ 39) :
+    σ (.n 1513) = ptr (ls 5) ∧ σ (.n 3128) = 1 + gen ^ (D.τ - 4) ∧ σ (.n 3129) = 1 ∧
+      σ (.n 3131) = ptr zvE * gen ^ 43 ∧
+      ∀ {kret : List E → Prop}, kret [σ (.n 1508), σ (.n 1509), σ (.n 1510), σ (.n 1511),
+        σ (.n 1512), σ (.n 1106) * gen ^ 64, σ (.n 699)] →
         Stmt.HoldsList (fun _ _ _ ↦ True) rd σ vkFinT False kret := by
   have hτ1 := h.1
   have hσ : ∀ v, σ v = σ (.n v.idx) := by subst hσd; exact (val_good h).1
@@ -154,43 +154,43 @@ theorem fin_on (h : D.Ok) (hm : D.Mem rd B curE chiE olE zvE slE tbE ls) {σ : V
     exact val_good' h (List.mem_append_right _ hst)
   have hrec := last_rec h hm
   rw [outWs_last h] at hrec
-  have hL := hm.lay 11 (by norm_num)
+  have hL := hm.lay 5 (by norm_num)
   rw [layerBufs_eq] at hL
   have mpt := memL_entry hm.lin (b := zvE + qkeccakVarsCap) (ws := D.point) (by simp [lin])
   have msl := memL_entry hm.lin (b := slE) (ws := D.slices) (by simp [lin])
-  have hpp : LoadHolds rd (σ (.n 161)) 266 (ptr (ls 11)) := by
+  have hpp : LoadHolds rd (σ (.n 161)) 134 (ptr (ls 5)) := by
     rw [h201]; simpa using hrec 2 (by norm_num)
-  have hlc : LoadHolds rd (σ (.n 161)) 268 (ptr (ls 11 + (D.layer 11).y + 128)) := by
+  have hlc : LoadHolds rd (σ (.n 161)) 136 (ptr (ls 5 + (D.layer 5).y + 128)) := by
     rw [h201]; simpa using hrec 4 (by norm_num)
-  have hlp : LoadHolds rd (σ (.n 161)) 267 (ptr (ls 11 + (D.layer 11).y + 139)) := by
+  have hlp : LoadHolds rd (σ (.n 161)) 135 (ptr (ls 5 + (D.layer 5).y + 139)) := by
     rw [h201]; simpa using hrec 3 (by norm_num)
-  have hpt : ReadsAt rd (ptr (ls 11)) D.L.1.point := by
+  have hpt : ReadsAt rd (ptr (ls 5)) D.L.1.point := by
     rw [L1_point h]; exact memL_entry hL (by simp)
-  have hloc : ReadsAt rd (ptr (ls 11 + (D.layer 11).y + 128)) ((D.layer 11).locPt (firstOf 11)) :=
+  have hloc : ReadsAt rd (ptr (ls 5 + (D.layer 5).y + 128)) ((D.layer 5).locPt (firstOf 5)) :=
     memL_entry hL (by simp)
-  have hlanes : ReadsAt rd (ptr (ls 11 + (D.layer 11).y + 139))
-      (lanesOut ((D.layer 11).locPt (firstOf 11)) ((D.layer 11).beta (firstOf 11)).1) :=
+  have hlanes : ReadsAt rd (ptr (ls 5 + (D.layer 5).y + 139))
+      (lanesOut ((D.layer 5).locPt (firstOf 5)) ((D.layer 5).beta (firstOf 5)).1) :=
     memL_entry hL (by simp)
-  have hslot : ReadsAt rd (σ (.n 1330)) D.S.1 := by
+  have hslot : ReadsAt rd (σ (.n 1098)) D.S.1 := by
     rw [h4107]
     have := (readsAt_append.1 mpt).2
     rw [List.length_append, I1_length h, List.length_take, L_point h,
       show min (D.τ - 4) (D.τ - 3) = D.τ - 4 by omega, ptr_mul_gen,
       show zvE + qkeccakVarsCap + (4 + (D.τ - 4)) = zvE + 39 + D.τ by simp; omega] at this
     rwa [ptr_mul_gen, ptr_mul_gen]
-  have hlocL := locPt_length h (by norm_num : 11 < 12)
+  have hlocL := locPt_length h (by norm_num : 5 < 6)
   -- the check
-  have hok := D.CL_ok h B ls (s := 12) le_rfl
-  simp only [ClaimLay.Ok, CL, show firstOf 12 = 0 from rfl, show (0 : ℕ) = 1 ↔ False by decide,
+  have hok := D.CL_ok h B ls (s := 6) le_rfl
+  simp only [ClaimLay.Ok, CL, show firstOf 6 = 0 from rfl, show (0 : ℕ) = 1 ↔ False by decide,
     ↓reduceIte] at hok
   obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, hw⟩ := hok
-  have hc12 : (D.layer 12).c = D.L.1 := by rw [L_eq h]; rfl
+  have hc12 : (D.layer 6).c = D.L.1 := by rw [L_eq h]; rfl
   rw [hc12] at hw
   have hdot := vk_in_check (τ := D.τ) (by omega) (L_point h) hlocL hw (S1_length h)
     h.2.2.2.2.2.2.2.2.2.1 (F := fun l ↦ ∑ m ∈ range 2,
       eqAt [D.L.1.point.getD (D.τ - 4) 0] m * eqAt D.S.1 (25 * (0 + m) + l))
     (Sh := fun r ↦ ∑ z ∈ range 64, D.slices.getD z 0 *
-      eqAt (((D.layer 11).locPt (firstOf 11)).take 6) ((z + r) % 64))
+      eqAt (((D.layer 5).locPt (firstOf 5)).take 6) ((z + r) % 64))
     (fun _ _ ↦ rfl) (fun _ _ ↦ rfl) (μ := 1) (one_mul _)
   rw [one_mul] at hdot
   have hchk := h.2.2.2.2.2.2.2.2.2.2.2

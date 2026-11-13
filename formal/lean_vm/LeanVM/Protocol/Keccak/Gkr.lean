@@ -14,7 +14,7 @@ public import LeanVM.Protocol.Keccak.GkrTail
 # `verifyKeccak` as a specification
 
 `verify_keccak` (`crates/verifier/src/keccak.rs:235-294`) is `gkrProg` (by `rfl`): the segment and
-lane challenges, `committed`, twelve layers, the committed outputs' opening and the inputs' opening
+lane challenges, `committed`, six layers, the committed outputs' opening and the inputs' opening
 (`inputTail`). Candidates are stacks of type `β`, each with its `q_keccak` column `qk q` (word `n`
 at `qk q n`); `C h` is the set of candidates a history binds (`Stable`, at most `L₀`).
 
@@ -27,7 +27,7 @@ at `qk q n`); `C h` is the set of candidates a history binds (`Stable`, at most 
 | `committed` | the first claim holds of `q`'s states, and `committed` opens `q`'s middle state |
 | each layer | as in `layerSpec`; the open value is carried |
 | the outputs' slot rounds | as in `sumcheckSpec`, for the family `Fo` |
-| `word` and the check | the column claim at `(inst, ρ)` holds; the claim at depth `12` is carried |
+| `word` and the check | the column claim at `(inst, ρ)` holds; the claim at depth `6` is carried |
 | the inputs' opening | as in `inputSpec` |
 
 **Escape bounds** (each group, `|E| = 2^128`): the start's six challenges `L₀/|E|` each (lead
@@ -37,11 +37,11 @@ position rounds at `L₀·3/|E|` (`h3`), `β` at `L₀·2/|E|` after a grind of 
 `6 + 4 + 6` rounds at `L₀·2/|E|`. At `L₀ = 1` each is within `2^-125`.
 
 `gkrSpec` states it with `Pre := Doomed C (outClaimsTrueMid ∧ midAgree ∧ R)`. The statement in
-terms of `keccakF` of the inputs needs `RegionValid` (the committed middle state is twelve
+terms of `keccakF` of the inputs needs `RegionValid` (the committed middle state is six
 rounds of the input at every step): `gkrSpec_regionValid`, from `Doomed C (outClaimsTrue ∧
 RegionValid ∧ R)` to doom of the reduction's claims with `RegionValid` carried. `RegionValid`
 cannot be dropped from the carried predicate: `inst` is drawn before this phase, and a middle
-state wrong at some step but agreeing with twelve rounds of the input at `inst` passes every
+state wrong at some step but agreeing with six rounds of the input at `inst` passes every
 check here (the phase drawing `inst` charges that, `zeroOn_escape`).
 -/
 
@@ -131,9 +131,9 @@ noncomputable def midSpec (hst : Stable C) (hcard : ∀ h, (C h).ncard ≤ L₀)
   have h2 : (L₀ : ℝ≥0∞) * errE 2 ≤ εmax := le_trans (by gcongr; exact errE_mono (by norm_num)) h3
   have h2' : (L₀ : ℝ≥0∞) * errE 2 + 0 ≤ εmax := by rw [add_zero]; exact h2
   let first := firstClaim inst segment lanesPt output committed
-  (Spec.congr (p := keccakLayers (P + 4) (List.range' 0 12) first) (by rw [List.range_eq_range']; rfl)
+  (Spec.congr (p := keccakLayers (P + 4) (List.range' 0 6) first) (by rw [List.range_eq_range']; rfl)
     (layersSpec (T := 0) hst hcard (fun q ↦ OpenTrue (P + 4) (qk q) inst segment lanesPt committed ∧ R q)
-      qk P h46 h3 h2' 12 0 rfl first (firstClaim_shape committed hi hs))).bind' fun claim ↦
+      qk P h46 h3 h2' 6 0 rfl first (firstClaim_shape committed hi hs))).bind' fun claim ↦
   if hc : ClaimShape P claim then
     (Spec.congr (keccakOpen_eq (P + 4) first 1 (keccakSegments - 1) committed).symm <|
       Spec.congr (p := sumcheck committed 3 (List.replicate 6 none) >>= fun x ↦
@@ -141,7 +141,7 @@ noncomputable def midSpec (hst : Stable C) (hcard : ∀ h, (C h).ncard ≤ L₀)
             [], x.2))
         (by rw [qkeccakSlotBits_eq]; rfl) <|
       ((sumcheckSpec (T := 0) hst hcard
-        (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 12) P claim ∧ R q)
+        (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 6) P claim ∧ R q)
         (Fo_plainFamily (P + 4) qk inst segment lanesPt) (count := 3) (by norm_num)
         (by norm_num) h0 h2' 6 [] committed (by simp)).mono
         (fun _ (hd : ClaimShape P claim ∧ Doomed C _ _) ↦ Doomed.mono hd.2
@@ -151,7 +151,7 @@ noncomputable def midSpec (hst : Stable C) (hcard : ∀ h, (C h).ncard ≤ L₀)
       (Spec.ret (Post := fun (x' : List E × List E × E) h ↦ x'.1.length = 6 ∧
           x'.2.1 = (foldAll x'.1 (keccakSlotWeights (P + 4) first 1 1)).headD [] ∧
           Doomed C (fun q ↦ x'.2.2 = Fo (P + 4) (qk q) inst segment lanesPt x'.1 ∧
-            (ClaimTrue (statesAt (P + 4) (qk q) 12) P claim ∧ R q)) h)
+            (ClaimTrue (statesAt (P + 4) (qk q) 6) P claim ∧ R q)) h)
         (x.1, (foldAll x.1 (keccakSlotWeights (P + 4) first 1 1)).headD [], x.2)).mono
         (fun _ hd ↦ ⟨hd.1, rfl, by simpa using hd.2⟩) (fun _ _ h' ↦ h') le_rfl le_rfl
         le_rfl).bind' fun x ↦
@@ -161,8 +161,8 @@ noncomputable def midSpec (hst : Stable C) (hcard : ∀ h, (C h).ncard ≤ L₀)
         le_rfl).bind' fun word ↦
       (Spec.require
         (Pre := Doomed C (fun q ↦ x.2.2 = Fo (P + 4) (qk q) inst segment lanesPt x.1 ∧
-            (ClaimTrue (statesAt (P + 4) (qk q) 12) P claim ∧ R q)))
-        (Post := fun _ h ↦ Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 12) P claim ∧
+            (ClaimTrue (statesAt (P + 4) (qk q) 6) P claim ∧ R q)))
+        (Post := fun _ h ↦ Doomed C (fun q ↦ ClaimTrue (statesAt (P + 4) (qk q) 6) P claim ∧
           ((∀ c ∈ [(⟨qkeccak, inst.take 4 ++ inst.drop 4 ++ x.1, word⟩ : ColumnClaim)],
             colTrue (P + 4) (qk q) c) ∧ R q)) h)
         fun _ hd hcheck ↦ Doomed.mono hd fun q ⟨hct, hcol, hR⟩ ↦ ⟨by
@@ -251,10 +251,10 @@ noncomputable def gkrSpec (hst : Stable C) (hcard : ∀ h, (C h).ncard ≤ L₀)
 theorem outClaims_iff_of_regionValid (h : ℕ) (col : ℕ → K) (inst output : List E)
     (hv : RegionValid h col) :
     outClaimsTrue h col inst output ↔ outClaimsTrueMid h col inst output := by
-  have hx : ∀ x ∈ range (2 ^ h), keccakF1600 (inState h col 0 x) = roundsFrom 12 12 (inState h col 1 x) :=
+  have hx : ∀ x ∈ range (2 ^ h), keccakF1600 (inState h col 0 x) = roundsFrom 6 6 (inState h col 1 x) :=
     fun x hx ↦ by rw [keccakF_eq, hv x (Finset.mem_range.1 hx)]
   have e : ∀ l, stepMle h inst (fun x ↦ laneWord (keccakF1600 (inState h col 0 x)) l) =
-      stepMle h inst (fun x ↦ laneWord (roundsFrom 12 12 (inState h col 1 x)) l) := fun l ↦
+      stepMle h inst (fun x ↦ laneWord (roundsFrom 6 6 (inState h col 1 x)) l) := fun l ↦
     Finset.sum_congr rfl fun x hxr ↦ by simp only; rw [hx x hxr]
   unfold outClaimsTrue outClaimsTrueMid
   simp only [e]

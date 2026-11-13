@@ -17,7 +17,7 @@ the layer's shape, `layerProve col' P d claim` makes the moves of
 `hLayer (statesAt (P + 4) col (d + 1)) P claim` and returns the same claim: `G`'s coefficients
 (`gCoeffs_eq`), the pack rounds (`corr_pack`), the position rounds (`corr_pos`), the `t` values
 from the folded tables (`posInv_full`), the next weights (`batchWeights_eq`). `corr_layers`: the
-twelve layers.
+six layers.
 -/
 
 namespace LeanVM.Prover.KeccakGkr
@@ -30,7 +30,7 @@ theorem batchWeights_eq (p : List E) (beta : E) : batchWeights p beta = batchW p
   simp only [batchWeights, batchW, eqTable_eq, array_getD_toArray]
 
 /-- **A layer makes the moves of `hLayer`**, and returns its claim. -/
-theorem corr_layer {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col) {d : ℕ} (hd : d < 12)
+theorem corr_layer {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col) {d : ℕ} (hd : d < 6)
     (claim : KeccakClaim) (hshape : ClaimShape P claim) :
     Corr (fun a b ↦ a = b ∧ ClaimShape P a) (layerProve col' P d claim)
       (hLayer (statesAt (P + 4) col (d + 1)) P claim) := by
@@ -55,7 +55,7 @@ theorem corr_layer {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col)
 
 /-- **The layers make the moves of `hLayers`.** -/
 theorem corr_layers {P : ℕ} {col' col : ℕ → K} (hcol : ColAgree P col' col) :
-    ∀ (n d : ℕ), d + n = 12 → ∀ claim, ClaimShape P claim →
+    ∀ (n d : ℕ), d + n = 6 → ∀ claim, ClaimShape P claim →
       Corr (fun a b ↦ a = b ∧ ClaimShape P a) (layersProve col' P (List.range' d n) claim)
         (hLayers P col (List.range' d n) claim)
   | 0, _, _, _, h => corr_ret ⟨rfl, h⟩

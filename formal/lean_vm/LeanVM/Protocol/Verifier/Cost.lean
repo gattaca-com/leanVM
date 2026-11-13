@@ -1029,9 +1029,9 @@ program's cost in quarters. -/
 def leanVmQueryBound : ℕ := 1 + 1 + leanVmCost / 4
 
 /-- The bound, evaluated. -/
-theorem leanVmQueryBound_eq : leanVmQueryBound = 13708 := by decide
+theorem leanVmQueryBound_eq : leanVmQueryBound = 12962 := by decide
 
-/-- **The compiled leanVM verifier makes at most `leanVmQueryBound = 13708` queries** to the random
+/-- **The compiled leanVM verifier makes at most `leanVmQueryBound = 12962` queries** to the random
 oracles on every proof, for every bytecode and public input: the hypothesis `hV` of `romSound`
 at the leanVM program and seed. -/
 theorem isTotalQueryBound_leanVm (bytecode : List K) (publicInput : Digest) (π : Proof) :

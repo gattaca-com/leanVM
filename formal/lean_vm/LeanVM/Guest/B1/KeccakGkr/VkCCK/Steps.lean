@@ -14,7 +14,7 @@ public import LeanVM.Guest.B1.KeccakGkr.VkChain
 
 `stepCore s b`: step `s` but its call (`stepT = stepCore ++ stepTailT`). `stepKer`: what the
 kernel checks of it (the loads that are not stores, the residual loads' pointers), checked for the
-twelve steps two at a time in `VkCCK/K0.lean` … `VkCCK/K5.lean`, so that the checks build in
+six steps two at a time in `VkCCK/K0.lean` … `VkCCK/K5.lean`, so that the checks build in
 parallel (a module checks its proofs one after another), and gathered in `VkCCK.lean`
 (`step_ker`).
 -/
@@ -31,7 +31,7 @@ variable {C : CallRel} {rd : Reader} {w : ℕ → E} {σ : Val}
 
 /-- Where step `s` starts. -/
 def stepB (s : ℕ) : ℕ :=
-  [448, 489, 524, 558, 601, 642, 685, 718, 759, 797, 840, 881].getD s 0
+  [448, 488, 524, 562, 605, 647].getD s 0
 
 /-- The capacity step `s` passes. -/
 def stepCap (s : ℕ) : List ℕ :=

@@ -10,7 +10,7 @@ instruction (`executeWithShared.c260`, `executeWith` as compiled), its memory re
 search in the memory table (`gLogTable.c316`, `findLane.c317`), and Keccak-f for `KECCAK`.
 
 * **`keccakRound_cost`**: one Keccak round (`keccakRoundShared.c281`) at most `13955`;
-  **`keccakF_cost`**: Keccak-f[1600], `24` rounds, at most `335259` (≈ `2^18.35`);
+  **`keccakF_cost`**: Keccak-f[1600], `12` rounds, at most `167631` (≈ `2^17.35`);
 * `readCells_cost`: thirteen reads and offsets, `13·(O + R) + 6466`; `readFirstCells_cost`, the
   first `count ≤ 13` of them (`KECCAK`'s written cells), `13·(O + R) + 6640`;
 * `executeXor_cost` … `executeKeccak_cost`, **`executeWith_cost`**: one instruction with reads of
@@ -407,13 +407,13 @@ theorem stateOfCells_cost (hP : Includes P stateOfCells.c290.costDeps) (cells : 
   simp only [List.length_finRange] at h2
   omega
 
-/-- **Keccak-f[1600]** (`keccakF1600`: the fold of `24` rounds over `keccakRC`, through
-`lam5.lam0.lam0`): at most `24·13969 + 3 = 335259`. -/
+/-- **Keccak-f[1600]** (`keccakF1600`: the fold of `12` rounds over `keccakRC`, through
+`lam5.lam0.lam0`): at most `12·13969 + 3 = 167631`. -/
 theorem keccakF_cost (hP : Includes P Auto.LeanVM.Cost.Extractor.executeWithShared.c260.lam5.lam0.lam0.costDeps)
     (hF : Includes P listFoldl.costDeps) (a : KeccakState) :
     machineCost P listFoldl.costIdx
       [.closure Auto.LeanVM.Cost.Extractor.executeWithShared.c260.lam5.lam0.lam0.costIdx [], encodeValue a,
-        encodeValue keccakRC] ≤ 335259 := by
+        encodeValue keccakRC] ≤ 167631 := by
   have := listFoldl_le P hF _ (.closure Auto.LeanVM.Cost.Extractor.executeWithShared.c260.lam5.lam0.lam0.costIdx [])
     (fun x y ↦ RunsApp.of_spec
       (Auto.LeanVM.Cost.Extractor.executeWithShared.c260.lam5.lam0.lam0.costSpec P hP x y))
@@ -423,7 +423,7 @@ theorem keccakF_cost (hP : Includes P Auto.LeanVM.Cost.Extractor.executeWithShar
       rw [Auto.LeanVM.Cost.Extractor.executeWithShared.c260.lam5.lam0.lam0.costEq P hP]
       have := keccakRound_cost P (by includes) acc rc
       omega⟩)
-  have hl : keccakRC.length = 24 := rfl
+  have hl : keccakRC.length = 12 := rfl
   rw [hl] at this
   omega
 

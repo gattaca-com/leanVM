@@ -72,7 +72,7 @@ theorem claimSum_congr {st st' : States} (P : ℕ)
   rw [stAt, stAt, h _ _ _ hm (Finset.mem_range.1 hj)]
 
 /-- The round constant of segment `m` at layer `step` (`crates/verifier/src/keccak.rs:137`): round
-`12(m + 1) - step - 1`. -/
+`6(m + 1) - step - 1`. -/
 def layerRC (step m : ℕ) : UInt64 := keccakRC.getD (keccakDepth * (m + 1) - step - 1) 0
 
 /-- The states after the layer's round. -/
