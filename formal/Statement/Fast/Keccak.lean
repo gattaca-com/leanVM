@@ -26,7 +26,7 @@ byte;
 `leLaneArray` reads them from an array (`leLane_eq_leLaneArray`).
 
 A `@[csimp]` lemma acts where code is compiled, and `keccakF1600` and `keccak256` were compiled with
-the definitions above. `keccakF1600` compiles as `keccakFScalar`: the twenty-four rounds of
+the definitions above. `keccakF1600` compiles as `keccakFScalar`: the twelve rounds of
 `roundLanes` as one loop whose twenty-five lanes are scalars passed from round to round
 (`keccakLoop`), so that it allocates the final state only, with `Keccak.rot` inlined
 (`keccakF_eq_keccakFScalar`, from `keccakLoop_lanes`); and `keccak256`, Keccak-256 over
@@ -152,7 +152,7 @@ def keccakLoop (i : ℕ)
     (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23
       a24 : UInt64) :
     KeccakState :=
-  if i < 24 then
+  if i < 12 then
     let rc := keccakRCArray.getD i 0
     let c0 := a0 ^^^ a5 ^^^ a10 ^^^ a15 ^^^ a20
     let c1 := a1 ^^^ a6 ^^^ a11 ^^^ a16 ^^^ a21
@@ -217,7 +217,7 @@ def keccakLoop (i : ℕ)
       (b24 ^^^ (~~~ b20 &&& b21))
   else #v[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18,
     a19, a20, a21, a22, a23, a24]
-termination_by 24 - i
+termination_by 12 - i
 
 /-- The loop from round `i` on a state's lanes is the rounds from `i` on. -/
 theorem keccakLoop_lanes (i : ℕ) (a : KeccakState) :
@@ -246,7 +246,7 @@ theorem keccakLoop_lanes (i : ℕ) (a : KeccakState) :
     apply Vector.ext
     intro j hj
     interval_cases j <;> simp [Keccak.lane, Array.getD_eq_getD_getElem?]
-termination_by 24 - i
+termination_by 12 - i
 
 /-- Keccak-f[1600] on scalars. -/
 def keccakFScalar (a : KeccakState) : KeccakState :=

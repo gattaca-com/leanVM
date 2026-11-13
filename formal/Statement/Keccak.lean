@@ -5,8 +5,9 @@ public import Mathlib.Data.Nat.Notation
 /-!
 # Keccak
 
-Keccak-f[1600] as leanVM computes it, and Keccak-256 over any permutation of its state, in any
-monad (`keccak256With`), the deployed one over Keccak-f[1600] (`keccak256`). Every party hashes with
+Keccak-p[1600, 12], the last `12` rounds of Keccak-f[1600], as leanVM computes it, and Keccak-256
+over any permutation of its state, in any monad (`keccak256With`), the deployed one over that
+permutation (`keccak256`). Every party hashes with
 Keccak-256 over the permutation it is given, `π` in the model (`RandomPermutation.lean`). The
 permutation's state is one type throughout, `KeccakState`: `25` lanes of `64` bits, lane `x + 5y`
 at index `x + 5y`.
@@ -22,11 +23,9 @@ message padded with `0x01 ‖ 0^* ‖ 0x80` (FIPS 202's SHA3-256 would put `0x06
 
 namespace LeanVM.Parameters
 
-/-- `KECCAK_RC` (`hash.rs:10-35`): the round constants of the `24` rounds. -/
+/-- `KECCAK_RC` (`hash.rs`): the round constants of the `12` rounds, the last `12` of
+Keccak-f[1600]'s `24`. -/
 def keccakRC : List UInt64 := [
-  0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
-  0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-  0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
   0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
   0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
   0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008]
@@ -81,7 +80,8 @@ def round (a : KeccakState) (rc : UInt64) : KeccakState :=
 
 end Keccak
 
-/-- **Keccak-f[1600]** (`keccak_f`, `hash.rs:49-68`): the `24` rounds. -/
+/-- **Keccak-p[1600, 12]** (`keccak_f`, `hash.rs`): the `12` rounds. The name `keccakF1600` is
+kept for the deployed permutation. -/
 def keccakF1600 (a : KeccakState) : KeccakState := keccakRC.foldl Keccak.round a
 
 end LeanVM.Semantics

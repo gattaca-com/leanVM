@@ -28,9 +28,9 @@ def cellAt (R : Array (Array K)) (x i : ℕ) : K := ((R[x]?).bind (·[i]?)).getD
 def tableColumn (R : Array (Array K)) (h i : ℕ) : Array K :=
   Array.ofFn (n := 2 ^ h) fun x ↦ cellAt R x.val i
 
-/-- Rounds `12m` to `12m + 11` of Keccak-f[1600]. -/
+/-- Rounds `6m` to `6m + 5` of the permutation. -/
 def segment (m : ℕ) (a : KeccakState) : KeccakState :=
-  ((keccakRC.drop (12 * m)).take 12).foldl Keccak.round a
+  ((keccakRC.drop (6 * m)).take 6).foldl Keccak.round a
 
 /-- The zero state. -/
 def zeroState : KeccakState := Vector.replicate 25 0
@@ -39,19 +39,19 @@ def zeroState : KeccakState := Vector.replicate 25 0
 def inState (R : Array (Array K)) (x : ℕ) : KeccakState :=
   Vector.ofFn fun l : Fin 25 ↦ (cellAt R x (15 + l.val)).lane
 
-/-- The state after twelve rounds of every step of the `KECCAK` table at the height `2^h`, once
+/-- The state after six rounds of every step of the `KECCAK` table at the height `2^h`, once
 per row; a padding row's is that of the zero state, computed once. -/
 def midStates (R : Array (Array K)) (h : ℕ) : Array KeccakState :=
   let zMid := segment 0 zeroState
   Array.ofFn (n := 2 ^ h) fun x ↦ if x.val < R.size then segment 0 (inState R x.val) else zMid
 
-/-- The state after twenty-four rounds of every step, from its state after twelve. -/
+/-- The state after the twelve rounds of every step, from its state after six. -/
 def outStates (R : Array (Array K)) (mids : Array KeccakState) : Array KeccakState :=
   let zOut := segment 1 (segment 0 zeroState)
   Array.ofFn (n := mids.size) fun x ↦ if x.val < R.size then segment 1 mids[x] else zOut
 
 /-- `QKECCAK` of the `KECCAK` table at the height `2^h`: slot `l < 25` of step `x` is input lane
-`l` of row `x`, slot `25 + l` lane `l` of its state after twelve rounds, slot `50 + k` its cell of
+`l` of row `x`, slot `25 + l` lane `l` of its state after six rounds, slot `50 + k` its cell of
 the column `k`, `pc` through `out_all` (`spare_local` and `qkeccak_slot`,
 `crates/verifier/src/layout.rs:390-430`). -/
 def qkeccakColumn (R : Array (Array K)) (h : ℕ) (mids : Array KeccakState) : Array K :=
@@ -70,7 +70,7 @@ def tableIndexOf (c : ℕ) : ℕ :=
 
 /-- The column of global number `c`: the memory's two limbs and finalize counts `0 … 2`, `BFCNT`
 `3`, `QKECCAK` `4`, then column `c - base` of the opcode table `c` falls in, the `KECCAK` output lanes
-(its columns `40 … 64`) derived from the twelve-round states `mids`, through the twenty-four-round
+(its columns `40 … 64`) derived from the six-round states `mids`, through the twelve-round
 states `outs`. -/
 def columnAt {κ : ℕ} (img : MemoryImage κ) (acc : Rows) (logs : List ℕ)
     (mids outs : Array KeccakState) (c : ℕ) : Array K :=

@@ -48,7 +48,7 @@ into the segment: per position `j`, the sixteen instances' bits as a mask. -/
 def packMasks (col : ℕ → K) (P e z : ℕ) : Array ℕ :=
   let m := z / 2 ^ P
   let ls : Array KeccakState := Array.ofFn (n := 16) fun i ↦
-    linearOf (roundsOf (12 * m) e (inStateOf col (P + 4) m (i.val + 16 * (z % 2 ^ P))))
+    linearOf (roundsOf (6 * m) e (inStateOf col (P + 4) m (i.val + 16 * (z % 2 ^ P))))
   Array.ofFn (n := 1600) fun j ↦ packBits (fun i ↦ bitOf (ls.getD i default) j.val) 16
 
 /-- The masks of every pack. -/
@@ -205,11 +205,11 @@ def batchWeights (p : List E) (beta : E) : List E :=
   (List.range keccakBits).map fun j ↦
     e.getD j 0 + beta * (e.getD (keccakAlong j 4) 0 + beta * e.getD (keccakAlong j 3) 0)
 
-/-- **The honest prover of layer `d`** on the column `col` (the states `11 - d` rounds into each
+/-- **The honest prover of layer `d`** on the column `col` (the states `5 - d` rounds into each
 segment), from `claim`: `G`'s coefficients, a grind and `s`, the pack rounds, the position
 rounds, `t`, a grind and `β`, and the next claim. -/
 def layerProve (col : ℕ → K) (P d : ℕ) (claim : KeccakClaim) : Script KeccakClaim :=
-  let masks := layerMasks col P (11 - d)
+  let masks := layerMasks col P (5 - d)
   (Script.sendList (gCoeffs P masks claim.point claim.weights)).bind fun _ ↦
   (Script.grindBits (grindingBits (productBits - 1))).bind fun _ ↦
   Script.sampleE.bind fun s ↦
