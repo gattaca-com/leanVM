@@ -78,7 +78,7 @@ fn layers_round_trip(n_instances: usize, depth: usize) {
 
 #[test]
 fn layers_reduce_outputs_to_inputs() {
-    layers_round_trip(700, 8);
+    layers_round_trip(700, 4);
 }
 
 const LABEL: &[u8] = b"keccak-gkr-test";
@@ -188,7 +188,7 @@ fn spare_slots_must_be_the_committed_ones() {
     use pcs::whir::{LOG_INV_RATE_0, config_for_rate};
 
     let mut rng = Rng::new(81);
-    let (n, depth) = (600, 12);
+    let (n, depth) = (600, 6);
     let inputs: Vec<[u64; LANES]> = (0..n).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
     let shape = Shape::new(n, depth);
     let states = shape.slots() * shape.n();
@@ -213,11 +213,11 @@ fn spare_slots_must_be_the_committed_ones() {
 
 #[test]
 fn proof_verifies_against_the_commitment() {
-    end_to_end(600, 8);
-    end_to_end(2048, 24);
+    end_to_end(600, 4);
+    end_to_end(2048, 12);
     // The VM's depth, over enough blocks that the input opening folds more than one run.
-    end_to_end(8192, 12);
     end_to_end(8192, 6);
+    end_to_end(8192, 3);
 }
 
 /// The witness of every block run, the padding ones included.
@@ -237,7 +237,7 @@ fn dense(shape: Shape, inputs: &[[u64; LANES]]) -> Witness {
 #[test]
 fn padding_proves_as_the_blocks_it_stands_for() {
     let mut rng = Rng::new(79);
-    for (n, depth) in [(0, 12), (300, 24), (1100, 8), (2600, 12), (4700, 6)] {
+    for (n, depth) in [(0, 6), (300, 12), (1100, 4), (2600, 6), (4700, 3)] {
         let inputs: Vec<[u64; LANES]> = (0..n).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
         let shape = Shape::new(n, depth);
         let mut committed = vec![primitives::field::F64(0); 1 << shape.stack_log()];
@@ -261,7 +261,7 @@ fn padding_proves_as_the_blocks_it_stands_for() {
 fn a_broken_committed_state_is_rejected() {
     let mut rng = Rng::new(78);
     let inputs: Vec<[u64; LANES]> = (0..600).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
-    let shape = Shape::new(inputs.len(), 6);
+    let shape = Shape::new(inputs.len(), 3);
     let mut committed = vec![primitives::field::F64(0); 1 << shape.stack_log()];
     Witness::generate(shape, &inputs, &mut committed);
     let accepts = |committed: &[primitives::field::F64], lane_error: F128| {
@@ -269,7 +269,7 @@ fn a_broken_committed_state_is_rejected() {
     };
     assert!(accepts(&committed, F128::ZERO), "the honest column");
     // A lane of the input and of each state between.
-    for slot in [3, 30, 60, 80, 99] {
+    for slot in [3, 20, 40, 60, 99] {
         let mut bad = committed.clone();
         bad[slot * shape.n() + 17].0 ^= 1 << 40;
         assert!(!accepts(&bad, F128::ZERO), "slot {slot}");

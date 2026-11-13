@@ -9,3 +9,7 @@ description = "Portable single-threaded verifier for leanVM execution proofs: st
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+keccak = "0.2"
+primitives.workspace = true

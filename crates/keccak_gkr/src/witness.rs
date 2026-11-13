@@ -677,7 +677,7 @@ mod tests {
     fn committed_states_follow_the_permutation() {
         let mut rng = Rng::new(9);
         let inputs: Vec<[u64; LANES]> = (0..1100).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
-        let shape = Shape::new(inputs.len(), 8);
+        let shape = Shape::new(inputs.len(), 4);
         let mut committed = vec![F64(1); 1 << shape.stack_log()];
         Witness::generate(shape, &inputs, &mut committed);
         let n = shape.n();
@@ -686,9 +686,9 @@ mod tests {
             for lane in 0..LANES {
                 assert_eq!(committed[lane * n + x].0, state[lane]);
             }
-            // The state after 16 rounds, bit by bit.
+            // The state after 8 rounds, bit by bit.
             let mut bits: Vec<bool> = (0..BITS).map(|j| state[j / 64] >> (j % 64) & 1 == 1).collect();
-            for round in 1..=16 {
+            for round in 1..=8 {
                 let mut u = vec![false; BITS];
                 linear(&bits, &mut u, |a, b| a ^ b);
                 for j in 0..BITS {
@@ -708,6 +708,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "too many instances")]
     fn an_unrepresentable_batch_is_refused() {
-        Shape::new(1usize << 63, 12);
+        Shape::new(1usize << 63, 6);
     }
 }

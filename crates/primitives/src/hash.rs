@@ -774,14 +774,44 @@ mod tests {
         (0..n).map(|i| ((i * 7 + 3) & 0xff) as u8).collect()
     }
 
-    /// Ethereum's `keccak256`, as an independent implementation computes it, across both sides of
-    /// every block boundary up to five blocks.
+    /// The permutation is Keccak-p[1600, 12], as the `keccak` crate computes it.
     #[test]
-    fn matches_ethereum_keccak256() {
-        use sha3::Digest;
+    fn permutation_matches_keccak_p_1600_12() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        for case in 0..64 {
+            let mut state: [u64; STATE_LANES] = std::array::from_fn(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if case == 0 { 0 } else { seed }
+            });
+            let mut expected = state;
+            keccak::Keccak::new().with_p1600::<{ ROUNDS }>(|f| f(&mut expected));
+            let mut scalar = state;
+            permute(&mut scalar);
+            keccak_f(&mut state);
+            assert_eq!(scalar, expected, "portable, case {case}");
+            assert_eq!(state, expected, "keccak_f, case {case}");
+        }
+    }
+
+    #[test]
+    fn sponge_matches_keccak_p_1600_12() {
         for n in (0..700).chain([1023, 1024, 1025, 4096]) {
             let data = pattern(n);
-            assert_eq!(&hash(&data)[..], &sha3::Keccak256::digest(&data)[..], "{n} bytes");
+            let mut padded = data.clone();
+            padded.push(0x01);
+            padded.resize(padded.len().div_ceil(136) * 136, 0);
+            *padded.last_mut().unwrap() |= 0x80;
+            let mut state = [0u64; 25];
+            for block in padded.chunks_exact(136) {
+                for (i, lane) in block.chunks_exact(8).enumerate() {
+                    state[i] ^= u64::from_le_bytes(lane.try_into().unwrap());
+                }
+                keccak::Keccak::new().with_p1600::<12>(|f| f(&mut state));
+            }
+            let want: Vec<u8> = state[..4].iter().flat_map(|x| x.to_le_bytes()).collect();
+            assert_eq!(hash(&data).as_slice(), want, "{n} bytes");
         }
     }
 
