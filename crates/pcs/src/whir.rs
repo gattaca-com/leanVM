@@ -884,7 +884,10 @@ pub(crate) fn recursive_prover_with_prepared_basis(
                 // The tree keeps no leaves: the rows of whole leaf groups are read back and rehashed.
                 let row_words = prover_data.row_words;
                 let group = l0_tree.group_positions(&queries);
-                let group_rows = prover_data.ntt.rows(&prover_data.codeword, &stack, &group);
+                // A rebuild reads the committed lanes only; the rest of the stack is zero. The stack is
+                // empty unless the codeword is rebuilt.
+                let committed = &stack[..stack.len().min(committed_lanes * lane_block)];
+                let group_rows = prover_data.ntt.rows(&prover_data.codeword, committed, &group);
                 let image = |q| &fetched_row(&group, &group_rows, row_words, q)[row_words - committed_lanes..];
                 // Lane `t` of the codeword is stack block `n_lanes-1-t`: reversing the image puts block `b` at index
                 // `b`, and the absent lanes' zeros at the end.
@@ -1020,6 +1023,12 @@ mod tests {
                 let (root_full, fs_full) = prove(&witness);
                 assert_eq!(root_trunc, root_full, "root differs at n_lanes = {n_lanes}");
                 assert_eq!(fs_trunc, fs_full, "the proofs differ at n_lanes = {n_lanes}");
+                // Committed truncated, opened over the whole stack: the zero tail is the opening's only.
+                let (cm, pd) = commit(&witness[..used], log_n, pc.initial_k, pc.log_inv_rates[0]);
+                let mut ps = fiat_shamir::transcript::ProverState::from_label(b"whir-test");
+                open_batch_mixed_whir_stacked(&mut ps, log_n, witness.clone(), pd, &pc, &claims, &ring);
+                assert_eq!(cm.root, root_full, "root differs at n_lanes = {n_lanes}");
+                assert_eq!(ps.into_proof(), fs_full, "the opening differs at n_lanes = {n_lanes}");
             }
         }
     }
