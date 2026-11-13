@@ -1103,7 +1103,7 @@ mod tests {
                 assert_eq!(root_trunc, root_full, "root differs at n_lanes = {n_lanes}");
                 assert_eq!(fs_trunc, fs_full, "the proofs differ at n_lanes = {n_lanes}");
                 // Committed truncated, opened over the whole stack: the zero tail is the opening's only.
-                let (cm, pd) = commit(&witness[..used], log_n, pc.initial_k, pc.log_inv_rates[0]);
+                let (cm, pd) = commit(&witness[..used], &[], log_n, pc.initial_k, pc.log_inv_rates[0]);
                 let mut ps = fiat_shamir::transcript::ProverState::from_label(b"whir-test");
                 open_batch_mixed_whir_stacked(&mut ps, log_n, witness.clone(), pd, &pc, &claims, &ring);
                 assert_eq!(cm.root, root_full, "root differs at n_lanes = {n_lanes}");
