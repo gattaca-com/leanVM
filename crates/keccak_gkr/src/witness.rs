@@ -30,7 +30,7 @@ pub(crate) fn words(block: &[u64], j: usize) -> &[u64; BLOCK_WORDS] {
 pub struct Shape {
     /// `log2` of the number of instances, at least 9.
     pub(crate) n_log: usize,
-    /// Rounds between two committed states. Divides 24.
+    /// Rounds between two committed states. Divides the round count.
     pub(crate) depth: usize,
 }
 

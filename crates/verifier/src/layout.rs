@@ -79,7 +79,7 @@ pub const K_BITS: usize = 64;
 
 // The Keccak reduction commits a step's state every KECCAK_DEPTH rounds but the output, a lane per
 // slot of q_keccak and a word per step: lane l of the state after KECCAK_DEPTH * m rounds is slot 25 m + l.
-pub const KECCAK_DEPTH: usize = 12;
+pub const KECCAK_DEPTH: usize = 6;
 pub const KECCAK_MIN_STEPS_LOG: usize = 9; // the reduction is sized for at least one block of 512 steps
 
 /// Every size a proof announces or commits is at most `2^30`: a table's rows, the memory, the bytecode and the stack.
@@ -406,7 +406,7 @@ const QKECCAK_SLOTS: usize = STATE_LANES * (crate::hash::ROUNDS / KECCAK_DEPTH);
 const QKECCAK_SPARE: usize = (1 << log2_ceil(QKECCAK_SLOTS as u64)) - QKECCAK_SLOTS;
 // The same guard the prover carries (`cpu::layout`): every spare slot needs a committed column
 // of the table to put in it, distinct from the others and not one of the value lanes. It holds
-// at this depth, not at every divisor of 24, and the two sides must refuse together.
+// at this depth, not at every divisor of the round count, and the two sides must refuse together.
 const _: () = {
     let mut k = 0;
     while k < QKECCAK_SPARE {
