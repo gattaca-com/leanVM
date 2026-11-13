@@ -122,20 +122,21 @@ impl Digest {
 mod tests {
     use super::*;
 
-    /// Keccak-256 of the bytes `00 01 ..` (mod 256), from the `sha3` crate's `Keccak256`, on each side of a block
-    /// boundary.
+    /// The sponge over Keccak-p[1600, 12] (Keccak-256 padding) of the bytes `00 01 ..` (mod 256), on each side of a
+    /// block boundary. A snapshot of this implementation, whose permutation `permutation_matches_keccak_p_1600_12`
+    /// checks against the `keccak` crate.
     const VECTORS: [(usize, &str); 11] = [
-        (0, "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
-        (1, "bc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a"),
-        (127, "c52f0bd08793b9e8601b29753539e1bf47f8e483eed0a901e8761982449c9b4c"),
-        (128, "ed4c9adc183fb8cb025b1500ec3eeae1b45517314441a187605de1bb8a64726e"),
-        (135, "cbdfd9dee5faad3818d6b06f95a219fd290b0e1706f6a82e5a595b9ce9faca62"),
-        (136, "7ce759f1ab7f9ce437719970c26b0a66ff11fe3e38e17df89cf5d29c7d7f807e"),
-        (137, "ac73d4fae68b8453f764007c1a20ce95994187861f0c3227a3a8e99a73a3b1db"),
-        (200, "bfb0aa97863e797943cf7c33bb7e880bb4543f3d2703c0923c6901c2af57b890"),
-        (271, "7c974895b2a88303ff2dc6b58f438ceb0b298cac91099ac0539cc0f477506191"),
-        (272, "fdf2ec49e749960d3c8521a0219af8d03e30e2b3bf19bd16150ee0eaf133d66e"),
-        (512, "f55ba327291604f0e5be6651752398b7be2331aad65f5763ce067df95cc13be1"),
+        (0, "e3dd2df0943bde6d82e39ec36059f35cd76720e2df38cc6b10b69fddfcaa3a4a"),
+        (1, "73ebf1d543d855a3c5e4be6322f75604c254f70394b396884b6010fcca694722"),
+        (127, "a5f7367f9fb25845b454ced8aa5cf3b4e45ae3ca5618380851689d1e1a7eb60f"),
+        (128, "94aa3dca53c901ba3d720fe6affff62ab03d352edd721857aa0699c3994c53cc"),
+        (135, "1d293c78401fd0d2d748e1e001aa9b8f63e6b5448361525727ce6fd1934c3015"),
+        (136, "7312c13db895e18f65174d26a0adf8e3fdcf4983069751aea26a55d4d355549a"),
+        (137, "3bb0daeba2195cc89de7b33ea0ec50136c5ad7aa2b117a4f2b6ac1a853040fd1"),
+        (200, "3411d0423274b94b9e1d8532608b918698074e4d6237657a6249143af003a015"),
+        (271, "d83b499ccc3e2e5f2547db040a740fea0e4bfe3615469b7bce097bc80b74b52b"),
+        (272, "19ac667ee9333b746bdd231f429bb2a029c83f926db5147129116e4755f1ef3d"),
+        (512, "58539a8d44d1728a4e4494b2ceccbacdc187df67ba9d3aa08fa21eb207bd910c"),
     ];
 
     /// The permutation is Keccak-p[1600, 12], as the `keccak` crate computes it.
