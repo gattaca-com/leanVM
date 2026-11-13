@@ -47,7 +47,7 @@ noncomputable def snaps12 : List B2C.Snap :=
 
 /-- Function 13's windows after the first start from these. -/
 noncomputable def snaps13 : List B2C.Snap :=
-  [snap13_1, snap13_2, snap13_3, snap13_4, snap13_5, snap13_6, snap13_7, snap13_8, snap13_9, snap13_10]
+  [snap13_1, snap13_2, snap13_3, snap13_4, snap13_5, snap13_6, snap13_7, snap13_8, snap13_9]
 
 /-- Function 17's windows after the first start from these. -/
 noncomputable def snaps17 : List B2C.Snap :=

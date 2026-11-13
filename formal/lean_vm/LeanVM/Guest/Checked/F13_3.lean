@@ -23,9 +23,6 @@ theorem w13_3 : WinOk 13 3 := winOk_of_C (by decide +kernel)
 /-- `verify_keccak`, window 4. -/
 theorem w13_4 : WinOk 13 4 := winOk_of_C (by decide +kernel)
 
-/-- `verify_keccak`, window 5. -/
-theorem w13_5 : WinOk 13 5 := winOk_of_C (by decide +kernel)
-
 /-- `ring_switch_target`, window 0. -/
 theorem w14_0 : WinOk 14 0 := winOk_of_C (by decide +kernel)
 
@@ -40,6 +37,9 @@ theorem w17_0 : WinOk 17 0 := winOk_of_C (by decide +kernel)
 
 /-- `check_opening_terminal`, window 0. -/
 theorem w18_0 : WinOk 18 0 := winOk_of_C (by decide +kernel)
+
+/-- `check_opening_terminal`, window 1. -/
+theorem w18_1 : WinOk 18 1 := winOk_of_C (by decide +kernel)
 
 theorem ok14 : CheckOk 14 := checkOk_one (by decide +kernel) w14_0
 

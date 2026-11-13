@@ -502,7 +502,7 @@ theorem ok12 : CplOk 12 := by
 
 theorem ok13 : CplOk 13 := by
   intro i hi k hk
-  have hc : (certOf 13).cuts.length = 5 := by decide +kernel
+  have hc : (certOf 13).cuts.length = 4 := by decide +kernel
   rw [hc] at hi
   interval_cases i
   · have hn : nParts 13 0 = 1 := by decide +kernel
@@ -521,14 +521,12 @@ theorem ok13 : CplOk 13 := by
     rw [hn] at hk
     interval_cases k
     · exact cw13_3_0
-  · have hn : nParts 13 4 = 1 := by decide +kernel
+  · have hn : nParts 13 4 = 3 := by decide +kernel
     rw [hn] at hk
     interval_cases k
     · exact cw13_4_0
-  · have hn : nParts 13 5 = 1 := by decide +kernel
-    rw [hn] at hk
-    interval_cases k
-    · exact cw13_5_0
+    · exact cw13_4_1
+    · exact cw13_4_2
 
 theorem ok18 : CplOk 18 := by
   intro i hi k hk

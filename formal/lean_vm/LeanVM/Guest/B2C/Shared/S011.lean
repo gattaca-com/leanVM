@@ -32,10 +32,6 @@ set_option maxRecDepth 100000 in
 theorem w13_9 : shareWin 13 (snapsOf 13) 9 = true := by decide +kernel
 
 set_option maxRecDepth 100000 in
-/-- `verify_keccak`, window 10. -/
-theorem w13_10 : shareWin 13 (snapsOf 13) 10 = true := by decide +kernel
-
-set_option maxRecDepth 100000 in
 /-- `ring_switch_target`, once. -/
 theorem st14 : shareStatic 14 = true := by decide +kernel
 
@@ -60,6 +56,23 @@ theorem ok15 : ShareOk 15 := ⟨st15, fun i hi ↦ by
   have h : (snapsOf 15).length = 0 := by decide +kernel
   obtain rfl : i = 0 := by omega
   exact w15_0⟩
+
+set_option maxRecDepth 100000 in
+/-- `certify_placement`, once. -/
+theorem st16 : shareStatic 16 = true := by decide +kernel
+
+set_option maxRecDepth 100000 in
+/-- `certify_placement`, window 0. -/
+theorem w16_0 : shareWin 16 (snapsOf 16) 0 = true := by decide +kernel
+
+theorem ok16 : ShareOk 16 := ⟨st16, fun i hi ↦ by
+  have h : (snapsOf 16).length = 0 := by decide +kernel
+  obtain rfl : i = 0 := by omega
+  exact w16_0⟩
+
+set_option maxRecDepth 100000 in
+/-- `selector_tables`, once. -/
+theorem st17 : shareStatic 17 = true := by decide +kernel
 
 end
 end LeanVM.Guest.B2C.Shared

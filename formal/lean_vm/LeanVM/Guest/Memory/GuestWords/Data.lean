@@ -3225,7 +3225,7 @@ def womegaTTlll : NTree (ℕ) :=
   (.node 100 (72)
     (.node 50 (52)
     (.node 25 (59)
-    (.node 12 (3304)
+    (.node 12 (3127)
     (.node 6 (58)
     (.node 3 (68)
     (.node 1 (2208)

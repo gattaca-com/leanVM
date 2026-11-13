@@ -22,8 +22,11 @@ theorem cw13_3_0 : cplWin 13 3 0 = true := by decide +kernel
 /-- `verify_keccak`, window 4, part 0. -/
 theorem cw13_4_0 : cplWin 13 4 0 = true := by decide +kernel
 
-/-- `verify_keccak`, window 5, part 0. -/
-theorem cw13_5_0 : cplWin 13 5 0 = true := by decide +kernel
+/-- `verify_keccak`, window 4, part 1. -/
+theorem cw13_4_1 : cplWin 13 4 1 = true := by decide +kernel
+
+/-- `verify_keccak`, window 4, part 2. -/
+theorem cw13_4_2 : cplWin 13 4 2 = true := by decide +kernel
 
 /-- `ring_switch_target`, window 0, part 0. -/
 theorem cw14_0_0 : cplWin 14 0 0 = true := by decide +kernel

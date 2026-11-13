@@ -17,20 +17,19 @@ public import LeanVM.Guest.Checked.F12_4
 public import LeanVM.Guest.Checked.F12_4
 public import LeanVM.Guest.Checked.F13_3
 public import LeanVM.Guest.Checked.F13_3
-public import LeanVM.Guest.Checked.F18_1
-public import LeanVM.Guest.Checked.F18_1
-public import LeanVM.Guest.Checked.F18_1
-public import LeanVM.Guest.Checked.F20_2
-public import LeanVM.Guest.Checked.F20_7
-public import LeanVM.Guest.Checked.F20_12
-public import LeanVM.Guest.Checked.F20_17
-public import LeanVM.Guest.Checked.F20_17
-public import LeanVM.Guest.Checked.F21_4
-public import LeanVM.Guest.Checked.F21_12
-public import LeanVM.Guest.Checked.F21_20
-public import LeanVM.Guest.Checked.F24_0
-public import LeanVM.Guest.Checked.F31_1
-public import LeanVM.Guest.Checked.F31_1
+public import LeanVM.Guest.Checked.F18_2
+public import LeanVM.Guest.Checked.F18_2
+public import LeanVM.Guest.Checked.F18_2
+public import LeanVM.Guest.Checked.F20_3
+public import LeanVM.Guest.Checked.F20_8
+public import LeanVM.Guest.Checked.F20_13
+public import LeanVM.Guest.Checked.F20_18
+public import LeanVM.Guest.Checked.F20_18
+public import LeanVM.Guest.Checked.F21_5
+public import LeanVM.Guest.Checked.F21_13
+public import LeanVM.Guest.Checked.F21_21
+public import LeanVM.Guest.Checked.F25_0
+public import LeanVM.Guest.Checked.F32_0
 public import LeanVM.Guest.Checked.F37_1
 public import LeanVM.Guest.Checked.F37_2
 public import LeanVM.Guest.Checked.F37_3
@@ -142,7 +141,7 @@ theorem plain12 : Plain 12 := by
   decide +kernel
 
 theorem ok13 : CheckOk 13 := fun i hi ↦ by
-  have h : (certOf 13).cuts.length = 5 := by decide +kernel
+  have h : (certOf 13).cuts.length = 4 := by decide +kernel
   rw [h] at hi
   interval_cases i
   · exact w13_0
@@ -150,7 +149,6 @@ theorem ok13 : CheckOk 13 := fun i hi ↦ by
   · exact w13_2
   · exact w13_3
   · exact w13_4
-  · exact w13_5
 
 theorem plain13 : Plain 13 := by
   unfold Plain

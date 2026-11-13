@@ -615,7 +615,7 @@ theorem ok12 : ShareOk 12 := ⟨st12, fun i hi ↦ by
 ⟩
 
 theorem ok13 : ShareOk 13 := ⟨st13, fun i hi ↦ by
-  have h : (snapsOf 13).length = 10 := by decide +kernel
+  have h : (snapsOf 13).length = 9 := by decide +kernel
   rw [h] at hi
   interval_cases i
   · exact w13_0
@@ -628,7 +628,6 @@ theorem ok13 : ShareOk 13 := ⟨st13, fun i hi ↦ by
   · exact w13_7
   · exact w13_8
   · exact w13_9
-  · exact w13_10
 ⟩
 
 theorem ok17 : ShareOk 17 := ⟨st17, fun i hi ↦ by
