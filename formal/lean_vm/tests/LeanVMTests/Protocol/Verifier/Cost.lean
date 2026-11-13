@@ -11,7 +11,7 @@ Regression and negative tests for `LeanVM.Protocol.Compile.Cost` and
   the cost the accounting gives, and the conditions doing the work are load-bearing: a
   commitment taller than the height bound, an opening charged per position and level, and a
   budget one short are refuted.
-* The leanVM constants: the bound is `13708`; the height bound is attained by an admissible
+* The leanVM constants: the bound is `12962`; the height bound is attained by an admissible
   ladder (`μ = 30` at rate `4`), and the WHIR bound by the ladder at `μ = 28`, rate `1`.
 * The seed: the leanVM seeding has three hash steps.
 * An executed run: the compiled leanVM verifier, its hash and permutation counting their calls,
@@ -63,7 +63,7 @@ example : ¬ (VerifierProgram.queryOpenings 0 [0, 1]).CostLE 3 31 := fun h ↦ a
 
 /-! ## The leanVM constants -/
 
-example : leanVmQueryBound = 13708 := leanVmQueryBound_eq
+example : leanVmQueryBound = 12962 := leanVmQueryBound_eq
 
 /-- The WHIR bound is attained, by the ladder at `μ = 28`, rate `1`. -/
 example : whirCost costHeight 28 ((Whir.ladder 28 1).getD []) = whirBound := by

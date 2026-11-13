@@ -112,30 +112,30 @@ def sphincs : List LeanSphincsClaim :=
     BitVec.ofNat 256 (2 ^ 256 - 1))]
 
 #guard claimListDigest xmssPublicKeyBytes xmss =
-  #v[0x414fd0b2c209e3b8, 0x6538b0954fa462a9, 0xe56f9cc0c9d4fdc7, 0xa490bc2e93724856]
+  #v[0xa4ec226585891c3d, 0xa85b86133b887198, 0xa41bc1142d412ba, 0x3c1b43782ff2091d]
 
 #guard claimListDigest Sphincs.PublicKey.toBytes sphincs =
-  #v[0xe8d78086d65bb925, 0x7ace3a6c82dbaf4e, 0xbf24729b60a19887, 0xc1ffa4b8c5dee59e]
+  #v[0xe7e247b70a882189, 0xdb03bad3b98d1589, 0x8309c511a3c41d31, 0x943ad6332bd6dc5d]
 
 /- An empty list hashes the empty string. -/
 #guard claimListDigest xmssPublicKeyBytes [] =
-  #v[0x3c23f7860146d2c5, 0xc003c7dcb27d7e92, 0x3b2782ca53b600e5, 0x70a4855d04d8fa7b]
+  #v[0x6dde3b94f02ddde3, 0x5cf35960c39ee382, 0x6bcc38dfe22067d7, 0x4a3aaafcdd9fb610]
 
 /-! ## The batching's seed -/
 
 /- `FiatShamirState::from_label(RECURSION_AGG_LABEL)`'s state, whose lanes `16..25` the guest
 bakes as `AGG_SEED_*`. -/
-#guard batchSeed = #v[0x870d207a806c795a, 0xb4b4ddd8d965e271, 0xf4d25a66d674ca27,
-  0xd58527e821d50d69, 0xe8b3b32bc6b41ca0, 0x1ac6405ae5e1c26c, 0x25100272f63a0add,
-  0xddac48119a39ccbb, 0x2f557d8fdc241fb9, 0xb03075526083a5c6, 0x0ae457bd1e0fd49d,
-  0xa690dfcc98cbc36e, 0xc8bc6a708f4be81f, 0xaf078f39833eded4, 0xfca5d5aea8d67de1,
-  0x160ed37a53dc979a, 0x15afc20f66b0d5b9, 0x6a647807f52d7266, 0xa5800c0973e6ab80,
-  0xc99f802c9aef9edd, 0xd2dc01646a279b0e, 0x5d0c9da7c6a96b8d, 0x971016a864ec6d1a,
-  0x92ef5eb709b9fa89, 0x02359fac99c1f265]
+#guard batchSeed = #v[0x7b01102c79c5b7be, 0x847cf1f24d9ec34e, 0x2d90d578c3add43,
+  0x638d5fc17f034837, 0x8908fffd6a3db3c9, 0x70e2e123d94ff318, 0x39b5efa3670d3575,
+  0x7ac4eddee7fa6aae, 0xc962960061cd2f36, 0x385b463db8a8e892, 0xab7b8c8359e943ea,
+  0x14c4b5acebf4dac3, 0x835fad8dcef3a2d, 0xa5faeaf1fdf71df3, 0xb411f0b74a25102e,
+  0x32bdc960d924a99, 0x50a09cd97911d301, 0x694116f29aa38728, 0x7ab5e534f0f15094,
+  0x23b9ced806e153a6, 0x6f277a43e4e11b16, 0x2aae2785bf1acea2, 0xe92ef88e65b14f4f,
+  0xc134733b28492059, 0xf5645b06f0464d29]
 
-/- No children: the empty sumcheck closes on the zero claim, the nonce `0` passing the proof of
+/- No children: the empty sumcheck closes on the zero claim, the nonce `3`, the least one passing the proof of
 work. -/
-#guard (batch [] ⟨0, [], 0⟩).isSome
+#guard (batch [] ⟨E.ofLimbs (K.ofBits 3) 0, [], 0⟩).isSome
 
 /-! ## The Rust vectors -/
 

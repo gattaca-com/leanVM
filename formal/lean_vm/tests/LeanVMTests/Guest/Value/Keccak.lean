@@ -6,7 +6,7 @@ import LeanVM.Guest.Batch.Def
 # Tests: the Keccak library
 
 * The natural-number evaluator (`KeccakEval`) against the Spec's compiled `keccakF` and
-  `keccak256`, and Keccak-256 of the empty string against its published value.
+  `keccak256`, and the empty string against the Rust verifier.
 * **The theorems' hypotheses are the compiler's chain.** `chain` runs the `KECCAK`s exactly as
   `keccak_chain` and `keccak_final` describe them (block `k` reading the previous output plus the
   padded cells from `17k / 2`, in the layouts `inLayout k` and `outLayout B k`) on messages of
@@ -39,10 +39,9 @@ def bytes (n : ℕ) : List UInt8 := (List.range n).map fun i ↦ (i * 37 + 11).t
 
 #guard [0, 1, 135, 136, 137, 271, 272, 500].all fun n ↦
   keccak256N ((bytes n).map UInt8.toNat) = (keccak256 (bytes n)).toList.map UInt64.toNat
--- Keccak-256 of the empty string,
--- `c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
+-- The empty string, from the twelve-round Rust verifier.
 #guard (keccak256 []).toList =
-  [4333579421379646149, 13836122230913597074, 4262519377828905189, 8116759062988257915]
+  [0x6dde3b94f02ddde3, 0x5cf35960c39ee382, 0x6bcc38dfe22067d7, 0x4a3aaafcdd9fb610]
 
 /-! ## The compiler's chain -/
 

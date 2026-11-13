@@ -146,7 +146,7 @@ costs are included in the bounds below.
 \paragraph{The extractor.} Knowledge soundness is stated for the extractor a program of a cost
 machine computes (\lean{LeanVM.extractorComputedBy}~$P$, \lean{Statement/CostMachine.lean}): the
 program $P$, of size at most $14159$ (\lean{leanVmKnowledgeExtractorSizeBound}: the compiled
-extractor's $14039$ and a slack of $120$, less than one leanXMSS signature's encoding), run on the encoded
+extractor's $14003$ and a slack of $156$, less than one leanXMSS signature's encoding), run on the encoded
 statement, transcript and proof within a budget (\lean{leanVmKnowledgeExtractorBudget}: the most its
 run may cost in the machine's price, so also the most steps it may execute,
 $2^{\max(80,\,2\mu + 25)} + (N + 2^{30})(D + 2)^2(2^{15} + 2D)$ for a proof announcing a stack of $2^\mu$
@@ -221,10 +221,10 @@ adversary making at most $Q \le 2^{128}$ queries to $\pi$ and $\pi^{-1}$ on ever
 \]
 (\lean{LeanVM.knowledgeSoundness_holds}). Each call may complete a verifier message, whose
 round-by-round error after its proof of work is at most $2^{-125}$. The constant $2^{14}$ absorbs
-the verifier's $13708$ Keccak-256 evaluations and duplex permutations (as calls of $\pi$ up to
-$13708\cdot 2^{30}$, the IV hashing a bytecode of up to $2^{30}$ instructions) and two further terms
+the verifier's $12962$ Keccak-256 evaluations and duplex permutations (as calls of $\pi$ up to
+$12962\cdot 2^{30}$, the IV hashing a bytecode of up to $2^{30}$ instructions) and two further terms
 of at most $2^{-128}$ each: the transfer to the RPM, which pays for those calls, and the verifier's own
-$13708/2^{256}$.
+$12962/2^{256}$.
 
 \paragraph{Completeness} (\lean{LeanVM.Completeness}). The statement names its honest prover,
 \lean{LeanVM.leanVmHonestProver}: the executable \lean{LeanVM.Prover.prove}
@@ -247,7 +247,7 @@ because the proof of work is bounded: for any fuel $f \le 2^{64}$ the rejection 
 most
 \[
 \delta(f) = Q_f\,(1-2^{-27})^{f} + (Q_f\cdot 2^{30})^2/2^{508}, \qquad
-Q_f = 13710 + 54825\,(2^{29} + 2f + 2)
+Q_f = 12964 + 51843\,(2^{29} + 2f + 2)
 \]
 (\lean{LeanVM.Rpm.completenessRpm}, \lean{lean_vm}). The \emph{committed size} (\lean{Execution.committedSize}) of an
 execution is
@@ -641,9 +641,9 @@ $(\mathit{pc}, \mathit{fp})$, and a repeated state would loop without halting
 ($2^\ell\cdot 2^\kappa$ states, $\ell = 19$, $\kappa \le 30$; argued, not a Lean theorem;
 \lean{lean_vm} proves fewer than $2^{128}$, \lean{steps_lt_replayFuel}).
 
-\paragraph{The decoder's size bound.} The bound (\lean{guestWitnessDecoderSizeBound}, $574499$)
-limits any program; it is the compiled decoder's size, $574069$ (proved
-at most that, measured exactly; the guest's frame-cell table is $521235$ of it), and a slack of
+\paragraph{The decoder's size bound.} The bound (\lean{guestWitnessDecoderSizeBound}, $574231$)
+limits any program; it is the compiled decoder's size, $573801$ (proved
+at most that, measured exactly; the guest's frame-cell table is $521003$ of it), and a slack of
 $430$: room for one leanXMSS signature's encoding ($309$) beside its code but not two, so no useful
 table of witnesses (hard-coded signatures that would mask a bug of $G$ on finitely many statements)
 fits there. It does not bound what a program written differently could hold: the frame-cell table

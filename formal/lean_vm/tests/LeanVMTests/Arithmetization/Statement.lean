@@ -85,15 +85,15 @@ def kLin : Vector K 25 :=
     K.ofBits 0x0, K.ofBits 0x0, K.ofBits 0x0, K.ofBits 0x0]
 
 def kLout : Vector K 25 :=
-  #v[K.ofBits 0x8dbfafed17b66d45, K.ofBits 0x30fd63be3bf8b935, K.ofBits 0x77167d7a851a2a5a,
-    K.ofBits 0xd9174937e0d9005e, K.ofBits 0xa6a08643e0752e62, K.ofBits 0x96fa9d5eb49e3867,
-    K.ofBits 0xd3075d1a22781d5, K.ofBits 0x81ae728bf7328686, K.ofBits 0xf51da81b6f1b6499,
-    K.ofBits 0xdaf2a8af5b43dbf9, K.ofBits 0xdbf85b3cc1312641, K.ofBits 0x993d35c56291827e,
-    K.ofBits 0x47fd59ac60e225e2, K.ofBits 0x36607d1d9e6abed, K.ofBits 0x6cee5561314ca0f3,
-    K.ofBits 0x3e20ee955c09012e, K.ofBits 0x8a928dc9e22c3dcf, K.ofBits 0x7f24a1dac6837929,
-    K.ofBits 0xd22b33eacce5fcd2, K.ofBits 0x2b1e71fdcd52b881, K.ofBits 0x427618061608ac91,
-    K.ofBits 0x44c480aa40bfdbf9, K.ofBits 0x7a29ee993739ddb0, K.ofBits 0xf7f9aa87f90247d1,
-    K.ofBits 0xe5177d767bf6bd92]
+  #v[K.ofBits 0x9fa90279572a3fec, K.ofBits 0xba729bb1c2340b65, K.ofBits 0x4055479da59ad114,
+    K.ofBits 0x11f4b44e650f42ed, K.ofBits 0xb8ff97faba68a653, K.ofBits 0x3eadddb6420a6f0b,
+    K.ofBits 0x625e2bb27d27342a, K.ofBits 0x86111eecb777b97e, K.ofBits 0xb872ae9f730efe78,
+    K.ofBits 0x7d7fdc0e447d1e5e, K.ofBits 0x4fcac03880abf602, K.ofBits 0x373295bc8b979f44,
+    K.ofBits 0xe1e609f665725e57, K.ofBits 0x19eb316e47d40dd1, K.ofBits 0x7016d1eb540f6172,
+    K.ofBits 0x17fa7a2190c46ca6, K.ofBits 0xb24a7d77bea84d0b, K.ofBits 0xfdad3ea78c2311b3,
+    K.ofBits 0xf03c77fd0e3a7e0e, K.ofBits 0xe3c4e7aefc220392, K.ofBits 0x57096e74eadcb2f2,
+    K.ofBits 0xe07cda442f370f1f, K.ofBits 0x124a415ba19d5e09, K.ofBits 0xac1b23bab94c53fe,
+    K.ofBits 0xb64063b2c2971a6c]
 
 /-- The thirteen output cells of the lanes `L` in the odd layout: lane `0` alone in the high limb
 of cell `0`, then the lane pairs `(2c - 1, 2c)`. At `kLout` they are the executor's (`kOut` of

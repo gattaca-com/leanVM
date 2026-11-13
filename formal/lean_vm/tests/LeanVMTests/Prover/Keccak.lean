@@ -5,7 +5,7 @@ import LeanVMTests.Runs
 # Tests: the executable Keccak prover against the verifier
 
 A toy `q_keccak` of `2^4` steps (`P = 0`, two packs): pseudo-random inputs (slots `0 .. 24`), the
-middle state twelve rounds further (slots `25 .. 49`), zeros above; the output lanes' claims at a
+middle state six rounds further (slots `25 .. 49`), zeros above; the output lanes' claims at a
 point are the true ones. The verifier's own program `verifyKeccak` is run against the prover's
 script with fixed challenges (`drive`): every read meets a scalar sent, every challenge is given
 to both, and every check passes. Then the same with a wrong output claim: the verifier rejects.
@@ -41,7 +41,7 @@ def qk : Array K := Array.ofFn (n := 2 ^ 10) fun n ↦
   let x := n.val % 16
   let o := n.val / 16
   if o < 25 then K.ofLane (Keccak.lane (input x) o)
-  else if o < 50 then K.ofLane (Keccak.lane (roundsOf 0 12 (input x)) (o - 25)) else 0
+  else if o < 50 then K.ofLane (Keccak.lane (roundsOf 0 6 (input x)) (o - 25)) else 0
 
 def col (n : ℕ) : K := qk.getD n 0
 
