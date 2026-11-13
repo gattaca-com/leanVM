@@ -4,7 +4,7 @@
 # place) and on a HeapBuf (bridged through the stack, one DEREF per cell), as
 # inputs and as the output. Published: the two 128-bit digest cells of
 # H(H(a[0:2], hb[0:2]), a[0:2]) read back from the heap.
-# public_input: 21505378141451040915105957038093575295, 314243486001112001756598571412583305209
+# public_input: 56288124009087724326033061591012898213, 158783217869136383666880914394410326922
 from snark_lib import *
 
 
