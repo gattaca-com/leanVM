@@ -123,3 +123,28 @@ fn tampers_fail_their_check() {
         assert!(found, "no tamper of scalar {position} fails with {error}");
     }
 }
+
+/// The rate word is `(rate, (mem_count << 2) | flag)`. A flag of 3, a memory count with no flag, and a truncated
+/// proof over no memory are refused before anything else is read.
+#[test]
+fn rate_word_refusals() {
+    let fixture = fixture();
+    let rate_word = 1 + leanvm_core::tables::N_TABLES;
+    let honest = scalar_proof(&fixture.proof);
+    assert_eq!(honest.stream[rate_word].c1, 0, "the fixture is a full proof");
+    let cases = [
+        (3, VerifierError::AnnouncedHighLimb),
+        (4, VerifierError::AnnouncedHighLimb),
+        ((5 << 2) | 3, VerifierError::AnnouncedHighLimb),
+        ((0 << 2) | 1, VerifierError::AnnouncedTableSizes),
+    ];
+    for (c1, error) in cases {
+        let mut proof = honest.clone();
+        proof.stream[rate_word].c1 = c1;
+        assert_eq!(
+            verify_execution(&fixture.bytecode, &fixture.public_input_bytes, &proof).map(|_| ()),
+            Err(error),
+            "a rate word high limb of {c1}"
+        );
+    }
+}
