@@ -12,3 +12,4 @@ workspace = true
 
 [dev-dependencies]
 keccak = "0.2"
+primitives.workspace = true

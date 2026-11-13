@@ -774,8 +774,32 @@ mod tests {
         (0..n).map(|i| ((i * 7 + 3) & 0xff) as u8).collect()
     }
 
-    /// Ethereum's `keccak256`, as an independent implementation computes it, across both sides of
-    /// every block boundary up to five blocks.
+    /// The sponge over Keccak-p[1600, 12] with rate 136 and `0x01 .. 0x80` padding, as the `keccak` crate's
+    /// permutation computes it: the reference the hash is tested against.
+    fn reference_sponge(data: &[u8]) -> [u8; 32] {
+        fn absorb(state: &mut [u64; STATE_LANES], block: &[u8]) {
+            for (lane, bytes) in state.iter_mut().zip(block.chunks_exact(8)) {
+                *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
+            }
+            keccak::Keccak::new().with_p1600::<{ ROUNDS }>(|f| f(state));
+        }
+        let mut state = [0u64; STATE_LANES];
+        let (blocks, tail) = data.as_chunks::<136>();
+        for block in blocks {
+            absorb(&mut state, block);
+        }
+        let mut last = [0u8; 136];
+        last[..tail.len()].copy_from_slice(tail);
+        last[tail.len()] ^= 0x01;
+        last[135] ^= 0x80;
+        absorb(&mut state, &last);
+        let mut out = [0u8; 32];
+        for (bytes, lane) in out.chunks_exact_mut(8).zip(state) {
+            bytes.copy_from_slice(&lane.to_le_bytes());
+        }
+        out
+    }
+
     /// The permutation is Keccak-p[1600, 12], as the `keccak` crate computes it.
     #[test]
     fn permutation_matches_keccak_p_1600_12() {
@@ -797,12 +821,12 @@ mod tests {
         }
     }
 
+    /// The hash is the reference sponge's, across both sides of every block boundary up to five blocks.
     #[test]
-    fn matches_ethereum_keccak256() {
-        use sha3::Digest;
+    fn matches_the_reference_sponge() {
         for n in (0..700).chain([1023, 1024, 1025, 4096]) {
             let data = pattern(n);
-            assert_eq!(&hash(&data)[..], &sha3::Keccak256::digest(&data)[..], "{n} bytes");
+            assert_eq!(&hash(&data)[..], &reference_sponge(&data)[..], "{n} bytes");
         }
     }
 
