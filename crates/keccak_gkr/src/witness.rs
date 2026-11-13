@@ -834,7 +834,7 @@ mod tests {
             .map(|_| std::array::from_fn(|_| rng.next_u64()))
             .collect();
         let mut scratch = Recompute::new();
-        for depth in [1, 2, 3, 4, 6, 8, 12, 24] {
+        for depth in [1, 2, 3, 4, 6, 8, 12, 24].into_iter().filter(|d| ROUNDS % d == 0) {
             let shape = Shape::new(4 * BLOCK, depth);
             let mut committed = vec![F64(0); 1 << shape.stack_log()];
             let witness = Witness::generate(shape, &inputs, &mut committed);
