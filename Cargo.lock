@@ -231,6 +231,7 @@ dependencies = [
  "experimental_primitives",
  "fiat_shamir_prover",
  "isa",
+ "libc",
  "tracing",
  "verifier",
 ]

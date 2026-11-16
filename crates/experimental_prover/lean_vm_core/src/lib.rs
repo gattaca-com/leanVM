@@ -24,6 +24,7 @@ pub mod cpu;
 pub mod gkr;
 pub mod keccak;
 pub mod leaf;
+mod mapping;
 pub mod pcs;
 mod prover;
 pub mod tables;
