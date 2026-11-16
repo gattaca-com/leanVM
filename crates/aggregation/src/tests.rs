@@ -4,15 +4,15 @@ use super::error::AggregateError;
 use super::guest::{GUEST_SOURCE, compile_guest, unified_guest};
 use super::hints::{FORGE, Forgery, Hints};
 use super::placeholders::placeholder_map;
-use super::proof::{AggregateClaims, AggregateProof, decode, encode};
-use super::statement::CLAIM_GROUP;
+use super::proof::{AggregateClaims, AggregateProof, decode, encode, is_well_formed};
+use super::statement::{CLAIM_GROUP, lean_xmss_claim_cells, list_split};
 use super::*;
 use fiat_shamir_prover::merkle::hash_to_scalars;
 use isa::Program;
 use isa::Prover;
 use keccak256::{hash, hash_pair};
 use lean_da::{BLOB_SYMBOLS, CELL_SYMBOLS, CELLS_PER_ROW, Codeword, DA_MAX_ROWS, Hash};
-use lean_sphincs::LeanSphincsSignature;
+use lean_sphincs::{LeanSphincsPublicKey, LeanSphincsSignature};
 use lean_vm_core::StableProver;
 use lean_vm_core::cpu::{execute, from_scalar, to_scalar};
 use lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
@@ -812,5 +812,321 @@ fn malformed_raw_signatures_are_errors() {
             aggregate(&[], xmss, sphincs, None, OutputClaims::All).err(),
             Some(AggregateError::InvalidSignature)
         );
+    }
+}
+
+/// A claim changed anywhere in the tree changes the commitment, so the statement no
+/// longer matches the proof: the verifier rejects it, on the wire too. A forged child
+/// commitment hint fails in the guest, whose rebuilt child statement matches no proof.
+#[test]
+fn tampered_claim_tree_is_rejected() {
+    let signers = get_signers::<StableProver>(SMALL_LEAF_SIZE + 1);
+    let children = [
+        prove(&[], &signers[..SMALL_LEAF_SIZE], &[]),
+        prove(&[], &signers[SMALL_LEAF_SIZE..], &[]),
+    ];
+    let node = prove(&children, &[], &[]);
+    let received = AggregateProof::from_bytes(&node.1.to_bytes()).expect("the wire round trips");
+    // A message swapped under a verified key, inside a child's list.
+    let mut forged = node.0.clone();
+    forged.tree.children[0].lean_xmss[0].1 = message_for(7);
+    assert!(!node.1.verify(&forged));
+    assert!(!received.verify(&forged));
+    // A child's claims presented as the node's own raw claims: same set, other tree.
+    let mut flattened = node.0.clone();
+    let child = flattened.tree.children.remove(0);
+    flattened.tree.lean_xmss = child.lean_xmss;
+    assert!(!node.1.verify(&flattened));
+    assert!(!received.verify(&flattened));
+    // A forged child commitment hint: the child's proof is of another statement.
+    let forgery: Forgery = Box::new(|hints: &mut Hints| hints.entry_mut("child_signers", 1)[0] += F128::ONE);
+    assert_forgery_rejected(forgery, &children, vec![], vec![], &[]);
+}
+
+/// A one-child chain of `levels` empty nodes, built without recursion.
+fn chain(levels: usize) -> ClaimTree {
+    let mut tree = ClaimTree::default();
+    for _ in 1..levels {
+        tree = ClaimTree {
+            children: vec![tree],
+            ..ClaimTree::default()
+        };
+    }
+    tree
+}
+
+/// Drops a tree of any depth without recursion: the derived drop recurses once a level.
+fn drop_flat(mut tree: ClaimTree) {
+    let mut stack = std::mem::take(&mut tree.children);
+    while let Some(mut node) = stack.pop() {
+        stack.append(&mut node.children);
+    }
+}
+
+/// A tree over the depth cap is rejected before any hashing or flattening, without
+/// overflowing the stack in the check, as the verified claims or as a child's.
+#[test]
+fn deep_claim_trees_are_rejected() {
+    let leaf = prove(&[], &get_signers::<StableProver>(1), &[]);
+    assert!(is_well_formed(&chain(MAX_TREE_DEPTH)));
+    for levels in [MAX_TREE_DEPTH + 1, 100_000] {
+        let child = (
+            AggregateClaims {
+                tree: chain(levels),
+                da_commitment: None,
+            },
+            leaf.1.clone(),
+        );
+        assert!(!is_well_formed(&child.0.tree));
+        assert!(!child.1.verify(&child.0));
+        let result = aggregate(std::slice::from_ref(&child), vec![], vec![], None, OutputClaims::All);
+        assert_eq!(result.err(), Some(AggregateError::InvalidChild));
+        drop_flat(child.0.tree);
+    }
+}
+
+/// A shallow tree of more than the node cap is rejected: 16-ary, four levels deep is 4369 nodes,
+/// so five levels at 16 children each (69905 nodes) is over. So is a node over the arity cap.
+#[test]
+fn wide_claim_trees_are_rejected() {
+    fn full(levels: usize) -> ClaimTree {
+        let children = if levels == 1 {
+            vec![]
+        } else {
+            (0..MAX_RECURSIONS).map(|_| full(levels - 1)).collect()
+        };
+        ClaimTree {
+            children,
+            ..ClaimTree::default()
+        }
+    }
+    assert!(is_well_formed(&full(4)));
+    assert!(!is_well_formed(&full(5)));
+    let too_many = ClaimTree {
+        children: vec![ClaimTree::default(); MAX_RECURSIONS + 1],
+        ..ClaimTree::default()
+    };
+    assert!(!is_well_formed(&too_many));
+}
+
+/// Every other tree over the same proof is rejected: order, arity, wrapping, flattening,
+/// a claim moved between children or schemes, or repeated at the root. Directly and on the wire.
+#[test]
+fn other_claim_trees_are_rejected() {
+    let signers = get_signers::<StableProver>(5);
+    let children = [prove(&[], &signers[..3], &[]), prove(&[], &signers[3..], &[])];
+    let node = prove(&children, &[], &[]);
+    let received = AggregateProof::from_bytes(&node.1.to_bytes()).expect("the wire round trips");
+    let honest = node.0.tree.clone();
+    type Edit = Box<dyn Fn(&mut ClaimTree)>;
+    let edits: Vec<(&str, Edit)> = vec![
+        ("children swapped", Box::new(|t| t.children.swap(0, 1))),
+        (
+            "a claim moved to the other child",
+            Box::new(|t| {
+                let claim = t.children[0].lean_xmss.pop().unwrap();
+                t.children[1].lean_xmss.push(claim);
+                t.children[1].lean_xmss.sort();
+            }),
+        ),
+        ("a child dropped", Box::new(|t| drop(t.children.pop()))),
+        (
+            "an empty child added",
+            Box::new(|t| t.children.push(ClaimTree::default())),
+        ),
+        (
+            "an empty child first",
+            Box::new(|t| t.children.insert(0, ClaimTree::default())),
+        ),
+        (
+            "wrapped in a one-child node",
+            Box::new(|t| {
+                let inner = std::mem::take(t);
+                t.children.push(inner);
+            }),
+        ),
+        (
+            "flattened to a leaf",
+            Box::new(|t| {
+                let mut all: Vec<LeanXmssClaim> = t.children.iter().flat_map(|c| c.lean_xmss.clone()).collect();
+                all.sort();
+                *t = ClaimTree {
+                    children: vec![],
+                    lean_xmss: all,
+                    lean_sphincs: vec![],
+                };
+            }),
+        ),
+        (
+            "a child's claim repeated at the root",
+            Box::new(|t| t.lean_xmss.push(t.children[0].lean_xmss[0])),
+        ),
+        (
+            "a child's list moved to the other scheme",
+            Box::new(|t| {
+                let moved: Vec<LeanSphincsClaim> = t.children[0]
+                    .lean_xmss
+                    .drain(..)
+                    .map(|(pk, m)| (LeanSphincsPublicKey::from_bytes(&pk.to_bytes()), m))
+                    .collect();
+                t.children[0].lean_sphincs = moved;
+                t.children[0].lean_sphincs.sort();
+            }),
+        ),
+        (
+            "a claim removed",
+            Box::new(|t| {
+                t.children[0].lean_xmss.pop();
+            }),
+        ),
+        ("a child repeated", Box::new(|t| t.children[1] = t.children[0].clone())),
+        (
+            "one child's claims split over two children",
+            Box::new(|t| {
+                let tail = t.children[0].lean_xmss.split_off(1);
+                t.children.insert(
+                    1,
+                    ClaimTree {
+                        children: vec![],
+                        lean_xmss: tail,
+                        lean_sphincs: vec![],
+                    },
+                );
+            }),
+        ),
+    ];
+    for (name, edit) in edits {
+        let mut forged = node.0.clone();
+        edit(&mut forged.tree);
+        assert_ne!(forged.tree, honest, "{name}");
+        assert!(!node.1.verify(&forged), "{name}");
+        assert!(!received.verify(&forged), "{name} over the wire");
+    }
+    // The honest tree still verifies over the wire, and a wrong DA root does not.
+    assert!(received.verify(&node.0));
+    let with_da = AggregateClaims {
+        da_commitment: Some([7; 32]),
+        ..node.0.clone()
+    };
+    assert!(!received.verify(&with_da));
+}
+
+/// Swapped child commitment hints: each child's proof is then of another statement.
+#[test]
+fn swapped_child_commitments_fail_the_guest() {
+    let signers = get_signers::<StableProver>(5);
+    let children = [prove(&[], &signers[..3], &[]), prove(&[], &signers[3..], &[])];
+    let forgery: Forgery = Box::new(|hints: &mut Hints| {
+        let first = hints.entry_mut("child_signers", 0).clone();
+        let second = std::mem::replace(hints.entry_mut("child_signers", 1), first);
+        *hints.entry_mut("child_signers", 0) = second;
+    });
+    assert_forgery_rejected(forgery, &children, vec![], vec![], &[]);
+}
+
+/// A node declares a raw claim no signature covers: with children only, through a duplicate
+/// slot, and in a leaf; and a leaf whose two signatures write one slot.
+#[test]
+fn uncovered_raw_claims_fail_the_guest() {
+    let signers = get_signers::<StableProver>(5);
+    let children = [prove(&[], &signers[..3], &[]), prove(&[], &signers[3..], &[])];
+    let stolen = lean_xmss_claim_cells(&(signers[0].0, message()));
+    // A node with children only declares one claim.
+    let declared: Forgery = Box::new(move |hints: &mut Hints| {
+        hints.entry_mut("meta", 0)[0] *= count(1);
+        hints.push("signers_split", list_split(1));
+        hints.push("claims", stolen.to_vec());
+    });
+    assert_forgery_rejected(declared, &children, vec![], vec![], &[]);
+    // A node with children only declares one duplicate.
+    let duplicate: Forgery = Box::new(move |hints: &mut Hints| {
+        hints.entry_mut("meta", 0)[1] *= count(1);
+        hints.push("dup_claims", stolen.to_vec());
+    });
+    assert_forgery_rejected(duplicate, &children, vec![], vec![], &[]);
+    // A leaf of two signatures declares a third claim.
+    let extra = lean_xmss_claim_cells(&(signers[4].0, message()));
+    let third: Forgery = Box::new(move |hints: &mut Hints| {
+        hints.entry_mut("meta", 0)[0] *= count(1);
+        *hints.entry_mut("signers_split", 0) = list_split(3);
+        hints.push("claims", extra.to_vec());
+    });
+    assert_forgery_rejected(third, &[], signers[..2].to_vec(), vec![], &[]);
+    // Two signatures of a leaf write the first slot.
+    let twice: Forgery = Box::new(|hints: &mut Hints| {
+        let first = hints.entry_mut("raw_index", 0).clone();
+        *hints.entry_mut("raw_index", 1) = first;
+    });
+    assert_forgery_rejected(twice, &[], signers[..2].to_vec(), vec![], &[]);
+}
+
+/// One child, three children, a node with children and raw claims of both schemes, a node over
+/// a node: each verifies, directly and over the wire with its tree.
+#[test]
+fn arities_and_mixed_nodes_verify() {
+    let signers = get_signers::<StableProver>(8);
+    let sphincs = get_lean_sphincs_signers::<StableProver>(2);
+    let leaf = |range: std::ops::Range<usize>| prove(&[], &signers[range], &[]);
+    let over_the_wire = |node: &Node, name: &str| {
+        let received = AggregateProof::from_bytes(&node.1.to_bytes()).unwrap_or_else(|| panic!("{name}: the wire"));
+        assert!(received.verify(&node.0), "{name} over the wire");
+    };
+    let one = prove(&[leaf(0..2)], &[], &[]);
+    over_the_wire(&one, "one child");
+    let three = prove(&[leaf(0..2), leaf(2..3), leaf(3..5)], &[], &[]);
+    over_the_wire(&three, "three children");
+    let mixed = prove(&[one.clone(), leaf(5..6)], &signers[6..8], &sphincs);
+    over_the_wire(&mixed, "children and raw claims");
+    assert_eq!(mixed.0.tree.children.len(), 2);
+    assert_eq!(mixed.0.tree.children[0].children.len(), 1);
+    assert_eq!((mixed.0.tree.lean_xmss.len(), mixed.0.tree.lean_sphincs.len()), (2, 2));
+    // The inner node's tree is not interchangeable with its flattening.
+    let mut forged = mixed.0.clone();
+    let inner = forged.tree.children[0].children.remove(0);
+    forged.tree.children[0].lean_xmss = inner.lean_xmss;
+    assert!(!mixed.1.verify(&forged));
+}
+
+/// What the tree no longer excludes: one claim in two subtrees and again raw at the root, and
+/// one child proof used twice. The flattened set holds each claim once.
+#[test]
+fn repeated_claims_are_accepted_and_flattened() {
+    let signers = get_signers::<StableProver>(4);
+    let left = prove(&[], &signers[..3], &[]);
+    let right = prove(&[], &signers[1..], &[]);
+    let node = prove(&[left.clone(), right, left], &signers[..1], &[]);
+    fn count_claims(tree: &ClaimTree) -> usize {
+        tree.lean_xmss.len() + tree.lean_sphincs.len() + tree.children.iter().map(count_claims).sum::<usize>()
+    }
+    assert_eq!(count_claims(&node.0.tree), 10);
+    assert_eq!(node.0.num_signature_claims(), 4);
+}
+
+/// Forged leaf-row hints of a child's WHIR opening fail the guest's run: a high lane on a cell of level 0's
+/// rows, whose cells have none, a cell's lanes swapped, a low lane changed, and a deeper level's lanes changed.
+#[test]
+fn forged_leaf_cells_fail_the_guest() {
+    let child = [prove(&[], &get_signers::<StableProver>(3), &[])];
+    type Edit = fn(&mut F128);
+    let edits: [(usize, Edit); 5] = [
+        (0, |cell| cell.c1 = 1),
+        (0, |cell| std::mem::swap(&mut cell.c0, &mut cell.c1)),
+        (0, |cell| cell.c0 ^= 1),
+        (usize::MAX, |cell| cell.c1 ^= 1),
+        (usize::MAX, |cell| cell.c0 ^= 1),
+    ];
+    for (entry, edit) in edits {
+        let forgery: Forgery = Box::new(move |hints: &mut Hints| {
+            let n = hints.entries("merkle_leaf_rows");
+            let entry = if entry == usize::MAX { n - 1 } else { entry };
+            let cells = hints.entry_mut("merkle_leaf_rows", entry);
+            let last = cells.len() - 1;
+            if entry == 0 {
+                // Level 0's rows are K lanes, each a cell with a zero high lane.
+                assert!(cells.iter().all(|cell| cell.c1 == 0));
+            }
+            edit(&mut cells[last]);
+        });
+        assert_forgery_rejected(forgery, &child, vec![], vec![], &[]);
     }
 }
