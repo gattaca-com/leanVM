@@ -45,7 +45,7 @@ pub fn keccak_value(col: usize) -> Option<(usize, KeccakLane)> {
 }
 
 /// `log2` of the steps the hash tables are each completed to: the tallest's height.
-pub(crate) fn hash_kappa(taus: &[usize; tables::N_TABLES]) -> usize {
+pub fn hash_kappa(taus: &[usize; tables::N_TABLES]) -> usize {
     verifier::layout::HASH_TABLES
         .iter()
         .map(|&t| taus[t])

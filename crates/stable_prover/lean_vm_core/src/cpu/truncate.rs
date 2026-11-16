@@ -6,18 +6,19 @@
 //! pieces, and each is cut again by the slot blocks of the half ([`crate::keccak::slot_blocks`]): a piece holds the
 //! slots of one block for the rows of one row piece, laid out `(row, slot within the block)`. The rest of a half is its
 //! public pad in the committed slots, and the slots no block holds (the padding lanes of a `KECCAK64` row) are public
-//! constants on every row.
+//! constants on every row. The layout maths of these pieces is the verifier's ([`verifier::Qt`]).
 
 use super::layout::{hash_kappa, qkeccak_slot_start};
-use super::{BYTECODE_FINAL_COUNTERS, GLOBAL_COLUMN_BASES, MEMORY_FINAL_COUNTERS, ProveError, QKECCAK};
-use crate::keccak::{public_slot, slot_blocks};
+use super::{
+    BYTECODE_FINAL_COUNTERS, GLOBAL_COLUMN_BASES, MEMORY_FINAL_COUNTERS, ProveError, QKECCAK, from_scalar, to_scalar,
+};
+use crate::keccak::public_slot;
 use crate::pcs::{self, RingSwitchClaim, RingSwitchOpen, StackClaim, StackPart};
 use crate::tables;
 use crate::witness::{self, Placement, StackShape};
 use primitives::field::{F64, F128};
-use verifier::layout::{HASH_TABLES, pieces};
-
-pub use verifier::layout::qt_pad;
+use verifier::layout::pieces;
+use verifier::{E, Qt};
 
 /// The pieces' digits of a column of `2^k` rows whose first `real` rows are real: bit `j` of the result says a piece
 /// of `2^(k - j)` rows, `j = 0` being the whole column.
@@ -52,86 +53,6 @@ impl Item {
     }
 }
 
-/// `eq(bits(i), point)`, bit 0 first.
-fn eq_bits(i: usize, point: &[F128]) -> F128 {
-    point
-        .iter()
-        .enumerate()
-        .map(|(j, &x)| if i >> j & 1 == 1 { x } else { F128::ONE + x })
-        .product()
-}
-
-/// The factor a slot block puts on a claim at slot point `slot`: `eq` of the slot bits the block fixes, at the point's
-/// coordinates above the block's own.
-fn fixed_slot_factor(block: (usize, usize), slot: &[F128]) -> F128 {
-    (block.1..slot.len())
-        .map(|i| {
-            if block.0 >> i & 1 == 1 {
-                slot[i]
-            } else {
-                F128::ONE + slot[i]
-            }
-        })
-        .product()
-}
-
-/// `q_keccak` as pieces: those of each half are items of the compact stack, after the columns'.
-struct Region {
-    /// `log2` of the steps each table is completed to.
-    kappa: usize,
-    /// What a padding step holds in each slot of each half.
-    pads: [[F64; 64]; HASH_TABLES.len()],
-}
-
-impl Region {
-    /// `e_j` of a piece at the row point `zeta`: the weight of its rows in the column.
-    fn weight(&self, piece: &Item, zeta: &[F128]) -> F128 {
-        (piece.b..self.kappa)
-            .map(|i| {
-                if piece.off >> i & 1 == 1 {
-                    zeta[i]
-                } else {
-                    F128::ONE + zeta[i]
-                }
-            })
-            .product()
-    }
-
-    /// Asserts that `q_keccak` holds each half's pad past its covered rows in the committed slots, and the constants of
-    /// the public slots on every row.
-    fn check_pad(&self, qk: &[F64], pieces: &[Item]) {
-        for half in 0..HASH_TABLES.len() {
-            let covered = pieces
-                .iter()
-                .filter(|p| p.half == half)
-                .map(|p| p.off + (1 << p.b))
-                .max()
-                .expect("a half has a piece");
-            for (s, &want) in self.pads[half].iter().enumerate() {
-                let col = &qk[qkeccak_slot_start(self.kappa, half, s)..][..1 << self.kappa];
-                if let Some(constant) = public_slot(half, s) {
-                    assert!(
-                        col.iter().all(|&x| x.0 == constant),
-                        "q_keccak half {half} slot {s} is public and is not its constant {constant:x}"
-                    );
-                    continue;
-                }
-                if covered == 1 << self.kappa {
-                    continue;
-                }
-                assert!(
-                    col[col.len() - 1] == want && col[covered] == want,
-                    "q_keccak half {half} slot {s} does not end in the pad"
-                );
-                debug_assert!(
-                    col[covered..].iter().all(|&x| x == want),
-                    "half {half} slot {s} has data past the pad"
-                );
-            }
-        }
-    }
-}
-
 /// The compact stack's layout: the items of every committed column, in increasing column then offset, then those of
 /// `q_keccak`.
 pub(super) struct Compact {
@@ -143,7 +64,8 @@ pub(super) struct Compact {
     pub(super) shape: StackShape,
     /// Words the items occupy.
     pub(super) placed: usize,
-    region: Region,
+    /// `q_keccak`'s items as the verifier's pieces, at their offsets in this stack.
+    qt: Qt,
     /// The memory cells the memory columns' pieces cover.
     mem_count: usize,
     /// Whether the memory and the table columns are cut: the rate word announces it.
@@ -187,18 +109,15 @@ impl Compact {
             "q_keccak is 64 slots of each hash table"
         );
         // `q_keccak`: for each half, each of its slot blocks, the row pieces covering the half's rows.
-        for (half, &table) in HASH_TABLES.iter().enumerate() {
-            for &block in slot_blocks(half) {
-                items.extend(pieces(kappa, l.rows[table] as u64).into_iter().map(|(off, b)| Item {
-                    col: REGION,
-                    half,
-                    block,
-                    off: off as usize,
-                    b,
-                    dst: 0,
-                }));
-            }
-        }
+        let shapes = verifier::qt_piece_shapes(kappa, &l.rows.map(|rows| rows as u64));
+        items.extend(shapes.iter().map(|&(half, block, off, b)| Item {
+            col: REGION,
+            half,
+            block,
+            off: off as usize,
+            b,
+            dst: 0,
+        }));
         let kappas: Vec<Option<usize>> = items.iter().map(|it| Some(it.log_len())).collect();
         let (placements, shape) = witness::placements_of(&kappas);
         for (it, p) in items.iter_mut().zip(&placements) {
@@ -210,16 +129,14 @@ impl Compact {
                 log_committed: shape.mu,
             });
         }
+        let offsets = items[n_columns..].iter().map(|it| it.dst as u64).collect();
         Ok(Self {
+            qt: Qt::new(kappa, &shapes, offsets),
             items,
             starts,
             n_columns,
             shape,
             placed,
-            region: Region {
-                kappa,
-                pads: [0, 1].map(|half| qt_pad(half).map(F64)),
-            },
             mem_count,
             truncated,
         })
@@ -261,27 +178,46 @@ impl Compact {
     }
 
     /// The compact stack: each item copied from the full stack `q`, the tail zero. A column past its prefix must hold
-    /// its public value, which is what the verifier takes it to be.
+    /// its public value, which is what the verifier takes it to be. So must each slot of `q_keccak`, a column of
+    /// `2^kappa` rows: its half's pad past the half's covered rows, or a public slot's constant on all rows.
     pub(super) fn copy(&self, q: &[F64], l: &super::Layout) -> Vec<F64> {
+        let check = |words: &[F64], end: usize, pad: F64, what: std::fmt::Arguments| {
+            if end < words.len() {
+                assert!(
+                    words[end] == pad && words[words.len() - 1] == pad,
+                    "{what} is not its pad past row {end}"
+                );
+                debug_assert!(words[end..].iter().all(|&x| x == pad), "{what} has data past row {end}");
+            }
+        };
         for (c, p) in l.placements.iter().enumerate() {
             let Some(last) = self.column(c).last() else { continue };
-            let end = last.off + (1 << last.b);
-            if end < 1 << p.n_vars {
-                let column = &q[p.offset..][..1 << p.n_vars];
-                let pad = Self::pad(c);
-                assert!(
-                    column[end] == pad && column[column.len() - 1] == pad,
-                    "column {c} is not its pad past row {end}"
-                );
-                debug_assert!(
-                    column[end..].iter().all(|&x| x == pad),
-                    "column {c} has data past row {end}"
-                );
-            }
+            let column = &q[p.offset..][..1 << p.n_vars];
+            check(
+                column,
+                last.off + (1 << last.b),
+                Self::pad(c),
+                format_args!("column {c}"),
+            );
         }
         let qk = l.placements[QKECCAK];
         let qk_words = &q[qk.offset..][..1 << qk.n_vars];
-        self.region.check_pad(qk_words, self.region_items());
+        let kappa = self.qt.log_steps;
+        for (half, pads) in self.qt.pads.iter().enumerate() {
+            let items = self.region_items().iter().filter(|it| it.half == half);
+            let covered = items.map(|it| it.off + (1 << it.b)).max().expect("a half has a piece");
+            for (s, &pad) in pads.iter().enumerate() {
+                let words = &qk_words[qkeccak_slot_start(kappa, half, s)..][..1 << kappa];
+                match public_slot(half, s) {
+                    // The verifier fills a public slot in itself, so every row is checked, in release too.
+                    Some(constant) => assert!(
+                        words.iter().all(|&x| x.0 == constant),
+                        "q_keccak half {half} slot {s} is public and is not its constant {constant:x}"
+                    ),
+                    None => check(words, covered, F64(pad), format_args!("q_keccak half {half} slot {s}")),
+                }
+            }
+        }
         let placements: Vec<Placement> = self
             .items
             .iter()
@@ -294,7 +230,6 @@ impl Compact {
         for (it, window) in self.items.iter().zip(witness::split_stack(&mut compact, &placements)) {
             if it.col == REGION {
                 // Slot `block.0 + s` of the piece's rows: `2^b` words, at `s * 2^b` of the piece.
-                let kappa = self.region.kappa;
                 parallel::chunks_mut(window, 1 << it.b, |s, dst| {
                     let slot = it.block.0 + s;
                     dst.copy_from_slice(&qk_words[qkeccak_slot_start(kappa, it.half, slot) + it.off..][..dst.len()]);
@@ -322,18 +257,16 @@ impl Compact {
         mut ring: RingSwitchOpen,
     ) -> (Vec<StackClaim>, RingSwitchOpen) {
         let qk = l.placements[QKECCAK];
-        let r = &self.region;
-        let pieces = self.region_items();
+        let qt = &self.qt;
+        let kappa = qt.log_steps;
         let [input] = <[RingSwitchClaim; 1]>::try_from(std::mem::take(&mut ring.claims)).expect("one claim");
-        let (row, rest) = input.point.split_at(r.kappa);
-        let (table, slot) = rest.split_at(crate::keccak::TABLE_BITS);
+        let point: Vec<_> = input.point.iter().map(to_scalar).collect();
         ring.offset = 0;
-        ring.claims = pieces
-            .iter()
-            .map(|piece| RingSwitchClaim {
-                offset: piece.dst,
-                point: [&row[..piece.b], &slot[..piece.block.1]].concat(),
-                scale: eq_bits(piece.half, table) * r.weight(piece, row) * fixed_slot_factor(piece.block, slot),
+        ring.claims = (qt.pieces.iter().zip(qt.ring_split(&point)))
+            .map(|(piece, (point, scale))| RingSwitchClaim {
+                offset: piece.placement.index as usize,
+                point: point.into_iter().map(from_scalar).collect(),
+                scale: from_scalar(scale),
             })
             .collect();
         let mapped = claims
@@ -347,54 +280,33 @@ impl Compact {
                     unreachable!("the prover builds Point claims")
                 };
                 if (qk.offset..qk.offset + (1 << qk.n_vars)).contains(&offset) {
-                    let mut parts = Vec::new();
-                    if zeta.len() <= r.kappa {
+                    // The claimed value is not the opening's to know: the verifier moves it.
+                    let (zeta, value) = (zeta.iter().map(to_scalar).collect::<Vec<_>>(), E::new(0, 0));
+                    let (parts, _) = if zeta.len() <= kappa {
                         // A slot claim: the slot's column of its half, at the rows of its table, on the pieces of
                         // the slot's block.
                         let rel = offset - qk.offset;
-                        let (half, slot) = ((rel >> r.kappa) & (crate::keccak::TABLES - 1), rel >> (r.kappa + 1));
-                        let block = *slot_blocks(half)
-                            .iter()
-                            .find(|&&(start, log)| (start..start + (1 << log)).contains(&slot))
-                            .expect("a claim on a committed slot");
-                        let mut row = zeta;
-                        row.resize(r.kappa, F128::ZERO);
-                        let bits: Vec<F128> = (0..block.1)
-                            .map(|j| {
-                                if (slot - block.0) >> j & 1 == 1 {
-                                    F128::ONE
-                                } else {
-                                    F128::ZERO
-                                }
-                            })
-                            .collect();
-                        for piece in pieces.iter().filter(|p| p.half == half && p.block == block) {
-                            parts.push(StackPart {
-                                offset: piece.dst,
-                                low_point: [&row[..piece.b], &bits[..]].concat(),
-                                scale: r.weight(piece, &row),
-                            });
-                        }
+                        let (half, slot) = ((rel >> kappa) & (crate::keccak::TABLES - 1), rel >> (kappa + 1));
+                        qt.slot_claim(half, slot, &zeta, value)
+                            .expect("a claim on a committed slot")
                     } else {
                         // The Keccak output claim, at the whole of `q_keccak`.
                         assert!(
-                            offset == qk.offset && zeta.len() == r.kappa + crate::keccak::TABLE_BITS + 6,
+                            offset == qk.offset && zeta.len() == kappa + crate::keccak::TABLE_BITS + 6,
                             "the output claim covers q_keccak"
                         );
-                        let (row, rest) = zeta.split_at(r.kappa);
-                        let (table, slot) = rest.split_at(crate::keccak::TABLE_BITS);
-                        for half in 0..HASH_TABLES.len() {
-                            let eq = eq_bits(half, table);
-                            for piece in pieces.iter().filter(|p| p.half == half) {
-                                parts.push(StackPart {
-                                    offset: piece.dst,
-                                    low_point: [&row[..piece.b], &slot[..piece.block.1]].concat(),
-                                    scale: eq * r.weight(piece, row) * fixed_slot_factor(piece.block, slot),
-                                });
-                            }
-                        }
-                    }
-                    return StackClaim::Sum(parts);
+                        qt.output_claim(&zeta, value)
+                    };
+                    return StackClaim::Sum(
+                        parts
+                            .into_iter()
+                            .map(|(piece, at, scale)| StackPart {
+                                offset: piece.placement.index as usize,
+                                low_point: at.into_iter().map(from_scalar).collect(),
+                                scale: from_scalar(scale),
+                            })
+                            .collect(),
+                    );
                 }
                 let c = l
                     .placements

@@ -33,6 +33,8 @@ pub(crate) const KECCAK64_ROW_CELLS: usize = 6;
 
 /// `log2` of the tables the reduction proves together: `KECCAK` is half 0 of `q_keccak`, `KECCAK64` half 1.
 pub const TABLE_BITS: usize = verifier::layout::TABLE_BITS;
+/// The layout's slots the verifier owns: which `KECCAK64` slots are public, and the blocks of the others.
+pub use verifier::layout::{KECCAK64_PUBLIC_SLOTS, public_slot, slot_blocks};
 /// The tables the reduction proves together.
 pub const TABLES: usize = 1 << TABLE_BITS;
 /// The half of `q_keccak`, and the table bit, of `KECCAK` and of `KECCAK64`.
@@ -49,26 +51,6 @@ pub(crate) fn kappa(rows: [usize; TABLES]) -> usize {
         .map(|n| Shape::new(n, DEPTH).n_log())
         .max()
         .expect("hash tables")
-}
-
-/// The slots of `q_keccak` a `KECCAK64` row does not commit: lanes 8 to 23 of its input state hold the padding on every row,
-/// executed or not. They are public constants, [`verifier::layout::keccak64_pad`]'s.
-pub const KECCAK64_PUBLIC_SLOTS: std::ops::Range<usize> = 8..24;
-
-/// The slot blocks a half of `q_keccak` commits, `(first slot, log slots)`, each an aligned cube of the slot index. A
-/// piece of a half is a row piece times a block. `KECCAK` commits all 64 slots in one block. `KECCAK64` leaves out the public
-/// slots 8 to 23: slots 0 to 7, 24 to 31 (lane 24 and the middle state's first seven lanes), and 32 to 63.
-pub const fn slot_blocks(half: usize) -> &'static [(usize, usize)] {
-    if half == KECCAK_HALF {
-        &[(0, 6)]
-    } else {
-        &[(0, 3), (24, 3), (32, 5)]
-    }
-}
-
-/// The constant slot `slot` of a half holds on every row, if it is public.
-pub fn public_slot(half: usize, slot: usize) -> Option<u64> {
-    (half == KECCAK64_HALF && KECCAK64_PUBLIC_SLOTS.contains(&slot)).then(|| verifier::layout::keccak64_pad()[slot])
 }
 
 /// The input every padding step of each table holds: zeros for `KECCAK`, a message of zeros for `KECCAK64`.
