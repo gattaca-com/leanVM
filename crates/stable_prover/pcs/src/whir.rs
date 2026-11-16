@@ -356,7 +356,7 @@ mod tests {
                     .collect();
                 let ring = RingSwitchOpen {
                     offset: 0,
-                    points: Vec::new(),
+                    claims: Vec::new(),
                 };
                 let prove = |msg: &[F64]| {
                     let mut ps = ProverState::from_label(b"whir-test");

@@ -8,7 +8,7 @@
 //! are only ever needed as the one they add up to: the committed polynomial at that point.
 
 use pcs::sumcheck::product_sumcheck;
-use pcs::{RingSwitchOpen, StackClaim};
+use pcs::{RingSwitchClaim, RingSwitchOpen, StackClaim};
 use primitives::bit_fold::BitFold;
 use primitives::field::{F64, F128, dot};
 use primitives::hash::STATE_LANES;
@@ -26,6 +26,8 @@ use crate::witness::{Shape, transpose64};
 pub struct Openings {
     pub outputs: Option<Vec<F128>>,
     pub inputs: Vec<F128>,
+    /// The 64 slices at the point `inputs`, which the reduction sent.
+    pub input_slices: Vec<F128>,
 }
 
 impl Openings {
@@ -34,7 +36,10 @@ impl Openings {
     pub fn into_pcs_claims(self, offset: usize) -> (RingSwitchOpen, Option<StackClaim>) {
         let ring = RingSwitchOpen {
             offset,
-            points: vec![self.inputs],
+            claims: vec![RingSwitchClaim {
+                offset: 0,
+                point: self.inputs,
+            }],
         };
         let outputs = self.outputs.map(|low_point| StackClaim::Point { offset, low_point });
         (ring, outputs)
@@ -133,8 +138,9 @@ pub fn open_outputs(
 }
 
 /// Open the claim on the inputs: the instances of a pack first, then the table, then the slot. The tables' states
-/// fold at the claim's table coordinates, which become coordinates of the opening's point. Returns that point.
-pub fn open_inputs(ps: &mut ProverState, shape: Shape, committed: &[F64], claim: &Claim) -> Vec<F128> {
+/// fold at the claim's table coordinates, which become coordinates of the opening's point. Returns that point and the
+/// 64 slices sent there.
+pub fn open_inputs(ps: &mut ProverState, shape: Shape, committed: &[F64], claim: &Claim) -> (Vec<F128>, Vec<F128>) {
     let pack = &claim.point[..shape.pack_vars()];
     let table_point = &claim.point[shape.pack_vars() + shape.round_seg_log()..];
     let folded = slices(shape, committed, &[pack, table_point].concat());
@@ -160,5 +166,5 @@ pub fn open_inputs(ps: &mut ProverState, shape: Shape, committed: &[F64], claim:
     }
     let (slices, _, slot) = product_sumcheck(ps, at_instance, weights, 64, mu[0]);
     ps.add_scalars(&slices);
-    [&low, pack, table_point, &slot].concat()
+    ([&low, pack, table_point, &slot].concat(), slices)
 }

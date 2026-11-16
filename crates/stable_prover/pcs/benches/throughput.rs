@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use bench::{Plan, Timing, env_usize};
 use isa::pretty_integer;
-use pcs::{RingSwitchOpen, StackClaim, commit, open};
+use pcs::{RingSwitchClaim, RingSwitchOpen, StackClaim, commit, open};
 use primitives::{field::F64, test_rng::Rng};
 use verifier::MIN_LOG_INV_RATE;
 
@@ -53,8 +53,11 @@ fn main() {
     }
     let ring = RingSwitchOpen {
         offset: 0,
-        points: (0..env_usize("PCS_RING_CLAIMS", 0))
-            .map(|_| rng.ext_vec(log_n - 1))
+        claims: (0..env_usize("PCS_RING_CLAIMS", 0))
+            .map(|_| RingSwitchClaim {
+                offset: 0,
+                point: rng.ext_vec(log_n - 1),
+            })
             .collect(),
     };
 

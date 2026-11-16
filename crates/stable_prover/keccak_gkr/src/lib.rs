@@ -102,7 +102,11 @@ impl Witness {
 
         let _span = tracing::info_span!("Openings").entered();
         let outputs = (shape.round_segments() > 1).then(|| open::open_outputs(ps, shape, &instance, &first, words));
-        let inputs = open::open_inputs(ps, shape, committed, &claim);
-        Openings { outputs, inputs }
+        let (inputs, input_slices) = open::open_inputs(ps, shape, committed, &claim);
+        Openings {
+            outputs,
+            inputs,
+            input_slices,
+        }
     }
 }

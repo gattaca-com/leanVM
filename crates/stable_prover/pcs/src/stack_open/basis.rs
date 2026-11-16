@@ -302,15 +302,14 @@ impl<'a> Projection<'a> {
 /// The opening's weight as terms, and its table `A`: a row of [`Terms::n_terms`] for each of the
 /// `2^(log_n - lane_vars)` lanes.
 ///
-/// `lane_vars` must be at least [`LOW_VARS`], and every claim must lie inside `2^log_n` words. The ring claims lie at
-/// `ring_offset`.
+/// `lane_vars` must be at least [`LOW_VARS`], and every claim must lie inside `2^log_n` words. Each ring claim is
+/// given with the offset of its block.
 pub(super) fn initial_basis(
     log_n: usize,
     lane_vars: usize,
     claims: &[StackClaim],
     lambdas: &[F128],
-    ring_offset: usize,
-    rings: &[RingWeight],
+    rings: &[(usize, RingWeight)],
 ) -> (Terms, Vec<F128>) {
     assert_eq!(claims.len(), lambdas.len());
     assert!(lane_vars >= LOW_VARS, "a lane block holds at least one block");
@@ -356,13 +355,13 @@ pub(super) fn initial_basis(
         }
     }
     let mut ring_lanes = Vec::new();
-    for (i, weight) in rings.iter().enumerate() {
-        let factors = point_factors(&weight.point, ring_offset, log_n);
+    for (i, (offset, weight)) in rings.iter().enumerate() {
+        let factors = point_factors(&weight.point, *offset, log_n);
         terms.rings.push(Ring {
             fold: BitFold::new(&table(&factors[..LOW_VARS])),
             e_hi: table(&factors[LOW_VARS..lane_vars]),
             point: weight.point.clone(),
-            x_offset: ring_offset & ((1 << lane_vars) - 1),
+            x_offset: offset & ((1 << lane_vars) - 1),
             first: claims.len() + DEGREE_E * i,
         });
         ring_lanes.push(table(&factors[lane_vars..]));
@@ -376,7 +375,7 @@ pub(super) fn initial_basis(
         for ((term, lanes), &lambda) in row.iter_mut().zip(&claim_lanes).zip(lambdas) {
             *term = lambda * lanes[l];
         }
-        for ((ring, weight), lanes) in terms.rings.iter().zip(rings).zip(&ring_lanes) {
+        for ((ring, (_, weight)), lanes) in terms.rings.iter().zip(rings).zip(&ring_lanes) {
             if lanes[l] != F128::ZERO {
                 for (w, term) in row[ring.first..][..DEGREE_E].iter_mut().enumerate() {
                     *term = weight.apply(F128::from(1u128 << w) * lanes[l]);
