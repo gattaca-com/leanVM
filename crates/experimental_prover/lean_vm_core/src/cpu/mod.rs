@@ -1191,4 +1191,37 @@ mod tests {
         let exec = execute(&program, &[], pi).unwrap();
         assert_eq!(exec.mem.word(4), x * y, "MUL computes the E product");
     }
+
+    /// A frame past the first page of cells keeps its words and access counts, and its program proves
+    /// the same bytes twice.
+    #[test]
+    fn dynamic_high_frame_keeps_its_memory_and_counts() {
+        let high = 1 << 16;
+        let fill = Op::Xor { a: 0, b: 0, c: 0 };
+        let jump = Op::Jump { oc: 0, od: 0, of: 1 };
+        let pi = [F128::from(g_pow(3)), F128::from(g_pow(high))];
+        let program = from_bytecode(
+            vec![
+                jump,
+                fill,
+                fill,
+                set(0, F128::from(g_pow(7))),
+                set(1, F128::ONE),
+                jump,
+                fill,
+                fill,
+            ],
+            2,
+        );
+        let exec = execute(&program, &[], pi).unwrap();
+        assert_eq!(exec.mem_used, high + 2);
+        assert_eq!(exec.mem.len(), (high + 2).next_power_of_two());
+        assert_eq!(exec.mem.word(high), F128::from(g_pow(7)));
+        assert_eq!(exec.mem.word(high + 1), F128::ONE);
+        assert_eq!(exec.mem.page(high >> Memory::page_log()).unwrap()[0].count, 3);
+        let (first, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &first).unwrap();
+        let (second, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        assert_eq!(first.to_bytes(), second.to_bytes());
+    }
 }
