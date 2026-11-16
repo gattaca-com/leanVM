@@ -98,12 +98,10 @@ impl<F: TreeField> Leaves<'_, F> {
     }
 }
 
-/// Stored blocks, columns read directly until the first fold, or the values as rows.
+/// Stored blocks, or columns read directly until the first fold.
 pub enum LeafData<'a, F: TreeField> {
     Blocks(Store<F::Block>),
     Columns(Columns<'a, F>),
-    /// What a builder that does not lay out blocks writes: block `b` is rows `64 b..64 b + 64`.
-    Rows(Vec<F>),
 }
 
 impl<F: TreeField> Default for LeafData<'_, F> {
@@ -117,14 +115,12 @@ impl<'a, F: TreeField> LeafData<'a, F> {
         match self {
             Self::Blocks(blocks) => F::leaf(blocks, l),
             Self::Columns(columns) => columns.read::<1>(l)[0],
-            Self::Rows(rows) => rows[l],
         }
     }
 
     fn state(self, len: usize, width: usize) -> QuaternaryLayerState<'a> {
         match self {
             Self::Blocks(blocks) => F::state_from_blocks(blocks, len, width),
-            Self::Rows(rows) => QuaternaryLayerState::new(rows, width),
             Self::Columns(columns) if len <= BLOCK_VALUES => {
                 QuaternaryLayerState::small((0..len).map(|l| columns.read::<1>(l)[0].embed()), width)
             }
@@ -383,9 +379,13 @@ impl TreeField for F64 {
     }
 }
 
+/// Overwrite leaf `l` of a block table.
+pub(crate) fn set_leaf(blocks: &mut [Block], l: usize, value: F128) {
+    blocks[l / BLOCK_VALUES][l % 8].set_lane(l / 8 % 8, value);
+}
+
 /// `leaves[4k] · … · leaves[4k + 3]` of a block table, whose tail is the identity.
-#[cfg(test)]
-fn quad_at<F: TreeField>(leaves: &[F::Block], k: usize) -> F {
+pub(crate) fn quad_at<F: TreeField>(leaves: &[F::Block], k: usize) -> F {
     F::product4(std::array::from_fn(|i| F::leaf(leaves, 4 * k + i)))
 }
 
