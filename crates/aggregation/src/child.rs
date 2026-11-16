@@ -4,7 +4,9 @@ use super::cells::count;
 use super::error::AggregateError;
 use super::hints::SubHints;
 use fiat_shamir_prover::merkle::{hash_pair, hash_to_scalars, hash_words};
-use lean_vm_core::cpu::{QKECCAK, block_kappa_sources, col_kappa_sources, from_scalar, layout_of, piece_digits};
+use lean_vm_core::cpu::{
+    KAPPA_SOURCE, QKECCAK, block_kappa_sources, col_kappa_sources, from_scalar, layout_of, piece_digits,
+};
 use lean_vm_core::leaf::{self, Block};
 use primitives::field::F128;
 use verifier::layout::N_TABLES;
@@ -118,6 +120,13 @@ pub(super) fn gen_verify(
         ("zc_tau_max", vec![count(*taus.iter().max().unwrap())]),
         // Every table's log height, which the guest certifies against its row count.
         ("table_logs", taus.iter().map(|&t| count(t)).collect()),
+        // Which of the two hash tables is the taller, the second's pick: the height the reduction completes both to.
+        (
+            "kappa_pick",
+            vec![F128::from(u128::from(
+                taus[verifier::layout::OP_KECCAK64] > taus[verifier::layout::OP_KECCAK],
+            ))],
+        ),
         ("col_slot_order", col_slot_order(kbc, summary, &taus)),
         ("block_group_order", block_group_order(kbc, &sides)),
     ];
@@ -141,6 +150,11 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
     let source_log = |source: usize| match source {
         0 => 0,
         1 => summary.log_memory,
+        KAPPA_SOURCE => verifier::layout::HASH_TABLES
+            .iter()
+            .map(|&t| taus[t])
+            .max()
+            .expect("hash tables"),
         s => taus[s - 2],
     };
     let digits = |source: usize| {
@@ -148,6 +162,7 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
         let real = match truncation {
             None => 1 << k,
             Some(t) if source == 1 => t.mem_count as usize,
+            Some(_) if source == KAPPA_SOURCE => 1 << k,
             Some(_) => summary.table_rows[source - 2] as usize,
         };
         piece_digits(k, real)

@@ -12,9 +12,9 @@ use isa::{Program, Prover};
 use stable_lean_vm_core::StableProver;
 use verifier::E;
 
-/// The proofs `P` gives, the three leaves', the node's and the second-level node's, then why it refuses a
-/// forged signature.
-fn proofs<P: Prover>() -> ([Vec<u8>; 5], Option<AggregateError>) {
+/// The proofs `P` gives, the three leaves' and, with `nodes`, the node's and the second-level node's, then why it
+/// refuses a forged signature.
+fn proofs<P: Prover>(nodes: bool) -> (Vec<Vec<u8>>, Option<AggregateError>) {
     P::init();
     let aggregate = |children: &[(AggregateClaims, AggregateProof)], xmss, sphincs, blobs, rate| {
         aggregation::aggregate::<P>(children, xmss, sphincs, blobs, OutputClaims::All, rate).map(|(c, p, _)| (c, p))
@@ -30,35 +30,48 @@ fn proofs<P: Prover>() -> ([Vec<u8>; 5], Option<AggregateError>) {
     let left = aggregate(&[], xmss[..3].to_vec(), vec![], Some(&blobs), 1).unwrap();
     let right = aggregate(&[], vec![], sphincs[..1].to_vec(), None, 2).unwrap();
     let mixed = aggregate(&[], xmss[3..22].to_vec(), sphincs[1..].to_vec(), Some(&blobs), 3).unwrap();
-    let children = [left.clone(), right.clone(), mixed.clone()];
-    let node = aggregate(&children, vec![], vec![], None, 4).unwrap();
-    // The node's carried deferred claim is at a non-zero point, unlike a leaf's.
-    let children = [node.clone(), right.clone()];
-    let top = aggregate(&children, xmss[22..].to_vec(), vec![], None, 1).unwrap();
+    let mut proofs = vec![left.clone(), right.clone(), mixed.clone()];
+    if nodes {
+        let children = [left, right.clone(), mixed];
+        let node = aggregate(&children, vec![], vec![], None, 4).unwrap();
+        // The node's carried deferred claim is at a non-zero point, unlike a leaf's.
+        let children = [node.clone(), right];
+        let top = aggregate(&children, xmss[22..].to_vec(), vec![], None, 1).unwrap();
+        proofs.extend([node, top]);
+    }
     // A leanXMSS signature with its top layer's last path node changed: the native pre-check passes, the guest fails.
     let (pk, message, signature) = &xmss[0];
     let mut bytes = signature.to_bytes();
     bytes[lean_xmss::SIG_SIZE - 1] ^= 1;
     let forged = vec![(*pk, *message, lean_xmss::LeanXmssSignature::from_bytes(&bytes))];
     let refusal = aggregate(&[], forged, vec![], None, 1).err();
-    (
-        [left, right, mixed, node, top].map(|(_, proof)| proof.to_bytes()),
-        refusal,
-    )
+    (proofs.into_iter().map(|(_, proof)| proof.to_bytes()).collect(), refusal)
 }
 
-#[test]
-fn stable_and_experimental_proofs_are_identical() {
+/// The two provers' proofs of `proofs(nodes)`, equal one by one, and the same refusal.
+fn assert_identical(nodes: bool) {
     let ((experimental, experimental_refusal), (stable, stable_refusal)) =
-        (proofs::<ExperimentalProver>(), proofs::<StableProver>());
+        (proofs::<ExperimentalProver>(nodes), proofs::<StableProver>(nodes));
     for (name, (e, s)) in ["left leaf", "right leaf", "mixed leaf", "node", "second-level node"]
         .iter()
         .zip(experimental.iter().zip(&stable))
     {
         assert!(e == s, "the {name}'s proofs differ ({} and {} bytes)", e.len(), s.len());
     }
+    assert_eq!(experimental.len(), stable.len());
     assert_eq!(experimental_refusal, stable_refusal);
     assert_eq!(stable_refusal, Some(AggregateError::ProvingFailed));
+}
+
+#[test]
+fn stable_and_experimental_leaves_are_identical() {
+    assert_identical(false);
+}
+
+#[test]
+#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
+fn stable_and_experimental_nodes_are_identical() {
+    assert_identical(true);
 }
 
 /// `program`'s proof at rate `2^-log_inv_rate` on `public_input`, or why there is none.

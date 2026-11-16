@@ -178,6 +178,7 @@ LOG2_BYTECODE_COLS = LOG2_BYTECODE_COLS_PLACEHOLDER
 # is sized for at least one block of 2^9 steps).
 TABLE_JUMP = 4
 TABLE_KECCAK = 5
+TABLE_KECCAK64 = 6
 N_TABLES = N_TABLES_PLACEHOLDER
 FLOORS = FLOORS_PLACEHOLDER
 N_TABLE_COLS = N_TABLE_COLS_PLACEHOLDER
@@ -2413,9 +2414,9 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
     # count need offsets (pull's slots go unread).
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
     rate = StackBuf(8)
-    kb = StackBuf(N_TABLES + 2)  # kappa_base, in the frame
+    kb = StackBuf(N_TABLES + 3)  # kappa_base, in the frame
     kb[0] = 1
-    for t in unroll(0, N_TABLES + 1):
+    for t in unroll(0, N_TABLES + 2):
         kb[1 + t] = dims_g[GEN ** t]
     # A block group, a run of a side's blocks sharing one kappa source, is consecutive
     # in its side's order, so a hinted order of the groups, certified strictly
@@ -3488,8 +3489,8 @@ def certify_placement(kappa_base, g_squares, pieces, qt):
     # Under QT q_keccak's region follows the other items at the next multiple of its size.
     # Returns g^(the words placed), and each piece's g^offset and g^kappa, at
     # N_PIECES c + j for piece j of column c.
-    kb = StackBuf(N_TABLES + 2)
-    for i in unroll(0, N_TABLES + 2):
+    kb = StackBuf(N_TABLES + 3)
+    for i in unroll(0, N_TABLES + 3):
         kb[i] = kappa_base[GEN ** i]
     rank_keys = g_squares * GEN ** RANK_KEYS_AT
     slot_key = HeapBuf(N_SLOTS)
@@ -3643,8 +3644,8 @@ def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem
 
     # Every low dimension here is a certified log at a baked kappa source, as
     # certify_placement derives the columns'.
-    kb = StackBuf(N_TABLES + 2)
-    for i in unroll(0, N_TABLES + 2):
+    kb = StackBuf(N_TABLES + 3)
+    for i in unroll(0, N_TABLES + 3):
         kb[i] = kappa_base[GEN ** i]
     sel_eq = selector_tables(point, point1)
     sel_g = g_squares * GEN ** SIZE_BITS  # exponent_tables' constant nibble shares
@@ -3848,7 +3849,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     assert (1 + trunc) * mem_count == 0
     rate_sel = g_power_of_word(log_inv_rate) / GEN
     assert log(rate_sel) < LIG_N_RATES
-    dims_g = HeapBuf(N_TABLES + 1)  # [g^log_mem, g^tau_0 .. g^tau_{N_TABLES-1}]
+    dims_g = HeapBuf(N_TABLES + 2)  # [g^log_mem, g^tau_0 .. g^tau_{N_TABLES-1}, g^kappa]
     g_log_mem = g_power_of_word(log_mem_word)
     assert log(g_log_mem) < MAX_LOG_MEM + 1  # native log_mem <= MAX_LOG_MEM
     assert log(g_log_mem / GEN ** MIN_LOG_MEM) < COUNT_BITS  # native MIN_LOG_MEM <= log_mem
@@ -3857,17 +3858,27 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     assert (g_mem + 1) * trunc + 1 + trunc != 0
     dims_g[GEN ** 0] = g_log_mem
     hint_witness(dims_g[1:1 + N_TABLES], "table_logs")  # certified in verify_tables
+    # The Keccak reduction completes each hash table to the taller one's height: kappa is the
+    # larger of the two taus, selected by a hinted bit and checked to be one of them and not below either.
+    tau_a = dims_g[GEN ** (TABLE_KECCAK + 1)]
+    tau_b = dims_g[GEN ** (TABLE_KECCAK64 + 1)]
+    pick_b = hint_witness("kappa_pick")
+    assert pick_b * (pick_b + 1) == 0
+    kappa_g = tau_a * (1 + pick_b * (1 + tau_b / tau_a))
+    assert log(kappa_g / tau_a) < SIZE_BITS
+    assert log(kappa_g / tau_b) < SIZE_BITS
+    dims_g[GEN ** (N_TABLES + 1)] = kappa_g
     # kappa_base maps a kappa source index to its certified log (source 0
     # = const via the baked adj). Each block's kappa then DERIVES from its
     # structural source as a compile-time offset off a certified log: no hint, and
     # nothing left free.
-    kappa_base = HeapBuf(N_TABLES + 2)
-    kb = StackBuf(N_TABLES + 2)  # the same, in the frame
+    kappa_base = HeapBuf(N_TABLES + 3)
+    kb = StackBuf(N_TABLES + 3)  # the same, in the frame
     kb[0] = 1
     kb[1] = g_log_mem
-    for t in unroll(0, N_TABLES):
+    for t in unroll(0, N_TABLES + 1):
         kb[2 + t] = dims_g[GEN ** (t + 1)]
-    for i in unroll(0, N_TABLES + 2):
+    for i in unroll(0, N_TABLES + 3):
         kappa_base[GEN ** i] = kb[i]
     # The ONE bus depth, COMPUTED (not hinted): mu = log2_ceil(Σ_b 2^κ_b) over
     # PUSH's blocks; pull matches by pairing, the count tree is padded to it.

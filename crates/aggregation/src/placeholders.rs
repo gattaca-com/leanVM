@@ -20,7 +20,7 @@ use lean_vm_core::cpu::{
     to_scalar, xi_form_base,
 };
 use lean_vm_core::gkr::{ROUND_GRIND, y_grind};
-use lean_vm_core::keccak::{MIN_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG};
+use lean_vm_core::keccak::{ONE_TABLE_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG};
 use lean_vm_core::leaf::{self, Block, Coord};
 use pcs::ntt::AdditiveNttF64;
 use primitives::field::{F64, F128, g_pow};
@@ -443,8 +443,9 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
             // A table column's claim is at its table's chi[..tau].
             ClaimSite::TableColumn { column, table } => match keccak_value(column) {
                 None => (POINT_BUF_RHO, compact_col(column), 0, (2 + table, 0)),
-                Some(KeccakLane::Slot(slot)) => (POINT_BUF_QKECCAK_RHO, qkeccak, slot, (2 + table, 0)),
-                Some(KeccakLane::Output(_)) => (POINT_BUF_KECCAK_OUT, qkeccak, 0, (2 + table, 0)),
+                // The guest reads one half of `q_keccak`, the KECCAK table's: a slot is named by its bits alone.
+                Some((_, KeccakLane::Slot(slot))) => (POINT_BUF_QKECCAK_RHO, qkeccak, slot, (2 + table, 0)),
+                Some((_, KeccakLane::Output(_))) => (POINT_BUF_KECCAK_OUT, qkeccak, 0, (2 + table, 0)),
             },
             ClaimSite::MemoryLimb { column } => (POINT_BUF_PI, compact_col(column), 0, (1, 0)),
         })
@@ -466,14 +467,28 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
             .iter()
             .flat_map(|c| (0..SLOT_LOG).map(move |k| (c.qkeccak_slot >> k) & 1)),
     );
-    // The output lanes' claims, consecutive in the pool: the reduction's claim on the output.
-    let out_pool = claims
-        .iter()
-        .position(|c| c.buffer == POINT_BUF_KECCAK_OUT)
-        .expect("the output lanes' claims");
+    // The output lanes' claims, in two runs in the pool, `KECCAK`'s 25 then `KECCAK64`'s 4: the reduction's claim on
+    // the output.
+    let outs: Vec<usize> = (0..claims.len())
+        .filter(|&j| claims[j].buffer == POINT_BUF_KECCAK_OUT)
+        .collect();
+    assert_eq!(
+        outs.len(),
+        keccak256::STATE_LANES + verifier::layout::KECCAK64_OUT_LANES
+    );
+    let out_pool = outs[0];
     assert!(
-        (0..claims.len()).all(|j| (claims[j].buffer == POINT_BUF_KECCAK_OUT)
-            == (out_pool..out_pool + keccak256::STATE_LANES).contains(&j))
+        outs[..keccak256::STATE_LANES]
+            .iter()
+            .enumerate()
+            .all(|(lane, &j)| j == out_pool + lane)
+    );
+    let keccak64_out_pool = outs[keccak256::STATE_LANES];
+    assert!(
+        outs[keccak256::STATE_LANES..]
+            .iter()
+            .enumerate()
+            .all(|(lane, &j)| j == keccak64_out_pool + lane)
     );
     ph.set("KECCAK_OUT_POOL", out_pool);
     // The stacked opening batches the ring-switched claim, the pool's on-stack claims and the
@@ -509,8 +524,8 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
     ph.list("COMBO_SRC", combos.iter().map(|c| c.1));
     ph.list("CLAIM_COMBO", claim_combo);
     ph.set("MFCNT_COMMITTED_COL", mfcnt);
-    // Under QT a slot's claim adds the pad of its slot past the covered chunks.
-    let pad = qt_pad();
+    // Under QT a slot's claim adds the pad of its slot past the covered rows: the KECCAK table's half's.
+    let pad = qt_pad(0);
     ph.list(
         "CLAIM_QT_PAD",
         claims.iter().map(|c| match c.buffer {
