@@ -181,11 +181,7 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
         0 => 0,
         1 => summary.log_memory,
         // The hash tables are completed to the taller one's height, and so are the halves of `q_keccak`.
-        s if s >= KAPPA_SOURCE => verifier::layout::HASH_TABLES
-            .iter()
-            .map(|&t| taus[t])
-            .max()
-            .expect("hash tables"),
+        s if s >= KAPPA_SOURCE => lean_vm_core::cpu::hash_kappa(taus),
         s => taus[s - 2],
     };
     let digits = |source: usize| {

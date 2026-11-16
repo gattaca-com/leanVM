@@ -562,12 +562,11 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
     // A claim on one weighs each piece by the eq of its point's top coordinates: one set per point
     // buffer and source, its `combo`.
     let cks: Vec<(usize, usize)> = col_kappa_sources(kbc).into_iter().flatten().collect();
-    let pieced = |column: usize| column != qkeccak && cut(cks[column]);
     let mut combos: Vec<(usize, usize)> = Vec::new();
     let claim_combo: Vec<usize> = claims
         .iter()
         .map(|c| {
-            if c.buffer == POINT_BUF_KECCAK_OUT || c.buffer == POINT_BUF_QKECCAK_RHO || !pieced(c.column) {
+            if c.buffer == POINT_BUF_KECCAK_OUT || c.buffer == POINT_BUF_QKECCAK_RHO || !cut(cks[c.column]) {
                 return NO_COMBO;
             }
             let combo = (c.buffer, cks[c.column].0);
@@ -578,7 +577,7 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
         })
         .collect();
     let mfcnt = compact_col(MEMORY_FINAL_COUNTERS);
-    assert!(pieced(mfcnt), "the memory counters are cut");
+    assert!(cut(cks[mfcnt]), "the memory counters are cut");
     ph.set("NO_COMBO", NO_COMBO);
     ph.set("N_COMBOS", combos.len());
     ph.list("COMBO_BUF", combos.iter().map(|c| c.0));
@@ -595,21 +594,11 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
             _ => 0,
         }),
     );
-    // The row pad of a half is in its committed slots only: the public slots of `KECCAK64` hold their constants on every
-    // row, `QT_PUBLIC`, and are no pad.
+    // The row pad of a half is zero in its public slots, which hold their constants on every row, `QT_PUBLIC`.
     let publics: Vec<u64> = (0..TABLES)
         .flat_map(|half| (0..1 << SLOT_LOG).map(move |s| public_slot(half, s).unwrap_or(0)))
         .collect();
-    let committed_pads: Vec<u64> = pads
-        .iter()
-        .enumerate()
-        .flat_map(|(half, pad)| {
-            pad.iter()
-                .enumerate()
-                .map(move |(s, &word)| if public_slot(half, s).is_some() { 0 } else { word })
-        })
-        .collect();
-    ph.list("QT_PAD", committed_pads);
+    ph.list("QT_PAD", pads.iter().flatten().copied());
     ph.list("QT_PUBLIC", publics);
     // The blocks of the halves of q_keccak, as columns of the guest after the native ones.
     let qt_cols = qt_columns();
