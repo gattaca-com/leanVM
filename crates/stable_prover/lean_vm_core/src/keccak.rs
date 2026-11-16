@@ -58,6 +58,17 @@ pub(crate) fn pad_inputs() -> [[u64; STATE_LANES]; TABLES] {
     [ZERO_PAD, verifier::layout::keccak64_pad()]
 }
 
+/// The 25 lanes of a `KECCAK64` row's state, from the four cells `cell(0..4)` it reads.
+pub(crate) fn keccak64_state(cell: impl Fn(usize) -> F128) -> [u64; STATE_LANES] {
+    let mut state = verifier::layout::keccak64_pad();
+    for c in 0..4 {
+        let w = cell(c);
+        state[2 * c] = w.c0;
+        state[2 * c + 1] = w.c1;
+    }
+    state
+}
+
 /// The 25 lanes the thirteen state cells `cell(0..13)` hold in a layout.
 pub(crate) fn state_of_cells(odd: bool, cell: impl Fn(usize) -> F128) -> [u64; STATE_LANES] {
     // The layout a constant, the loop compiles to straight-line moves.

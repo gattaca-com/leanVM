@@ -15,7 +15,7 @@
 //! identities to the table sumcheck as a degree-2 form (`Table::constraint`).
 
 use crate::constraints::Form;
-use crate::cpu::{Drow, Jrow, Krow, Memory, Op, Srow, Trace};
+use crate::cpu::{Drow, Jrow, Krow, Memory, Op, Srow, Trace, Trow};
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
 use primitives::field::{F64, F128, mul_by_g};
 use std::ops::Range;
@@ -923,7 +923,6 @@ impl Table for KeccakTable {
 /// their claims are the reduction's claim on the output. The other committed columns but `r_bc` and the three
 /// immediates ride the slots the states leave free.
 ///
-/// The stable prover runs no `KECCAK64` row yet, so the table is padding steps only.
 struct Keccak64Table;
 
 pub(crate) mod keccak64 {
@@ -954,6 +953,76 @@ pub(crate) mod keccak64 {
 /// order of the bytecode slots, and how far.
 const KECCAK64_CELLS: [(usize, u32); crate::keccak::KECCAK64_ROW_CELLS] =
     [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (4, 1)];
+
+/// A `KECCAK64` instruction: its offset operands `o_p`, `o_a`, `o_x`, `o_y` and `out` in the order of their bytecode
+/// slots, whether it writes the second output cell, and its immediates.
+#[derive(Clone, Copy)]
+pub(crate) struct Keccak64Op {
+    offsets: [u32; 5],
+    pub(crate) out_two: bool,
+    s_a: F64,
+    s_inv: F64,
+    k_a: F64,
+    k_y: F64,
+}
+
+impl Keccak64Op {
+    pub(crate) fn of(op: &Op) -> Self {
+        match *op {
+            Op::Keccak64 {
+                o,
+                out,
+                out_two,
+                s_a,
+                s_inv,
+                k_a,
+                k_y,
+            } => Self {
+                offsets: [o[0], o[1], o[2], o[3], out],
+                out_two,
+                s_a: F64(s_a.0),
+                s_inv: F64(s_inv.0),
+                k_a: F64(k_a.0),
+                k_y: F64(k_y.0),
+            },
+            op => unreachable!("not a KECCAK64: {op:?}"),
+        }
+    }
+
+    /// Whether the instruction is well formed: `s_inv` is the inverse of `s_a`, which is not zero.
+    pub(crate) fn well_formed(&self) -> bool {
+        self.s_a * self.s_inv == F64::ONE
+    }
+
+    /// The four cells of the message from the four cells read: `A'.lo = (A.lo + k_a) / s_a` and
+    /// `Y'.lo = Y.lo + k_y`, the high limbs as they are.
+    pub(crate) fn message(&self, cells: [F128; 4]) -> [F128; 4] {
+        let [p, a, x, y] = cells;
+        [
+            p,
+            F128::new(((F64(a.c0) + self.k_a) * self.s_inv).0, a.c1),
+            x,
+            F128::new((F64(y.c0) + self.k_y).0, y.c1),
+        ]
+    }
+
+    /// Cell `c` (in flush order) of a row at frame `fp`.
+    pub(crate) fn cell(&self, fp: u32, c: usize) -> u32 {
+        let (offset, step) = self.cell_parts(c);
+        fp + offset + step
+    }
+
+    /// Cell `c` of a row at frame `fp` is `fp + offset + step`.
+    pub(crate) fn cell_parts(&self, c: usize) -> (u32, u32) {
+        let (operand, step) = KECCAK64_CELLS[c];
+        (self.offsets[operand], step)
+    }
+
+    /// The cells the row touches: the four it reads, and the one or two it writes.
+    pub(crate) fn cells(&self) -> usize {
+        crate::keccak::KECCAK64_ROW_CELLS - usize::from(!self.out_two)
+    }
+}
 
 impl Table for Keccak64Table {
     fn n_committed_columns(&self) -> usize {
@@ -1014,11 +1083,40 @@ impl Table for Keccak64Table {
             }
         }
     }
-    /// Every column but the input lanes, which are `q_keccak`'s and have no window here: no row, so all padding.
+    /// Every column but the input lanes, which are `q_keccak`'s and have no window here. The output lanes are the
+    /// permutation of the message the row holds, of which the table keeps the first four.
     fn fill(&self, ctx: &FillCtx, out: &mut [&mut [F64]]) {
         use keccak64::*;
-        ctx.cols_at(out, 0, PC, |_| [F64::ZERO; V_IN]);
-        ctx.cols_at(out, 0, V_OUT, |_| [F64::ZERO; N - V_OUT]);
+        let rows = &ctx.trace.keccak64;
+        let op = |r: &Trow| Keccak64Op::of(&ctx.prog[r.pc as usize]);
+        ctx.col(out, rows, PC, |r| ctx.g_at(r.pc));
+        ctx.col(out, rows, FP, |r| ctx.g_at(r.fp));
+        ctx.cols(out, rows, O_A, |r| {
+            let k = op(r);
+            let [p, a, x, y, o] = k.offsets.map(|o| ctx.g_at(o));
+            [p, a, x, y, o, F64(u64::from(k.out_two))]
+        });
+        // The permutations eight at a time, with the batched one.
+        let outputs = parallel::map_collect(rows.len().div_ceil(8), |g| {
+            let mut states = [[0; primitives::hash::STATE_LANES]; 8];
+            for (state, r) in states.iter_mut().zip(&rows[8 * g..]) {
+                let k = op(r);
+                let message = k.message(std::array::from_fn(|c| ctx.mem.word(k.cell(r.fp, c) as usize)));
+                *state = crate::keccak::keccak64_state(|c| message[c]);
+            }
+            primitives::hash::keccak_f_many(&mut states);
+            states
+        })
+        .into_flattened();
+        ctx.cols_at(out, rows.len(), V_OUT, |i| {
+            std::array::from_fn::<_, OUT_LANES, _>(|l| F64(outputs[i][l]))
+        });
+        ctx.cols(out, rows, R0, |r| r.r.map(|k| ctx.g_at(k)));
+        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        ctx.cols(out, rows, S_A, |r| {
+            let k = op(r);
+            [k.s_a, k.k_a, k.k_y]
+        });
     }
 }
 

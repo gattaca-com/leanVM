@@ -1,4 +1,4 @@
-//! The whole program: its run ([`execute`]), its public layout ([`layout_of`]), and [`prove`], which binds the six
+//! The whole program: its run ([`execute`]), its public layout ([`layout_of`]), and [`prove`], which binds the seven
 //! instruction tables to one commitment through the state, memory and bytecode buses (`doc/leanvm/main.tex`).
 //! [`verify`] wraps the `verifier` crate.
 
@@ -23,7 +23,7 @@ pub use execute::{ExecError, Execution, Fault, Memory, execute};
 use isa::Program;
 pub use isa::{DerefMode, Op, OutCells, Stats};
 pub use layout::*;
-pub(crate) use trace::{Drow, Jrow, Krow, Srow, Trace, Xrow};
+pub(crate) use trace::{Drow, Jrow, Krow, Srow, Trace, Trow, Xrow};
 pub use truncate::{piece_digits, qt_pad};
 
 /// Announce the prover's sizes (`log_mem`, every table's row count, the PCS rate) on the stream, from which the
@@ -557,6 +557,250 @@ mod tests {
 
         let (proof, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &pi, &proof).expect("a hand-assembled program verifies");
+    }
+
+    /// A straight-line program of `keccak64` `KECCAK64` rows and `keccak` `KECCAK` rows on the same four message cells
+    /// (2..6), the `KECCAK`s with the constants a 64-byte message leaves in `tail` (6..10), `b8` (10) and `cap`
+    /// (11..15). Row `i` of `KECCAK64` writes cell `base + 2 i` (and the one after when `out_two`), and of `KECCAK`
+    /// cell `kbase + 13 i`, two cells. Odd `KECCAK64` rows hash the message rotated by a cell. The last slot is the
+    /// sentinel.
+    fn keccak64_mix_program(
+        message: [F128; 4],
+        keccak64: usize,
+        keccak: usize,
+        out_two: bool,
+        truncate: bool,
+    ) -> (Program, u32, u32) {
+        let (base, kbase) = (64u32, 64 + 2 * keccak64 as u32 + 8);
+        let mut prog = Vec::new();
+        for (c, &m) in message.iter().enumerate() {
+            prog.push(set(2 + c as u32, m));
+        }
+        prog.push(set(6, F128::new(primitives::hash::PAD_FIRST as u64, 0)));
+        for o in [7, 8, 9] {
+            prog.push(set(o, F128::ZERO));
+        }
+        prog.push(set(10, F128::new(primitives::hash::END_BIT, 0x5555)));
+        for o in 11..15 {
+            prog.push(set(o, F128::ZERO));
+        }
+        for (c, o) in (16..20u32).enumerate() {
+            prog.push(set(o, message[(c + 1) % 4]));
+        }
+        for i in 0..keccak64 as u32 {
+            let cells = if i % 2 == 0 { [2, 3, 4, 5] } else { [16, 17, 18, 19] };
+            let (s_a, k_a, k_y) = (verifier::K(1), verifier::K(0), verifier::K(0));
+            prog.push(Op::keccak64(cells, base + 2 * i, out_two, s_a, k_a, k_y).expect("a nonzero scale"));
+        }
+        for i in 0..keccak as u32 {
+            prog.push(Op::Keccak {
+                m: [2, 3, 4, 5],
+                tail: 6,
+                b8: 10,
+                cap: 11,
+                out: kbase + 13 * i,
+                in_odd: false,
+                out_odd: false,
+                out_cells: OutCells::Two,
+            });
+        }
+        let frame = kbase + 13 * keccak as u32 + 16;
+        // Filler SETs, then the sentinel in the last slot.
+        let len = (prog.len() + 2).next_power_of_two();
+        let mut spare = frame;
+        while prog.len() < len - 1 {
+            prog.push(set(spare, F128::ONE));
+            spare += 1;
+        }
+        prog.push(Op::Xor { a: 0, b: 0, c: 0 });
+        let mut program = from_bytecode(prog, spare + 1);
+        program.truncate = truncate;
+        (program, base, kbase)
+    }
+
+    /// `KECCAK64` is the `KECCAK` of its four cells with the padding in the others: the same output cells, for both
+    /// values of `out_two`, on random messages, and a cell it does not write stays unwritten.
+    #[test]
+    fn keccak64_equals_keccak_on_the_same_cells() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pi = [w(7), w(11)];
+        for round in 0..8 {
+            let message: [F128; 4] = std::array::from_fn(|_| F128::new(next(), next()));
+            let out_two = round % 2 == 0;
+            let (program, base, kbase) = keccak64_mix_program(message, 3, 1, out_two, false);
+            let exec = execute(&program, &[], pi).unwrap();
+            assert_eq!(exec.rows()[verifier::layout::OP_KECCAK64], 3);
+            let (k0, k1) = (exec.mem.word(kbase as usize), exec.mem.word(kbase as usize + 1));
+            // Row 1 hashes the rotated message.
+            assert_ne!(exec.mem.word(base as usize + 2), k0);
+            for i in [0usize, 2] {
+                assert_eq!(exec.mem.word(base as usize + 2 * i), k0, "cell 0 of row {i}");
+                let second = exec.mem.word(base as usize + 2 * i + 1);
+                assert_eq!(second, if out_two { k1 } else { F128::ZERO }, "cell 1 of row {i}");
+            }
+            let bytes: Vec<u8> = message
+                .iter()
+                .flat_map(|c| [c.c0, c.c1])
+                .flat_map(u64::to_le_bytes)
+                .collect();
+            let cells: Vec<u8> = [k0, k1]
+                .iter()
+                .flat_map(|c| [c.c0, c.c1])
+                .flat_map(u64::to_le_bytes)
+                .collect();
+            assert_eq!(cells, primitives::hash::hash(&bytes));
+        }
+    }
+
+    /// `KECCAK64` with the immediates `(g^(-n), c g^(-n), d)` is the `KECCAK` of `P`, `A g^n + c`, `X`, `Y + d`, the two
+    /// cells made by `MUL` and `XOR`: random cells, shifts 0 to 7, random immediates, both values of `out_two`. `A` is
+    /// K-valued where it is shifted, as the compiler's `a_shift` asks.
+    #[test]
+    fn keccak64_equals_keccak_on_the_shifted_cells() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pi = [w(7), w(11)];
+        for n in 0..8usize {
+            for out_two in [false, true] {
+                let mut message: [F128; 4] = std::array::from_fn(|_| F128::new(next(), next()));
+                if n > 0 {
+                    message[1] = F128::new(next(), 0);
+                }
+                let (c, d) = (F64(next()), F64(next()));
+                let g_n = g_pow(n);
+                let s_a = g_n.inv();
+                let mut prog = Vec::new();
+                for (cell, &m) in message.iter().enumerate() {
+                    prog.push(set(2 + cell as u32, m));
+                }
+                // The padding a 64-byte message leaves in the cells the `KECCAK` reads past its four.
+                prog.push(set(6, F128::new(primitives::hash::PAD_FIRST as u64, 0)));
+                for o in [7, 8, 9] {
+                    prog.push(set(o, F128::ZERO));
+                }
+                prog.push(set(10, F128::new(primitives::hash::END_BIT, 0x5555)));
+                for o in 11..15 {
+                    prog.push(set(o, F128::ZERO));
+                }
+                // `A g^n + c` and `Y + d` by `MUL` and `XOR`.
+                for (o, k) in [(16, F128::from(g_n)), (17, F128::from(c)), (18, F128::from(d))] {
+                    prog.push(set(o, k));
+                }
+                prog.push(Op::Mul { a: 3, b: 16, c: 19 });
+                prog.push(Op::Xor { a: 19, b: 17, c: 20 });
+                prog.push(Op::Xor { a: 5, b: 18, c: 21 });
+                prog.push(Op::Keccak {
+                    m: [2, 20, 4, 21],
+                    tail: 6,
+                    b8: 10,
+                    cap: 11,
+                    out: 40,
+                    in_odd: false,
+                    out_odd: false,
+                    out_cells: OutCells::Two,
+                });
+                let (s_a, k_a, k_y) = (verifier::K(s_a.0), verifier::K((c * s_a).0), verifier::K(d.0));
+                prog.push(Op::keccak64([2, 3, 4, 5], 30, out_two, s_a, k_a, k_y).expect("a nonzero scale"));
+                let len = (prog.len() + 2).next_power_of_two();
+                while prog.len() < len - 1 {
+                    prog.push(set(60, F128::ONE));
+                }
+                prog.push(Op::Xor { a: 0, b: 0, c: 0 });
+                let program = from_bytecode(prog, 64);
+                let exec = execute(&program, &[], pi).unwrap();
+                assert_eq!(exec.rows()[verifier::layout::OP_KECCAK64], 1);
+                let (k0, k1) = (exec.mem.word(40), exec.mem.word(41));
+                assert_eq!(exec.mem.word(30), k0, "output cell 0, shift {n}");
+                let second = exec.mem.word(31);
+                assert_eq!(
+                    second,
+                    if out_two { k1 } else { F128::ZERO },
+                    "output cell 1, shift {n}"
+                );
+                // The proof of the run verifies: the bus carries the shifted lane.
+                let (proof, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+                verify(&program, &pi, &proof).unwrap_or_else(|e| panic!("shift {n}: {e}"));
+            }
+        }
+    }
+
+    /// A `KECCAK64` with a zero scale cannot be built, and the interpreter refuses one that is built by hand, or
+    /// whose stored inverse is not the scale's.
+    #[test]
+    fn a_keccak64_with_a_zero_scale_is_refused() {
+        use verifier::K;
+        assert_eq!(
+            Op::keccak64([2, 3, 4, 5], 6, false, K(0), K(1), K(1)).err(),
+            Some(isa::ZeroScale)
+        );
+        let pi = [w(7), w(11)];
+        let run = |s_a: K, s_inv: K| {
+            let mut prog = vec![set(2, F128::ONE)];
+            prog.push(Op::Keccak64 {
+                o: [2, 2, 2, 2],
+                out: 6,
+                out_two: false,
+                s_a,
+                s_inv,
+                k_a: K(0),
+                k_y: K(0),
+            });
+            while prog.len() < 3 {
+                prog.push(set(8, F128::ONE));
+            }
+            prog.push(Op::Xor { a: 0, b: 0, c: 0 });
+            execute(&from_bytecode(prog, 9), &[], pi).err().map(|e| e.fault)
+        };
+        assert_eq!(run(K(0), K(0)), Some(Fault::BadInstruction));
+        assert_eq!(run(K(2), K(2)), Some(Fault::BadInstruction));
+        assert_eq!(run(K(2), K(2).inv()), None);
+    }
+
+    /// A proof with only `KECCAK64` rows, one with only `KECCAK` rows, and ones with both at different heights, all
+    /// verify, the truncated ones with `q_keccak` in pieces.
+    #[test]
+    fn proofs_with_keccak64_and_keccak_rows_verify() {
+        let message: [F128; 4] = std::array::from_fn(|i| F128::new(0x1111 * (i as u64 + 1), 0x7777 * (i as u64 + 3)));
+        let pi = [w(7), w(11)];
+        for (keccak64, keccak, out_two, truncate) in [
+            (3, 0, true, false),
+            (3, 0, false, false),
+            (0, 3, true, false),
+            (3, 3, true, false),
+            (600, 20, true, false),
+            (20, 600, false, false),
+            (70_000, 40, true, true),
+            (40, 70_000, true, true),
+        ] {
+            let (program, _, _) = keccak64_mix_program(message, keccak64, keccak, out_two, truncate);
+            let (proof, stats) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+            assert_eq!(
+                [
+                    stats.rows[verifier::layout::OP_KECCAK],
+                    stats.rows[verifier::layout::OP_KECCAK64]
+                ],
+                [keccak, keccak64]
+            );
+            let summary = verify(&program, &pi, &proof)
+                .unwrap_or_else(|e| panic!("{keccak64} KECCAK64 and {keccak} KECCAK rows: {e}"));
+            if truncate {
+                assert!(
+                    summary.truncation.is_some_and(|t| t.qt),
+                    "{keccak64} KECCAK64 and {keccak} KECCAK rows: q_keccak is pieces"
+                );
+            }
+        }
     }
 
     /// The last slot in a frame other than main's is an ordinary slot: the machine halts in the

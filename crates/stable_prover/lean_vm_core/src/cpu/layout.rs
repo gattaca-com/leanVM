@@ -376,7 +376,7 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout) -> Witness {
             gpow[tr.bytecode_count[i] as usize]
         });
     });
-    // The committed Keccak states, step `j` the `j`-th KECCAK row, its input read back from the final memory
+    // The committed Keccak states, step `j` of a table its `j`-th row, its input read back from the final memory
     // image, which is write-once.
     let keccak_reduction = crate::stage!("Build q_keccak", || {
         let inputs = parallel::map_collect(tr.keccak.len(), |i| {
@@ -384,8 +384,13 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout) -> Witness {
             let op = tables::KeccakOp::of(&program.prog[row.pc as usize]);
             crate::keccak::state_of_cells(op.in_odd, |c| exec.mem.word(op.cell(row.fp, c) as usize))
         });
-        // The stable prover runs no `KECCAK64`: its table holds only padding steps.
-        crate::keccak::place([&inputs, &[]], kappa, windows[QKECCAK])
+        let inputs64 = parallel::map_collect(tr.keccak64.len(), |i| {
+            let row = &tr.keccak64[i];
+            let op = tables::Keccak64Op::of(&program.prog[row.pc as usize]);
+            let message = op.message(std::array::from_fn(|c| exec.mem.word(op.cell(row.fp, c) as usize)));
+            crate::keccak::keccak64_state(|c| message[c])
+        });
+        crate::keccak::place([&inputs, &inputs64], kappa, windows[QKECCAK])
     });
     drop(windows);
     Witness {

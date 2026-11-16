@@ -52,6 +52,15 @@ pub(crate) struct Krow {
     pub(crate) bytecode_read: u32,
 }
 
+/// `KECCAK64` row: the access counts of the four cells read, then the output cell 0 and cell 1, the latter zero
+/// when the row does not write it (`tables::Keccak64Op::cell`).
+pub(crate) struct Trow {
+    pub(crate) pc: u32,
+    pub(crate) fp: u32,
+    pub(crate) r: [u32; crate::keccak::KECCAK64_ROW_CELLS],
+    pub(crate) bytecode_read: u32,
+}
+
 pub(crate) struct Trace {
     pub(crate) xor: Vec<Xrow>,
     pub(crate) mul: Vec<Xrow>,
@@ -59,6 +68,7 @@ pub(crate) struct Trace {
     pub(crate) deref: Vec<Drow>,
     pub(crate) jump: Vec<Jrow>,
     pub(crate) keccak: Vec<Krow>,
+    pub(crate) keccak64: Vec<Trow>,
     pub(crate) bytecode_count: Vec<u32>, // per-pc execution count; the column holds g^{A[pc]}
     /// One past the highest access count, of a cell or a pc: the `g`-powers a fill looks up.
     pub(crate) counts: usize,
@@ -74,7 +84,7 @@ impl Trace {
             self.deref.len(),
             self.jump.len(),
             self.keccak.len(),
-            0, // `KECCAK64`: the stable prover runs none
+            self.keccak64.len(),
         ]
     }
 }

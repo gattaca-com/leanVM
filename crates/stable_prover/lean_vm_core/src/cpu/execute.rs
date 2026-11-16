@@ -121,8 +121,8 @@ pub enum Fault {
     NotAGPower { what: &'static str, value: F64 },
     /// A `MUL` asked to solve `a·x = c` for `x` with `a = 0`.
     BackSolveThroughZero,
-    /// An instruction this prover does not run.
-    Unsupported { op: &'static str },
+    /// An instruction the machine does not run: a `KECCAK64` whose scale is zero.
+    BadInstruction,
     /// The advice does not fit the program: a witness stream is missing, given
     /// twice or exhausted, or an entry has the wrong length.
     Witness(String),
@@ -188,7 +188,7 @@ impl std::fmt::Display for Fault {
             Self::NotInK { what, value } => write!(f, "{what} is not a K-valued word ({})", word(*value)),
             Self::NotAGPower { what, value } => write!(f, "{what} is not a g-power in range (0x{:016x})", value.0),
             Self::BackSolveThroughZero => write!(f, "cannot back-solve MUL through a zero operand"),
-            Self::Unsupported { op } => write!(f, "the stable prover does not run {op}"),
+            Self::BadInstruction => write!(f, "a KECCAK64 with a zero scale is not an instruction"),
             Self::Witness(problem) => write!(f, "{problem}"),
             Self::OutOfMemory => write!(
                 f,
@@ -486,8 +486,15 @@ pub fn execute(
         .then(|| vec![0u64; program.prog.len()]);
 
     let mut bytecode_count: Vec<u32> = vec![0; program.prog.len()];
-    let (mut xor, mut mul, mut set, mut deref, mut jump, mut keccak) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut xor, mut mul, mut set, mut deref, mut jump, mut keccak, mut keccak64) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
     let (mut pc, mut fp) = (0u32, 0u32);
     let mut steps = 0usize;
     loop {
@@ -667,9 +674,41 @@ pub fn execute(
                 });
                 pc += 1;
             }
-            // The stable prover does not run `KECCAK64` yet: its table, the second half of `q_keccak`, holds padding steps
-            // only, so a run that executes one has no proof here.
-            Op::Keccak64 { .. } => return Err(fail(Fault::Unsupported { op: "KECCAK64" })),
+            Op::Keccak64 { .. } => {
+                use crate::keccak::KECCAK64_ROW_CELLS;
+                let k = crate::tables::Keccak64Op::of(&op);
+                // A zero scale would leave `in_2` free: the instruction is not run.
+                if !k.well_formed() {
+                    return Err(fail(Fault::BadInstruction));
+                }
+                let written = k.cells();
+                let mut cells = [0; KECCAK64_ROW_CELLS];
+                for (c, cell) in cells[..written].iter_mut().enumerate() {
+                    let (offset, step) = k.cell_parts(c);
+                    *cell = at(at(fp, offset)?, step)?;
+                }
+                // The Keccak reduction proves the output; the run computes it for the later reads.
+                let message = k.message(std::array::from_fn(|c| m.read(cells[c])));
+                let mut lanes = crate::keccak::keccak64_state(|c| message[c]);
+                primitives::hash::keccak_f(&mut lanes);
+                m.put(cells[4], F128::new(lanes[0], lanes[1])).map_err(fail)?;
+                if k.out_two {
+                    m.put(cells[5], F128::new(lanes[2], lanes[3])).map_err(fail)?;
+                }
+                // In flush order, so a cell two operands alias pairs each read with its own count. The second output
+                // cell keeps count 0 when it is not written.
+                let mut r = [0; KECCAK64_ROW_CELLS];
+                for (count, &cell) in r.iter_mut().zip(&cells[..written]) {
+                    *count = m.bump_access_count(cell);
+                }
+                keccak64.push(Trow {
+                    pc,
+                    fp,
+                    r,
+                    bytecode_read,
+                });
+                pc += 1;
+            }
         }
         steps += 1;
     }
@@ -685,6 +724,7 @@ pub fn execute(
         deref,
         jump,
         keccak,
+        keccak64,
         bytecode_count,
         counts,
     };

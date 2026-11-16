@@ -12,7 +12,7 @@
 //! - [`keccak`]: the `KECCAK` steps, by the Keccak reduction over the same commitment;
 //! - and opens every claim in one stacked WHIR ([`pcs`]).
 //!
-//! [`tables`] declares the six instruction tables, [`cpu`] the whole program's layout, execution and witness.
+//! [`tables`] declares the seven instruction tables, [`cpu`] the whole program's layout, execution and witness.
 
 pub mod constraints;
 pub mod cpu;
