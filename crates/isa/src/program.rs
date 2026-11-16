@@ -21,6 +21,8 @@ pub struct Program {
     stacked_bytecode: Vec<u64>,
     /// `stacked_bytecode` prepared for the verifier, on first use: a program that is only executed never needs it.
     bytecode: OnceLock<verifier::Bytecode>,
+    /// Whether a prover commits only the covered prefix of each memory and table column, announcing it in the proof.
+    pub truncate: bool,
 }
 
 /// # Panics
@@ -40,6 +42,7 @@ impl From<CompiledProgram> for Program {
             compiled,
             stacked_bytecode: stacked,
             bytecode: OnceLock::new(),
+            truncate: false,
         }
     }
 }
