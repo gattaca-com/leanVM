@@ -3,7 +3,8 @@
 use super::MAX_RECURSIONS;
 use super::cells::pack_16_bytes;
 use super::child::{
-    MU_CAP, QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, block_groups, col_groups, merkle_cap_depth, whir_levels,
+    MU_CAP, QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, block_groups, col_groups, col_slots, cut,
+    merkle_cap_depth, whir_levels,
 };
 use super::claim_pool::{ClaimSite, claim_pool, coord_difference, coord_kind, coord_scale, push_coord_terms};
 use super::deferred::{BATCH_LAM_GRIND_BITS, RECURSION_AGG_LABEL};
@@ -15,8 +16,8 @@ use fiat_shamir_prover::{FiatShamirState, RATE_SCALARS, grinding_bits};
 use lean_da::{CELLS_PER_ROW, DA_MAX_ROWS, LOG_BLOB_SYMBOLS, LOG_CELL_SYMBOLS, LOG_CODEWORD_SYMBOLS};
 use lean_vm_core::constraints::xi_offsets;
 use lean_vm_core::cpu::{
-    KeccakLane, QKECCAK, block_kappa_sources, col_kappa_sources, keccak_value, layout_of, n_xi_powers, to_scalar,
-    xi_form_base,
+    KeccakLane, QKECCAK, block_kappa_sources, col_kappa_sources, keccak_value, layout_of, n_xi_powers, qt_pad,
+    to_scalar, xi_form_base,
 };
 use lean_vm_core::gkr::{ROUND_GRIND, y_grind};
 use lean_vm_core::keccak::{MIN_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG};
@@ -26,7 +27,7 @@ use primitives::field::{F64, F128, g_pow};
 use std::collections::BTreeMap;
 use verifier::bus_grinding_bits;
 use verifier::layout::BUS_BITS;
-use verifier::layout::{GLOBAL_COLUMN_BASES, N_TABLES, TABLE_LOG_FLOORS, TABLE_WIDTHS, tables};
+use verifier::layout::{GLOBAL_COLUMN_BASES, MEMORY_FINAL_COUNTERS, N_TABLES, TABLE_LOG_FLOORS, TABLE_WIDTHS, tables};
 use verifier::{BATCH_GRINDING_BITS, FOLD_GRINDING_BITS, OOD_GRINDING_BITS, QUERY_GRINDING_BITS};
 
 /// A value as the guest's literal for it: an integer in decimal, a field element as the integer its limbs spell, a
@@ -479,7 +480,48 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
     let stacked = 2 + claims.iter().filter(|c| c.buffer != POINT_BUF_KECCAK_OUT).count() + 1;
     assert!(stacked <= verifier::MAX_STACKED_CLAIMS, "too many stacked claims");
     ph.set("QKECCAK_COMMITTED_COL", qkeccak);
+
+    // A truncated proof cuts every column of kappa source `(s, 0)`, `s >= 1`, but q_keccak into pieces.
+    // A claim on one weighs each piece by the eq of its point's top coordinates: one set per point
+    // buffer and source, its `combo`.
+    let cks: Vec<(usize, usize)> = col_kappa_sources(kbc).into_iter().flatten().collect();
+    let pieced = |column: usize| column != qkeccak && cut(cks[column]);
+    let mut combos: Vec<(usize, usize)> = Vec::new();
+    let claim_combo: Vec<usize> = claims
+        .iter()
+        .map(|c| {
+            if c.buffer == POINT_BUF_KECCAK_OUT || c.buffer == POINT_BUF_QKECCAK_RHO || !pieced(c.column) {
+                return NO_COMBO;
+            }
+            let combo = (c.buffer, cks[c.column].0);
+            combos.iter().position(|&x| x == combo).unwrap_or_else(|| {
+                combos.push(combo);
+                combos.len() - 1
+            })
+        })
+        .collect();
+    let mfcnt = compact_col(MEMORY_FINAL_COUNTERS);
+    assert!(pieced(mfcnt), "the memory counters are cut");
+    ph.set("NO_COMBO", NO_COMBO);
+    ph.set("N_COMBOS", combos.len());
+    ph.list("COMBO_BUF", combos.iter().map(|c| c.0));
+    ph.list("COMBO_SRC", combos.iter().map(|c| c.1));
+    ph.list("CLAIM_COMBO", claim_combo);
+    ph.set("MFCNT_COMMITTED_COL", mfcnt);
+    // Under QT a slot's claim adds the pad of its slot past the covered chunks.
+    let pad = qt_pad();
+    ph.list(
+        "CLAIM_QT_PAD",
+        claims.iter().map(|c| match c.buffer {
+            POINT_BUF_QKECCAK_RHO => pad[c.qkeccak_slot],
+            _ => 0,
+        }),
+    );
+    ph.list("QT_PAD", pad);
 }
+
+/// The combo of a claim that is not on a cut column.
+const NO_COMBO: usize = 1000;
 
 /// The Keccak reduction's RMFE projection and embedding as straight-line programs, and its iota and linear layer, as
 /// index lists the guest unrolls.
@@ -767,6 +809,12 @@ fn opening_placeholders(ph: &mut Placeholders, kbc: usize) {
     let groups = col_groups(&cks);
     ph.set("N_COL_GROUPS", groups.len());
     ph.list("COL_GROUP_START", groups.iter().copied().chain([cks.len()]));
+    ph.list("COL_CUT", cks.iter().map(|&source| cut(source) as usize));
+    ph.list("COL_GROUP_PIECED", groups.iter().map(|&start| cut(cks[start]) as usize));
+    let slots = col_slots(&cks, &groups);
+    ph.set("N_SLOTS", slots.len());
+    ph.list("SLOT_GROUP", slots.iter().map(|s| s.0));
+    ph.list("SLOT_PIECE", slots.iter().map(|s| s.1));
     // The subspace-vanishing values of a level's message columns and their inverses, by the column count: block `n`
     // at n(n+1)/2.
     let by_cols: Vec<F64> = (0..=max_cols)

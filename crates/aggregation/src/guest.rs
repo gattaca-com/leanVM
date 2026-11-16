@@ -27,7 +27,10 @@ pub fn unified_guest() -> &'static Program {
             let guest = compile_guest(guess);
             let actual = guest.prog.len().trailing_zeros() as usize;
             if actual == guess {
-                return Program::from(guest);
+                // Every aggregate commits the covered prefixes of its columns.
+                let mut program = Program::from(guest);
+                program.truncate = true;
+                return program;
             }
             guess = actual;
         }

@@ -444,6 +444,26 @@ fn a_node_passes_on_one_childs_da_root() {
     assert_eq!(top.0.da_commitment, Some(first));
 }
 
+/// A child's rate word flag is certified in the guest: flag 3, and a memory count over a full proof, fail the run.
+#[test]
+fn forged_rate_word_flags_fail_the_guest() {
+    let child = prove(&[], &get_signers::<StableProver>(SMALL_LEAF_SIZE), &[]);
+    let rate_word = 1 + verifier::layout::N_TABLES;
+    type Edit = fn(u64) -> u64;
+    let high_limbs: [(&str, Edit); 2] = [
+        ("flag 3", |c1| c1 | 3),
+        ("a memory count over flag 0", |c1| (c1 & !3) | (1 << 2)),
+    ];
+    for (name, edit) in high_limbs {
+        let forgery: Forgery = Box::new(move |hints: &mut Hints| {
+            let word = &mut hints.entry_mut("stream", 0)[rate_word];
+            assert_ne!(edit(word.c1), word.c1, "{name} changes the honest word");
+            word.c1 = edit(word.c1);
+        });
+        assert_forgery_rejected(forgery, std::slice::from_ref(&child), vec![], vec![], &[]);
+    }
+}
+
 /// A list hash's split is advice the guest then dispatches on, so the claim count
 /// after the last group has to be bounded before the `match`: a negative
 /// exponent that satisfies the product identity must fail the range check in

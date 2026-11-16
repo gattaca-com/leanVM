@@ -4,9 +4,10 @@ use super::cells::count;
 use super::error::AggregateError;
 use super::hints::SubHints;
 use fiat_shamir_prover::merkle::{hash_pair, hash_to_scalars, hash_words};
-use lean_vm_core::cpu::{block_kappa_sources, col_kappa_sources, from_scalar, layout_of};
+use lean_vm_core::cpu::{QKECCAK, block_kappa_sources, col_kappa_sources, from_scalar, layout_of, piece_digits};
 use lean_vm_core::leaf::{self, Block};
 use primitives::field::F128;
+use verifier::layout::N_TABLES;
 
 /// The stacked WHIR opening of a `2^mu` stack at a rate: the verifier's config, then each level's message columns
 /// after its folds and its Merkle tree's depth. The hint builder needs it for the real opening and the placeholder map
@@ -54,6 +55,23 @@ pub(super) fn col_groups(sources: &[(usize, usize)]) -> Vec<usize> {
         .collect()
 }
 
+/// Whether a truncated proof cuts a column of this kappa source: the memory's and the tables' are.
+pub(super) fn cut(source: (usize, usize)) -> bool {
+    source.0 >= 1 && source.1 == 0
+}
+
+/// A cut column group's slots in the stacked order: piece `j` is `2^(kappa - j)` rows, `j = 0` the whole column.
+pub(super) const PIECES: usize = 5;
+
+/// The placement slots `(group, piece)`: [`PIECES`] for a cut group, one for any other.
+pub(super) fn col_slots(sources: &[(usize, usize)], groups: &[usize]) -> Vec<(usize, usize)> {
+    groups
+        .iter()
+        .enumerate()
+        .flat_map(|(g, &start)| (0..if cut(sources[start]) { PIECES } else { 1 }).map(move |j| (g, j)))
+        .collect()
+}
+
 /// The first block of each block group: as [`col_groups`], over the bus blocks, a group never crossing the start of a
 /// side (`side_starts`), since a side's blocks tile its own cube.
 pub(super) fn block_groups(sources: &[(usize, usize)], side_starts: &[usize]) -> Vec<usize> {
@@ -89,8 +107,6 @@ pub(super) fn gen_verify(
     if !fits {
         return Err(AggregateError::InvalidChild);
     }
-    let column_offsets: Vec<usize> = layout.placements.iter().map(|p| p.offset).collect();
-    let mu = layout.shape.mu;
     let mut stream: Vec<F128> = proof.stream.iter().copied().map(from_scalar).collect();
     stream.resize(STREAM_CAP, F128::ZERO);
 
@@ -102,31 +118,59 @@ pub(super) fn gen_verify(
         ("zc_tau_max", vec![count(*taus.iter().max().unwrap())]),
         // Every table's log height, which the guest certifies against its row count.
         ("table_logs", taus.iter().map(|&t| count(t)).collect()),
-        ("col_group_order", col_group_order(kbc, &column_offsets)),
+        ("col_slot_order", col_slot_order(kbc, summary, &taus)),
         ("block_group_order", block_group_order(kbc, &sides)),
     ];
-    let (config, _, depth) = whir_levels(mu, summary.log_inv_rate).ok_or(AggregateError::InvalidChild)?;
+    let (config, _, depth) =
+        whir_levels(summary.stack_log, summary.log_inv_rate).ok_or(AggregateError::InvalidChild)?;
     hints.extend(merkle_hints(config.queries, &depth, proof));
     Ok(hints)
 }
 
-/// The committed columns in their stacking order (`column_offsets`, from `placements_of`: descending kappa, then
-/// index), each run of a column group ([`col_groups`]) named once. The guest certifies the order before it reads
+/// The placement slots ([`col_slots`]) in their stacking order: the slots a proof of this `summary` commits first, by
+/// descending kappa then first column, the absent ones after them in slot order. A truncated proof has no layout of its
+/// own to read the order off, so it follows from the sizes the proof announces; the guest certifies it before it reads
 /// claims by it.
-fn col_group_order(kbc: usize, column_offsets: &[usize]) -> Vec<F128> {
+fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABLES]) -> Vec<F128> {
     let sources = col_kappa_sources(kbc);
     // Compact index to global column.
     let committed: Vec<usize> = (0..sources.len()).filter(|&c| sources[c].is_some()).collect();
-    let groups = col_groups(&sources.iter().flatten().copied().collect::<Vec<_>>());
-    let mut stacked: Vec<usize> = (0..committed.len()).collect();
-    stacked.sort_by_key(|&compact| column_offsets[committed[compact]]);
-    let order = group_runs(
-        stacked
-            .into_iter()
-            .map(|compact| groups.partition_point(|&start| start <= compact) - 1),
-    );
-    assert_eq!(order.len(), groups.len(), "a column group's columns are consecutive");
-    order
+    let cks: Vec<(usize, usize)> = sources.iter().flatten().copied().collect();
+    let groups = col_groups(&cks);
+    let truncation = summary.truncation;
+    let source_log = |source: usize| match source {
+        0 => 0,
+        1 => summary.log_memory,
+        s => taus[s - 2],
+    };
+    let digits = |source: usize| {
+        let k = source_log(source);
+        let real = match truncation {
+            None => 1 << k,
+            Some(t) if source == 1 => t.mem_count as usize,
+            Some(_) => summary.table_rows[source - 2] as usize,
+        };
+        piece_digits(k, real)
+    };
+    let qkeccak = committed.iter().position(|&global| global == QKECCAK);
+    let mut slots: Vec<(bool, usize, usize, usize)> = col_slots(&cks, &groups)
+        .into_iter()
+        .enumerate()
+        .map(|(slot, (g, j))| {
+            let (source, adj) = cks[groups[g]];
+            let present = if cut((source, adj)) {
+                digits(source)[j]
+            } else {
+                Some(groups[g]) != qkeccak || truncation.is_none_or(|t| !t.qt)
+            };
+            (present, source_log(source) + adj - j, groups[g], slot)
+        })
+        .collect();
+    slots.sort_by_key(|&(present, kappa, start, slot)| match present {
+        true => (0, std::cmp::Reverse(kappa), start),
+        false => (1, std::cmp::Reverse(0), slot),
+    });
+    slots.into_iter().map(|(.., slot)| count(slot)).collect()
 }
 
 /// Per bus side, its blocks in their stacking order (`leaf::layout`'s offsets), each run of a block group
