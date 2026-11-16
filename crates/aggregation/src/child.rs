@@ -7,7 +7,7 @@ use fiat_shamir_prover::merkle::{hash_pair, hash_to_scalars, hash_words};
 use lean_vm_core::cpu::{
     KAPPA_SOURCE, QKECCAK, block_kappa_sources, col_kappa_sources, from_scalar, layout_of, piece_digits,
 };
-use lean_vm_core::keccak::{SLOT_LOG, TABLES};
+use lean_vm_core::keccak::{SLOT_LOG, TABLE_BITS, TABLES, slot_blocks};
 use lean_vm_core::leaf::{self, Block};
 use primitives::field::F128;
 use verifier::layout::N_TABLES;
@@ -59,25 +59,36 @@ pub(super) fn col_groups(sources: &[(usize, usize)]) -> Vec<usize> {
 }
 
 /// Whether a truncated proof cuts a column of this kappa source: the memory's and the tables' are, and the
-/// halves of `q_keccak` under QT (see [`guest_col_sources`]).
+/// slot blocks of the halves of `q_keccak` (see [`guest_col_sources`]).
 pub(super) fn cut(source: (usize, usize)) -> bool {
     source.0 >= 1 && (source.1 == 0 || is_half(source))
 }
 
-/// The adjustment of a half of `q_keccak`: its pieces hold all the slots of their rows.
-pub(super) const HALF_ADJ: usize = SLOT_LOG;
-
-/// Whether a kappa source is a half of `q_keccak` under QT.
-pub(super) fn is_half(source: (usize, usize)) -> bool {
-    source.0 >= KAPPA_SOURCE && source.0 < KAPPA_SOURCE + TABLES && source.1 == HALF_ADJ
+/// The slot blocks of the halves of `q_keccak`, each a column of the guest: `(half, first slot, log slots)`, by half
+/// then block. `KECCAK` is one block of all 64 slots, `KECCAK64` three that leave out its public slots.
+pub(super) fn qt_columns() -> Vec<(usize, usize, usize)> {
+    (0..TABLES)
+        .flat_map(|half| slot_blocks(half).iter().map(move |&(first, log)| (half, first, log)))
+        .collect()
 }
 
-/// The committed columns' kappa sources, then those of the two halves of `q_keccak`, which are columns of the
-/// guest alone: their pieces are what a QT proof commits in place of the column, each half cut at its table's rows
-/// like a table column. The guest places them with the others, in this order, a half absent unless the proof is QT.
+/// Whether a kappa source is a slot block of a half of `q_keccak`: the source of its half's rows, and the log of
+/// the block's slots as the adjustment, below the whole column's `SLOT_LOG + TABLE_BITS`.
+pub(super) fn is_half(source: (usize, usize)) -> bool {
+    source.0 >= KAPPA_SOURCE && source.0 < KAPPA_SOURCE + TABLES && source.1 < SLOT_LOG + TABLE_BITS
+}
+
+/// The committed columns' kappa sources, then those of the slot blocks of the halves of `q_keccak`, which are
+/// columns of the guest alone: their pieces are what a proof commits in place of the column, each block cut at its
+/// table's rows like a table column. The guest places them with the others, in this order. The column `q_keccak`
+/// itself has no words.
 pub(super) fn guest_col_sources(kbc: usize) -> Vec<(usize, usize)> {
     let mut sources: Vec<(usize, usize)> = col_kappa_sources(kbc).into_iter().flatten().collect();
-    sources.extend((0..TABLES).map(|half| (KAPPA_SOURCE + half, HALF_ADJ)));
+    sources.extend(
+        qt_columns()
+            .into_iter()
+            .map(|(half, _, log)| (KAPPA_SOURCE + half, log)),
+    );
     sources
 }
 
@@ -180,12 +191,12 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
     let digits = |source: usize| {
         let k = source_log(source);
         let real = match truncation {
-            None => 1 << k,
-            Some(t) if source == 1 => t.mem_count as usize,
-            // A half of `q_keccak` is cut at the rows of its table.
-            Some(_) if source >= KAPPA_SOURCE => {
+            // The blocks of `q_keccak` are cut at their table's rows in every proof.
+            _ if source >= KAPPA_SOURCE => {
                 summary.table_rows[verifier::layout::HASH_TABLES[source - KAPPA_SOURCE]] as usize
             }
+            None => 1 << k,
+            Some(t) if source == 1 => t.mem_count as usize,
             Some(_) => summary.table_rows[source - 2] as usize,
         };
         piece_digits(k, real)
@@ -196,13 +207,11 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
         .enumerate()
         .map(|(slot, (g, j))| {
             let (source, adj) = cks[groups[g]];
-            let present = if is_half((source, adj)) {
-                // The pieces of `q_keccak` replace the column, in a QT proof only.
-                truncation.is_some_and(|t| t.qt) && digits(source)[j]
-            } else if cut((source, adj)) {
+            // The pieces of `q_keccak` replace the column: it has no words.
+            let present = if cut((source, adj)) {
                 digits(source)[j]
             } else {
-                Some(groups[g]) != qkeccak || truncation.is_none_or(|t| !t.qt)
+                Some(groups[g]) != qkeccak
             };
             (present, source_log(source) + adj - j, groups[g], slot)
         })

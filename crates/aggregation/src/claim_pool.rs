@@ -109,7 +109,7 @@ pub(super) fn coord_difference(a: &[Term], b: &[Term]) -> Vec<Term> {
 
 /// The claim pool in the exact order the guest indexes it: the framework bus
 /// claims (deduped by `(column, kappa)`, as `leaf.rs` pools them), then every
-/// table's committed columns, then the PI memory limbs. With it, for every
+/// table's committed columns but the public ones, then the PI memory limbs. With it, for every
 /// coordinate of every block in order, `(fresh, slot)`: whether it raises its
 /// framework claim first, and that claim's slot; zero for one that raises none.
 pub(super) fn claim_pool(sides: &[Vec<Block>; 3], kbc: usize) -> (Vec<ClaimSite>, Vec<(usize, usize)>) {
@@ -141,8 +141,15 @@ pub(super) fn claim_pool(sides: &[Vec<Block>; 3], kbc: usize) -> (Vec<ClaimSite>
             coords.push((usize::from(fresh), slot_of[&key]));
         }
     }
+    // A public column is a constant on every row: nothing claims it.
+    let tables = verifier::layout::tables();
     for (t, (&base, &width)) in GLOBAL_COLUMN_BASES.iter().zip(&TABLE_WIDTHS).enumerate() {
-        pool.extend((base..base + width).map(|column| ClaimSite::TableColumn { column, table: t }));
+        let public = &tables[t].public;
+        pool.extend(
+            (base..base + width)
+                .filter(|column| !public.iter().any(|&(p, _)| base + p == *column))
+                .map(|column| ClaimSite::TableColumn { column, table: t }),
+        );
     }
     pool.extend([MEMORY_0, MEMORY_1].map(|column| ClaimSite::MemoryLimb { column }));
     (pool, coords)

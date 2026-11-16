@@ -419,29 +419,37 @@ fn guest_piece_ring_weights_match_the_definition() {
         };
         let rs_point: Vec<F128> = (0..40).map(|_| random()).collect();
         let point1: Vec<F128> = (0..40).map(|_| random()).collect();
-        let present = [0usize, 2, 6, 8];
+        // The row pieces of each half that are present: all the blocks of a half share them.
+        let present = [vec![0usize, 2], vec![1, 3]];
+        let blocks = super::child::qt_columns();
+        let n_qt = blocks.len() * n_pieces;
         let mut pieces = vec![F128::ZERO; record * sources];
-        let mut cf = vec![F128::ZERO; 2 * n_pieces];
-        let mut expected = vec![F128::ZERO; 2 * n_pieces];
-        for &i in &present {
-            let (half, j) = (i / n_pieces, i % n_pieces);
-            let rec = &mut pieces[record * (n_tables + 2 + half)..][..record];
-            rec[j] = F128::ONE;
-            let b = kappa - j;
-            cf[i] = random();
-            // The piece's point: its rows of the input point, then its six slot coordinates.
-            let slot_start = kappa + table_bits;
-            let z: Vec<F128> = rs_point[..b]
-                .iter()
-                .chain(&rs_point[slot_start..slot_start + 6])
-                .copied()
-                .collect();
-            let r: Vec<F128> = point1[..b + 6].iter().map(|&p| F128::ONE + p).collect();
-            let (eq_z, eq_r) = (
-                primitives::multilinear::eq_table(&z),
-                primitives::multilinear::eq_table(&r),
-            );
-            expected[i] = eq_z.iter().zip(&eq_r).map(|(&e, &w)| phi(cf[i] * e) * w).sum();
+        let mut cf = vec![F128::ZERO; n_qt];
+        let mut expected = vec![F128::ZERO; n_qt];
+        for (half, rows) in present.iter().enumerate() {
+            for &j in rows {
+                pieces[record * (n_tables + 2 + half) + j] = F128::ONE;
+            }
+        }
+        for (column, &(half, _, log)) in blocks.iter().enumerate() {
+            for &j in &present[half] {
+                let i = column * n_pieces + j;
+                let b = kappa - j;
+                cf[i] = random();
+                // The piece's point: its rows of the input point, then the slot coordinates its block leaves free.
+                let slot_start = kappa + table_bits;
+                let z: Vec<F128> = rs_point[..b]
+                    .iter()
+                    .chain(&rs_point[slot_start..slot_start + log])
+                    .copied()
+                    .collect();
+                let r: Vec<F128> = point1[..b + log].iter().map(|&p| F128::ONE + p).collect();
+                let (eq_z, eq_r) = (
+                    primitives::multilinear::eq_table(&z),
+                    primitives::multilinear::eq_table(&r),
+                );
+                expected[i] = eq_z.iter().zip(&eq_r).map(|(&e, &w)| phi(cf[i] * e) * w).sum();
+            }
         }
         for source in 0..sources {
             for j in 0..n_pieces {
@@ -1260,7 +1268,12 @@ fn forged_leaf_cells_fail_the_guest() {
             let n = hints.entries("merkle_leaf_rows");
             let entry = if entry == usize::MAX { n - 1 } else { entry };
             let cells = hints.entry_mut("merkle_leaf_rows", entry);
-            let last = cells.len() - 1;
+            // The last cell with a lane set: a swap of the lanes of a zero cell would change nothing, and the
+            // last lanes of a row are zero where the stack ends.
+            let last = cells
+                .iter()
+                .rposition(|cell| cell.c0 != 0 || cell.c1 != 0)
+                .unwrap_or(cells.len() - 1);
             if entry == 0 {
                 // Level 0's rows are K lanes, each a cell with a zero high lane.
                 assert!(cells.iter().all(|cell| cell.c1 == 0));

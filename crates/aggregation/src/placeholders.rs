@@ -4,7 +4,7 @@ use super::MAX_RECURSIONS;
 use super::cells::pack_16_bytes;
 use super::child::{
     MU_CAP, QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, block_groups, col_groups, col_slots, cut,
-    guest_col_sources, merkle_cap_depth, whir_levels,
+    guest_col_sources, merkle_cap_depth, qt_columns, whir_levels,
 };
 use super::claim_pool::{ClaimSite, claim_pool, coord_difference, coord_kind, coord_scale, push_coord_terms};
 use super::deferred::{BATCH_LAM_GRIND_BITS, RECURSION_AGG_LABEL};
@@ -20,7 +20,7 @@ use lean_vm_core::cpu::{
     to_scalar, xi_form_base,
 };
 use lean_vm_core::gkr::{ROUND_GRIND, y_grind};
-use lean_vm_core::keccak::{MIN_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG, TABLE_BITS, TABLES};
+use lean_vm_core::keccak::{MIN_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG, TABLE_BITS, TABLES, public_slot};
 use lean_vm_core::leaf::{self, Block, Coord};
 use pcs::ntt::AdditiveNttF64;
 use primitives::field::{F64, F128, g_pow};
@@ -101,6 +101,8 @@ struct ClaimDescriptor {
     qkeccak_slot: usize,
     /// The kappa source `(src, adj)` of the claim's low dimension.
     source: (usize, usize),
+    /// A slot claim's block of `q_keccak`, as an index into [`qt_columns`]; zero for another claim.
+    qt_col: usize,
 }
 
 // The guest's `POINT_BUF_*`, the point a pooled claim is made at: the bus's `zeta`, the table
@@ -255,7 +257,6 @@ fn constants(ph: &mut Placeholders) {
         ("N_ETA_POWS", &n_xi_powers()),
         ("N_TABLE_COLS", &TABLE_WIDTHS),
         ("TABLE_COL_BASE", &xi_offsets(TABLE_WIDTHS.iter().copied())),
-        ("N_COL_EVALS", &TABLE_WIDTHS.iter().sum::<usize>()),
         ("TABLE_COLS_CAP", &(TABLE_WIDTHS.iter().max().unwrap() + 1)),
         // The grinds: the bus's by the push depth, a sumcheck round of degree `d`, eq factor included, then each
         // other challenge the guest grinds for.
@@ -335,7 +336,37 @@ fn constants(ph: &mut Placeholders) {
     for &(name, value) in constants {
         ph.set(name, value);
     }
+    col_eval_placeholders(ph);
 }
+
+/// The evaluations the table sumcheck sends: every column's but the public ones'. A column's place among the words it
+/// sends, or `NOT_SENT`, and the constant a public column holds.
+fn col_eval_placeholders(ph: &mut Placeholders) {
+    let mut sent = 0usize;
+    let (mut place, mut constant): (Vec<usize>, Vec<u64>) = (Vec::new(), Vec::new());
+    for table in tables() {
+        for c in 0..table.width() {
+            match table.public.iter().find(|&&(p, _)| p == c) {
+                Some(&(_, word)) => {
+                    place.push(NOT_SENT);
+                    constant.push(word.c0);
+                }
+                None => {
+                    place.push(sent);
+                    constant.push(0);
+                    sent += 1;
+                }
+            }
+        }
+    }
+    ph.set("NOT_SENT", NOT_SENT);
+    ph.list("COL_EVAL_SENT", place);
+    ph.list("COL_EVAL_PUBLIC", constant);
+    ph.set("N_COL_EVALS", sent);
+}
+
+/// The place of a public column among the evaluations a table sumcheck sends: none.
+const NOT_SENT: usize = 100_000;
 
 /// The bus blocks and their coordinates and terms, given each coordinate's `(fresh, slot)` in the claim pool.
 fn bus_placeholders(ph: &mut Placeholders, sides: &[Vec<Block>; 3], kbc: usize, coord_claims: &[(usize, usize)]) {
@@ -452,26 +483,35 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
     let qkeccak = compact_col(QKECCAK);
     let claims: Vec<ClaimDescriptor> = (pool.iter())
         .map(|site| match *site {
-            ClaimSite::Framework { column, source } => (POINT_BUF_ZETA, compact_col(column), 0, source),
+            ClaimSite::Framework { column, source } => (POINT_BUF_ZETA, compact_col(column), 0, source, 0),
             // A table column's claim is at its table's chi[..tau].
             ClaimSite::TableColumn { column, table } => match keccak_value(column) {
-                None => (POINT_BUF_RHO, compact_col(column), 0, (2 + table, 0)),
-                // The half of `q_keccak` the slot is in rides above the slot's bits.
-                Some((half, KeccakLane::Slot(slot))) => (
-                    POINT_BUF_QKECCAK_RHO,
-                    qkeccak,
-                    slot + (half << SLOT_LOG),
-                    (2 + table, 0),
-                ),
-                Some((_, KeccakLane::Output(_))) => (POINT_BUF_KECCAK_OUT, qkeccak, 0, (2 + table, 0)),
+                None => (POINT_BUF_RHO, compact_col(column), 0, (2 + table, 0), 0),
+                Some((half, KeccakLane::Slot(slot))) => {
+                    // The block of the half's slots the slot is in: a public slot has no block, and no claim.
+                    let qt_col = qt_columns()
+                        .iter()
+                        .position(|&(h, first, log)| h == half && (first..first + (1 << log)).contains(&slot))
+                        .expect("a claim on a committed slot");
+                    // The half of `q_keccak` the slot is in rides above the slot's bits.
+                    (
+                        POINT_BUF_QKECCAK_RHO,
+                        qkeccak,
+                        slot + (half << SLOT_LOG),
+                        (2 + table, 0),
+                        qt_col,
+                    )
+                }
+                Some((_, KeccakLane::Output(_))) => (POINT_BUF_KECCAK_OUT, qkeccak, 0, (2 + table, 0), 0),
             },
-            ClaimSite::MemoryLimb { column } => (POINT_BUF_PI, compact_col(column), 0, (1, 0)),
+            ClaimSite::MemoryLimb { column } => (POINT_BUF_PI, compact_col(column), 0, (1, 0), 0),
         })
-        .map(|(buffer, column, qkeccak_slot, source)| ClaimDescriptor {
+        .map(|(buffer, column, qkeccak_slot, source, qt_col)| ClaimDescriptor {
             buffer,
             column,
             qkeccak_slot,
             source,
+            qt_col,
         })
         .collect();
     ph.set("N_CLAIMS", claims.len());
@@ -512,9 +552,10 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
     ph.set("KECCAK64_OUT_POOL", keccak64_out_pool);
     // The stacked opening batches the ring-switched claim, the pool's on-stack claims and the
     // Keccak reduction's claim on its output word and level 0's OOD claim; the batching is accounted for up to a cap.
-    // A QT proof has one ring claim over all the pieces of q_keccak, as a plain proof has.
+    // The pieces of q_keccak have one ring claim over all of them.
     let stacked = 1 + 1 + claims.iter().filter(|c| c.buffer != POINT_BUF_KECCAK_OUT).count() + 1;
     assert!(stacked <= verifier::MAX_STACKED_CLAIMS, "too many stacked claims");
+    ph.list("CLAIM_QT_COL", claims.iter().map(|c| c.qt_col));
     ph.set("QKECCAK_COMMITTED_COL", qkeccak);
 
     // A truncated proof cuts every column of kappa source `(s, 0)`, `s >= 1`, but q_keccak into pieces.
@@ -544,7 +585,7 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
     ph.list("COMBO_SRC", combos.iter().map(|c| c.1));
     ph.list("CLAIM_COMBO", claim_combo);
     ph.set("MFCNT_COMMITTED_COL", mfcnt);
-    // Under QT a slot's claim adds the pad of its slot past the covered rows, in its half.
+    // A slot's claim adds the pad of its slot past the covered rows, in its half.
     let pads = [qt_pad(0), qt_pad(1)];
     let slot_mask = (1 << SLOT_LOG) - 1;
     ph.list(
@@ -554,7 +595,28 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
             _ => 0,
         }),
     );
-    ph.list("QT_PAD", pads.concat());
+    // The row pad of a half is in its committed slots only: the public slots of `KECCAK64` hold their constants on every
+    // row, `QT_PUBLIC`, and are no pad.
+    let publics: Vec<u64> = (0..TABLES)
+        .flat_map(|half| (0..1 << SLOT_LOG).map(move |s| public_slot(half, s).unwrap_or(0)))
+        .collect();
+    let committed_pads: Vec<u64> = pads
+        .iter()
+        .enumerate()
+        .flat_map(|(half, pad)| {
+            pad.iter()
+                .enumerate()
+                .map(move |(s, &word)| if public_slot(half, s).is_some() { 0 } else { word })
+        })
+        .collect();
+    ph.list("QT_PAD", committed_pads);
+    ph.list("QT_PUBLIC", publics);
+    // The blocks of the halves of q_keccak, as columns of the guest after the native ones.
+    let qt_cols = qt_columns();
+    ph.set("N_QT_COLS", qt_cols.len());
+    ph.list("QT_COL_HALF", qt_cols.iter().map(|c| c.0));
+    ph.list("QT_COL_FIRST", qt_cols.iter().map(|c| c.1));
+    ph.list("QT_COL_LOG", qt_cols.iter().map(|c| c.2));
 }
 
 /// The combo of a claim that is not on a cut column.
@@ -841,8 +903,8 @@ fn opening_placeholders(ph: &mut Placeholders, kbc: usize) {
     ph.set("LIG_MIN_SHIFT_INV", F128::from(g_pow(minm).inv()));
     let cks = guest_col_sources(kbc);
     ph.set("N_COMMITTED_COLS", cks.len());
-    // The columns of the native layout: the guest's own two, the halves of q_keccak, follow them.
-    ph.set("N_NATIVE_COLS", cks.len() - TABLES);
+    // The columns of the native layout: the guest's own, the slot blocks of the halves of q_keccak, follow them.
+    ph.set("N_NATIVE_COLS", cks.len() - qt_columns().len());
     ph.list("COL_KAPPA_SRC", cks.iter().map(|&(s, _)| s));
     ph.list("COL_KAPPA_ADJ", cks.iter().map(|&(_, a)| a));
     let groups = col_groups(&cks);
