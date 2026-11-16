@@ -46,7 +46,10 @@ mod tests {
             offset,
             low_point,
             value,
-        } = ood_sample(&mut ps, &stack, log_n);
+        } = ood_sample(&mut ps, &stack, log_n)
+        else {
+            unreachable!("the OOD sample is a point claim")
+        };
         assert_eq!((offset, low_point.len()), (0, log_n));
         let naive: F128 = stack
             .iter()
