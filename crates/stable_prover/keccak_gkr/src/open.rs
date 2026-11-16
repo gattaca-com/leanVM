@@ -36,7 +36,7 @@ impl Openings {
             offset,
             points: vec![self.inputs],
         };
-        let outputs = self.outputs.map(|low_point| StackClaim { offset, low_point });
+        let outputs = self.outputs.map(|low_point| StackClaim::Point { offset, low_point });
         (ring, outputs)
     }
 }

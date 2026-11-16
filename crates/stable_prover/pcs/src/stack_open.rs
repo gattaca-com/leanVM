@@ -28,12 +28,55 @@ mod basis;
 
 pub(crate) use basis::{LOW_VARS, Terms};
 
-/// A point claim on the stack: `eq(low_point, .)` on the aligned slice `[offset, offset + 2^|low_point|)`; `offset`
-/// must be a multiple of `2^|low_point|`.
+/// A claim on the stack, with one batching coefficient.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StackClaim {
+pub enum StackClaim {
+    /// The weight `eq(low_point, .)` on the aligned slice `[offset, offset + 2^|low_point|)`; `offset` must be a
+    /// multiple of `2^|low_point|`.
+    Point { offset: usize, low_point: Vec<F128> },
+    /// The weight `sum_j scale_j * eq(low_point_j, .)`, each part on its aligned slice.
+    Sum(Vec<StackPart>),
+}
+
+/// One part of a [`StackClaim::Sum`]: `scale * eq(low_point, .)` on the aligned slice at `offset`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackPart {
     pub offset: usize,
     pub low_point: Vec<F128>,
+    pub scale: F128,
+}
+
+impl StackClaim {
+    /// Whether every aligned slice its weight is supported on ends within `len`.
+    fn fits(&self, len: usize) -> bool {
+        match self {
+            StackClaim::Point { offset, low_point } => offset + (1usize << low_point.len()) <= len,
+            StackClaim::Sum(parts) => parts.iter().all(|p| p.offset + (1usize << p.low_point.len()) <= len),
+        }
+    }
+}
+
+/// One point per Point claim and per Sum part, each with its batching coefficient (`lambda`, or `lambda * scale`).
+fn flatten(claims: &[StackClaim], lambdas: &[F128]) -> (Vec<StackClaim>, Vec<F128>) {
+    let (mut points, mut coefficients) = (Vec::new(), Vec::new());
+    for (claim, &lambda) in claims.iter().zip(lambdas) {
+        match claim {
+            StackClaim::Point { .. } => {
+                points.push(claim.clone());
+                coefficients.push(lambda);
+            }
+            StackClaim::Sum(parts) => {
+                for part in parts {
+                    points.push(StackClaim::Point {
+                        offset: part.offset,
+                        low_point: part.low_point.clone(),
+                    });
+                    coefficients.push(lambda * part.scale);
+                }
+            }
+        }
+    }
+    (points, coefficients)
 }
 
 /// The ring-switched claims, all on the slice `q_keccak = stack[offset..offset + 2^qkeccak_vars]`, `offset` a multiple
@@ -78,7 +121,7 @@ pub fn commit(ps: &mut ProverState, stack: &[F64], log_n: usize, log_inv_rate: u
         prover_data,
         log_n,
         log_inv_rate,
-        ood: StackClaim { offset: 0, low_point },
+        ood: StackClaim::Point { offset: 0, low_point },
     }
 }
 
@@ -110,12 +153,10 @@ pub fn open(
         ring.points.iter().all(|point| point.len() == ring.qkeccak_vars()),
         "every ring claim is on q_keccak"
     );
-    for StackClaim { offset, low_point } in &point_claims {
-        assert!(
-            offset + (1 << low_point.len()) <= 1 << log_n,
-            "every claim lies inside the stack"
-        );
-    }
+    assert!(
+        point_claims.iter().all(|claim| claim.fits(1 << log_n)),
+        "every claim lies inside the stack"
+    );
     assert!(ring.points.len() + point_claims.len() <= MAX_STACKED_CLAIMS);
     // One grind covers the map's challenges and lambda: one verifier message.
     ps.grind(BATCH_GRINDING_BITS);
@@ -133,8 +174,9 @@ pub fn open(
         .collect();
 
     let lane_vars = log_n - INITIAL_FOLDING_FACTOR;
+    let (points, coefficients) = flatten(&point_claims, point_lambdas);
     let (terms, a) = tracing::info_span!("Basis")
-        .in_scope(|| basis::initial_basis(log_n, lane_vars, &point_claims, point_lambdas, ring.offset, &rings));
+        .in_scope(|| basis::initial_basis(log_n, lane_vars, &points, &coefficients, ring.offset, &rings));
     whir::open(ps, &config, LaneRounds::new(stack, terms, a), prover_data);
 }
 
@@ -152,7 +194,9 @@ mod tests {
         let (log_n, lane_vars) = (16, 10);
         let stack: Vec<F64> = (0..13 << lane_vars).map(|_| F64(rng.next_u64())).collect();
         let mut ps = ProverState::new([1; 4], [2; 4]);
-        let StackClaim { offset, low_point } = commit(&mut ps, &stack, log_n, 1).ood;
+        let StackClaim::Point { offset, low_point } = commit(&mut ps, &stack, log_n, 1).ood else {
+            unreachable!("the OOD sample is a point claim")
+        };
         assert_eq!((offset, low_point.len()), (0, log_n));
         let naive: F128 = stack
             .iter()
@@ -231,7 +275,7 @@ mod tests {
                 shapes.push((0, lane_vars + LANE_ROUNDS, None));
                 let claims: Vec<_> = shapes
                     .into_iter()
-                    .map(|(offset, vars, point)| StackClaim {
+                    .map(|(offset, vars, point)| StackClaim::Point {
                         offset,
                         low_point: point.unwrap_or_else(|| rng.ext_vec(vars)),
                     })
@@ -244,7 +288,9 @@ mod tests {
                     RingFold::new(ring.phi, &ring.point).add_chunk(0, &mut dense[offset..offset + qkeccak_len]);
                 }
                 for (claim, &lambda) in claims.iter().zip(&lambdas) {
-                    let StackClaim { offset, low_point } = claim;
+                    let StackClaim::Point { offset, low_point } = claim else {
+                        unreachable!("the test builds Point claims only")
+                    };
                     for j in 0..1usize << low_point.len() {
                         let w = low_point.iter().enumerate().fold(lambda, |w, (i, &p_i)| {
                             w * if (j >> i) & 1 == 1 { p_i } else { F128::ONE + p_i }
@@ -285,5 +331,42 @@ mod tests {
                 assert_eq!(w, reference.w, "{context}, weight");
             }
         }
+    }
+
+    /// A Sum claim over the two halves of a column gives the first round and the lane and weight of the Point claim on
+    /// the whole column.
+    #[test]
+    fn sum_of_halves_matches_the_point_on_the_whole_column() {
+        let mut rng = Rng::new(0x5B17);
+        let (lane_vars, vars, offset) = (8usize, 7usize, 128usize);
+        let stack: Vec<F64> = (0..2 << lane_vars).map(|_| F64(rng.next_u64())).collect();
+        let (point, lambda) = (rng.ext_vec(vars), rng.ext());
+        let top = point[vars - 1];
+        let part = |offset, scale| StackPart {
+            offset,
+            low_point: point[..vars - 1].to_vec(),
+            scale,
+        };
+        let whole = [StackClaim::Point {
+            offset,
+            low_point: point.clone(),
+        }];
+        let halves = [StackClaim::Sum(vec![
+            part(offset, F128::ONE + top),
+            part(offset + (1 << (vars - 1)), top),
+        ])];
+        let run = |claims: &[StackClaim]| {
+            let (points, coefficients) = flatten(claims, &[lambda]);
+            let (terms, a) = basis::initial_basis(lane_vars + 1, lane_vars, &points, &coefficients, 0, &[]);
+            let mut lanes = LaneRounds::new(stack.clone(), terms, a);
+            let table = lanes.table();
+            lanes.fold(&FoldChallenges {
+                alpha: lambda,
+                beta: top,
+            });
+            let (p, w) = lanes.finish();
+            (table, p, w)
+        };
+        assert_eq!(run(&whole), run(&halves));
     }
 }

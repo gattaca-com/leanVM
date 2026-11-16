@@ -349,7 +349,7 @@ mod tests {
                 // The first and the last committed lane, and the whole stack, whose weight reaches past them.
                 let claims: Vec<_> = [(0, lane_vars), (used - lane_block, lane_vars), (0, log_n)]
                     .into_iter()
-                    .map(|(offset, vars)| StackClaim {
+                    .map(|(offset, vars)| StackClaim::Point {
                         offset,
                         low_point: rng.ext_vec(vars),
                     })
@@ -365,6 +365,15 @@ mod tests {
                     ps.into_proof()
                 };
                 assert_eq!(prove(&witness[..used]), prove(&witness), "n_lanes = {n_lanes}");
+                // Committed truncated, opened over the whole stack: the zero tail is the opening's only.
+                let mut ps = ProverState::from_label(b"whir-test");
+                let committed = commit(&mut ps, &witness[..used], log_n, MIN_LOG_INV_RATE);
+                open(&mut ps, committed, witness.clone(), &claims, &ring);
+                assert_eq!(
+                    ps.into_proof(),
+                    prove(&witness),
+                    "the opening differs at n_lanes = {n_lanes}"
+                );
             }
         }
     }

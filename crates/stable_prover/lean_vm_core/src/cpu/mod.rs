@@ -18,21 +18,33 @@ mod execute;
 mod hints;
 pub mod layout;
 mod trace;
+mod truncate;
 pub use execute::{ExecError, Execution, Fault, Memory, execute};
 use isa::Program;
 pub use isa::{DerefMode, Op, OutCells, Stats};
 pub use layout::*;
 pub(crate) use trace::{Drow, Jrow, Krow, Srow, Trace, Xrow};
+pub use truncate::{piece_digits, qt_pad};
 
 /// Announce the prover's sizes (`log_mem`, every table's row count, the PCS rate) on the stream, from which the
 /// verifier rebuilds the layout ([`layout::table_logs`]). The statement, the program and the public input, is not
 /// announced: it seeds the transcript.
-fn announce_public(ps: &mut ProverState, log_mem: usize, rows: [usize; tables::N_TABLES], log_inv_rate: usize) {
+///
+/// A truncated proof (`truncate` holds its memory count and whether q_keccak is a region) packs
+/// `(mem_count << 2) | flag` in the rate word's high limb. Flag 1 is a truncated proof, flag 2 one with the region.
+fn announce_public(
+    ps: &mut ProverState,
+    log_mem: usize,
+    rows: [usize; tables::N_TABLES],
+    log_inv_rate: usize,
+    truncate: Option<(usize, bool)>,
+) {
     ps.add_scalar(F128::new(log_mem as u64, 0));
     for n in rows {
         ps.add_scalar(F128::new(n as u64, 0));
     }
-    ps.add_scalar(F128::new(log_inv_rate as u64, 0));
+    let memory = truncate.map_or(0, |(mem_count, qt)| ((mem_count as u64) << 2) | (1 + qt as u64));
+    ps.add_scalar(F128::new(log_inv_rate as u64, memory));
 }
 
 pub use verifier::Proof;
@@ -154,15 +166,22 @@ pub fn prove(
         log_mem,
         exec.trace.row_counts(),
     );
-    if layout.shape.mu > pcs::MAX_STACKED_LOG {
+    let compact = if program.truncate {
+        let floor = verifier::min_execution_stacked_log(crate::log2_strict_usize(program.prog.len()));
+        truncate::Compact::reaching(&layout, exec.mem_used, floor)?
+    } else {
+        None
+    };
+    let shape = compact.as_ref().map_or(layout.shape, |c| c.shape);
+    if !(pcs::MIN_STACKED_LOG..=pcs::MAX_STACKED_LOG).contains(&shape.mu) {
         return Err(ProveError::WitnessOutOfRange {
-            log_committed: layout.shape.mu,
+            log_committed: shape.mu,
         });
     }
     let stats = Stats {
         cycles: exec.cycles,
         rows: layout.rows,
-        committed: layout.committed_size(),
+        committed: compact.as_ref().map_or_else(|| layout.committed_size(), |c| c.placed),
         log_mem,
         mem_used: exec.mem_used,
     };
@@ -175,8 +194,20 @@ pub fn prove(
         verifier::Digest(program.bytecode().fiat_shamir_iv()).words(),
         verifier::Digest(public_input_bytes(&public_input)).words(),
     );
-    announce_public(&mut ps, log_mem, w.layout.rows, log_inv_rate);
-    let committed = crate::stage!("Commit", || pcs::commit(&mut ps, &w.q, w.layout.shape.mu, log_inv_rate));
+    announce_public(
+        &mut ps,
+        log_mem,
+        w.layout.rows,
+        log_inv_rate,
+        compact.as_ref().map(truncate::Compact::announced),
+    );
+    let compact_q = compact
+        .as_ref()
+        .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
+    let committed = crate::stage!("Commit", || {
+        let q = compact_q.as_deref().unwrap_or(&w.q);
+        pcs::commit(&mut ps, &q[..shape.committed_len()], shape.mu, log_inv_rate)
+    });
 
     let (bus, table_claims) = {
         let l = &w.layout;
@@ -209,7 +240,16 @@ pub fn prove(
     });
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
-    crate::stage!("PCS open", || pcs::open(&mut ps, committed, w.q, &slots, &ring));
+    // The reduction was the last reader of the full stack: a truncated proof opens the compact one.
+    let (q, slots, ring) = match (compact.as_ref(), compact_q) {
+        (Some(c), Some(compact_q)) => {
+            drop(w.q);
+            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
+            (compact_q, slots, ring)
+        }
+        _ => (w.q, slots, ring),
+    };
+    crate::stage!("PCS open", || pcs::open(&mut ps, committed, q, &slots, &ring));
     Ok((ps.into_proof(), stats))
 }
 
@@ -285,7 +325,7 @@ fn slot_claim(l: &Layout, col: usize, point: Vec<F128>) -> pcs::StackClaim {
         Some(KeccakLane::Slot(slot)) => l.placements[QKECCAK].offset + (slot << point.len()),
         _ => l.placements[col].offset,
     };
-    pcs::StackClaim {
+    pcs::StackClaim::Point {
         offset,
         low_point: point,
     }

@@ -41,12 +41,12 @@ fn main() {
     let n = 1usize << log_n;
     let witness: Vec<F64> = (0..n).map(|_| F64(rng.next_u64())).collect();
     // One point claim over the whole witness, then smaller ones on its quarters, and ring claims on its first half.
-    let mut claims = vec![StackClaim {
+    let mut claims = vec![StackClaim::Point {
         offset: 0,
         low_point: rng.ext_vec(log_n),
     }];
     for c in 1..env_usize("PCS_POINT_CLAIMS", 1) {
-        claims.push(StackClaim {
+        claims.push(StackClaim::Point {
             offset: (c % 4) << (log_n - 2),
             low_point: rng.ext_vec(log_n - 2),
         });

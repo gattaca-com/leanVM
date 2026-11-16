@@ -316,7 +316,12 @@ pub(super) fn initial_basis(
     assert!(lane_vars >= LOW_VARS, "a lane block holds at least one block");
     let factors: Vec<Vec<Factor>> = claims
         .iter()
-        .map(|StackClaim { offset, low_point }| point_factors(low_point, *offset, log_n))
+        .map(|claim| {
+            let StackClaim::Point { offset, low_point } = claim else {
+                unreachable!("initial_basis takes flattened Point claims")
+            };
+            point_factors(low_point, *offset, log_n)
+        })
         .collect();
     let mut terms = Terms {
         lane_vars,
