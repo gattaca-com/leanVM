@@ -63,7 +63,8 @@ def main():
     let want = hash_cells(&scalar_cells([5, 7, 5, 7]));
 
     let (proof, _) = prove(&program, &[], want, lean_vm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 1, "one KECCAK instruction");
+    // A 64-byte message from no state is a KECCAK64, which is `KECCAK`'s narrow form.
+    assert_eq!(mix(src, want)[5..].iter().sum::<usize>(), 1, "one hash instruction");
     verify(&program, &want, &proof).expect("StackBuf self-hash verifies");
 }
 
@@ -489,7 +490,11 @@ def step(state, v):
     let want = hash_cells(&second);
 
     let (proof, _) = prove(&program, &[], want, lean_vm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 2, "two KECCAK instructions (one per inlined step)");
+    assert_eq!(
+        mix(src, want)[5..].iter().sum::<usize>(),
+        2,
+        "two hash instructions (one per inlined step)"
+    );
     verify(&program, &want, &proof).expect("inline StackBuf+scalar tuple return verifies");
 }
 
@@ -598,7 +603,7 @@ def main():
     // s = [7, 5] after the swap → words [7,0,5,0]; t = [7 ^ 5, 3] = [2, 3] → [2,0,3,0].
     let want = hash_cells(&scalar_cells([7, 5, 2, 3]));
     let (proof, _) = prove(&program, &[], want, lean_vm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 1, "one KECCAK instruction");
+    assert_eq!(mix(src, want)[5..].iter().sum::<usize>(), 1, "one hash instruction");
     verify(&program, &want, &proof).expect("list-literal StackBuf verifies");
 }
 

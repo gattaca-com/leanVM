@@ -346,6 +346,16 @@ impl FnLower<'_> {
         out: &KeccakOut,
         padded: bool,
     ) {
+        // A message of four cells and 64 bytes, from no state, into one or two cells: the narrow `KECCAK64`, plain.
+        if state.is_none()
+            && final_len == Some(64)
+            && cells.len() == 4
+            && !padded
+            && matches!(out.cells, OutCells::One | OutCells::Two)
+        {
+            self.emit_keccak64(&cells, out, (F64::ONE, F64::ZERO, F64::ZERO));
+            return;
+        }
         let blocks = match final_len {
             Some(len) => keccak256::permutations(len as usize),
             None => (16 * cells.len()).div_ceil(RATE),

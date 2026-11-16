@@ -73,7 +73,9 @@ fn any_number_of_steps_proves() {
         let pi = chained_digest(n);
         let program = compile(&parse(&source).expect("parse"));
         let (proof, stats) = prove(&program, &[], pi, lean_vm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-        assert_eq!(stats.rows[5], n, "{n} steps");
+        // Each `keccak` of two 2-cell buffers is a `KECCAK64`.
+        assert_eq!(stats.rows[5..].iter().sum::<usize>(), n, "{n} steps");
+        assert_eq!(stats.rows[6], n, "{n} steps are KECCAK64 rows");
         verify(&program, &pi, &proof).unwrap_or_else(|e| panic!("{n} steps: {e:?}"));
     }
 }
