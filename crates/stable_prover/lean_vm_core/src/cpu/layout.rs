@@ -22,14 +22,41 @@ pub enum KeccakLane {
     Output(usize),
 }
 
-/// What `q_keccak` holds for the global column `col`, if it holds anything: a value lane of
-/// the KECCAK table, or one of its columns riding a spare slot.
-pub fn keccak_value(col: usize) -> Option<KeccakLane> {
-    if let Some(slot) = verifier::layout::qkeccak_slot(col) {
-        return Some(KeccakLane::Slot(slot));
+/// What `q_keccak` holds for the global column `col`, if it holds anything: the half of `q_keccak` it is a column of
+/// (the table bit), and a value lane of that table or one of its columns riding a spare slot.
+pub fn keccak_value(col: usize) -> Option<(usize, KeccakLane)> {
+    use verifier::layout::{HASH_TABLES, KECCAK_OUT, KECCAK64_OUT, KECCAK64_OUT_LANES};
+    if let Some((half, slot)) = verifier::layout::qkeccak_slot(col) {
+        return Some((half, KeccakLane::Slot(slot)));
     }
-    let lane = col.checked_sub(GLOBAL_COLUMN_BASES[verifier::layout::OP_KECCAK] + tables::keccakt::V_OUT)?;
-    (lane < primitives::hash::STATE_LANES).then_some(KeccakLane::Output(lane))
+    // The output lanes the bus reads: all 25 of `KECCAK`'s, and the first 4 of `KECCAK64`'s.
+    let outputs = [
+        (KECCAK_OUT, primitives::hash::STATE_LANES),
+        (KECCAK64_OUT, KECCAK64_OUT_LANES),
+    ];
+    HASH_TABLES
+        .iter()
+        .zip(outputs)
+        .enumerate()
+        .find_map(|(half, (&table, (first, lanes)))| {
+            let lane = col.checked_sub(GLOBAL_COLUMN_BASES[table] + first)?;
+            (lane < lanes).then_some((half, KeccakLane::Output(lane)))
+        })
+}
+
+/// `log2` of the steps the hash tables are each completed to: the tallest's height.
+pub(crate) fn hash_kappa(taus: &[usize; tables::N_TABLES]) -> usize {
+    verifier::layout::HASH_TABLES
+        .iter()
+        .map(|&t| taus[t])
+        .max()
+        .expect("hash tables")
+}
+
+/// Where the slot `slot` of table half `half` starts in `q_keccak`, laid out `(step, table, slot)` over `2^kappa` steps a
+/// table: the half's slot is a run of `2^kappa` words, of which its table's first `2^tau` are its column.
+pub(crate) fn qkeccak_slot_start(kappa: usize, half: usize, slot: usize) -> usize {
+    verifier::layout::qkeccak_slot_start(kappa, half, slot) as usize
 }
 // `q_keccak`'s slots as the verifier counts them: the committed states', then a spare one per riding column.
 const _: () = {
@@ -100,14 +127,17 @@ impl Witness {
     /// the private buffer for an output lane.
     pub(crate) fn columns(&self) -> Vec<&[F64]> {
         let q_keccak = self.layout.placements[QKECCAK].offset;
-        let steps = 1 << self.layout.taus[verifier::layout::OP_KECCAK];
+        let kappa = hash_kappa(&self.layout.taus);
         let mut cols: Vec<&[F64]> = self
             .layout
             .placements
             .iter()
             .enumerate()
             .map(|(i, p)| match keccak_value(i) {
-                Some(KeccakLane::Slot(slot)) => &self.q[q_keccak + slot * steps..][..steps],
+                Some((half, KeccakLane::Slot(slot))) => {
+                    let tau = self.layout.taus[verifier::layout::HASH_TABLES[half]];
+                    &self.q[q_keccak + qkeccak_slot_start(kappa, half, slot)..][..1 << tau]
+                }
                 _ if p.is_virtual() => &[][..],
                 _ => &self.q[p.offset..][..1 << p.n_vars],
             })
@@ -119,10 +149,15 @@ impl Witness {
     }
 }
 
+/// The kappa source of the tallest hash table's height: the log of the steps the Keccak reduction completes each
+/// table to.
+pub const KAPPA_SOURCE: usize = 2 + tables::N_TABLES;
+
 /// The committed columns' kappa sources, for the recursion guest's in-circuit certification of the stacked size
 /// `m = max(log2_ceil(Σ 2^kappa), MIN_STACKED_LOG)`. Per committed column `Some((source, adj))`, with
 /// `kappa = value(source) + adj`: source 0 is the constant 0 (the bytecode's count column takes
-/// `adj = log_bytecode`), source 1 is `log_mem`, and source `2 + t` is `tau_t`. `None` marks a virtual column, never
+/// `adj = log_bytecode`), source 1 is `log_mem`, source `2 + t` is `tau_t`, and [`KAPPA_SOURCE`] is the tallest hash
+/// table's `tau`. `None` marks a virtual column, never
 /// committed. `col_kappas` is derived from this, so the two cannot drift apart.
 pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     let mut k = vec![Some((0usize, 0usize)); N_COLUMNS];
@@ -130,8 +165,8 @@ pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     k[MEMORY_1] = Some((1, 0));
     k[MEMORY_FINAL_COUNTERS] = Some((1, 0));
     k[BYTECODE_FINAL_COUNTERS] = Some((0, log_bytecode));
-    // `q_keccak` is `2^(SLOT_LOG + n_steps_log)` words, and the KECCAK table is `2^n_steps_log` rows.
-    k[QKECCAK] = Some((2 + verifier::layout::OP_KECCAK, crate::keccak::SLOT_LOG));
+    // `q_keccak` is `2^(SLOT_LOG + TABLE_BITS + kappa)` words, `kappa` the tallest hash table's height.
+    k[QKECCAK] = Some((KAPPA_SOURCE, crate::keccak::SLOT_LOG + crate::keccak::TABLE_BITS));
     for t in 0..tables::N_TABLES {
         let base = GLOBAL_COLUMN_BASES[t];
         k[base..base + TABLE_WIDTHS[t]].fill(Some((2 + t, 0)));
@@ -169,6 +204,7 @@ pub fn block_kappa_sources(log_bytecode: usize) -> Vec<(usize, usize)> {
 fn col_kappas(log_mem: usize, log_bytecode: usize, taus: [usize; tables::N_TABLES]) -> Vec<Option<usize>> {
     let mut values = vec![0usize, log_mem];
     values.extend(taus);
+    values.push(hash_kappa(&taus));
     col_kappa_sources(log_bytecode)
         .iter()
         .map(|s| s.map(|(source, adj)| values[source] + adj))
@@ -265,9 +301,9 @@ pub fn layout_of(log_bytecode: usize, log_mem: usize, rows: [usize; tables::N_TA
 pub(crate) fn table_logs(rows: [usize; tables::N_TABLES]) -> [usize; tables::N_TABLES] {
     let taus = std::array::from_fn(|t| crate::log2_ceil_usize(rows[t]).max(tables::TABLE_LOG_FLOORS[t]));
     debug_assert_eq!(
-        taus[verifier::layout::OP_KECCAK],
-        crate::keccak::n_steps_log(rows[verifier::layout::OP_KECCAK]),
-        "the KECCAK table is the Keccak reduction's batch"
+        hash_kappa(&taus),
+        crate::keccak::kappa(verifier::layout::HASH_TABLES.map(|t| rows[t])),
+        "the hash tables are the Keccak reduction's batch"
     );
     taus
 }
@@ -282,19 +318,29 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout) -> Witness {
     let mut q = parallel::filled(l.shape.committed_len(), F64::ZERO);
     let mut windows = witness::split_stack(&mut q, &l.placements);
     // An output lane is in neither the stack nor `q_keccak`, but the bus reads it: it has a buffer of its own.
-    let steps = 1 << l.taus[verifier::layout::OP_KECCAK];
+    let kappa = hash_kappa(&l.taus);
+    let steps = 1usize << kappa;
     let mut virt: Vec<(usize, Vec<F64>)> = (0..N_COLUMNS)
-        .filter(|&i| matches!(keccak_value(i), Some(KeccakLane::Output(_))))
-        .map(|i| (i, vec![F64::ZERO; steps]))
+        .filter_map(|i| match keccak_value(i) {
+            Some((half, KeccakLane::Output(_))) => {
+                Some((i, vec![F64::ZERO; 1 << l.taus[verifier::layout::HASH_TABLES[half]]]))
+            }
+            _ => None,
+        })
         .collect();
     for (i, buf) in virt.iter_mut() {
         windows[*i] = buf;
     }
-    // `q_keccak`'s window is the committed states, then a spare slot per KECCAK column riding there.
-    let (states, spare) = std::mem::take(&mut windows[QKECCAK]).split_at_mut(crate::keccak::SLOTS * steps);
+    // `q_keccak`'s window is the committed states of each table, then a spare slot of each table per hash column riding
+    // there. A table shorter than the tallest has zeros past its own rows in its slot, where the fill leaves them.
+    let states_len = crate::keccak::SLOTS * steps * crate::keccak::TABLES;
+    let (states, spare) = std::mem::take(&mut windows[QKECCAK]).split_at_mut(states_len);
     windows[QKECCAK] = states;
-    for (k, window) in spare.chunks_exact_mut(steps).enumerate() {
-        windows[GLOBAL_COLUMN_BASES[verifier::layout::OP_KECCAK] + verifier::layout::spare_local(k)] = window;
+    for (i, window) in spare.chunks_exact_mut(steps).enumerate() {
+        let (k, half) = (i >> crate::keccak::TABLE_BITS, i & (crate::keccak::TABLES - 1));
+        let table = verifier::layout::HASH_TABLES[half];
+        windows[GLOBAL_COLUMN_BASES[table] + verifier::layout::spare_local(half, k)] =
+            &mut window[..1 << l.taus[table]];
     }
 
     crate::stage!("Fill columns", || {
@@ -338,7 +384,8 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout) -> Witness {
             let op = tables::KeccakOp::of(&program.prog[row.pc as usize]);
             crate::keccak::state_of_cells(op.in_odd, |c| exec.mem.word(op.cell(row.fp, c) as usize))
         });
-        crate::keccak::place(&inputs, windows[QKECCAK])
+        // The stable prover runs no `KECCAK64`: its table holds only padding steps.
+        crate::keccak::place([&inputs, &[]], kappa, windows[QKECCAK])
     });
     drop(windows);
     Witness {

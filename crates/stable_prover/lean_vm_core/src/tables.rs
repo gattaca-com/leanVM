@@ -57,6 +57,7 @@ pub(crate) const OP_SET: F64 = g_pow(verifier::layout::OP_SET);
 pub(crate) const OP_DEREF: F64 = g_pow(verifier::layout::OP_DEREF);
 pub(crate) const OP_JUMP: F64 = g_pow(verifier::layout::OP_JUMP);
 pub(crate) const OP_KECCAK: F64 = g_pow(verifier::layout::OP_KECCAK);
+pub(crate) const OP_KECCAK64: F64 = g_pow(verifier::layout::OP_KECCAK64);
 
 // ---- flush builder -----------------------------------------------------------
 
@@ -297,7 +298,7 @@ pub(crate) trait Table: Sync {
     fn fill(&self, ctx: &FillCtx, out: &mut [&mut [F64]]);
 }
 
-/// The tables in fixed order `[XOR, MUL, SET, DEREF, JUMP, KECCAK]`, the
+/// The tables in fixed order `[XOR, MUL, SET, DEREF, JUMP, KECCAK, KECCAK64]`, the
 /// order of `row_counts` / `taus` throughout `cpu`.
 pub use verifier::layout::N_TABLES;
 
@@ -309,12 +310,16 @@ pub(crate) fn tables() -> [&'static dyn Table; N_TABLES] {
         &DerefTable,
         &JumpTable,
         &KeccakTable,
+        &Keccak64Table,
     ]
 }
 
-/// Each table's least log height: 0, but the Keccak reduction's block of steps for `KECCAK`.
+/// Each table's least log height: 0, but the Keccak reduction's block of steps for the tables it proves.
 pub use verifier::layout::TABLE_LOG_FLOORS;
-const _: () = assert!(crate::keccak::MIN_STEPS == 1 << TABLE_LOG_FLOORS[verifier::layout::OP_KECCAK]);
+const _: () = assert!(
+    crate::keccak::MIN_STEPS == 1 << TABLE_LOG_FLOORS[verifier::layout::OP_KECCAK]
+        && crate::keccak::MIN_STEPS == 1 << TABLE_LOG_FLOORS[verifier::layout::OP_KECCAK64]
+);
 
 /// What each cell a `KECCAK` row touches is addressed by, in flush order (the four `m` cells, the
 /// four `tail` cells, `b8`, the four `cap` cells, then the thirteen output cells): the offset
@@ -904,10 +909,125 @@ impl Table for KeccakTable {
     }
 }
 
+// ---- KECCAK64 --------------------------------------------------------------------------
+
+/// `KECCAK64` (`Op::Keccak64`): the Keccak-f\[1600\] permutation of a 64-byte message `P | A' | X | Y'`, four cells
+/// addressed independently at `fp·o_p`, `fp·o_a`, `fp·o_x` and `fp·o_y`, two lanes a cell in the even layout. Lane 2
+/// of the state is `in_2 = (A.lo + k_a) / s_a` and lane 6 is `in_6 = Y.lo + k_y`, so the memory flush of `A` carries
+/// `(s_a · in_2 + k_a, in_3)` and that of `Y` carries `(in_6 + k_y, in_7)`. `s_a`, `k_a` and `k_y` are bytecode
+/// operands, K-valued. Lanes 8 to 24 of the state are the constants such a message leaves there under the padding
+/// (`verifier::layout::keccak64_pad`), which seventeen degree-one identities pin. It writes output cell 0, lanes 0 and
+/// 1, at `fp·o_out`, and with `out_two` cell 1, lanes 2 and 3, at `g·fp·o_out`.
+///
+/// Like `KECCAK`'s, the input lanes are slots of `q_keccak` (its second half), and the output lanes 0 to 3 are virtual:
+/// their claims are the reduction's claim on the output. The other committed columns but `r_bc` and the three
+/// immediates ride the slots the states leave free.
+///
+/// The stable prover runs no `KECCAK64` row yet, so the table is padding steps only.
+struct Keccak64Table;
+
+pub(crate) mod keccak64 {
+    use crate::keccak::KECCAK64_ROW_CELLS;
+    use primitives::hash::STATE_LANES;
+
+    pub const PC: usize = 0;
+    pub const FP: usize = 1;
+    pub const O_A: usize = 2; // the g-powers of the four cell operands …
+    pub const O_OUT: usize = O_A + 4; // … and of the output cell
+    pub const OUT_TWO: usize = O_OUT + 1; // whether output cell 1 is written
+    pub const V_IN: usize = OUT_TWO + 1; // the 25 input lanes, in lane order …
+    pub const V_OUT: usize = V_IN + STATE_LANES; // … and output lanes 0 to 3
+    pub const OUT_LANES: usize = 4;
+    pub const R0: usize = V_OUT + OUT_LANES; // one read count per cell: four read, two written
+    pub const RBC: usize = R0 + KECCAK64_ROW_CELLS;
+    /// The three immediates `A'` and `Y'` carry: bytecode operands, K-valued. They sit after `RBC` because `q_keccak`'s
+    /// spare slots hold the first columns and counts, and take no more.
+    pub const S_A: usize = RBC + 1;
+    pub const K_A: usize = S_A + 1;
+    pub const K_Y: usize = K_A + 1;
+    pub const N: usize = K_Y + 1;
+    /// Lanes of the message, which the four cells hold.
+    pub const MESSAGE_LANES: usize = 8;
+}
+
+/// What each cell a `KECCAK64` row touches is addressed by, in flush order: the offset operand it follows, in the
+/// order of the bytecode slots, and how far.
+const KECCAK64_CELLS: [(usize, u32); crate::keccak::KECCAK64_ROW_CELLS] =
+    [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (4, 1)];
+
+impl Table for Keccak64Table {
+    fn n_committed_columns(&self) -> usize {
+        keccak64::N
+    }
+    fn count_columns(&self) -> Range<usize> {
+        keccak64::R0..keccak64::RBC + 1
+    }
+    /// Zeros, but for the input lanes the padding fixes and the output lanes: a padding row permutes the state of a
+    /// 64-byte message of zeros, in the even layout.
+    fn padding(&self) -> Vec<F64> {
+        let mut row = vec![F64::ZERO; keccak64::N];
+        let pad = verifier::layout::keccak64_pad();
+        let mut out = pad;
+        primitives::hash::keccak_f(&mut out);
+        for (lane, &w) in pad.iter().enumerate() {
+            row[keccak64::V_IN + lane] = F64(w);
+        }
+        for (lane, &w) in out[..keccak64::OUT_LANES].iter().enumerate() {
+            row[keccak64::V_OUT + lane] = F64(w);
+        }
+        row
+    }
+    fn n_constraints(&self) -> usize {
+        primitives::hash::STATE_LANES - keccak64::MESSAGE_LANES
+    }
+    /// `in_l = PAD_l` for lanes 8 to 24, identity `l - 8` weighted `pows[l - 8]`.
+    fn constraint(&self, pows: &[F128]) -> Form {
+        use keccak64::*;
+        let pad = verifier::layout::keccak64_pad();
+        let mut form = Form::new(N);
+        for lane in MESSAGE_LANES..primitives::hash::STATE_LANES {
+            let w = pows[lane - MESSAGE_LANES];
+            form.coeffs[V_IN + lane] = w;
+            form.constant += w * F128::from(F64(pad[lane]));
+        }
+        form
+    }
+    fn flushes(&self, f: &mut FlushBuilder) {
+        use keccak64::*;
+        f.state_step(PC, FP);
+        // Nine operands: the five offsets, `out_two`, then the three immediates.
+        let operands: Vec<Coord> = (O_A..=OUT_TWO).chain([S_A, K_A, K_Y]).map(Col).collect();
+        f.bytecode(PC, RBC, OP_KECCAK64, &operands);
+        for (c, &(operand, step)) in KECCAK64_CELLS.iter().enumerate() {
+            let addr = Prod(FP, O_A + operand, step);
+            match c {
+                // Cell `A` holds `s_a · in_2 + k_a` in its low limb, and cell `Y` holds `in_6 + k_y`.
+                1 => f.memory_coords(
+                    addr,
+                    R0 + c,
+                    [Coord::Sum(vec![Prod(V_IN + 2, S_A, 0), Col(K_A)]), Col(V_IN + 3)],
+                ),
+                3 => f.memory_coords(addr, R0 + c, [Coord::Sum(vec![Col(V_IN + 6), Col(K_Y)]), Col(V_IN + 7)]),
+                0..4 => f.memory(addr, R0 + c, V_IN + 2 * c, V_IN + 2 * c + 1),
+                4 => f.memory(addr, R0 + c, V_OUT, V_OUT + 1),
+                _ => f.memory_coords_if(OUT_TWO, addr, R0 + c, [Col(V_OUT + 2), Col(V_OUT + 3)]),
+            }
+        }
+    }
+    /// Every column but the input lanes, which are `q_keccak`'s and have no window here: no row, so all padding.
+    fn fill(&self, ctx: &FillCtx, out: &mut [&mut [F64]]) {
+        use keccak64::*;
+        ctx.cols_at(out, 0, PC, |_| [F64::ZERO; V_IN]);
+        ctx.cols_at(out, 0, V_OUT, |_| [F64::ZERO; N - V_OUT]);
+    }
+}
+
 /// The fewest committed columns of a table's row, `SET`'s: a run of `n` steps commits at least `n` times it, which
 /// bounds the steps of a provable run (the interpreter's step limit).
 pub(crate) const MIN_COMMITTED_COLUMNS: usize = set::N;
-const _: () = assert!(set::N <= arith::N && set::N <= deref::N && set::N <= jump::N && set::N <= keccakt::N);
+const _: () = assert!(
+    set::N <= arith::N && set::N <= deref::N && set::N <= jump::N && set::N <= keccakt::N && set::N <= keccak64::N
+);
 
 // Each table's columns are the verifier's, in number, and the KECCAK value lanes and read counts where the verifier's
 // spare slots expect them.
@@ -917,6 +1037,9 @@ const _: () = {
     assert!(set::N == TABLE_WIDTHS[OP_SET] && deref::N == TABLE_WIDTHS[OP_DEREF] && jump::N == TABLE_WIDTHS[OP_JUMP]);
     assert!(keccakt::N == TABLE_WIDTHS[verifier::layout::OP_KECCAK]);
     assert!(keccakt::V_IN == KECCAK_IN && keccakt::V_OUT == KECCAK_OUT && keccakt::R0 == KECCAK_CNT);
+    assert!(keccak64::N == TABLE_WIDTHS[verifier::layout::OP_KECCAK64]);
+    assert!(keccak64::V_IN == verifier::layout::KECCAK64_IN && keccak64::V_OUT == verifier::layout::KECCAK64_OUT);
+    assert!(keccak64::OUT_LANES == verifier::layout::KECCAK64_OUT_LANES);
 };
 
 #[cfg(test)]

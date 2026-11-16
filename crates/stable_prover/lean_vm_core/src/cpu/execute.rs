@@ -121,6 +121,8 @@ pub enum Fault {
     NotAGPower { what: &'static str, value: F64 },
     /// A `MUL` asked to solve `a·x = c` for `x` with `a = 0`.
     BackSolveThroughZero,
+    /// An instruction this prover does not run.
+    Unsupported { op: &'static str },
     /// The advice does not fit the program: a witness stream is missing, given
     /// twice or exhausted, or an entry has the wrong length.
     Witness(String),
@@ -186,6 +188,7 @@ impl std::fmt::Display for Fault {
             Self::NotInK { what, value } => write!(f, "{what} is not a K-valued word ({})", word(*value)),
             Self::NotAGPower { what, value } => write!(f, "{what} is not a g-power in range (0x{:016x})", value.0),
             Self::BackSolveThroughZero => write!(f, "cannot back-solve MUL through a zero operand"),
+            Self::Unsupported { op } => write!(f, "the stable prover does not run {op}"),
             Self::Witness(problem) => write!(f, "{problem}"),
             Self::OutOfMemory => write!(
                 f,
@@ -664,6 +667,9 @@ pub fn execute(
                 });
                 pc += 1;
             }
+            // The stable prover does not run `KECCAK64` yet: its table, the second half of `q_keccak`, holds padding steps
+            // only, so a run that executes one has no proof here.
+            Op::Keccak64 { .. } => return Err(fail(Fault::Unsupported { op: "KECCAK64" })),
         }
         steps += 1;
     }

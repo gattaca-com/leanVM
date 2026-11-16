@@ -10,8 +10,8 @@ use crate::witness;
 use primitives::field::{F64, F128, g_pow};
 use primitives::transcript::ProverState;
 use verifier::layout::{
-    BYTECODE_FINAL_COUNTERS, GLOBAL_COLUMN_BASES, MEMORY_0, MEMORY_1, MEMORY_FINAL_COUNTERS, NUM_GLOBAL_COLUMNS,
-    TABLE_WIDTHS,
+    BYTECODE_FINAL_COUNTERS, GLOBAL_COLUMN_BASES, HASH_TABLES, MEMORY_0, MEMORY_1, MEMORY_FINAL_COUNTERS,
+    NUM_GLOBAL_COLUMNS, TABLE_WIDTHS,
 };
 
 mod execute;
@@ -129,14 +129,73 @@ pub fn n_xi_powers() -> usize {
     xi_form_base() + verifier::N_BUS_TREES
 }
 
-/// The KECCAK table's claims on its output lanes, which are the Keccak reduction's claim on the permutation's
-/// output: the table sumcheck claims every column of the table at one point.
-fn keccak_output_claim(table_claims: &[constraints::Claims]) -> keccak_gkr::OutputClaim {
-    let claims = &table_claims[verifier::layout::OP_KECCAK];
-    keccak_gkr::OutputClaim {
-        instance: claims.chi.clone(),
-        lanes: vec![std::array::from_fn(|l| claims.evals[tables::keccakt::V_OUT + l])],
-    }
+/// The hash tables' claims on their output lanes, which are the Keccak reduction's claim on the permutations' output:
+/// the table sumcheck claims every column of a table at one point, a prefix of the point of the tallest table, and
+/// `keccak64_rest` holds `KECCAK64`'s lanes the table does not claim, at its own point.
+///
+/// A table shorter than the tallest is completed with its padding step, so its claim at the tallest's point is
+/// `eq(0) * claim + (1 - eq(0)) * padding`, `eq(0)` the product of `1 - rho_i` over the completed variables.
+fn keccak_output_claim(
+    table_claims: &[constraints::Claims],
+    taus: &[usize; tables::N_TABLES],
+    keccak64_rest: &[F128; KECCAK64_SENT_LANES],
+) -> keccak_gkr::OutputClaim {
+    let kappa = layout::hash_kappa(taus);
+    let tallest = HASH_TABLES
+        .iter()
+        .find(|&&t| taus[t] == kappa)
+        .expect("a tallest hash table");
+    let rho = table_claims[*tallest].chi[..kappa].to_vec();
+    let lanes = HASH_TABLES
+        .iter()
+        .zip(crate::keccak::pad_inputs())
+        .enumerate()
+        .map(|(half, (&table, mut padding))| {
+            let claims = &table_claims[table];
+            let claimed = |lane: usize| -> F128 {
+                if half == crate::keccak::KECCAK_HALF {
+                    claims.evals[tables::keccakt::V_OUT + lane]
+                } else if lane < tables::keccak64::OUT_LANES {
+                    claims.evals[tables::keccak64::V_OUT + lane]
+                } else {
+                    keccak64_rest[lane - tables::keccak64::OUT_LANES]
+                }
+            };
+            primitives::hash::keccak_f(&mut padding);
+            let uncovered: F128 = rho[taus[table]..].iter().map(|&x| F128::ONE + x).product();
+            std::array::from_fn(|l| uncovered * claimed(l) + (F128::ONE + uncovered) * F128::from(F64(padding[l])))
+        })
+        .collect();
+    keccak_gkr::OutputClaim { instance: rho, lanes }
+}
+
+/// The lanes of `KECCAK64`'s output the table's claims leave out: 4 to 24.
+const KECCAK64_SENT_LANES: usize = primitives::hash::STATE_LANES - tables::keccak64::OUT_LANES;
+
+/// `KECCAK64`'s output lanes 4 to 24 as a multilinear in its steps, at `point`, from the input lanes `q_keccak` holds:
+/// the values the prover sends before the reduction folds the tables' claims.
+fn keccak64_output_lanes(q_keccak: &[F64], kappa: usize, tau: usize, point: &[F128]) -> [F128; KECCAK64_SENT_LANES] {
+    let eq = primitives::multilinear::eq_table(point);
+    let starts: [usize; primitives::hash::STATE_LANES] =
+        std::array::from_fn(|lane| layout::qkeccak_slot_start(kappa, crate::keccak::KECCAK64_HALF, lane));
+    parallel::fold_reduce(
+        1 << tau,
+        || [F128::ZERO; KECCAK64_SENT_LANES],
+        |sums, row| {
+            let mut state: [u64; primitives::hash::STATE_LANES] =
+                std::array::from_fn(|lane| q_keccak[starts[lane] + row].0);
+            primitives::hash::keccak_f(&mut state);
+            for (sum, &word) in sums.iter_mut().zip(&state[tables::keccak64::OUT_LANES..]) {
+                *sum += eq[row].mul_base(F64(word));
+            }
+        },
+        |mut a, b| {
+            for (a, b) in a.iter_mut().zip(b) {
+                *a += b;
+            }
+            a
+        },
+    )
 }
 
 /// Prove the program on `public_input` and `witness` ([`execute`]) at the PCS rate `2^-log_inv_rate`: run it, commit
@@ -233,18 +292,32 @@ pub fn prove(
     // The Keccak reduction ends on two claims on `q_keccak`, which join the one opening: one ring-switched, one a
     // point claim.
     let witness::Placement { offset, n_vars } = w.layout.placements[QKECCAK];
-    let output = keccak_output_claim(&table_claims);
+    let q_keccak = &w.q[offset..][..1 << n_vars];
+    // `KECCAK64`'s table claims only its output lanes 0 to 3; the others are sent at its own point, before the
+    // reduction draws the challenge that folds the tables.
+    let keccak64_rest = {
+        let kappa = layout::hash_kappa(&w.layout.taus);
+        let table = verifier::layout::OP_KECCAK64;
+        let rest = keccak64_output_lanes(q_keccak, kappa, w.layout.taus[table], &table_claims[table].chi);
+        ps.add_scalars(&rest);
+        rest
+    };
+    let output = keccak_output_claim(&table_claims, &w.layout.taus, &keccak64_rest);
     let openings = crate::stage!("Keccak reduction", || {
-        w.keccak_reduction
-            .prove(&mut ps, &w.q[offset..][..1 << n_vars], &output)
+        w.keccak_reduction.prove(&mut ps, q_keccak, &output)
     });
+    let input_slices = openings.input_slices.clone();
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
     // The reduction was the last reader of the full stack: a truncated proof opens the compact one.
     let (q, slots, ring) = match (compact.as_ref(), compact_q) {
         (Some(c), Some(compact_q)) => {
             drop(w.q);
-            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
+            let (slots, ring, sent) = c.map_claims(&w.layout, slots, ring, &input_slices, &compact_q);
+            // The slices of the pieces of `q_keccak` the verifier does not derive.
+            for slices in &sent {
+                ps.add_scalars(slices);
+            }
             (compact_q, slots, ring)
         }
         _ => (w.q, slots, ring),
@@ -269,7 +342,7 @@ fn finish_claims(
     let tables = (0..tables::N_TABLES).flat_map(|t| {
         (GLOBAL_COLUMN_BASES[t]..GLOBAL_COLUMN_BASES[t] + TABLE_WIDTHS[t])
             // the Keccak reduction's claim on the output (`keccak_output_claim`)
-            .filter(|&col| !matches!(keccak_value(col), Some(KeccakLane::Output(_))))
+            .filter(|&col| !matches!(keccak_value(col), Some((_, KeccakLane::Output(_)))))
             .map(move |col| (col, table_claims[t].chi.clone()))
     });
     let pi = pi_point(r_pi, l);
@@ -322,7 +395,10 @@ pub fn verify(
 /// `q_keccak`, which folds into the one opening like every other point claim.
 fn slot_claim(l: &Layout, col: usize, point: Vec<F128>) -> pcs::StackClaim {
     let offset = match keccak_value(col) {
-        Some(KeccakLane::Slot(slot)) => l.placements[QKECCAK].offset + (slot << point.len()),
+        Some((half, KeccakLane::Slot(slot))) => {
+            debug_assert_eq!(point.len(), l.taus[HASH_TABLES[half]]);
+            l.placements[QKECCAK].offset + qkeccak_slot_start(hash_kappa(&l.taus), half, slot)
+        }
         _ => l.placements[col].offset,
     };
     pcs::StackClaim::Point {
@@ -510,7 +586,11 @@ mod tests {
         let jumping = program(Op::Jump { oc: 1, od: 2, of: 1 });
         let exec = execute(&jumping, &[], pi).expect("the run halts in the final state");
         assert_eq!(exec.cycles, 5, "three SETs and both JUMPs, the last slot's included");
-        assert_eq!(exec.rows(), [0, 0, 3, 0, 2, 0], "XOR, MUL, SET, DEREF, JUMP, KECCAK");
+        assert_eq!(
+            exec.rows(),
+            [0, 0, 3, 0, 2, 0, 0],
+            "XOR, MUL, SET, DEREF, JUMP, KECCAK, KECCAK64"
+        );
         let (proof, _) = prove(&jumping, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&jumping, &pi, &proof).expect("the verifier accepts the run");
 

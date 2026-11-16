@@ -74,6 +74,7 @@ impl Trace {
             self.deref.len(),
             self.jump.len(),
             self.keccak.len(),
+            0, // `KECCAK64`: the stable prover runs none
         ]
     }
 }

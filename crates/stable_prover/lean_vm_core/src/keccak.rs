@@ -19,6 +19,8 @@ pub use isa::STATE_CELLS;
 pub const DEPTH: usize = verifier::layout::KECCAK_DEPTH;
 /// The reduction's shape at its fewest steps.
 pub const MIN_SHAPE: Shape = shape(0);
+/// The shape of the reduction of one table at its fewest steps, which the recursion guest verifies.
+pub const ONE_TABLE_SHAPE: Shape = Shape::new(0, DEPTH);
 /// `log2` of `q_keccak`'s slots a step: one per lane of each committed state, rounded up to a power of two.
 pub const SLOT_LOG: usize = MIN_SHAPE.slot_log();
 /// Slots a step's committed states occupy: the ones from here to `2^SLOT_LOG` carry the KECCAK table's own columns
@@ -28,14 +30,32 @@ pub const SLOTS: usize = MIN_SHAPE.slots();
 pub const MIN_STEPS: usize = MIN_SHAPE.n();
 /// Cells one `KECCAK` row flushes: thirteen read, thirteen written or, past what it writes, cancelled.
 pub(crate) const ROW_CELLS: usize = 2 * STATE_CELLS;
+/// Cells one `KECCAK64` row flushes: four read, then the one or two written (the second cancelled when it is not).
+pub(crate) const KECCAK64_ROW_CELLS: usize = 6;
+
+/// `log2` of the tables the reduction proves together: `KECCAK` is half 0 of `q_keccak`, `KECCAK64` half 1.
+pub const TABLE_BITS: usize = verifier::layout::TABLE_BITS;
+/// The tables the reduction proves together.
+pub const TABLES: usize = 1 << TABLE_BITS;
+/// The half of `q_keccak`, and the table bit, of `KECCAK` and of `KECCAK64`.
+pub const KECCAK_HALF: usize = 0;
+pub const KECCAK64_HALF: usize = 1;
 
 const fn shape(n_steps: usize) -> Shape {
-    Shape::new(n_steps, DEPTH)
+    Shape::with_tables(n_steps, DEPTH, TABLE_BITS)
 }
 
-/// `log2` of the steps the reduction proves for `n` executed ones.
-pub(crate) fn n_steps_log(n: usize) -> usize {
-    shape(n).n_log()
+/// `log2` of the steps each table is completed to, for tables of `rows` executed steps: the tallest's.
+pub(crate) fn kappa(rows: [usize; TABLES]) -> usize {
+    rows.into_iter()
+        .map(|n| Shape::new(n, DEPTH).n_log())
+        .max()
+        .expect("hash tables")
+}
+
+/// The input every padding step of each table holds: zeros for `KECCAK`, a message of zeros for `KECCAK64`.
+pub(crate) fn pad_inputs() -> [[u64; STATE_LANES]; TABLES] {
+    [ZERO_PAD, verifier::layout::keccak64_pad()]
 }
 
 /// The 25 lanes the thirteen state cells `cell(0..13)` hold in a layout.
@@ -79,27 +99,31 @@ pub(crate) fn permute_cells(cells: &[F128; STATE_CELLS], in_odd: bool, out_odd: 
 /// when it runs: held from the witness build instead, it would sit beside the bus's trees, at the prover's peak.
 pub(crate) struct Reduction {
     shape: Shape,
-    steps: usize,
+    steps: [usize; TABLES],
 }
 
 impl Reduction {
     /// Rebuild the witness from `q_keccak`, the whole committed column, and run the reduction.
     pub(crate) fn prove(self, ps: &mut ProverState, q_keccak: &[F64], output: &OutputClaim) -> Openings {
         let witness = tracing::info_span!("Witness")
-            .in_scope(|| Witness::from_committed(self.shape, &[self.steps], &[ZERO_PAD], q_keccak));
+            .in_scope(|| Witness::from_committed(self.shape, &self.steps, &pad_inputs(), q_keccak));
         witness.prove(ps, q_keccak, output)
     }
 }
 
-/// Write the committed states of the steps `inputs`, padded with all-zero steps, over `q_keccak`'s first [`SLOTS`]
-/// slots, `states`: the spare slots past them are their columns' to fill.
-pub(crate) fn place(inputs: &[[u64; STATE_LANES]], states: &mut [F64]) -> Reduction {
-    let shape = shape(inputs.len());
-    let table = TableInputs { inputs, pad: ZERO_PAD };
-    keccak_gkr::witness::commit_states(shape, &[table], states);
+/// Write the committed states of the steps `inputs` of each table, each padded with its padding steps up to `2^kappa`,
+/// over `q_keccak`'s first [`SLOTS`] slots of each table, `states`: the spare slots past them are their columns' to fill.
+pub(crate) fn place(inputs: [&[[u64; STATE_LANES]]; TABLES], kappa: usize, states: &mut [F64]) -> Reduction {
+    let pads = pad_inputs();
+    let tables: [TableInputs; TABLES] = std::array::from_fn(|t| TableInputs {
+        inputs: inputs[t],
+        pad: pads[t],
+    });
+    let shape = shape(1 << kappa);
+    keccak_gkr::witness::commit_states(shape, &tables, states);
     Reduction {
         shape,
-        steps: inputs.len(),
+        steps: inputs.map(<[_]>::len),
     }
 }
 
@@ -159,14 +183,24 @@ mod tests {
     /// have no slot.
     #[test]
     fn qkeccak_words_match_layout() {
-        let instances = sample_instances(5);
-        let n = 1usize << n_steps_log(instances.len());
-        let mut q_keccak = vec![F64::ZERO; SLOTS * n];
-        place(&instances, &mut q_keccak);
-        for (j, input) in instances.iter().enumerate() {
-            for i in 0..STATE_LANES {
-                assert_eq!(q_keccak[i * n + j], F64(input[i]));
+        let (keccak, keccak64) = (sample_instances(5), sample_instances(9));
+        let kappa = kappa([keccak.len(), keccak64.len()]);
+        let n = 1usize << kappa;
+        let mut q_keccak = vec![F64::ZERO; SLOTS * n * TABLES];
+        place([&keccak, &keccak64], kappa, &mut q_keccak);
+        // The layout is `(step, table, slot)`: a table's slot is a run of `n` words.
+        for (t, instances) in [&keccak, &keccak64].into_iter().enumerate() {
+            for (j, input) in instances.iter().enumerate() {
+                for i in 0..STATE_LANES {
+                    assert_eq!(q_keccak[(i * TABLES + t) * n + j], F64(input[i]));
+                }
             }
+        }
+        // The steps past a table's own hold its padding step.
+        let pads = pad_inputs();
+        for i in 0..STATE_LANES {
+            assert_eq!(q_keccak[i * TABLES * n + 5], F64(pads[0][i]));
+            assert_eq!(q_keccak[(i * TABLES + 1) * n + 9], F64(pads[1][i]));
         }
     }
 }
