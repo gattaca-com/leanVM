@@ -127,13 +127,65 @@ pub(crate) fn extend_group(v: &[u32; GROUP]) -> [u32; MIXED] {
 /// The ternary index of each output of [`extend_group`]: variable `k`'s point is its `k`-th
 /// digit, with infinity as 2.
 pub(crate) fn mixed_points() -> [usize; MIXED] {
-    let index = |(c0, c1): (usize, usize), (c2, c3): (usize, usize)| c0 + 3 * c1 + 9 * c2 + 27 * c3;
-    std::array::from_fn(|i| match i {
+    std::array::from_fn(mixed_point)
+}
+
+/// Entry `i` of [`mixed_points`].
+pub(crate) const fn mixed_point(i: usize) -> usize {
+    const fn index((c0, c1): (usize, usize), (c2, c3): (usize, usize)) -> usize {
+        c0 + 3 * c1 + 9 * c2 + 27 * c3
+    }
+    match i {
         0..20 => index(((i % 4) & 1, (i % 4) >> 1), HIGH[4 + i / 4]),
         20..56 => index(LOW_MIXED[(i - 20) % 4], HIGH[(i - 20) / 4]),
         _ => index((2, 2), HIGH[i - 56]),
-    })
+    }
 }
+
+/// Whether the grouped rounds use the point of [`mixed_points`] index `p`: its last coordinate is
+/// binary. They skip three variables and take the fourth round's quadratic coefficient from a pass
+/// of group differences, so the points with that coordinate at infinity are never read.
+pub(crate) const fn used(p: usize) -> bool {
+    p / 27 < 2
+}
+
+/// Whether the grouped rounds read [`slot`] `p`: a kernel may leave the others out.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq",
+        not(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))
+    )),
+    allow(dead_code)
+)]
+pub(crate) const fn slot_used(p: usize) -> bool {
+    match p {
+        0..128 => used(mixed_point(p % 64)),
+        128..130 => used(mixed_point(64)),
+        _ => false,
+    }
+}
+
+/// Whether a layer's bit-level rounds skip three variables, the fourth being a pass of group
+/// differences, in place of skipping four. The Skip kernels then leave out the points the fourth
+/// variable would take at infinity, which it pays with AVX2: the kernel there is bound by carry-less
+/// products, which with AVX-512 and GFNI the residue kernel (`skip_gfni`) does not use.
+pub(crate) const GROUPED: bool = cfg!(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "pclmulqdq",
+    not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "gfni"
+    ))
+));
 
 /// Both groups of a block position, at their [`slot`]s.
 pub fn extend(packs: &[u32; PACKS], out: &mut [u32; SLOTS]) {
@@ -260,6 +312,14 @@ cfg_select! {
         target_feature = "gfni"
     ) => {
         pub(crate) use crate::skip_gfni::SkipBlock;
+    }
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "vpclmulqdq",
+        not(target_feature = "avx512f")
+    ) => {
+        pub(crate) use crate::skip_vpclmul::SkipBlock;
     }
     _ => {
         /// [`skip_row`] over every row and slice of a block, a position at a time.
@@ -591,11 +651,15 @@ mod avx2 {
 
     /// `2 * N` slots at a time, their sums over the row kept in registers. A slot's product lies
     /// in the low word of its lane, which multiplies the weights as it is. The padding slots past
-    /// the last whole register are skipped: nothing reads their sums.
+    /// the last whole register are skipped: nothing reads their sums. With the grouped rounds a
+    /// register of slots they do not read is skipped too, and its sums stay zero.
     #[inline(always)]
     pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 2]; 5]) {
         let w: [[V; 2]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
-        for p in (0..2 * MIXED).step_by(2 * V::N) {
+        for p in (0..2 * MIXED)
+            .step_by(2 * V::N)
+            .filter(|&p| !GROUPED || (p..p + 2 * V::N).any(slot_used))
+        {
             // SAFETY: `p + 2 * N` is at most `SLOTS`.
             let z: [V; 5] = std::array::from_fn(|x| unsafe { V::load_packs(e[x].as_ptr().add(p)) });
             let mut sums = [[V::zero(); 2]; 2];
@@ -889,7 +953,8 @@ mod tests {
                 skip_row(&mut fast, &row, row_weights);
                 skip_row_portable(&mut slow, &row, row_weights);
             }
-            for slot in 0..SLOTS {
+            // The grouped rounds' kernels leave out the slots those rounds do not read.
+            for slot in (0..SLOTS).filter(|&p| !GROUPED || slot_used(p)) {
                 assert_eq!(fast.get(slot), slow.get(slot));
             }
             let fold: [[u64; GROUP]; 2] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64()));
@@ -907,6 +972,9 @@ mod tests {
             for (b, block) in blocks.iter().enumerate() {
                 skip.run(block);
                 for (i, expected) in skip_block_portable(block, &weights).into_iter().enumerate() {
+                    if GROUPED && !slot_used(i) {
+                        continue;
+                    }
                     assert_eq!(skip.get(i), expected, "block {b} slot {i}");
                 }
             }

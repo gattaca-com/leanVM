@@ -162,6 +162,26 @@ impl PowerField {
         (zero, infinity)
     }
 
+    /// `sum over j of weights[j] * a[j] * b[j]`, unreduced, for rows laid out by word.
+    pub fn weighted_dot(&self, a: &[u64], b: &[u64], weights: &[u64], width: usize) -> [u64; 4] {
+        assert!([a, b, weights].iter().all(|row| row.len() >= 2 * width));
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+        if width.is_multiple_of(x86::STEP) {
+            // SAFETY: the features are enabled at compile time, and the rows are bounded above.
+            return unsafe { x86::weighted_dot(self, a, b, weights, width) };
+        }
+        self.weighted_dot_portable(a, b, weights, width)
+    }
+
+    pub fn weighted_dot_portable(&self, a: &[u64], b: &[u64], weights: &[u64], width: usize) -> [u64; 4] {
+        let mut sum = [0u64; 4];
+        for j in 0..width {
+            let weighted = self.mul(&get(weights, width, j), &get(a, width, j));
+            add_mul(&mut sum, &weighted, &get(b, width, j));
+        }
+        sum
+    }
+
     /// `dst[j] = lo[j] + challenge * (lo[j] + hi[j])`.
     pub fn fold_row(&self, dst: &mut [u64], lo: &[u64], hi: &[u64], challenge: &Element, width: usize) {
         assert!(dst.len() >= 2 * width && lo.len() >= 2 * width && hi.len() >= 2 * width);
@@ -375,6 +395,26 @@ mod x86 {
             out
         };
         (finish(&acc[0]), finish(&acc[1]))
+    }
+
+    pub unsafe fn weighted_dot(field: &PowerField, a: &[u64], b: &[u64], w: &[u64], width: usize) -> [u64; 4] {
+        let mut acc = [V::zero(); 3];
+        for j in (0..width).step_by(STEP) {
+            // SAFETY: the caller bounds every row.
+            let (w, a, b) = unsafe { (load2(w, width, j), load2(a, width, j), load2(b, width, j)) };
+            let weighted = reduce_pair(field, &karatsuba(&w, w[0].xor(w[1]), &a, a[0].xor(a[1])));
+            let p = partial(&weighted, &b);
+            for s in 0..3 {
+                acc[s] = acc[s].xor(p[0][s].xor(p[1][s]));
+            }
+        }
+        let mut out = [0u64; 4];
+        for (s, sum) in acc.iter().enumerate() {
+            let sum = sum.sum();
+            out[s] ^= sum as u64;
+            out[s + 1] ^= (sum >> 64) as u64;
+        }
+        out
     }
 
     pub unsafe fn reduce_row(field: &PowerField, dst: &mut [u64], wide: &[u64], width: usize) {

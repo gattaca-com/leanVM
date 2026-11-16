@@ -15,11 +15,13 @@ use primitives::multilinear::{eq_table, interp, poly_eval};
 use primitives::transcript::ProverState;
 use verifier::keccak::{BITS, LOCAL_BITS, along, linear_transpose};
 
-use crate::basis::{PolyEval, add_mul};
-use crate::kernels::{GROUP, MIXED, PACKS, SKIP, SkipBlock, TERNARY, embed, mixed_points, products, slot};
+use crate::basis::{PolyEval, add_mul, carry};
+use crate::kernels::{
+    GROUP, GROUPED, MIXED, PACKS, SKIP, SkipBlock, TERNARY, embed, fold_groups, mixed_points, products, slot, used,
+};
 use crate::power::{Element, PowerField, get, set};
 use crate::protocol::{Claim, chi_weights, mu_at};
-use crate::witness::{Recompute, Shape, TableWitness, Witness, transpose64, words};
+use crate::witness::{BLOCK_WORDS, Recompute, Shape, TableWitness, Witness, transpose64, words};
 use verifier::keccak::PRODUCT_BITS;
 
 /// The pattern index of a binary assignment.
@@ -445,6 +447,122 @@ impl<'a> Layer<'a> {
         sums
     }
 
+    /// [`Self::skip_sums`] of the grouped rounds: the sums over the points of `{0, 1, infinity}^(SKIP - 1)`
+    /// for each of the two groups of a half, the fourth variable binary. `binary[side][q]` is the sum of
+    /// pack `q` of group `side`. The points the fourth variable would take at infinity are not summed.
+    fn skip_sums_grouped(
+        &self,
+        claim: &Claim,
+        weights: &[Element],
+        field: &PowerField,
+        s: F128,
+        binary: &[[F128; GROUP / 2]; 2],
+    ) -> [Vec<F128>; 2] {
+        const POINTS: usize = TERNARY / 3;
+        let groups: Vec<Element> = eq_table(&claim.point[SKIP..])
+            .iter()
+            .map(|&e| field.to_poly(e))
+            .collect();
+        let points: Vec<(usize, usize, usize)> = mixed_points()
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, p)| used(p))
+            .map(|(i, p)| (i, p / POINTS, p % POINTS))
+            .collect();
+        let nb = self.witness.shape.n_blocks();
+        let mixed = parallel::map_reduce_with_state(
+            self.n_written_tasks(),
+            || (SkipBlock::new(weights), Recompute::new()),
+            || std::array::from_fn::<_, 2, _>(|_| vec![[0u64; 5]; POINTS]),
+            |(skip, recompute), total, task| {
+                let (segment, g) = self.written_task(task);
+                let (row, block) = (
+                    g + nb * segment,
+                    self.table_of(segment).state(recompute, self.rounds[segment], g),
+                );
+                skip.run(block);
+                for half in 0..2 {
+                    for &(i, side, p) in &points {
+                        add_mul(&mut total[side][p], &skip.get(slot(half, i)), &groups[2 * row + half]);
+                    }
+                }
+            },
+            |mut a, b| {
+                for (a, b) in a.iter_mut().zip(b) {
+                    for (x, y) in a.iter_mut().zip(b) {
+                        for (x, y) in x.iter_mut().zip(y) {
+                            *x ^= y;
+                        }
+                    }
+                }
+                a
+            },
+        );
+        let eval = PolyEval::new(s, 40);
+        std::array::from_fn(|side| {
+            let mut sums = vec![F128::ZERO; POINTS];
+            for &(_, _, p) in points.iter().filter(|&&(_, group, _)| group == side) {
+                sums[p] = eval.eval(&mixed[side][p]);
+            }
+            for (q, &value) in binary[side].iter().enumerate() {
+                sums[ternary(q)] = value;
+            }
+            sums
+        })
+    }
+
+    /// The fourth round's quadratic coefficient of the grouped rounds, its values at zero and one having
+    /// ridden [`Self::skip_sums_grouped`]: the sum over blocks, halves and positions of
+    /// `weights[j] * D[j + 1] * D[j + 2]`, with `D` the difference of the two groups' folds at `challenges`.
+    /// A padding block's groups are equal, so it adds nothing.
+    fn group_infinity(&self, round: &Round, challenges: &[F128], point: &[F128]) -> F128 {
+        let field = round.field;
+        let differences = Differences::new(field, challenges);
+        let groups: Vec<Element> = eq_table(&point[SKIP..]).iter().map(|&e| field.to_poly(e)).collect();
+        // The weights by lane, then by word.
+        let mut lane_weights = vec![0u64; BITS / 64 * LANE_ROW];
+        for (j, w) in lane_weights.as_chunks_mut::<LANE_ROW>().0.iter_mut().enumerate() {
+            for k in 0..2 {
+                w[64 * k..][..64].copy_from_slice(&round.weights[k * BITS + 64 * j..][..64]);
+            }
+        }
+        let nb = self.witness.shape.n_blocks();
+        let sum = parallel::map_reduce_with_state(
+            self.n_written_tasks(),
+            || (vec![0u64; 10 * LANE_ROW], vec![0u64; 10 * 3 * 64], Recompute::new()),
+            || [0u64; 6],
+            |(rows, wide, recompute), total, task| {
+                let (segment, g) = self.written_task(task);
+                let block = self.table_of(segment).state(recompute, self.rounds[segment], g);
+                let mut sums = [[0u64; 4]; 2];
+                for r in 0..5 {
+                    differences.rows(field, &block[r * 5 * 64 * BLOCK_WORDS..], rows, wide);
+                    for (half, sum) in sums.iter_mut().enumerate() {
+                        let lanes = &rows[5 * half * LANE_ROW..][..5 * LANE_ROW];
+                        for x in 0..5 {
+                            let a = &lanes[(x + 1) % 5 * LANE_ROW..][..LANE_ROW];
+                            let b = &lanes[(x + 2) % 5 * LANE_ROW..][..LANE_ROW];
+                            let w = &lane_weights[(5 * r + x) * LANE_ROW..][..LANE_ROW];
+                            for (sum, value) in sum.iter_mut().zip(field.weighted_dot(a, b, w, 64)) {
+                                *sum ^= value;
+                            }
+                        }
+                    }
+                }
+                for (half, sum) in sums.iter().enumerate() {
+                    add_mul(total, sum, &groups[2 * (nb * segment + g) + half]);
+                }
+            },
+            |mut a, b| {
+                for (a, b) in a.iter_mut().zip(b) {
+                    *a ^= b;
+                }
+                a
+            },
+        );
+        round.eval.eval(&sum)
+    }
+
     /// The table the remaining rounds fold, a row per group: `T[j]`, the value at `s` of position
     /// `j`'s embeddings, folded over the group's packs at `challenges`. A block's two groups are
     /// the first of those rounds' pairs, so its round values are summed while the rows are at hand.
@@ -493,6 +611,72 @@ impl<'a> Layer<'a> {
     }
 }
 
+/// Words of one lane's row in the power basis: 64 positions, two words each, laid out by word.
+pub(crate) const LANE_ROW: usize = 2 * 64;
+
+/// The folds of the differences of a block's two groups, in each half, at the challenges of the
+/// grouped rounds: the first `SKIP - 1` variables' fold of the packs of a group.
+struct Differences {
+    /// The fold's weights, a half's first eight packs, the other eight weighing zero.
+    weights: [[u64; GROUP]; 2],
+    /// The same fold as nibble tables, which AVX2 looks up faster than it multiplies.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    shuffle: crate::shuffle_fold::ShuffleFold,
+}
+
+impl Differences {
+    fn new(field: &PowerField, challenges: &[F128]) -> Self {
+        assert_eq!(challenges.len(), SKIP - 1);
+        let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
+        Self {
+            weights: std::array::from_fn(|k| std::array::from_fn(|q| fold.get(q).map_or(0, |e| e[k]))),
+            // Input byte `i` of a lane is a byte of pack `i / 2` of the group.
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+            shuffle: crate::shuffle_fold::ShuffleFold::new(field, |byte| fold[byte / 2 % fold.len()]),
+        }
+    }
+
+    /// The differences of the five lanes of one row of `block` (its first `5 * 64` positions): ten
+    /// rows in `rows`, those of lane `x` of half `h` at `5 * h + x`. `wide` is their unreduced sums.
+    fn rows(&self, field: &PowerField, block: &[u64], rows: &mut [u64], wide: &mut [u64]) {
+        cfg_select! {
+            all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")) => {
+                let _ = (field, wide);
+                self.shuffle.differences(block, rows);
+            }
+            _ => { self.rows_clmul(field, block, rows, wide) }
+        }
+    }
+
+    /// [`Self::rows`] by carry-less products, which the nibble tables replace on AVX2.
+    #[cfg_attr(
+        all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")),
+        allow(dead_code)
+    )]
+    fn rows_clmul(&self, field: &PowerField, block: &[u64], rows: &mut [u64], wide: &mut [u64]) {
+        for x in 0..5 {
+            for z in 0..64 {
+                let w = words(block, 64 * x + z);
+                // Words 0 and 1 of a half are its first group's packs, 2 and 3 its second's.
+                let packed = [w[0] ^ w[2], w[1] ^ w[3], 0, 0, w[4] ^ w[6], w[5] ^ w[7], 0, 0];
+                for (half, folded) in fold_groups(&embed(&packed), &self.weights).iter().enumerate() {
+                    for (k, word) in carry::<2, 3>(folded).into_iter().enumerate() {
+                        wide[(5 * half + x) * 3 * 64 + k * 64 + z] = word;
+                    }
+                }
+            }
+        }
+        for (row, wide) in rows
+            .as_chunks_mut::<LANE_ROW>()
+            .0
+            .iter_mut()
+            .zip(wide.as_chunks::<{ 3 * 64 }>().0)
+        {
+            field.reduce_row(row, wide, 64);
+        }
+    }
+}
+
 /// The rows of one block's groups: `T[j]`, the value at `s` of position `j`'s embeddings, folded
 /// over a group's packs at the bit-level rounds' challenges.
 struct RowBuilder<'a> {
@@ -514,6 +698,9 @@ struct RowBuilder<'a> {
         target_feature = "gfni"
     )))]
     fold: [[u64; GROUP]; 2],
+    /// The same fold as nibble tables: AVX2 looks a pack up faster than it multiplies it.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    shuffle: crate::shuffle_fold::ShuffleFold,
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -525,11 +712,15 @@ struct RowBuilder<'a> {
 
 impl<'a> RowBuilder<'a> {
     fn new(field: &'a PowerField, challenges: &[F128]) -> Self {
-        let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
-        let fold: [[u64; GROUP]; 2] = std::array::from_fn(|k| std::array::from_fn(|q| fold[q][k]));
+        let weights: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
+        let fold: [[u64; GROUP]; 2] = std::array::from_fn(|k| std::array::from_fn(|q| weights[q][k]));
         cfg_select! {
             all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni") => {
                 Self { field, row_maps: crate::table_gfni::RowMaps::new(field, &fold) }
+            }
+            all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")) => {
+                // Input byte `i` of a lane is a byte of pack `i / 2` of the group.
+                Self { field, fold, shuffle: crate::shuffle_fold::ShuffleFold::new(field, |byte| weights[byte / 2]) }
             }
             _ => { Self { field, fold } }
         }
@@ -556,6 +747,12 @@ impl<'a> RowBuilder<'a> {
                 self.row_maps.rows(block, rows, halves);
             }
             _ => {
+                // A written block's two rows by nibble tables, where there are any.
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+                if halves == 2 {
+                    self.shuffle.rows(block, rows);
+                    return;
+                }
                 // Both groups' unreduced sums, three words each and laid out by word, then reduced.
                 for j in 0..BITS {
                     let sums = crate::kernels::fold_groups(&embed(words(block, j)), &self.fold);
@@ -1109,6 +1306,19 @@ pub fn prove_layer(
     step: usize,
     claim: &Claim,
 ) -> Claim {
+    prove_layer_with(ps, witness, scratch, step, claim, GROUPED)
+}
+
+/// [`prove_layer`] with the bit-level rounds [`GROUPED`] or not: the messages are the same.
+/// A grouped layer needs a Skip kernel that sums the points the fourth variable takes binary.
+fn prove_layer_with(
+    ps: &mut ProverState,
+    witness: &Witness,
+    scratch: &mut Scratch,
+    step: usize,
+    claim: &Claim,
+    grouped: bool,
+) -> Claim {
     let shape = witness.shape;
     let layer = Layer::new(
         witness,
@@ -1131,37 +1341,75 @@ pub fn prove_layer(
     let mut value = poly_eval(&product, s);
     let field = PowerField::new(s).expect("an `s` outside `K` has a power basis");
 
-    // The packs of a group, from sums of bit-level products. A pack's own sum is its product
-    // polynomial at `s`, over both groups of the block.
-    let binary: [F128; GROUP] = std::array::from_fn(|q| {
-        let half = claim.point[SKIP];
-        (F128::ONE + half) * poly_eval(&per_pack[q], s) + half * poly_eval(&per_pack[GROUP + q], s)
-    });
     // The claim's weights in the power basis, which Skip and the later rounds share.
     let polys: Vec<Element> = claim.weights.iter().map(|&w| field.to_poly(w)).collect();
-    let mut sums = tracing::info_span!("Skip").in_scope(|| layer.skip_sums(claim, &polys, &field, s, &binary));
+    let round = Round::new(&field, claim, &polys, s, kappa);
     let mut point = Vec::with_capacity(claim.point.len());
-    for i in 0..SKIP {
-        let later = eq_table(&claim.point[i + 1..SKIP]);
-        let mut h = [F128::ZERO; 3];
-        for (b, &eq) in later.iter().enumerate() {
-            for (d, h) in h.iter_mut().enumerate() {
-                *h += eq * sums[d + 3 * ternary(b)];
+    if grouped {
+        // The first SKIP - 1 rounds, the last variable of a group staying binary, then its round.
+        // A pack's own sum is its product polynomial at `s`, over both halves of the block.
+        let binary: [[F128; GROUP / 2]; 2] = std::array::from_fn(|side| {
+            std::array::from_fn(|q| {
+                let half = claim.point[SKIP];
+                let q = GROUP / 2 * side + q;
+                (F128::ONE + half) * poly_eval(&per_pack[q], s) + half * poly_eval(&per_pack[GROUP + q], s)
+            })
+        });
+        let mut sums =
+            tracing::info_span!("Skip").in_scope(|| layer.skip_sums_grouped(claim, &polys, &field, s, &binary));
+        let side_weights = [F128::ONE + claim.point[SKIP - 1], claim.point[SKIP - 1]];
+        for i in 0..SKIP - 1 {
+            let later = eq_table(&claim.point[i + 1..SKIP - 1]);
+            let mut h = [F128::ZERO; 3];
+            for (b, &eq) in later.iter().enumerate() {
+                for (d, h) in h.iter_mut().enumerate() {
+                    *h += eq
+                        * (side_weights[0] * sums[0][d + 3 * ternary(b)]
+                            + side_weights[1] * sums[1][d + 3 * ternary(b)]);
+                }
             }
+            let coeffs = [h[0], h[0] + h[1] + h[2], h[2]];
+            let challenge = bind(ps, &coeffs, &mut value, &mut point);
+            sums = sums.map(|sums| {
+                sums.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|v| v[0] + challenge * (v[0] + v[1]) + (challenge.square() + challenge) * v[2])
+                    .collect()
+            });
         }
-        let coeffs = [h[0], h[0] + h[1] + h[2], h[2]];
-        let challenge = bind(ps, &coeffs, &mut value, &mut point);
-        sums = sums
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|v| v[0] + challenge * (v[0] + v[1]) + (challenge.square() + challenge) * v[2])
-            .collect();
+        let infinity = tracing::info_span!("Groups").in_scope(|| layer.group_infinity(&round, &point, &claim.point));
+        let coeffs = [sums[0][0], sums[0][0] + sums[1][0] + infinity, infinity];
+        bind(ps, &coeffs, &mut value, &mut point);
+    } else {
+        // The packs of a group, from sums of bit-level products. A pack's own sum is its product
+        // polynomial at `s`, over both groups of the block.
+        let binary: [F128; GROUP] = std::array::from_fn(|q| {
+            let half = claim.point[SKIP];
+            (F128::ONE + half) * poly_eval(&per_pack[q], s) + half * poly_eval(&per_pack[GROUP + q], s)
+        });
+        let mut sums = tracing::info_span!("Skip").in_scope(|| layer.skip_sums(claim, &polys, &field, s, &binary));
+        for i in 0..SKIP {
+            let later = eq_table(&claim.point[i + 1..SKIP]);
+            let mut h = [F128::ZERO; 3];
+            for (b, &eq) in later.iter().enumerate() {
+                for (d, h) in h.iter_mut().enumerate() {
+                    *h += eq * sums[d + 3 * ternary(b)];
+                }
+            }
+            let coeffs = [h[0], h[0] + h[1] + h[2], h[2]];
+            let challenge = bind(ps, &coeffs, &mut value, &mut point);
+            sums = sums
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|v| v[0] + challenge * (v[0] + v[1]) + (challenge.square() + challenge) * v[2])
+                .collect();
+        }
     }
 
     // The groups, blocks and segments, on a table in the power basis. Each pass over it writes
     // the rows of one round and sums that round's values over them.
-    let round = Round::new(&field, claim, &polys, s, kappa);
     let mut layout = Rows {
         m: 2 * shape.n_blocks(),
         live: std::array::from_fn(|segment| {
@@ -1278,11 +1526,73 @@ fn round_coefficients(zero: F128, infinity: F128, value: F128, r: F128) -> [F128
 }
 
 #[cfg(test)]
-mod paired_tests {
+mod tests {
     use primitives::test_rng::Rng;
     use verifier::keccak::PACK;
 
     use super::*;
+    use crate::protocol::first_claim;
+
+    /// The fold of the differences of a block's groups is the same by the nibble tables as by
+    /// carry-less products, and a quad of those is what the single rows give.
+    #[test]
+    fn group_differences_agree_between_kernels() {
+        let mut rng = Rng::new(50);
+        let field = PowerField::new(rng.ext()).unwrap();
+        let block: Vec<u64> = (0..BITS * BLOCK_WORDS).map(|_| rng.next_u64()).collect();
+        let differences = Differences::new(&field, &rng.ext_vec(SKIP - 1));
+        let (mut fast, mut slow) = (vec![0u64; 10 * LANE_ROW], vec![0u64; 10 * LANE_ROW]);
+        let mut wide = vec![0u64; 10 * 3 * 64];
+        for r in 0..5 {
+            differences.rows(&field, &block[r * 5 * 64 * BLOCK_WORDS..], &mut fast, &mut wide);
+            differences.rows_clmul(&field, &block[r * 5 * 64 * BLOCK_WORDS..], &mut slow, &mut wide);
+            assert!(fast == slow, "row {r}");
+        }
+    }
+
+    /// The grouped rounds send what the four skipped rounds send, and leave the same claim and
+    /// transcript, with a padding block and at several steps, for one table and for several of
+    /// different heights and paddings.
+    #[test]
+    fn grouped_rounds_equal_the_skipped_ones() {
+        if GROUPED {
+            // Its kernels leave out what the skipped rounds read.
+            return;
+        }
+        let mut rng = Rng::new(49);
+        let cases: [(&[usize], usize); 3] = [(&[1100], 12), (&[1100, 2600], 12), (&[700, 0, 3000, 40], 6)];
+        for (rows, depth) in cases {
+            let inputs: Vec<Vec<[u64; primitives::hash::STATE_LANES]>> = rows
+                .iter()
+                .map(|&n| (0..n).map(|_| std::array::from_fn(|_| rng.next_u64())).collect())
+                .collect();
+            let tables: Vec<crate::witness::TableInputs> = inputs
+                .iter()
+                .enumerate()
+                .map(|(t, inputs)| crate::witness::TableInputs {
+                    inputs,
+                    pad: std::array::from_fn(|l| if t == 0 { 0 } else { 0x0101 * (l as u64 + t as u64) }),
+                })
+                .collect();
+            let shape = Shape::with_tables(*rows.iter().max().unwrap(), depth, rows.len().ilog2() as usize);
+            let mut committed = vec![primitives::field::F64(0); 1 << shape.stack_log()];
+            let witness = Witness::generate_tables(shape, &tables, &mut committed);
+            assert!(
+                (0..shape.tables()).any(|t| witness.table(t).written() < shape.n_blocks()),
+                "a padding block"
+            );
+            for step in [0, 1, depth - 1] {
+                let claim = first_claim(shape, &rng.ext_vec(4), rng.ext_vec(shape.y_vars()), &rng.ext_vec(5));
+                let run = |grouped| {
+                    let mut ps = ProverState::from_label(b"keccak-gkr-grouped");
+                    let mut scratch = Scratch::new(shape);
+                    let next = prove_layer_with(&mut ps, &witness, &mut scratch, step, &claim, grouped);
+                    (next, ps.into_proof())
+                };
+                assert!(run(true) == run(false), "{rows:?} step {step}");
+            }
+        }
+    }
 
     /// A pair round's two messages are those of two single rounds, whether its four rows differ,
     /// repeat, or are all one padding row.

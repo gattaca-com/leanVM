@@ -110,6 +110,15 @@ mod products_gfni;
 mod protocol;
 mod prover;
 pub mod rmfe;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+mod shuffle_fold;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "vpclmulqdq",
+    not(target_feature = "avx512f")
+))]
+mod skip_vpclmul;
 cfg_select! {
     all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni") => {
         mod skip_gfni;
