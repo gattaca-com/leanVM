@@ -171,6 +171,28 @@ pub fn mle_eval(table: &[F64], point: &[F128]) -> F128 {
     fold_ladder(rows, &point[low_vars..])
 }
 
+/// [`mle_eval`] of a table whose entries from `real` on all equal `pad`, which it never reads: a table of
+/// padding rows costs only its real rows, rounded up to whole rows of the low `eq` table.
+///
+/// The padding entries weigh `pad` by their `eq` mass, which the table of the high variables adds up by row.
+pub fn mle_eval_padded(table: &[F64], real: usize, pad: F64, point: &[F128]) -> F128 {
+    assert_eq!(table.len(), 1 << point.len());
+    let row = 1 << MLE_LOW_VARS;
+    let rows = real.div_ceil(row);
+    if point.len() <= MLE_LOW_VARS || rows * row >= table.len() {
+        return mle_eval(table, point);
+    }
+    let low = packed_eq(&point[..MLE_LOW_VARS]);
+    let high = eq_table(&point[MLE_LOW_VARS..]);
+    let (real_weights, pad_weights) = high.split_at(rows);
+    let head = table[..rows * row]
+        .chunks_exact(row)
+        .zip(real_weights)
+        .fold(F128::ZERO, |acc, (r, &h)| acc + h * dot_base(&low, r).reduce());
+    let mass = pad_weights.iter().fold(F128::ZERO, |acc, &h| acc + h);
+    head + mass.mul_base(pad)
+}
+
 /// [`mle_eval`] with the rows spread over the worker pool. A shorter `table` is zero past its end, which must be a
 /// whole number of rows.
 /// A caller already inside a dispatch must use [`mle_eval`] to avoid nesting.
@@ -264,6 +286,31 @@ mod tests {
         let jobs: Vec<(&[F64], &[F128])> = tables.iter().zip(&points).map(|(t, p)| (&t[..], &p[..])).collect();
         let want: Vec<F128> = jobs.iter().map(|&(t, p)| mle_eval(t, p)).collect();
         assert_eq!(mle_eval_many(&jobs), want);
+    }
+
+    #[test]
+    fn padded_mle_matches_the_full_table() {
+        let pad = F64(0x1234_5678_9abc_def0);
+        for n in [3usize, 10, 11, 13] {
+            let point: Vec<_> = (0..n as u64).map(|i| F128::new(17 + i, 231 + 3 * i)).collect();
+            for real in [0usize, 1, 1023, 1024, 1025, 3000, (1 << n) - 1, 1 << n] {
+                let real = real.min(1 << n);
+                let table: Vec<_> = (0..1usize << n)
+                    .map(|i| {
+                        if i < real {
+                            F64((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                        } else {
+                            pad
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    mle_eval_padded(&table, real, pad, &point),
+                    mle_eval(&table, &point),
+                    "n {n} real {real}"
+                );
+            }
+        }
     }
 
     #[test]
