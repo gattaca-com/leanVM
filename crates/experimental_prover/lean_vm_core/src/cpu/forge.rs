@@ -31,6 +31,15 @@ pub(crate) enum Forge {
     PieceWord,
     /// Past its rows each half of `q_keccak` holds the padding step of the other half.
     SwapPads,
+    /// A word of the first row piece of `KECCAK64`'s slot block `[first slot, first slot + 2^log)` changes in the committed
+    /// stack, not in the reduction's witness.
+    BlockWord { first: usize, log: usize },
+    /// The prover's share of the public slots in the ring claim leaves out the table's `eq`.
+    PublicShareNoTheta,
+    /// The blocks `[0, 8)` and `[24, 32)` of the first row piece of `KECCAK64` change places in the committed stack.
+    SwapBlocks,
+    /// The block `[24, 32)` of the first row piece of `KECCAK64` holds the second row piece's, in the committed stack.
+    BorrowBlock,
 }
 
 thread_local! {
@@ -42,7 +51,7 @@ pub(crate) fn set(forge: Option<Forge>) {
     FORGE.with(|f| *f.borrow_mut() = forge);
 }
 
-fn current() -> Option<Forge> {
+pub(super) fn current() -> Option<Forge> {
     FORGE.with(|f| *f.borrow())
 }
 
@@ -131,7 +140,12 @@ pub(crate) fn tamper(w: &mut Witness) {
                 }
             }
         }
-        Forge::SentLane | Forge::PieceWord => {}
+        Forge::SentLane
+        | Forge::PieceWord
+        | Forge::BlockWord { .. }
+        | Forge::PublicShareNoTheta
+        | Forge::SwapBlocks
+        | Forge::BorrowBlock => {}
         Forge::Keccak64PaddingRowIsReal => {
             for lane in 0..8 {
                 let at = slot(w, crate::keccak::KECCAK64_HALF, lane);
@@ -151,8 +165,12 @@ pub(crate) fn tamper(w: &mut Witness) {
 
 /// Apply the forgery to the compact stack the prover commits, which the reduction never reads.
 pub(super) fn tamper_compact(compact: &super::truncate::Compact, q: &mut [F64]) {
-    if let Some(Forge::PieceWord) = current() {
-        compact.flip_piece_word(q);
+    match current() {
+        Some(Forge::PieceWord) => compact.flip_piece_word(q),
+        Some(Forge::BlockWord { first, log }) => compact.flip_block_word(q, (first, log)),
+        Some(Forge::SwapBlocks) => compact.swap_blocks(q),
+        Some(Forge::BorrowBlock) => compact.borrow_block(q),
+        _ => {}
     }
 }
 

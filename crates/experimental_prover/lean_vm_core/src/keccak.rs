@@ -73,6 +73,26 @@ pub fn keccak64_pad() -> [u64; STATE_LANES] {
     pad
 }
 
+/// The slots of `q_keccak` a `KECCAK64` row does not commit: lanes 8 to 23 of its input state hold the padding on every row,
+/// executed or not. They are public constants, [`keccak64_pad`]'s.
+pub const KECCAK64_PUBLIC_SLOTS: std::ops::Range<usize> = 8..24;
+
+/// The slot blocks a half of `q_keccak` commits, `(first slot, log slots)`, each an aligned cube of the slot index. A
+/// piece of a half is a row piece times a block. `KECCAK` commits all 64 slots in one block. `KECCAK64` leaves out the public
+/// slots 8 to 23: slots 0 to 7, 24 to 31 (lane 24 and the middle state's first seven lanes), and 32 to 63.
+pub const fn slot_blocks(half: usize) -> &'static [(usize, usize)] {
+    if half == KECCAK_HALF {
+        &[(0, 6)]
+    } else {
+        &[(0, 3), (24, 3), (32, 5)]
+    }
+}
+
+/// The constant slot `slot` of a half holds on every row, if it is public.
+pub fn public_slot(half: usize, slot: usize) -> Option<u64> {
+    (half == KECCAK64_HALF && KECCAK64_PUBLIC_SLOTS.contains(&slot)).then(|| keccak64_pad()[slot])
+}
+
 /// The input every padding step of each table holds: zeros for `KECCAK`, a message of zeros for `KECCAK64`.
 pub fn pad_inputs() -> [[u64; STATE_LANES]; TABLES] {
     [ZERO_PAD, keccak64_pad()]

@@ -56,6 +56,9 @@ pub struct Air<'a> {
     pub cols: &'a [&'a [F64]],
     /// Its summand, a degree-2 form over `cols`.
     pub form: BusForm,
+    /// The columns of one constant on every row, by local index, ascending: their evaluations are the constant, which the
+    /// verifier knows, so they are not sent.
+    pub public: Vec<usize>,
 }
 
 /// Start of each table's disjoint range of `ξ`-powers.
@@ -456,10 +459,18 @@ pub fn prove(airs: &[Air<'_>], zeta: &[F128], ps: &mut ProverState) -> Vec<Claim
     crate::stage!("Constraint evals", || {
         tables
             .iter()
-            .map(|t| {
+            .zip(airs)
+            .map(|(t, air)| {
                 let chi = &chi[..t.tau];
                 let evals = parallel::map_collect(t.cols.len(), |c| mle_eval(t.cols[c], chi));
-                ps.add_scalars(&evals);
+                // A public column's evaluation is known to the verifier: only the others are sent.
+                let sent: Vec<F128> = evals
+                    .iter()
+                    .enumerate()
+                    .filter(|(c, _)| !air.public.contains(c))
+                    .map(|(_, &e)| e)
+                    .collect();
+                ps.add_scalars(&sent);
                 Claims {
                     chi: chi.to_vec(),
                     evals,

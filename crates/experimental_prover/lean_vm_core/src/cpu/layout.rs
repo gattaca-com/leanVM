@@ -230,16 +230,6 @@ impl Witness {
         }
         cols
     }
-
-    /// Committed data before the zero-pad to `2^m`: the real witness size.
-    pub(crate) fn committed_size(&self) -> usize {
-        self.layout
-            .placements
-            .iter()
-            .filter(|p| !p.is_virtual())
-            .map(|p| 1usize << p.n_vars)
-            .sum()
-    }
 }
 
 /// The kappa source of the tallest hash table's height: the log of the steps the Keccak reduction completes each

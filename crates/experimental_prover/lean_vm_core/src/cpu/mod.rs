@@ -40,20 +40,20 @@ pub use truncate::{piece_digits, qt_pad};
 /// here; it seeds the transcript at construction (the program's Fiat-Shamir IV). The boundary
 /// states are derived from the program, so they need no binding.
 ///
-/// A truncated proof (`truncate` holds its memory count and whether q_keccak is a region) packs
-/// `(mem_count << 2) | flag` in the rate word's high limb. Flag 1 is a truncated proof, flag 2 one with the region.
+/// A truncated proof (`truncate` holds its memory count) packs `(mem_count << 2) | 1` in the rate word's high limb.
+/// A full proof leaves it zero. q_keccak is pieces in both.
 fn announce_public(
     ps: &mut ProverState,
     log_mem: usize,
     rows: [usize; tables::N_TABLES],
     log_inv_rate: usize,
-    truncate: Option<(usize, bool)>,
+    truncate: Option<usize>,
 ) {
     ps.add_scalar(F128::new(log_mem as u64, 0));
     for n in rows {
         ps.add_scalar(F128::new(n as u64, 0));
     }
-    let memory = truncate.map_or(0, |(mem_count, qt)| ((mem_count as u64) << 2) | (1 + qt as u64));
+    let memory = truncate.map_or(0, |mem_count| ((mem_count as u64) << 2) | 1);
     ps.add_scalar(F128::new(log_inv_rate as u64, memory));
 }
 
@@ -162,6 +162,7 @@ fn airs<'a>(
                 tau,
                 cols: &cols[start..start + n],
                 form: leaf::BusForm::sum(bus_forms.chain([identities])),
+                public: table.public_columns().into_iter().map(|(column, _)| column).collect(),
             }
         })
         .collect()
@@ -291,25 +292,26 @@ pub fn prove(
         exec.trace.row_counts(),
         public_input,
     );
-    let compact = if program.truncate {
+    // q_keccak is pieces in every proof. A truncated program also cuts the memory and the table columns, unless that
+    // leaves the stack below what a recursion guest opens: then it keeps them whole, as a full proof does.
+    let truncated = if program.truncate {
         let floor = verifier::min_execution_stacked_log(crate::log2_strict_usize(program.prog.len()));
         truncate::Compact::reaching(&layout, exec.mem_used, floor)?
     } else {
         None
     };
-    let shape = compact.as_ref().map_or(layout.shape, |c| c.shape);
-    if !(pcs::MIN_STACKED_LOG..=pcs::MAX_STACKED_LOG).contains(&shape.mu) {
-        return Err(ProveError::WitnessOutOfRange {
-            log_committed: shape.mu,
-        });
-    }
+    let compact = match truncated {
+        Some(compact) => compact,
+        None => truncate::Compact::new(&layout, 1 << layout.placements[MEMORY_FINAL_COUNTERS].n_vars, false)?,
+    };
+    let shape = compact.shape;
     let cycles = exec.cycles;
     let mut w = crate::stage!("Build witness", || build(program, &exec, layout, keccak_blocks));
     #[cfg(test)]
     forge::tamper(&mut w);
     let mem_used = exec.mem_used;
     drop(exec);
-    let committed_size = compact.as_ref().map_or_else(|| w.committed_size(), |c| c.placed);
+    let committed_size = compact.placed;
     // The public statement (program digest + input) seeds the transcript, so
     // every challenge depends on the exact program and public input.
     let mut ps = ProverState::new(
@@ -318,28 +320,16 @@ pub fn prove(
     );
 
     // Announce sizes and commit before sampling any challenge.
-    announce_public(
-        &mut ps,
-        w.log_mem,
-        w.layout.rows,
-        log_inv_rate,
-        compact.as_ref().map(truncate::Compact::announced),
-    );
-    let compact_q = compact
-        .as_ref()
-        .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
+    announce_public(&mut ps, w.log_mem, w.layout.rows, log_inv_rate, compact.announced());
+    let compact_q = crate::stage!("Compact copy", || compact.copy(&w.q, &w.layout));
     #[cfg(test)]
-    let compact_q = compact_q.map(|mut q| {
-        forge::tamper_compact(compact.as_ref().expect("a compact stack"), &mut q);
+    let compact_q = {
+        let mut q = compact_q;
+        forge::tamper_compact(&compact, &mut q);
         q
-    });
+    };
     let committed = crate::stage!("Commit", || {
-        pcs::commit(
-            &mut ps,
-            &compact_q.as_deref().unwrap_or(&w.q)[..shape.committed_len()],
-            shape,
-            log_inv_rate,
-        )
+        pcs::commit(&mut ps, &compact_q[..shape.committed_len()], shape, log_inv_rate)
     });
 
     // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
@@ -417,17 +407,12 @@ pub fn prove(
     });
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
-    // The reduction was the last reader of the full stack: a truncated proof opens the compact one.
-    let full_q = std::mem::take(&mut w.q);
-    let (q, slots, ring) = match (compact.as_ref(), compact_q) {
-        (Some(c), Some(compact_q)) => {
-            drop(full_q);
-            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
-            (compact_q, slots, ring)
-        }
-        _ => (full_q, slots, ring),
-    };
-    crate::stage!("PCS open", || { pcs::open(&mut ps, committed, q, &slots, &ring) });
+    // The reduction was the last reader of the full stack: the proof opens the compact one.
+    drop(std::mem::take(&mut w.q));
+    let (slots, ring) = compact.map_claims(&w.layout, slots, ring);
+    crate::stage!("PCS open", || {
+        pcs::open(&mut ps, committed, compact_q, &slots, &ring)
+    });
     Ok((
         ps.into_proof(),
         Stats {
@@ -455,10 +440,14 @@ fn finish_claims(
     let sch = schema();
     claims.reserve(sch.n - NUM_GLOBAL_COLUMNS);
     for (t, table) in tables::tables().iter().enumerate() {
+        let public = table.public_columns();
         for c in 0..table.n_committed_columns() {
             let col = sch.base[t] + c;
             if let Some((_, KeccakLane::Output(_))) = keccak_value(col) {
                 continue; // the Keccak reduction's claim on the output (`keccak_output_claim`)
+            }
+            if public.iter().any(|&(p, _)| p == c) {
+                continue; // a constant on every row: no claim, the verifier knows its value
             }
             claims.push(ColumnClaim {
                 col,
@@ -962,6 +951,9 @@ mod tests {
             (70_000, 40, true, true),
             (40, 70_000, true, true),
             (70_000, 70_000, false, true),
+            // Four row pieces of `KECCAK64` (12 pieces by slot block) and two of `KECCAK`: fourteen ring blocks, more than
+            // the eight an opening used to carry.
+            (122_000, 98_000, true, true),
         ] {
             let (program, _, _) = keccak64_mix_program(message, keccak64, keccak, out_two, truncate);
             let (proof, stats) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
@@ -974,12 +966,11 @@ mod tests {
             );
             let summary = verify(&program, &pi, &proof)
                 .unwrap_or_else(|e| panic!("{keccak64} KECCAK64 and {keccak} KECCAK rows: {e}"));
-            if truncate {
-                assert!(
-                    summary.truncation.is_some_and(|t| t.qt),
-                    "{keccak64} KECCAK64 and {keccak} KECCAK rows: q_keccak is pieces"
-                );
-            }
+            assert_eq!(
+                summary.truncation.is_some(),
+                truncate,
+                "{keccak64} KECCAK64 and {keccak} KECCAK rows: the rate word announces the truncation"
+            );
         }
     }
 
@@ -1103,8 +1094,9 @@ mod tests {
             let (proof, _) = forged.unwrap_or_else(|e| panic!("{forge:?}: no proof: {e}"));
             assert!(verify(&program, &pi, &proof).is_err(), "{forge:?} is accepted");
         };
-        // A lane the padding fixes.
-        for lane in [8, 16, 24] {
+        // A lane the padding fixes: lanes 8, 16 and 20 are public, so the committed pieces stay honest and the
+        // reduction runs on the forged state. Lane 24 is committed and pinned by its identity.
+        for lane in [8, 16, 20, 24] {
             rejects(Forge::Keccak64InputLane(lane), 3, 2, true, F128::ZERO);
         }
         rejects(Forge::Keccak64OtherRowsOutput, 3, 2, true, F128::ZERO);
@@ -1117,8 +1109,13 @@ mod tests {
         rejects(Forge::Keccak64OutTwo(false), 3, 2, true, F128::ZERO);
     }
 
-    /// `q_keccak` as pieces of its halves (70,000 `KECCAK64` rows are two pieces, 40 `KECCAK` rows one): the one ring claim
-    /// over them refuses a word of a piece changed in the committed stack, and a pad taken from the other half.
+    /// `q_keccak` as pieces of its halves (70,000 `KECCAK64` rows are two row pieces of three slot blocks, 40 `KECCAK` rows
+    /// one): the one ring claim over them refuses a word of a piece changed in the committed stack, a pad taken from
+    /// the other half, two slot blocks of one row piece that change places, and a block that holds another row
+    /// piece's.
+    ///
+    /// The public share of the padding lanes is not sent: a prover that forms it without the table's `eq` writes the
+    /// same proof, and the verifier's own share decides. The verifier's side of that is `qt_claims_equal_the_full_layout`.
     #[test]
     fn forged_pieces_of_q_keccak_are_rejected() {
         use super::forge::{Forge, set};
@@ -1126,16 +1123,32 @@ mod tests {
         let pi = [w(7), w(11)];
         let (program, _, _) = keccak64_mix_program(message, 70_000, 40, true, true);
         set(None);
-        let (proof, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
-        let summary = verify(&program, &pi, &proof).expect("the honest proof verifies");
-        assert!(summary.truncation.is_some_and(|t| t.qt), "q_keccak is pieces");
-        for forge in [Forge::PieceWord, Forge::SwapPads] {
+        let (honest, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        verify(&program, &pi, &honest).expect("the honest proof verifies");
+        for forge in [
+            Forge::PieceWord,
+            // A word in each of `KECCAK64`'s three slot blocks.
+            Forge::BlockWord { first: 0, log: 3 },
+            Forge::BlockWord { first: 24, log: 3 },
+            Forge::BlockWord { first: 32, log: 5 },
+            Forge::SwapPads,
+            Forge::SwapBlocks,
+            Forge::BorrowBlock,
+        ] {
             set(Some(forge));
             let forged = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE);
             set(None);
             let (proof, _) = forged.unwrap_or_else(|e| panic!("{forge:?}: no proof: {e}"));
             assert!(verify(&program, &pi, &proof).is_err(), "{forge:?} is accepted");
         }
+        set(Some(Forge::PublicShareNoTheta));
+        let forged = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE);
+        set(None);
+        let (proof, _) = forged.expect("a proof");
+        assert!(
+            proof.stream == honest.stream,
+            "the prover's share enters no byte of the proof"
+        );
     }
 
     /// The last slot in a frame other than main's is an ordinary slot: the machine halts in the
