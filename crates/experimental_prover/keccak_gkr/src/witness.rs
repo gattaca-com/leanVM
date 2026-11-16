@@ -9,8 +9,7 @@ use std::marker::PhantomData;
 
 use parallel::SendPtr;
 use primitives::field::F64;
-use primitives::hash::positions::linear;
-use primitives::hash::{RC, ROUNDS, STATE_LANES};
+use primitives::hash::{PI, RC, RHO, ROUNDS, STATE_LANES};
 use primitives::stream::Stream;
 use verifier::keccak::{BITS, along};
 
@@ -278,8 +277,54 @@ pub fn transpose64_portable(a: &mut [u64; 64]) {
 
 type Word = [u64; BLOCK_WORDS];
 
-fn xor(a: Word, b: Word) -> Word {
-    std::array::from_fn(|i| a[i] ^ b[i])
+// The round works on runs of consecutive positions, flattened to words: a loop over positions of
+// `Word`s is vectorized across positions, with a gather per word.
+
+/// `out = a ^ b`, word by word.
+#[inline(always)]
+fn xor_run(out: &mut [Word], a: &[Word], b: &[Word]) {
+    for ((o, x), y) in out
+        .as_flattened_mut()
+        .iter_mut()
+        .zip(a.as_flattened())
+        .zip(b.as_flattened())
+    {
+        *o = x ^ y;
+    }
+}
+
+/// [`primitives::hash::positions::linear`] on a sliced block, a lane's 64 positions at a time.
+fn linear(a: &[Word], out: &mut [Word]) {
+    let mut c = [[0u64; BLOCK_WORDS]; 5 * 64];
+    for (x, c) in c.as_chunks_mut::<64>().0.iter_mut().enumerate() {
+        xor_run(c, &a[64 * x..][..64], &a[64 * (x + 5)..][..64]);
+        for y in 2..5 {
+            for (c, a) in c
+                .as_flattened_mut()
+                .iter_mut()
+                .zip(a[64 * (x + 5 * y)..][..64].as_flattened())
+            {
+                *c ^= a;
+            }
+        }
+    }
+    let mut d = [[0u64; BLOCK_WORDS]; 5 * 64];
+    for x in 0..5 {
+        let (c4, c1) = (&c[64 * ((x + 4) % 5)..][..64], &c[64 * ((x + 1) % 5)..][..64]);
+        let d = &mut d[64 * x..][..64];
+        xor_run(&mut d[1..], &c4[1..], &c1[..63]);
+        xor_run(&mut d[..1], &c4[..1], &c1[63..]);
+    }
+    for lane in 0..STATE_LANES {
+        let rot = RHO[lane] as usize;
+        let (a, d, out) = (
+            &a[64 * lane..][..64],
+            &d[64 * (lane % 5)..][..64],
+            &mut out[64 * PI[lane]..][..64],
+        );
+        xor_run(&mut out[rot..], &a[..64 - rot], &d[..64 - rot]);
+        xor_run(&mut out[..rot], &a[64 - rot..], &d[64 - rot..]);
+    }
 }
 
 /// The input a table's padding instances hold, all zero but for a table that says otherwise.
@@ -360,7 +405,7 @@ pub unsafe fn block(
     store(0, &state);
     lanes(0, &state);
     for round in 1..=last {
-        linear(&state, &mut u, xor);
+        linear(&state, &mut u);
         store(round, &u);
         chi_iota(&u, round, &mut state);
         if round.is_multiple_of(depth) && round < ROUNDS {
@@ -715,7 +760,7 @@ impl TableWitness {
         }
         for r in from + 1..=round {
             let input: &[Word] = if r == 1 { stored } else { state };
-            linear(input, u, xor);
+            linear(input, u);
             if r < round {
                 chi_iota(u, r, state);
             }
@@ -969,7 +1014,7 @@ mod tests {
             let mut bits: Vec<bool> = (0..BITS).map(|j| state[j / 64] >> (j % 64) & 1 == 1).collect();
             for round in 1..=16 {
                 let mut u = vec![false; BITS];
-                linear(&bits, &mut u, |a, b| a ^ b);
+                primitives::hash::positions::linear(&bits, &mut u, |a, b| a ^ b);
                 for j in 0..BITS {
                     bits[j] = u[j] ^ (!u[along(j, 1)] & u[along(j, 2)]) ^ (j < 64 && iota_bit(round, j));
                 }
