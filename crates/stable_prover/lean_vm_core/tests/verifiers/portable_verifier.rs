@@ -67,14 +67,7 @@ fn tampers_fail_their_check() {
     // The WHIR opening ends the stream. Its final level, after its `k` rounds of four scalars and a nonce: the
     // `2^mu + k` coefficients of the folded lane, the query nonce, then the tail rounds. The level before ends on its
     // high part, the OOD nonce, the OOD value and the query nonce.
-    let summary = &fixture.summary;
-    let stack_log = verifier::layout::build_layout(
-        fixture.program.bytecode(),
-        summary.log_memory as u64,
-        &summary.table_rows,
-    )
-    .unwrap()
-    .stack_log;
+    let stack_log = fixture.summary.stack_log;
     let (mut mu, mut k) = (stack_log - 6, 6); // the ladder: 6 lane variables, then 4 a level while over 5 remain
     while mu > 5 {
         k = mu.min(4);
@@ -123,5 +116,30 @@ fn tampers_fail_their_check() {
             verify_execution(fixture.program.bytecode(), &fixture.public_input_bytes, &proof) == Err(error)
         });
         assert!(found, "no tamper of scalar {position} fails with {error}");
+    }
+}
+
+/// The rate word is `(rate, (mem_count << 2) | flag)`. A flag of 3, a memory count with no flag, and a truncated
+/// proof over no memory are refused before anything else is read.
+#[test]
+fn rate_word_refusals() {
+    let fixture = fixture();
+    let rate_word = 1 + verifier::layout::N_TABLES;
+    let honest = &fixture.proof;
+    assert_eq!(honest.stream[rate_word].c1, 0, "the fixture is a full proof");
+    let cases = [
+        (3, VerifierError::AnnouncedHighLimb),
+        (4, VerifierError::AnnouncedHighLimb),
+        ((5 << 2) | 3, VerifierError::AnnouncedHighLimb),
+        (1, VerifierError::AnnouncedTableSizes),
+    ];
+    for (c1, error) in cases {
+        let mut proof = honest.clone();
+        proof.stream[rate_word].c1 = c1;
+        assert_eq!(
+            verify_execution(fixture.program.bytecode(), &fixture.public_input_bytes, &proof).map(|_| ()),
+            Err(error),
+            "a rate word high limb of {c1}"
+        );
     }
 }

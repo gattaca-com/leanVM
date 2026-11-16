@@ -25,7 +25,7 @@ mod wire;
 pub use bytecode::Bytecode;
 pub use field::{E, K};
 pub use layout::{
-    MAX_LOG_BYTECODE, MAX_LOG_MEMORY, MAX_STACKED_LOG, MAX_TABLE_LOG, MIN_LOG_MEMORY, MIN_STACKED_LOG, TAG,
+    MAX_LOG_BYTECODE, MAX_LOG_MEMORY, MAX_STACKED_LOG, MAX_TABLE_LOG, MIN_LOG_MEMORY, MIN_STACKED_LOG, TAG, Truncation,
     min_execution_stacked_log,
 };
 pub use merkle::MerklePath;
@@ -180,6 +180,10 @@ pub struct Summary {
     pub log_memory: usize,
     pub table_rows: Vec<u64>,
     pub log_inv_rate: usize,
+    /// What the rate word announces of a truncated proof, `None` for a full one.
+    pub truncation: Option<Truncation>,
+    /// The committed stack's log size.
+    pub stack_log: usize,
     /// Where the bus's bytecode sumcheck leaves the stacked bytecode, `(zeta_low, r)`. Its value there is the claim an aggregate defers.
     pub bytecode_point: Vec<E>,
     /// The stream positions the Keccak reduction reads.
@@ -257,18 +261,26 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
 
     // 1] memory log-size, table row counts, and log-inv-rate in WHIR
     let announced = transcript.next_scalars(2 + N_TABLES)?;
+    // The last word is `(rate, (mem_count << 2) | flag)`. Flag 1 announces a truncated proof over `mem_count`
+    // memory cells. Flag 2 announces one whose q_keccak is a region (QT). Flag 3 is refused.
+    let rate_word = announced[1 + N_TABLES];
+    let flag = rate_word.c1 & 3;
     require(
-        announced.iter().all(|value| value.c1 == 0),
+        announced[..1 + N_TABLES].iter().all(|value| value.c1 == 0) && flag != 3 && (flag != 0 || rate_word.c1 == 0),
         VerifierError::AnnouncedHighLimb,
     )?;
     let log_memory = announced[0].c0;
     let table_rows: Vec<u64> = announced[1..1 + N_TABLES].iter().map(|value| value.c0).collect();
-    let log_inverse_rate = announced[1 + N_TABLES].c0;
+    let log_inverse_rate = rate_word.c0;
     require(
         (MIN_LOG_INV_RATE as u64..=MAX_LOG_INV_RATE as u64).contains(&log_inverse_rate),
         VerifierError::PcsInverseRate,
     )?;
-    let layout = build_layout(bytecode, log_memory, &table_rows)?;
+    let truncation = (flag != 0).then_some(Truncation {
+        mem_count: rate_word.c1 >> 2,
+        qt: flag == 2,
+    });
+    let layout = build_layout(bytecode, log_memory, &table_rows, truncation)?;
     require(
         (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&layout.stack_log),
         VerifierError::CommittedSize,
@@ -348,6 +360,10 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
 
     // 7] Ring-switching
     let (point, slices) = openings.inputs;
+    let (point, slices) = match &layout.qt {
+        Some(qt) => qt.ring_inputs(point, slices),
+        None => (point, slices),
+    };
     let (ringswitch_target, ringswitch_weight) = ring_switch(point, &slices, &mut transcript)?;
     // That claim is supported on q_keccak's region of the stack, so its weight carries the
     // placement's selector, and it leads the batch, taking the first power.
@@ -371,6 +387,8 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         log_memory: layout.log_memory,
         table_rows,
         log_inv_rate: log_inverse_rate as usize,
+        truncation,
+        stack_log: layout.stack_log,
         bytecode_point: bus.bytecode_point,
         keccak_scalars,
     })
