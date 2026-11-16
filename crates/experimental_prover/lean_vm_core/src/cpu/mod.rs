@@ -350,6 +350,7 @@ pub fn prove(
                 program.stacked_bytecode(),
                 &owners,
                 &spans,
+                mem_used,
                 &mut ps,
             )
         });

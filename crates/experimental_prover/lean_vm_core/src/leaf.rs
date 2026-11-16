@@ -185,6 +185,52 @@ struct LeafBlock {
     /// Of those, the leading blocks that GKR recomputes from the columns, in whole groups of four so that
     /// two folds write complete destination blocks.
     unstored: usize,
+    tail: Option<Tail>,
+}
+
+/// A memory block's leaves from row `start` on, past the cells the run used: its memory columns are
+/// constant there, so a leaf is `value + index · g^z` with no column read.
+#[derive(Clone, Copy)]
+struct Tail {
+    start: usize,
+    value: F128,
+    index: F128,
+}
+
+impl Tail {
+    /// The tail of a block that flushes only memory columns and the index, from row `start`, if it has one.
+    /// The memory columns must be constant from `start` to the block's last row.
+    fn of(terms: &[Term], const_part: F128, cols: &[&[F64]], start: usize, rows: usize) -> Option<Self> {
+        let memory = |i: usize| i <= verifier::layout::MEMORY_FINAL_COUNTERS;
+        let columns = terms
+            .iter()
+            .filter(|t| matches!(t.0, Source::Col(i) if memory(i)))
+            .count();
+        let only_memory = terms.iter().all(|t| match t.0 {
+            Source::Col(i) => memory(i),
+            Source::Index => true,
+            Source::Prod(..) => false,
+        });
+        if start >= rows || columns == 0 || !only_memory {
+            return None;
+        }
+        let mut tail = Self {
+            start,
+            value: const_part,
+            index: F128::ZERO,
+        };
+        for &(source, c) in terms {
+            match source {
+                Source::Col(i) => {
+                    debug_assert!(cols[i][start..rows].iter().all(|&v| v == cols[i][start]));
+                    tail.value += c.mul_base(cols[i][start]);
+                }
+                Source::Index => tail.index += c,
+                Source::Prod(..) => unreachable!("memory blocks carry no products"),
+            }
+        }
+        Some(tail)
+    }
 }
 
 impl LeafBlock {
@@ -194,10 +240,20 @@ impl LeafBlock {
         for &t in &other.terms {
             add_term(&mut terms, t);
         }
+        // Both tails start at one row, or the difference reads its columns throughout.
+        let tail = match (self.tail, other.tail) {
+            (Some(a), Some(b)) if a.start == b.start => Some(Tail {
+                start: a.start,
+                value: a.value + b.value,
+                index: a.index + b.index,
+            }),
+            _ => None,
+        };
         Self {
             const_part: self.const_part + other.const_part,
             terms,
             onto: true,
+            tail,
             ..*other
         }
     }
@@ -265,6 +321,14 @@ impl<'a> Rows8<'a> {
         let cols = self.cols;
         let eight = |i: usize| -> &[F64; 8] { cols[i][z..z + 8].try_into().expect("eight words") };
         let mut acc = Prod8::ZERO;
+        if let Some(tail) = block.tail.filter(|tail| z >= tail.start) {
+            if self.reads_index {
+                acc ^= mul_base_splat8(tail.index, &self.index.to_array());
+                self.index = self.index * self.step;
+            }
+            self.z += 8;
+            return acc.reduce_lanes() + F128x8::splat(tail.value);
+        }
         for &(source, c) in &block.terms {
             acc ^= match source {
                 Source::Col(i) => mul_base_splat8(c, eight(i)),
@@ -573,11 +637,13 @@ impl gkr::LeafColumns for ColumnLeaves<'_> {
 /// with reading stored leaves. A side that does not tile its layout keeps all its leaves.
 ///
 /// `cols` are the `committed` columns, then the stacked bytecode's, which [`Coord::Public`] numbers from zero.
+/// The memory columns must be constant from `memory_len` to the end of their blocks.
 pub(crate) fn build_leaves<'a>(
     sides: [(&[Block], &Layout, &[F128], F128); 2],
     cols: &'a [&'a [F64]],
     committed: usize,
     columns: bool,
+    memory_len: usize,
 ) -> ([gkr::Leaves<'static>; 2], Option<ColumnLeaves<'a>>) {
     let mut built: Vec<Side> = Vec::with_capacity(2);
     let mut blocks: Vec<LeafBlock> = Vec::new();
@@ -640,6 +706,8 @@ pub(crate) fn build_leaves<'a>(
             for (i, c) in blk.coords.iter().enumerate() {
                 push_terms(c, w[i], committed, &mut terms, &mut const_part);
             }
+            // Whole vectors of rows, so a call of eight is wholly in the tail or out of it.
+            let tail = Tail::of(&terms, const_part, cols, memory_len.next_multiple_of(8), blk.rows);
             blocks.push(LeafBlock {
                 side,
                 offset,
@@ -650,6 +718,7 @@ pub(crate) fn build_leaves<'a>(
                 onto: false,
                 bulk,
                 unstored,
+                tail,
             });
         }
         built.push(Side {
@@ -1254,6 +1323,8 @@ fn rebuilds_leaves(mu: usize, workers: usize) -> bool {
 /// The stream, in order: the [`verifier::bus_grinding_bits`] grind and the fingerprint `(α⃗, β)`; the
 /// batched GKR ([`gkr::prove_products_from`]); the framework blocks' fresh column values; the
 /// bytecode's share ([`prove_bytecode_share`]).
+///
+/// The three memory columns must be constant from `memory_len` to their logical end.
 pub(crate) fn prove_balance(
     push: &[Block],
     pull: &[Block],
@@ -1262,6 +1333,7 @@ pub(crate) fn prove_balance(
     stacked_bytecode: &[u64],
     owners: &[Vec<Option<(usize, usize)>>; 3],
     tables: &[(usize, usize)],
+    memory_len: usize,
     ps: &mut ProverState,
 ) -> BusProof {
     // The columns [`Coord::Public`] names.
@@ -1293,7 +1365,7 @@ pub(crate) fn prove_balance(
         && rebuilds_leaves(push_lay.mu, parallel::num_threads());
     // Push and pull are built together, so a table's columns are read once for both sides.
     let (push_leaves, pull_leaves, count_leaves, column_leaves) = crate::stage!("Bus leaves", || {
-        let (leaves, column_leaves) = build_leaves([sides[0], sides[1]], &all_cols, cols.len(), columns);
+        let (leaves, column_leaves) = build_leaves([sides[0], sides[1]], &all_cols, cols.len(), columns, memory_len);
         let [push_leaves, pull_leaves] = leaves;
         (
             push_leaves,
@@ -1502,17 +1574,17 @@ mod tests {
         let want = sides.map(|(blocks, lay, w, beta)| naive_leaves(blocks, lay, &cols, &public, w, beta));
         let two = [sides[0], sides[1]];
 
-        let (dense, none) = build_leaves(two, &all, cols.len(), false);
+        let (dense, none) = build_leaves(two, &all, cols.len(), false, 1 << 12);
         assert!(none.is_none());
         check_leaves(&dense, None, &want);
-        let (sparse, from_columns) = build_leaves(two, &all, cols.len(), true);
+        let (sparse, from_columns) = build_leaves(two, &all, cols.len(), true, 1 << 12);
         let from_columns = from_columns.expect("the tall blocks have unstored leaves");
         check_leaves(&sparse, Some(&from_columns), &want);
         assert!(dense.iter().all(|leaves| !leaves.ones.is_empty()));
 
         // The GKR wants its first two products equal, so each side is paired with itself.
         let leaves = |side: usize| {
-            build_leaves(two, &all, cols.len(), false)
+            build_leaves(two, &all, cols.len(), false, 1 << 12)
                 .0
                 .into_iter()
                 .nth(side)
@@ -1553,6 +1625,55 @@ mod tests {
         }
     }
 
+    /// A memory block whose columns are constant from `real` on, built with its tail and without: the same
+    /// quads, and column tasks that yield the leaves of the one without.
+    #[test]
+    fn memory_tail_leaves_match_dense_at_boundaries() {
+        let n = 1 << 14;
+        let weights: Vec<F128> = (0..1 << BUS_BITS).map(|i| F128::new(i as u64 + 3, 17)).collect();
+        let block = Block::full(
+            14,
+            vec![
+                Coord::Const(F64(7)),
+                Coord::Index,
+                Coord::Col(0),
+                Coord::Col(1),
+                Coord::Col(2),
+            ],
+        );
+        let blocks = std::slice::from_ref(&block);
+        let lay = layout(blocks);
+        let sides = [(blocks, &lay, &weights[..], F128::Y); 2];
+        for real in [0, 1, 7, 8, 9, 63, 64, 65, 1023, 1024, 1025, 8191, 8192, 8193, n] {
+            let values: Vec<_> = (0..3 * n)
+                .map(|i| {
+                    if i % n < real {
+                        F64((i as u64).wrapping_mul(0xabcdef))
+                    } else {
+                        F64(u64::from(i / n == 2))
+                    }
+                })
+                .collect();
+            let cols = std::array::from_fn::<_, 3, _>(|c| &values[c * n..(c + 1) * n]);
+            let (dense, _) = build_leaves(sides, &cols, cols.len(), false, n);
+            let (sparse, from_columns) = build_leaves(sides, &cols, cols.len(), true, real);
+            let from_columns = from_columns.unwrap();
+            for side in 0..2 {
+                assert_eq!(dense[side].quads, sparse[side].quads, "real={real}");
+            }
+            for t in 0..gkr::LeafColumns::tasks(&from_columns) {
+                gkr::LeafColumns::task(&from_columns, t, &mut |side, b, got| {
+                    let gkr::LeafData::Blocks(ref expected) = dense[side].leaves else {
+                        unreachable!()
+                    };
+                    for (a, e) in got.iter().zip(expected[b]) {
+                        assert_eq!(a.to_array(), e.to_array(), "real={real}");
+                    }
+                });
+            }
+        }
+    }
+
     #[test]
     fn a_block_follows_the_one_before_it_as_their_difference_when_that_is_cheaper() {
         let w = |i: u64| F128::new(i + 2, 1);
@@ -1566,6 +1687,7 @@ mod tests {
             onto: false,
             bulk: 64,
             unstored,
+            tail: None,
         };
         let push = vec![(Source::Col(0), w(0)), (Source::Col(1), w(1)), (Source::Index, w(2))];
         let near = vec![(Source::Col(0), w(0)), (Source::Col(2), w(1)), (Source::Index, w(2))];
@@ -1635,8 +1757,8 @@ mod tests {
             (&push[..], &lay, &weights[..], F128::Y),
             (&pull[..], &lay, &weights[..], F128::Y),
         ];
-        let (dense, _) = build_leaves(sides, &cols, cols.len(), false);
-        let (sparse, from_columns) = build_leaves(sides, &cols, cols.len(), true);
+        let (dense, _) = build_leaves(sides, &cols, cols.len(), false, n);
+        let (sparse, from_columns) = build_leaves(sides, &cols, cols.len(), true, n);
         let from_columns = from_columns.unwrap();
         let tasks = gkr::LeafColumns::tasks(&from_columns);
         assert!(tasks > 0);
