@@ -107,6 +107,25 @@ impl Drop for Stream {
     }
 }
 
+/// Prefetch hints: the values of `_MM_HINT_T0` (every cache level) and `_MM_HINT_T1` (L2 and below).
+pub const HINT_T0: i32 = 3;
+pub const HINT_T1: i32 = 2;
+
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(HINT_T0 == core::arch::x86_64::_MM_HINT_T0 && HINT_T1 == core::arch::x86_64::_MM_HINT_T1);
+
+/// Starts fetching the `bytes` at `base`, a line at a time, as `HINT` says. Nothing is read, so any address will do.
+#[inline(always)]
+pub fn prefetch_lines<const HINT: i32>(base: *const u8, bytes: usize) {
+    #[cfg(target_arch = "x86_64")]
+    for line in 0..bytes / 64 {
+        // SAFETY: a prefetch of any address is harmless.
+        unsafe { core::arch::x86_64::_mm_prefetch::<HINT>(base.wrapping_add(64 * line).cast()) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (base, bytes);
+}
+
 /// Stream `bytes` (a multiple of 64) from `src` to the line-aligned `dst`.
 ///
 /// # Safety
