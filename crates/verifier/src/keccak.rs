@@ -50,25 +50,40 @@ pub const RMFE_PROJECT: [u64; PACK] = [
     0x400000000000,
 ];
 
-/// A batch: `2^log_steps` permutations, a state committed every `depth` rounds.
+/// A batch: `2^table_bits` tables of `2^log_steps` permutations each, a state committed every `depth` rounds.
 #[derive(Clone, Copy, Debug)]
 pub struct KeccakShape {
     pub log_steps: usize,
     pub depth: usize,
+    pub table_bits: usize,
 }
 
 impl KeccakShape {
-    pub fn segments(&self) -> usize {
+    /// The runs of `depth` rounds a permutation splits into.
+    pub fn run_segments(&self) -> usize {
         ROUNDS / self.depth
+    }
+
+    fn run_bits(&self) -> usize {
+        log2_ceil(self.run_segments() as u64)
+    }
+
+    /// The bits of a segment index: the run, then the table. Segment `m + 2^run_bits t` is run `m` of table `t`.
+    fn segment_bits(&self) -> usize {
+        self.run_bits() + self.table_bits
+    }
+
+    pub fn tables(&self) -> usize {
+        1 << self.table_bits
     }
 
     fn pack_bits(&self) -> usize {
         self.log_steps - PACK_BITS
     }
 
-    /// The slot index of q_keccak: lane `l` of the state segment `m` starts from is slot `25 m + l`.
+    /// The slot index of q_keccak: lane `l` of the state run `m` starts from is slot `25 m + l`.
     pub fn slot_bits(&self) -> usize {
-        log2_ceil((STATE_LANES * self.segments()) as u64)
+        log2_ceil((STATE_LANES * self.run_segments()) as u64)
     }
 }
 
@@ -140,9 +155,12 @@ fn verify_layer(
         // iota flips known positions of lane 0 in every instance.
         let segments = eq_kernel(&claim.point[shape.pack_bits()..]);
         let mut iota = ZERO;
-        for (segment, &weight) in segments.iter().enumerate().take(shape.segments()) {
-            let constant = KECCAK_RC[shape.depth * (segment + 1) - step - 1];
-            iota += weight * E::sum((0..64).filter(|z| constant >> z & 1 == 1).map(|z| claim.weights[z]));
+        for table in 0..shape.tables() {
+            for run in 0..shape.run_segments() {
+                let weight = segments[run + (table << shape.run_bits())];
+                let constant = KECCAK_RC[shape.depth * (run + 1) - step - 1];
+                iota += weight * E::sum((0..64).filter(|z| constant >> z & 1 == 1).map(|z| claim.weights[z]));
+            }
         }
         require(
             projected + iota * E::sum(claim.mu.iter().copied()) == claim.value,
@@ -212,7 +230,8 @@ fn open(
     // The weight on `(slot, z)` is the segment's eq times the claim's position weight, on the slots of the states
     // the claim speaks of: segment `m` holds lane `l` at slot `STATE_LANES * (first + m) + l`.
     // At the slot challenges, each slot's row of 64 scales by `eq(slot, s)`.
-    let segments = eq_kernel(&claim.point[shape.pack_bits()..]);
+    // The claim's table coordinates are coordinates of the point the opening ends on, not weights.
+    let segments = eq_kernel(&claim.point[shape.pack_bits()..shape.pack_bits() + shape.run_bits()]);
     let slots = eq_kernel(&slot);
     let mut row = [ZERO; 64];
     for segment in 0..count {
@@ -234,8 +253,9 @@ pub(crate) struct KeccakOpenings {
 }
 
 /// The reduction: a random claim on every segment's output at `instance`, `depth` layers down to the committed inputs.
-/// The last segment's output is the permutation's, claimed by `output`, its lanes as words at `instance`; the others
-/// are committed.
+/// The last run's output is the permutation's, claimed by `output`, the lanes of table 0 as words at `instance`, then
+/// those of table 1, and so on; the other runs' are committed. The tables' lanes fold at the table challenges, which
+/// the reduction draws with the segment and lane challenges, and which end the point of the committed claims.
 pub(crate) fn verify_keccak(
     transcript: &mut Transcript,
     shape: KeccakShape,
@@ -245,19 +265,29 @@ pub(crate) fn verify_keccak(
     // `replay_unchecked` reaches this with a child's announced shape, where the contract is an error and
     // never a panic. The pack bound is what keeps `pack_bits` below from underflowing.
     require(
-        instance.len() == shape.log_steps && output.len() == STATE_LANES && shape.log_steps >= PACK_BITS,
+        instance.len() == shape.log_steps
+            && output.len() == shape.tables() * STATE_LANES
+            && shape.log_steps >= PACK_BITS,
         VerifierError::AnnouncedTableSizes,
     )?;
-    // One message, the segment then the lane: the first claim is multilinear in them.
-    let segment_bits = log2_ceil(shape.segments() as u64);
+    // One message, the segment (run, then table) then the lane: the first claim is multilinear in them.
+    let segment_bits = shape.segment_bits();
     transcript.grind_check(grinding_bits((segment_bits + LANE_BITS) as u128))?;
     let segment = transcript.samples(segment_bits);
+    let (run, theta) = segment.split_at(shape.run_bits());
     let point = [&instance[PACK_BITS..], &segment[..]].concat();
     // The first claim combines the output lanes as words: bit z of a word weighs x^z.
     let lanes = eq_kernel(&transcript.samples(LANE_BITS));
     let weights = (0..BITS).map(|j| lanes[j / 64] * K(1 << (j % 64))).collect();
-    let last = eq_kernel(&segment)[shape.segments() - 1] * dot(&lanes[..STATE_LANES], output);
-    let committed = if shape.segments() > 1 {
+    let tables = eq_kernel(theta);
+    let folded = E::sum(
+        output
+            .chunks(STATE_LANES)
+            .zip(&tables)
+            .map(|(output, &weight)| weight * dot(&lanes[..STATE_LANES], output)),
+    );
+    let last = eq_kernel(run)[shape.run_segments() - 1] * folded;
+    let committed = if shape.run_segments() > 1 {
         transcript.next_scalar()?
     } else {
         ZERO
@@ -275,17 +305,17 @@ pub(crate) fn verify_keccak(
 
     // The committed outputs, whose instance weights are an eq already: slice 0 holds the slot's weight, the others x^z times it.
     let mut outputs = None;
-    if shape.segments() > 1 {
-        let (slot, weights, value) = open(transcript, shape, &first, 1, shape.segments() - 1, committed)?;
+    if shape.run_segments() > 1 {
+        let (slot, weights, value) = open(transcript, shape, &first, 1, shape.run_segments() - 1, committed)?;
         let word = transcript.next_scalar()?;
         if transcript.checked() {
             require(weights[0] * word == value, VerifierError::KeccakOutputOpening)?;
         }
-        outputs = Some(([instance, &slot].concat(), word));
+        outputs = Some(([instance, theta, &slot].concat(), word));
     }
     // The inputs: the instances of a pack first, then the slot.
     let (low, value) = sumcheck(transcript, claim.value, 3, &[None; PACK_BITS])?;
-    let (slot, weights, value) = open(transcript, shape, &claim, 0, shape.segments(), value)?;
+    let (slot, weights, value) = open(transcript, shape, &claim, 0, shape.run_segments(), value)?;
     let slices = transcript.next_scalars(K_BITS)?;
     if transcript.checked() {
         require(
@@ -293,7 +323,8 @@ pub(crate) fn verify_keccak(
             VerifierError::KeccakInputOpening,
         )?;
     }
-    let point = [&low, &claim.point[..shape.pack_bits()], &slot].concat();
+    let tables = &claim.point[shape.pack_bits() + shape.run_bits()..];
+    let point = [&low, &claim.point[..shape.pack_bits()], tables, &slot].concat();
     Ok(KeccakOpenings {
         outputs,
         inputs: (point, slices),

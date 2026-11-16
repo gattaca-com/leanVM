@@ -627,6 +627,7 @@ fn keccak_shape(table_log_heights: &[usize]) -> KeccakShape {
     KeccakShape {
         log_steps: table_log_heights[OP_KECCAK],
         depth: KECCAK_DEPTH,
+        table_bits: 0,
     }
 }
 

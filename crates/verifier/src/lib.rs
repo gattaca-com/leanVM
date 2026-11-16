@@ -202,25 +202,34 @@ pub fn replay_unchecked(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Pr
     walk(bytecode, public_input, proof, false)
 }
 
-/// Exposed for the Keccak reduction's benchmark and tests: a batch of `2^log_steps` permutations proved alone, a state
-/// committed every `depth` rounds, the committed states the whole stack.
+/// Exposed for the Keccak reduction's benchmark and tests: `2^table_bits` tables of `2^log_steps` permutations each
+/// proved alone, a state committed every `depth` rounds, the committed states the whole stack.
 ///
-/// The proof is the commitment root and its OOD sample, the output lanes claimed at a challenge point, the reduction, then the ring
-/// switch and its opening, as in an execution proof. Its public input is the shape, the words `log_steps`, `depth`,
-/// `log_inv_rate` and zero, so a proof of one shape verifies for no other.
+/// The proof is the commitment root and its OOD sample, the output lanes of every table claimed at a challenge point,
+/// the reduction, then the ring switch and its opening, as in an execution proof. Its public input is the shape, the
+/// words `log_steps`, `depth`, `log_inv_rate` and `table_bits`, so a proof of one shape verifies for no other.
 pub fn verify_keccak_batch(
     fiat_shamir_iv: &[u8; 32],
     log_steps: usize,
     depth: usize,
+    table_bits: usize,
     log_inv_rate: usize,
     proof: &Proof,
 ) -> Result<(), VerifierError> {
     require(
-        log_steps >= layout::KECCAK_MIN_STEPS_LOG && depth > 0 && ROUNDS.is_multiple_of(depth),
+        log_steps >= layout::KECCAK_MIN_STEPS_LOG
+            && depth > 0
+            && ROUNDS.is_multiple_of(depth)
+            && table_bits <= 2
+            && (table_bits == 0 || (ROUNDS / depth).is_power_of_two()),
         VerifierError::CommittedSize,
     )?;
-    let shape = KeccakShape { log_steps, depth };
-    let stack_log = log_steps + shape.slot_bits();
+    let shape = KeccakShape {
+        log_steps,
+        depth,
+        table_bits,
+    };
+    let stack_log = log_steps + table_bits + shape.slot_bits();
     require(
         (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&stack_log),
         VerifierError::CommittedSize,
@@ -230,7 +239,7 @@ pub fn verify_keccak_batch(
         .as_chunks_mut::<8>()
         .0
         .iter_mut()
-        .zip([log_steps, depth, log_inv_rate])
+        .zip([log_steps, depth, log_inv_rate, table_bits])
     {
         *bytes = (word as u64).to_le_bytes();
     }
@@ -241,7 +250,7 @@ pub fn verify_keccak_batch(
     // The instance pins the committed middle states, a multilinear identity of degree `log_steps` in it.
     transcript.grind_check(grinding_bits(log_steps as u128))?;
     let instance = transcript.samples(log_steps);
-    let output = transcript.next_scalars(STATE_LANES)?;
+    let output = transcript.next_scalars(shape.tables() * STATE_LANES)?;
     let openings = verify_keccak(&mut transcript, shape, &instance, &output)?;
     let (point, slices) = openings.inputs;
     let (target, weight) = ring_switch(point, &slices, &mut transcript)?;
