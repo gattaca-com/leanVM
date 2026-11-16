@@ -537,14 +537,15 @@ pub(super) fn initial_basis(
             .collect();
     }
     for (i, weight) in rings.iter().enumerate() {
-        let factors = point_factors(weight.point(), ring.offset, bits);
+        let offset = ring.offset + ring.claims[i].offset;
+        let factors = point_factors(weight.point(), offset, bits);
         let (low, rest) = factors.split_at(low_vars);
         let (mid, lane) = rest.split_at(lane_vars - low_vars);
         terms.rings.push(Ring {
             fold: BitFold::new(&table(low)),
             e_hi: table(mid),
             point: weight.point().to_vec(),
-            x_offset: ring.offset & (block - 1),
+            x_offset: offset & (block - 1),
             first: claims.len() + DEGREE_E * i,
         });
         extend_table(&mut lanes, lane);

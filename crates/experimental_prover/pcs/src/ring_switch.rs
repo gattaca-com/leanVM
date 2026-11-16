@@ -385,15 +385,16 @@ pub struct RingSwitchProveState {
 /// reduction sends them itself), which is what lets this
 /// phase touch no transcript at all. `precomputed_s_hat_v` is `None` only for a
 /// caller that wants them folded out of the witness instead.
+///
+/// `packed_witness` is the leading words of the `2^|suffix_point|` it stands for, which are zero past it.
 pub fn prove_prepare(
     packed_witness: &[F64],
     suffix_point: &[F128],
     precomputed_s_hat_v: Option<&[F128]>,
 ) -> RingSwitchProveState {
-    assert_eq!(
-        packed_witness.len(),
-        1usize << suffix_point.len(),
-        "packed witness must have 2^|suffix_point| words"
+    assert!(
+        packed_witness.len() <= 1usize << suffix_point.len(),
+        "packed witness must have at most 2^|suffix_point| words"
     );
     let s_hat_v = match precomputed_s_hat_v {
         Some(v) => v.try_into().expect("one slice per packing bit"),

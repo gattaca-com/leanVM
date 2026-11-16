@@ -137,6 +137,9 @@ fn flatten(claims: &[StackClaim], lambdas: &[F128]) -> (Vec<StackClaim>, Vec<F12
 /// layer only binds them to the commitment. `None` asks the prover to fold the slices from the witness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RingSwitchClaim {
+    /// Where the claim's block starts, relative to [`RingSwitchOpen::offset`]: a multiple of
+    /// `2^|suffix_point|`, the block's length, so that a claim may be on a piece of q_keccak.
+    pub offset: usize,
     pub suffix_point: Vec<F128>,
     pub s_hat_v: Option<Vec<F128>>,
 }
@@ -146,19 +149,11 @@ pub struct RingSwitchClaim {
 /// precomputed `s_hat_v`.
 #[derive(Clone, Debug)]
 pub struct RingSwitchOpen {
-    /// q_keccak's offset inside the committed stack; must be a multiple of
-    /// `2^qkeccak_vars` (an aligned slice).
+    /// Where q_keccak starts inside the `2^log_n`-word stack, the claims' offsets relative to it. A claim's
+    /// absolute offset must be a multiple of `2^|suffix_point|` (an aligned slice). A block may end past the
+    /// committed lanes, where the stack is zero.
     pub offset: usize,
     pub claims: Vec<RingSwitchClaim>,
-}
-
-impl RingSwitchOpen {
-    /// log2 of q_keccak's length in F64 words, its claims' point length; the
-    /// opener slices `q_keccak = stack[offset .. offset + 2^qkeccak_vars]` (no
-    /// separate copy).
-    pub(crate) fn qkeccak_vars(&self) -> usize {
-        self.claims.first().map_or(0, |claim| claim.suffix_point.len())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,15 +178,17 @@ pub fn open_batch_mixed_whir_stacked(
     point_claims: &[StackClaim],
     ring: &RingSwitchOpen,
 ) {
-    let qkeccak_len = 1usize << ring.qkeccak_vars();
-    assert!(
-        ring.offset.is_multiple_of(qkeccak_len),
-        "q_keccak offset must be 2^qkeccak_vars-aligned"
-    );
-    assert!(
-        ring.offset + qkeccak_len <= stack.len(),
-        "q_keccak slice must fit inside the stack"
-    );
+    for claim in &ring.claims {
+        let (offset, len) = (ring.offset + claim.offset, 1usize << claim.suffix_point.len());
+        assert!(
+            offset.is_multiple_of(len),
+            "a ring-switch block must be aligned to its length"
+        );
+        assert!(
+            offset + len <= 1 << log_n,
+            "a ring-switch block must fit inside the stack"
+        );
+    }
     assert!(
         point_claims.iter().all(|c| c.fits(1 << log_n)),
         "every claim must live inside the stack"
@@ -204,16 +201,13 @@ pub fn open_batch_mixed_whir_stacked(
 
     // 1. Ring-switch reduction: prepare every claim's s_hat_v (the caller bound
     //    them upstream), then sample one shared linear map.
-    let qkeccak = &stack[ring.offset..ring.offset + qkeccak_len];
     let mut rs_states = Vec::with_capacity(ring.claims.len());
     for claim in &ring.claims {
-        assert_eq!(
-            claim.suffix_point.len(),
-            ring.qkeccak_vars(),
-            "every ring-switch suffix point must have qkeccak_vars coords"
-        );
+        let offset = ring.offset + claim.offset;
+        // The block may reach past the committed lanes, where the stack is zero.
+        let block = &stack[offset.min(stack.len())..(offset + (1usize << claim.suffix_point.len())).min(stack.len())];
         rs_states.push(ring_switch::prove_prepare(
-            qkeccak,
+            block,
             &claim.suffix_point,
             claim.s_hat_v.as_deref(),
         ));
@@ -301,15 +295,37 @@ mod tests {
                 stack.copy_within((b - 1) * block..b * block, b * block);
             }
             let qkeccak_len = 1usize << qkeccak_vars;
-            for offset in [0, qkeccak_len] {
-                if offset + qkeccak_len > stack.len() {
+            // The ring's lanes start on an even lane, an odd one, and past a pair or two: its `F` or its `G` is the lane
+            // a later round projects onto the ring's terms first.
+            for (offset, pieces) in [0, qkeccak_len, 2 * qkeccak_len, 3 * qkeccak_len, 5 * qkeccak_len]
+                .into_iter()
+                .flat_map(|offset| [(offset, false), (offset, true)])
+            {
+                // Two blocks at one place; or, three pieces of different sizes, as the pieces of
+                // `q_keccak`'s halves are, from `offset` on.
+                let blocks: Vec<(usize, usize)> = if pieces {
+                    let top = qkeccak_vars;
+                    vec![(0, top), (1 << top, top - 1), ((1 << top) + (1 << (top - 1)), top - 2)]
+                } else {
+                    vec![(0, qkeccak_vars); 2]
+                };
+                // The pieces need a block of at least 2^6 words; the slice may end past the committed lanes, or lie
+                // past them whole: the stack is zero there.
+                let span = blocks
+                    .iter()
+                    .map(|&(off, vars)| off + (1 << vars))
+                    .max()
+                    .expect("a block");
+                if (pieces && qkeccak_vars < 8) || offset + span > lane_block << LANE_ROUNDS {
                     continue;
                 }
                 let ring = RingSwitchOpen {
                     offset,
-                    claims: (0..2)
-                        .map(|_| RingSwitchClaim {
-                            suffix_point: rng.ext_vec(qkeccak_vars),
+                    claims: blocks
+                        .iter()
+                        .map(|&(off, vars)| RingSwitchClaim {
+                            offset: off,
+                            suffix_point: rng.ext_vec(vars),
                             s_hat_v: None,
                         })
                         .collect(),
@@ -319,8 +335,9 @@ mod tests {
                     .claims
                     .iter()
                     .map(|claim| {
-                        let state =
-                            ring_switch::prove_prepare(&stack[offset..offset + qkeccak_len], &claim.suffix_point, None);
+                        let (at, len) = (offset + claim.offset, 1usize << claim.suffix_point.len());
+                        let block = &stack[at.min(stack.len())..(at + len).min(stack.len())];
+                        let state = ring_switch::prove_prepare(block, &claim.suffix_point, None);
                         ring_switch::prove_finish_deferred(state, &coordinates, rng.ext())
                     })
                     .collect();
@@ -361,7 +378,11 @@ mod tests {
 
                 // Oracle: the dense weight written out naively, one eq entry at a time.
                 let mut dense = vec![F128::ZERO; lane_block << LANE_ROUNDS];
-                ring_switch::combine_deferred_chunk(&rs_outputs, &mut dense[offset..offset + qkeccak_len]);
+                for (claim, weight) in ring.claims.iter().zip(&rs_outputs) {
+                    let at = offset + claim.offset;
+                    let len = 1usize << claim.suffix_point.len();
+                    ring_switch::combine_deferred_chunk(std::slice::from_ref(weight), &mut dense[at..at + len]);
+                }
                 for (claim, &lambda) in claims.iter().zip(&lambdas) {
                     let StackClaim::Point { offset, low_point, .. } = claim else {
                         unreachable!("the test builds Point claims only")
@@ -385,8 +406,9 @@ mod tests {
                     &rings,
                 );
                 let mut lanes = LaneRounds::new(stack.clone(), projected, lane_block, false);
-                let context =
-                    format!("lane_vars={lane_vars}, lanes={lanes_count}, qkeccak_vars={qkeccak_vars}, offset={offset}");
+                let context = format!(
+                    "lane_vars={lane_vars}, lanes={lanes_count}, qkeccak_vars={qkeccak_vars}, offset={offset}, pieces={pieces}"
+                );
                 // The reference: the stack and the weight coefficient by coefficient, lanes interleaved, the stack's
                 // absent ones zero.
                 let stride = 1usize << LANE_ROUNDS;

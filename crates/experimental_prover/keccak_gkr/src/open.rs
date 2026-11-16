@@ -48,6 +48,7 @@ impl Openings {
         let ring = RingSwitchOpen {
             offset,
             claims: vec![RingSwitchClaim {
+                offset: 0,
                 suffix_point: self.inputs.point,
                 s_hat_v: Some(self.inputs.slices),
             }],
