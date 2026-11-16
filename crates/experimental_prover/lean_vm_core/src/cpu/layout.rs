@@ -51,50 +51,102 @@ pub enum KeccakLane {
 /// which is `QKECCAK_SPARE` columns the stack does not have to hold twice.
 pub const QKECCAK_SPARE: usize = (1 << crate::keccak::SLOT_LOG) - crate::keccak::SLOTS;
 
-/// The local KECCAK column riding spare slot `k`: its committed columns in local order, which
-/// are the ones before the value lanes, then the read counts after them.
-const fn spare_local(k: usize) -> usize {
-    if k < tables::keccakt::V_IN {
+/// The local column of table half `half` riding spare slot `k`: the table's committed columns in local order,
+/// the ones before the value lanes, then the read counts after them. `KECCAK64`'s last count, `r_bc`, rides none:
+/// the table has one column fewer than there are spare slots.
+const fn spare_local(half: usize, k: usize) -> usize {
+    if half == crate::keccak::KECCAK_HALF {
+        if k < tables::keccakt::V_IN {
+            k
+        } else {
+            tables::keccakt::R0 + (k - tables::keccakt::V_IN)
+        }
+    } else if k < tables::keccak64::V_IN {
         k
     } else {
-        tables::keccakt::R0 + (k - tables::keccakt::V_IN)
+        tables::keccak64::R0 + (k - tables::keccak64::V_IN)
     }
 }
+
+/// The first local column of a half's table that is not a head column, the value lanes, and the end of its columns.
+const fn half_columns(half: usize) -> (usize, usize, usize) {
+    if half == crate::keccak::KECCAK_HALF {
+        (tables::keccakt::V_IN, tables::keccakt::R0, tables::keccakt::N)
+    } else {
+        (tables::keccak64::V_IN, tables::keccak64::R0, tables::keccak64::N)
+    }
+}
+
 const _: () = {
-    let mut k = 0;
-    while k < QKECCAK_SPARE {
-        let local = spare_local(k);
-        // Increasing, so distinct: two spare slots sharing a column would leave the other's
-        // words unwritten. And never a value lane, which q_keccak already holds.
-        assert!(
-            k == 0 || spare_local(k - 1) < local,
-            "the spare columns must be distinct"
-        );
-        assert!(
-            local < tables::keccakt::V_IN || (local >= tables::keccakt::R0 && local < tables::keccakt::N),
-            "the KECCAK table has fewer committed columns than q_keccak has spare slots"
-        );
-        k += 1;
+    let mut half = 0;
+    while half < crate::keccak::TABLES {
+        let (head, counts, end) = half_columns(half);
+        let mut k = 0;
+        while k < QKECCAK_SPARE {
+            let local = spare_local(half, k);
+            // Increasing, so distinct: two spare slots sharing a column would leave the other's
+            // words unwritten. And never a value lane, which q_keccak already holds.
+            assert!(
+                k == 0 || spare_local(half, k - 1) < local,
+                "the spare columns must be distinct"
+            );
+            assert!(
+                local < head || (local >= counts && local < end),
+                "a hash table has fewer committed columns than q_keccak has spare slots"
+            );
+            k += 1;
+        }
+        half += 1;
     }
 };
 
-/// What `q_keccak` holds for the global column `col`, if it holds anything: a value lane of
-/// the KECCAK table, or one of its columns riding a spare slot.
-pub fn keccak_value(col: usize) -> Option<KeccakLane> {
+/// The half of `q_keccak` a hash table's local columns live in, and the first global column's table.
+fn half_of(col: usize) -> Option<(usize, usize)> {
+    let sch = schema();
+    verifier::layout::HASH_TABLES
+        .iter()
+        .position(|&t| col >= sch.base[t] && col < sch.base[t] + tables::tables()[t].n_committed_columns())
+        .map(|half| (half, col - sch.base[verifier::layout::HASH_TABLES[half]]))
+}
+
+/// What `q_keccak` holds for the global column `col`, if it holds anything: the half of `q_keccak` it is a column
+/// of (the table bit), and a value lane of that table, or one of its columns riding a spare slot.
+pub fn keccak_value(col: usize) -> Option<(usize, KeccakLane)> {
     use primitives::hash::STATE_LANES;
-    let local = col.checked_sub(schema().base[verifier::layout::OP_KECCAK])?;
-    if local >= tables::keccakt::N {
-        return None;
+    let (half, local) = half_of(col)?;
+    if let Some(k) = (0..QKECCAK_SPARE).find(|&k| spare_local(half, k) == local) {
+        return Some((half, KeccakLane::Slot(crate::keccak::SLOTS + k)));
     }
-    if let Some(k) = (0..QKECCAK_SPARE).find(|&k| spare_local(k) == local) {
-        return Some(KeccakLane::Slot(crate::keccak::SLOTS + k));
-    }
-    let lane = local.checked_sub(tables::keccakt::V_IN)?;
+    let lane = if half == crate::keccak::KECCAK_HALF {
+        local.checked_sub(tables::keccakt::V_IN)?
+    } else {
+        local.checked_sub(tables::keccak64::V_IN)?
+    };
+    let outputs = if half == crate::keccak::KECCAK_HALF {
+        STATE_LANES
+    } else {
+        tables::keccak64::OUT_LANES
+    };
     match lane {
-        0..STATE_LANES => Some(KeccakLane::Slot(lane)),
-        _ if lane < 2 * STATE_LANES => Some(KeccakLane::Output(lane - STATE_LANES)),
+        0..STATE_LANES => Some((half, KeccakLane::Slot(lane))),
+        _ if lane < STATE_LANES + outputs => Some((half, KeccakLane::Output(lane - STATE_LANES))),
         _ => None,
     }
+}
+
+/// `log2` of the steps the hash tables are each completed to: the tallest's height.
+pub(crate) fn hash_kappa(taus: &[usize; tables::N_TABLES]) -> usize {
+    verifier::layout::HASH_TABLES
+        .iter()
+        .map(|&t| taus[t])
+        .max()
+        .expect("hash tables")
+}
+
+/// Where the slot `slot` of table half `half` starts in `q_keccak`, laid out `(step, table, slot)` over `2^kappa` steps
+/// a table: the half's slot is a run of `2^kappa` words, of which its table's first `2^tau` are its column.
+pub(crate) fn qkeccak_slot_start(kappa: usize, half: usize, slot: usize) -> usize {
+    ((slot << crate::keccak::TABLE_BITS) + half) << kappa
 }
 
 /// Offset a table's local flush coordinates to global column indices.
@@ -156,14 +208,19 @@ impl Witness {
     /// the private buffer for an output lane.
     pub(crate) fn columns(&self) -> Vec<&[F64]> {
         let q_keccak = self.layout.placements[QKECCAK].offset;
-        let steps = 1 << self.layout.taus[verifier::layout::OP_KECCAK];
+        let kappa = hash_kappa(&self.layout.taus);
+        let sch = schema();
         let mut cols: Vec<&[F64]> = self
             .layout
             .placements
             .iter()
             .enumerate()
             .map(|(i, p)| match keccak_value(i) {
-                Some(KeccakLane::Slot(slot)) => &self.q[q_keccak + slot * steps..][..steps],
+                Some((half, KeccakLane::Slot(slot))) => {
+                    let tau = self.layout.taus[verifier::layout::HASH_TABLES[half]];
+                    debug_assert!(i >= sch.base[verifier::layout::HASH_TABLES[half]]);
+                    &self.q[q_keccak + qkeccak_slot_start(kappa, half, slot)..][..1 << tau]
+                }
                 _ if p.is_virtual() => &[][..],
                 _ => &self.q[p.offset..][..1 << p.n_vars],
             })
@@ -185,13 +242,18 @@ impl Witness {
     }
 }
 
+/// The kappa source of the tallest hash table's height: the log of the steps the Keccak reduction completes each
+/// table to.
+pub const KAPPA_SOURCE: usize = 2 + tables::N_TABLES;
+
 /// The committed columns' kappa SOURCES, for the recursion guest's
 /// in-circuit certification of the stacked size m = max(log2_ceil(sum of
 /// 2^kappa), MIN_STACKED_LOG). Per committed column: `Some((source, adj))` with
 /// kappa = value(source) + adj, where source 0 is the constant 0 (kappa =
 /// adj; used for the fixed-size columns and the program bytecode length,
-/// which the caller passes as `log_bytecode`), source 1 is log_mem, and
-/// source 2 + t is tau_t. `None` = virtual (never committed). `col_kappas`
+/// which the caller passes as `log_bytecode`), source 1 is log_mem,
+/// source 2 + t is tau_t, and [`KAPPA_SOURCE`] is the tallest hash table's
+/// tau. `None` = virtual (never committed). `col_kappas`
 /// is derived from this, so the two cannot drift apart.
 pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     let sch = schema();
@@ -200,10 +262,9 @@ pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     k[MEMORY_1] = Some((1, 0));
     k[MEMORY_FINAL_COUNTERS] = Some((1, 0));
     k[BYTECODE_FINAL_COUNTERS] = Some((0, log_bytecode));
-    // q_keccak is `2^(SLOT_LOG + n_steps_log)` F64 words, and tau_5 IS
-    // n_steps_log (the announced-size certification uses the same floor), so this
-    // reproduces `qkeccak_kappa`.
-    k[QKECCAK] = Some((2 + verifier::layout::OP_KECCAK, crate::keccak::SLOT_LOG));
+    // q_keccak is `2^(SLOT_LOG + TABLE_BITS + kappa)` F64 words, `kappa` the tallest hash table's height (the
+    // announced-size certification uses the same floor), which is source `2 + N_TABLES`.
+    k[QKECCAK] = Some((KAPPA_SOURCE, crate::keccak::SLOT_LOG + crate::keccak::TABLE_BITS));
     for (t, table) in tables::tables().iter().enumerate() {
         let base = sch.base[t];
         k[base..base + table.n_committed_columns()].fill(Some((2 + t, 0)));
@@ -252,6 +313,7 @@ pub fn block_kappa_sources(log_bytecode: usize) -> Vec<(usize, usize)> {
 fn col_kappas(log_mem: usize, log_bytecode: usize, taus: [usize; tables::N_TABLES]) -> Vec<Option<usize>> {
     let mut values = vec![0usize, log_mem];
     values.extend(taus);
+    values.push(hash_kappa(&taus));
     col_kappa_sources(log_bytecode)
         .iter()
         .map(|s| s.map(|(source, adj)| values[source] + adj))
@@ -348,9 +410,9 @@ pub(crate) fn layout_of(log_bytecode: usize, log_mem: usize, rows: [usize; table
 pub(crate) fn table_logs(rows: [usize; tables::N_TABLES]) -> [usize; tables::N_TABLES] {
     let taus = std::array::from_fn(|t| crate::log2_ceil_usize(rows[t]).max(tables::TABLE_LOG_FLOORS[t]));
     debug_assert_eq!(
-        taus[verifier::layout::OP_KECCAK],
-        crate::keccak::n_steps_log(rows[verifier::layout::OP_KECCAK]),
-        "the KECCAK table is the Keccak reduction's batch"
+        hash_kappa(&taus),
+        crate::keccak::kappa(verifier::layout::HASH_TABLES.map(|t| rows[t])),
+        "the hash tables are the Keccak reduction's batch"
     );
     taus
 }
@@ -388,24 +450,34 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
     // An output lane is neither in the stack nor in `q_keccak`, so its values need
     // storage of their own: it carries data for the bus. Every other column `q_keccak`
     // carries ([`Witness::columns`]) is filled through the slot window handed out below.
-    let steps = 1 << l.taus[verifier::layout::OP_KECCAK];
+    let kappa = hash_kappa(&l.taus);
+    let steps = 1usize << kappa;
     let mut virt: Vec<(usize, Vec<F64>)> = (0..sch.n)
-        .filter(|&i| matches!(keccak_value(i), Some(KeccakLane::Output(_))))
+        .filter_map(|i| match keccak_value(i) {
+            Some((half, KeccakLane::Output(_))) => Some((i, 1usize << l.taus[verifier::layout::HASH_TABLES[half]])),
+            _ => None,
+        })
         // SAFETY: `FillCtx::runs` writes every row of every window it is given, and
         // `fill_table` asserts each table wrote all of its windows.
-        .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
+        .map(|(i, rows)| (i, unsafe { primitives::uninit_vec::<F64>(rows) }))
         .collect();
     let mut windows = witness::split_stack(&mut q, &l.placements);
     for (i, buf) in virt.iter_mut() {
         windows[*i] = buf;
     }
-    // q_keccak's window is the committed states and then the spare slots, a slot per
-    // KECCAK column riding them: hand each its slot, so its fill writes it where it
-    // lives and the stack never holds it twice.
-    let (states, spare) = std::mem::take(&mut windows[QKECCAK]).split_at_mut(crate::keccak::SLOTS * steps);
+    // q_keccak's window is the committed states and then the spare slots, a slot of each table
+    // per hash column riding them: hand each its slot, so its fill writes it where it
+    // lives and the stack never holds it twice. The slot of a table shorter than the tallest is
+    // zero past its own rows, and the fill leaves it so.
+    let states_len = crate::keccak::SLOTS * steps * crate::keccak::TABLES;
+    let (states, spare) = std::mem::take(&mut windows[QKECCAK]).split_at_mut(states_len);
     windows[QKECCAK] = states;
-    for (k, window) in spare.chunks_exact_mut(steps).enumerate() {
-        windows[sch.base[verifier::layout::OP_KECCAK] + spare_local(k)] = window;
+    for (i, window) in spare.chunks_exact_mut(steps).enumerate() {
+        let (k, half) = (i >> crate::keccak::TABLE_BITS, i & (crate::keccak::TABLES - 1));
+        let table = verifier::layout::HASH_TABLES[half];
+        let (own, rest) = window.split_at_mut(1 << l.taus[table]);
+        rest.fill(F64::ZERO);
+        windows[sch.base[table] + spare_local(half, k)] = own;
     }
 
     // Each table fills its own columns from the trace (local indices, offset
@@ -475,7 +547,7 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
     // The committed Keccak states q_keccak, ALWAYS in this same stack: built from
     // the executed KECCAK rows in order (row j = step j).
     let keccak_reduction = crate::stage!("Build q_keccak", || {
-        keccak_blocks.place(tr.keccak.len(), windows[QKECCAK])
+        keccak_blocks.place([tr.keccak.len(), tr.keccak64.len()], kappa, windows[QKECCAK])
     });
 
     // (`execute` already asserts the run halts at the sentinel (pc, fp) =

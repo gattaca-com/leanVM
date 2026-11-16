@@ -4,10 +4,12 @@
 use std::collections::HashMap;
 
 use super::super::execute::{Execution, Lanes, execute_as};
-use super::super::{DerefMode, ExecError, Op, Program, to_scalar};
+use super::super::{DerefMode, ExecError, Op, OutCells, Program, to_scalar};
 use super::{LOOPS, LOW};
 use isa::RHint;
 use primitives::field::{F128, g_pow};
+use verifier::K;
+use verifier::layout::{OP_KECCAK, OP_KECCAK64};
 
 /// The first iteration's frame, above `LOW` so that the segments own their frames.
 const FRAME0: usize = 70_000;
@@ -61,10 +63,39 @@ fn main(frame0: usize) -> usize {
     frame0 + (ITERATIONS + 2) * STRIDE
 }
 
+/// Instructions a hashing iteration runs before its jump back, in frame cells no other instruction uses: five
+/// constants, then a `KECCAK64` and a `KECCAK` over the iteration's own words (cells 1 and 2) and the first two.
+/// The `KECCAK`'s `tail` and `cap` are the same four cells.
+const HASH_OPS: usize = 7;
+
+fn hash_ops() -> [Op; HASH_OPS] {
+    [
+        set(52, word(11)),
+        set(53, word(13)),
+        set(54, word(17)),
+        set(55, word(19)),
+        set(58, word(23)),
+        Op::keccak64([1, 2, 52, 53], 56, true, K(1), K(0), K(0)).expect("a nonzero scale"),
+        Op::Keccak {
+            m: [1, 2, 52, 53],
+            tail: 52,
+            b8: 58,
+            cap: 52,
+            out: 59,
+            in_odd: false,
+            out_odd: false,
+            out_cells: OutCells::One,
+        },
+    ]
+}
+
 /// The loop over `iterations`, its first frame at `frame0`, with `prefix` run in main's frame before it. With `heap`,
-/// each iteration allocates two buffers of `HEAP / 2` cells, at its first instruction and after its `DEREF`s.
-fn program(frame0: usize, iterations: &[Iteration], heap: bool, prefix: [Op; 2]) -> Run {
-    let mut code = vec![set(7, F128::ZERO); 64];
+/// each iteration allocates two buffers of `HEAP / 2` cells, at its first instruction and after its `DEREF`s. With
+/// `hashes`, it also runs a `KECCAK64` and a `KECCAK` ([`hash_ops`]).
+fn program(frame0: usize, iterations: &[Iteration], heap: bool, hashes: bool, prefix: [Op; 2]) -> Run {
+    let len = if hashes { 128 } else { 64 };
+    let tail = 17 + if hashes { HASH_OPS } else { 0 };
+    let mut code = vec![set(7, F128::ZERO); len];
     code[0] = set(frame0, word(7));
     code[1] = set(2, F128::ONE);
     code[2] = set(3, address(MARKER as usize));
@@ -85,12 +116,15 @@ fn program(frame0: usize, iterations: &[Iteration], heap: bool, prefix: [Op; 2])
         code[12 + k as usize] = deref(8 + k, 24 + k);
     }
     code[16] = set(6, address(MARKER as usize));
-    code[17] = Op::Jump { oc: 3, od: 6, of: 2 };
-    // The exit path, in the last iteration's frame.
-    code[18] = set(7, address(63));
-    code[19] = set(30, address(5000));
-    code[20] = deref(30, 31);
-    code[21] = Op::Jump { oc: 5, od: 7, of: 5 };
+    if hashes {
+        code[17..tail].copy_from_slice(&hash_ops());
+    }
+    code[tail] = Op::Jump { oc: 3, od: 6, of: 2 };
+    // The exit path, in the last iteration's frame, ending at the last slot.
+    code[tail + 1] = set(7, address(len - 1));
+    code[tail + 2] = set(30, address(5000));
+    code[tail + 3] = deref(30, 31);
+    code[tail + 4] = Op::Jump { oc: 5, od: 7, of: 5 };
     let stack = |name: &str, base, len| RHint::WitnessStack {
         name: name.into(),
         base,
@@ -141,25 +175,34 @@ fn program(frame0: usize, iterations: &[Iteration], heap: bool, prefix: [Op; 2])
     (program, streams)
 }
 
-fn plain(frame0: usize, iterations: &[Iteration], heap: bool) -> Run {
-    program(frame0, iterations, heap, [set(311, word(9)), set(312, word(7))])
+fn plain(frame0: usize, iterations: &[Iteration], heap: bool, hashes: bool) -> Run {
+    program(frame0, iterations, heap, hashes, [set(311, word(9)), set(312, word(7))])
 }
 
-fn execute((program, witness): &Run, segments: bool) -> Result<Execution, ExecError> {
-    execute_as(program, witness, [F128::ZERO; 2], &mut |_: &Lanes| {}, segments)
+/// The run, and the steps it handed to the Keccak reduction, in order.
+fn execute((program, witness): &Run, segments: bool) -> Result<(Execution, Vec<Lanes>), ExecError> {
+    let mut steps = Vec::new();
+    let e = execute_as(
+        program,
+        witness,
+        [F128::ZERO; 2],
+        &mut |step: &Lanes| steps.push(*step),
+        segments,
+    )?;
+    Ok((e, steps))
 }
 
-/// How the run with segments differs from the serial one (memory image, counts, write states, rows, or error), if it
-/// does, and the loops it dispatched and merged.
+/// How the run with segments differs from the serial one (memory image, counts, write states, rows, Keccak steps, or
+/// error), if it does, and the loops it dispatched and merged.
 fn divergence(run: &Run) -> (Option<String>, (usize, usize)) {
     let serial = execute(run, false);
     LOOPS.set((0, 0));
     let d = match (serial, execute(run, true)) {
-        (Ok(s), Ok(e)) => {
+        (Ok((s, serial_steps)), Ok((e, steps))) => {
             let cells = (0..s.mem_used).all(|i| s.mem.cell(i) == e.mem.cell(i));
             let same = (s.cycles, s.mem_used, s.mem.len(), &s.unconstrained_reads, &s.trace)
                 == (e.cycles, e.mem_used, e.mem.len(), &e.unconstrained_reads, &e.trace);
-            (!cells || !same).then(|| "differs from serial".into())
+            (!cells || !same || steps != serial_steps).then(|| "differs from serial".into())
         }
         (Err(s), Err(e)) => (s != e).then(|| format!("error `{e}`, serial error `{s}`")),
         (Ok(_), Err(e)) => Some(format!("error `{e}`, the serial run succeeds")),
@@ -182,19 +225,38 @@ fn benign(i: usize) -> Iteration {
     }
 }
 
-/// Positive control: the plain loop runs as segments and matches, with and without allocations, wherever its frames.
+/// Positive control: the plain loop runs as segments and matches, with and without allocations or hashes, wherever its
+/// frames.
 #[test]
 fn plain_loop_runs_as_segments() {
     let iterations: Vec<_> = (0..ITERATIONS).map(benign).collect();
     for frame0 in [FRAME0, LOWER[0], LOWER[1]] {
-        for heap in [false, true] {
+        for (heap, hashes) in [(false, false), (true, false), (false, true), (true, true)] {
             assert_eq!(
-                divergence(&plain(frame0, &iterations, heap)),
+                divergence(&plain(frame0, &iterations, heap, hashes)),
                 (None, (merges(), merges())),
-                "frame0 {frame0}, heap {heap}"
+                "frame0 {frame0}, heap {heap}, hashes {hashes}"
             );
         }
     }
+}
+
+/// Invariant: a loop whose iterations run a `KECCAK` and a `KECCAK64` gives, as segments, the serial run's rows of
+/// both tables and the steps it passes on, in the serial order and tagged with their table.
+#[test]
+fn keccak_rows_of_both_tables_merge_as_serial() {
+    let iterations: Vec<_> = (0..ITERATIONS).map(benign).collect();
+    let run = plain(FRAME0, &iterations, false, true);
+    let (serial, steps) = execute(&run, false).expect("the serial run succeeds");
+    let rows = serial.rows();
+    assert_eq!((rows[OP_KECCAK], rows[OP_KECCAK64]), (ITERATIONS, ITERATIONS));
+    let tagged = |table| steps.iter().filter(|(t, _)| *t == table).count();
+    assert_eq!(
+        (tagged(crate::keccak::KECCAK_HALF), tagged(crate::keccak::KECCAK64_HALF)),
+        (ITERATIONS, ITERATIONS),
+        "a step per row, by table"
+    );
+    assert_eq!(divergence(&run), (None, (merges(), merges())));
 }
 
 /// A segment sees its own cells as memory holds them when the loop starts, so a run whose prefix writes or links a
@@ -206,12 +268,18 @@ fn prefix_touching_own_cells_is_serial() {
     let iterations: Vec<_> = (0..ITERATIONS).map(benign).collect();
     for b in 3..ITERATIONS - 1 {
         let fp = FRAME0 + b * STRIDE;
-        let argument = program(FRAME0, &iterations, false, [set(311, word(9)), set(fp, word(9))]);
+        let argument = program(FRAME0, &iterations, false, false, [set(311, word(9)), set(fp, word(9))]);
         assert_eq!(execute(&argument, false).err().map(|e| e.pc), Some(10), "frame {b}");
         let mut linked = iterations.clone();
         linked[b].wptrs[0] = fp + 25;
-        let link = program(FRAME0, &linked, false, [set(311, address(fp + 25)), deref(311, 305)]);
-        assert_eq!(execute(&link, false).unwrap().mem.word(305), word(7), "frame {b}");
+        let link = program(
+            FRAME0,
+            &linked,
+            false,
+            false,
+            [set(311, address(fp + 25)), deref(311, 305)],
+        );
+        assert_eq!(execute(&link, false).unwrap().0.mem.word(305), word(7), "frame {b}");
         for (name, run) in [("argument", argument), ("link", link)] {
             assert_eq!(divergence(&run).0, None, "{name} in frame {b}");
         }
@@ -263,7 +331,7 @@ fn random_links_and_stores_merge_as_serial() {
                 Iteration { ptrs, wptrs, values }
             })
             .collect();
-        let run = plain(frame0, &iterations, heap);
+        let run = plain(frame0, &iterations, heap, case % 4 == 1);
         failing += usize::from(execute(&run, false).is_err());
         let (d, (dispatched, ok)) = divergence(&run);
         assert_eq!(d, None, "case {case}");

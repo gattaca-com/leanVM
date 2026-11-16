@@ -25,30 +25,68 @@ use verifier::layout::keccak_cell_lanes;
 
 /// Rounds between two committed states.
 pub const DEPTH: usize = 12;
+/// `log2` of the tables the reduction proves together: `KECCAK` is half 0 of the committed column, `KECCAK64` half 1.
+pub const TABLE_BITS: usize = 1;
+/// The tables the reduction proves together.
+pub const TABLES: usize = 1 << TABLE_BITS;
+/// The half of the committed column, and the table bit, of `KECCAK` and of `KECCAK64`.
+pub const KECCAK_HALF: usize = 0;
+pub const KECCAK64_HALF: usize = 1;
 /// The reduction's shape at its fewest steps.
 const MIN_SHAPE: Shape = shape(0);
 /// `log2` of the slots the committed column holds per step: one per lane of each state but the
 /// output, rounded up to a power of two.
 pub const SLOT_LOG: usize = MIN_SHAPE.slot_log();
 /// Slots of a step the committed states occupy, one per lane of each: the ones from here to
-/// `2^SLOT_LOG` carry no state, and the KECCAK table's own columns ride them
-/// (`cpu::keccak_value`).
+/// `2^SLOT_LOG` carry no state, and the tables' own columns ride them (`cpu::keccak_value`).
 pub const SLOTS: usize = MIN_SHAPE.slots();
-/// The fewest steps the reduction is sized for, one of its blocks.
+/// The fewest steps the reduction is sized for, one of its blocks. Each table is sized for at least this.
 pub const MIN_STEPS: usize = MIN_SHAPE.n();
 
-/// `log2` of the steps the reduction proves for `n` executed ones.
-pub(crate) fn n_steps_log(n: usize) -> usize {
-    shape(n).n_log()
+/// `log2` of the steps each table is completed to, for tables of `rows` executed steps: the tallest's.
+pub(crate) fn kappa(rows: [usize; TABLES]) -> usize {
+    rows.into_iter()
+        .map(|n| Shape::new(n, DEPTH).n_log())
+        .max()
+        .unwrap_or(0)
 }
 
+/// The reduction's shape for tables of `2^kappa` steps each.
 const fn shape(n_steps: usize) -> Shape {
-    Shape::new(n_steps, DEPTH)
+    Shape::with_tables(n_steps, DEPTH, TABLE_BITS)
 }
 
-/// `log2` of the committed column, in words.
-pub fn qkeccak_kappa(n_steps: usize) -> usize {
-    shape(n_steps).stack_log()
+/// `log2` of the committed column, in words: the step, the table, then the slot.
+pub fn qkeccak_log(kappa: usize) -> usize {
+    shape(1 << kappa).stack_log()
+}
+
+/// Cells one `KECCAK64` row flushes: four read, then the one or two written (the second cancelled when it is not).
+pub const KECCAK64_ROW_CELLS: usize = 6;
+
+/// The state a 64-byte message leaves, but for the message's own eight lanes: the padding's first byte in lane 8
+/// and its last in lane 16, the end of the rate. A `KECCAK64` row holds these in lanes 8 to 24.
+pub fn keccak64_pad() -> [u64; STATE_LANES] {
+    let mut pad = [0; STATE_LANES];
+    pad[8] = u64::from(primitives::hash::PAD_FIRST);
+    pad[primitives::hash::RATE / 8 - 1] = primitives::hash::END_BIT;
+    pad
+}
+
+/// The input every padding step of each table holds: zeros for `KECCAK`, a message of zeros for `KECCAK64`.
+pub fn pad_inputs() -> [[u64; STATE_LANES]; TABLES] {
+    [ZERO_PAD, keccak64_pad()]
+}
+
+/// The 25 lanes of a `KECCAK64` row's state, from the four cells `cell(0..4)` it reads.
+pub(crate) fn keccak64_state(cell: impl Fn(usize) -> F128) -> [u64; STATE_LANES] {
+    let mut state = keccak64_pad();
+    for c in 0..4 {
+        let w = cell(c);
+        state[2 * c] = w.c0;
+        state[2 * c + 1] = w.c1;
+    }
+    state
 }
 
 pub use isa::STATE_CELLS;
@@ -98,101 +136,124 @@ pub(crate) fn permute_cells(cells: &[F128; STATE_CELLS], in_odd: bool, out_odd: 
 /// Held from the run instead, it would sit beside the bus's trees, at the prover's peak.
 pub(crate) struct Reduction {
     shape: Shape,
-    steps: usize,
+    steps: [usize; TABLES],
 }
 
 impl Reduction {
     /// Rebuild the witness from `q_keccak`, the whole committed block, and run the reduction.
     pub(crate) fn prove(self, ps: &mut ProverState, q_keccak: &[F64], output: &OutputClaim) -> Openings {
         let witness = tracing::info_span!("Witness")
-            .in_scope(|| Witness::from_committed(self.shape, &[self.steps], &[ZERO_PAD], q_keccak));
+            .in_scope(|| Witness::from_committed(self.shape, &self.steps, &pad_inputs(), q_keccak));
         witness.prove(ps, q_keccak, output)
     }
 }
 
-/// The committed lanes of the steps a program ran, built while it ran: every block of steps,
+/// A step the interpreter reports to the reduction: the table that ran it (the index of the half of `q_keccak`) and
+/// the lanes it reads.
+pub(crate) type Step = (usize, [u64; STATE_LANES]);
+
+/// The committed lanes of the steps a program ran, built while it ran: every block of steps of every table,
 /// slot after slot.
 pub(crate) struct Blocks {
-    lanes: Vec<Vec<u64>>,
-    steps: usize,
+    lanes: [Vec<Vec<u64>>; TABLES],
+    steps: [usize; TABLES],
 }
 
-/// Where an execution hands the lanes each `KECCAK` step reads, in step order.
+/// Where an execution hands the steps of the Keccak tables, in step order.
 pub(crate) trait Steps {
-    fn step(&mut self, lanes: &[u64; STATE_LANES]);
+    fn step(&mut self, step: &Step);
     /// The steps of `runs`, end to end.
-    fn steps(&mut self, runs: &[&[[u64; STATE_LANES]]]) {
-        runs.iter().copied().flatten().for_each(|lanes| self.step(lanes));
+    fn steps(&mut self, runs: &[&[Step]]) {
+        runs.iter().copied().flatten().for_each(|step| self.step(step));
     }
 }
 
-impl<F: FnMut(&[u64; STATE_LANES])> Steps for F {
-    fn step(&mut self, lanes: &[u64; STATE_LANES]) {
-        self(lanes)
+impl<F: FnMut(&Step)> Steps for F {
+    fn step(&mut self, step: &Step) {
+        self(step)
     }
 }
 
-type Job = (usize, Vec<[u64; STATE_LANES]>);
+/// A block of one table's steps for a worker: the table, the block's index in it, and the lanes it reads.
+type Job = (usize, usize, Vec<[u64; STATE_LANES]>);
 
 /// The steps of a run as [`while_executing`] takes them: whole blocks to its workers, the last
-/// one's lanes on the executing thread.
+/// ones' lanes on the executing thread.
 struct Sink<'a> {
     jobs: Option<&'a std::sync::mpsc::Sender<Job>>,
-    pending: Vec<[u64; STATE_LANES]>,
-    /// Blocks done here, by their index.
-    inline: Vec<(usize, Vec<u64>)>,
-    blocks: usize,
-    steps: usize,
+    /// Each table's steps of its block so far.
+    pending: [Vec<[u64; STATE_LANES]>; TABLES],
+    /// Blocks done here, by their table and index.
+    inline: Vec<(usize, usize, Vec<u64>)>,
+    blocks: [usize; TABLES],
+    steps: [usize; TABLES],
 }
 
 impl Sink<'_> {
-    fn dispatch(&mut self) {
-        let block = std::mem::replace(&mut self.pending, Vec::with_capacity(BLOCK));
+    fn dispatch(&mut self, table: usize) {
+        let block = std::mem::replace(&mut self.pending[table], Vec::with_capacity(BLOCK));
         match self.jobs {
-            Some(jobs) => jobs.send((self.blocks, block)).expect("the workers outlive the run"),
-            None => self.inline.push((self.blocks, block_lanes(DEPTH, &ZERO_PAD, &block))),
+            Some(jobs) => jobs
+                .send((table, self.blocks[table], block))
+                .expect("the workers outlive the run"),
+            None => self.inline.push((
+                table,
+                self.blocks[table],
+                block_lanes(DEPTH, &pad_inputs()[table], &block),
+            )),
         }
-        self.blocks += 1;
+        self.blocks[table] += 1;
     }
 }
 
 impl Steps for Sink<'_> {
-    fn step(&mut self, lanes: &[u64; STATE_LANES]) {
-        self.pending.push(*lanes);
-        self.steps += 1;
-        if self.pending.len() == BLOCK {
-            self.dispatch();
+    fn step(&mut self, &(table, lanes): &Step) {
+        self.pending[table].push(lanes);
+        self.steps[table] += 1;
+        if self.pending[table].len() == BLOCK {
+            self.dispatch(table);
         }
     }
 
-    /// The whole blocks among `runs` on the pool, which their sender leaves idle.
-    fn steps(&mut self, runs: &[&[[u64; STATE_LANES]]]) {
-        let mut all = runs.iter().copied().flatten();
-        // Fill the pending block, so that the rest starts one.
-        while !self.pending.is_empty()
-            && let Some(lanes) = all.next()
-        {
-            self.step(lanes);
+    /// The whole blocks of each table among `runs` on the pool, which their sender leaves idle.
+    fn steps(&mut self, runs: &[&[Step]]) {
+        let pads = pad_inputs();
+        for table in 0..TABLES {
+            let mut all = runs
+                .iter()
+                .copied()
+                .flatten()
+                .filter(|step| step.0 == table)
+                .map(|step| &step.1);
+            // Fill the pending block, so that the rest starts one.
+            while !self.pending[table].is_empty()
+                && let Some(lanes) = all.next()
+            {
+                self.step(&(table, *lanes));
+            }
+            let rest: Vec<_> = all.collect();
+            let whole = rest.len() / BLOCK;
+            let done = parallel::map_collect(whole, |b| {
+                let block: Vec<_> = rest[b * BLOCK..(b + 1) * BLOCK].iter().map(|&&lanes| lanes).collect();
+                block_lanes(DEPTH, &pads[table], &block)
+            });
+            for lanes in done {
+                self.inline.push((table, self.blocks[table], lanes));
+                self.blocks[table] += 1;
+            }
+            self.steps[table] += whole * BLOCK;
+            rest[whole * BLOCK..]
+                .iter()
+                .for_each(|&&lanes| self.step(&(table, lanes)));
         }
-        let rest: Vec<_> = all.collect();
-        let whole = rest.len() / BLOCK;
-        let done = parallel::map_collect(whole, |b| {
-            let block: Vec<_> = rest[b * BLOCK..(b + 1) * BLOCK].iter().map(|&&lanes| lanes).collect();
-            block_lanes(DEPTH, &ZERO_PAD, &block)
-        });
-        for lanes in done {
-            self.inline.push((self.blocks, lanes));
-            self.blocks += 1;
-        }
-        self.steps += whole * BLOCK;
-        rest[whole * BLOCK..].iter().for_each(|lanes| self.step(lanes));
     }
 }
 
-/// Run `run`, which reports the lanes of each step it executes, and compute the committed lanes
+/// Run `run`, which reports each step it executes, and compute the committed lanes
 /// behind it: executing is one thread's work, so the others take each block of steps as it
 /// completes instead of waiting for the last.
 pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn Steps) -> R) -> (R, Blocks) {
+    let pads = pad_inputs();
     let (jobs, queue) = std::sync::mpsc::channel::<Job>();
     let queue = std::sync::Mutex::new(queue);
     // More workers than this slow the executing thread by more than they finish early.
@@ -204,8 +265,8 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn Steps) -> R) -> (R, B
                     let mut done = Vec::new();
                     loop {
                         let job = queue.lock().expect("a worker panicked").recv();
-                        let Ok((g, steps)) = job else { break };
-                        done.push((g, block_lanes(DEPTH, &ZERO_PAD, &steps)));
+                        let Ok((table, g, steps)) = job else { break };
+                        done.push((table, g, block_lanes(DEPTH, &pads[table], &steps)));
                     }
                     done
                 })
@@ -213,15 +274,17 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn Steps) -> R) -> (R, B
             .collect();
         let mut sink = Sink {
             jobs: (workers > 0).then_some(&jobs),
-            pending: Vec::with_capacity(BLOCK),
+            pending: std::array::from_fn(|_| Vec::with_capacity(BLOCK)),
             inline: Vec::new(),
-            blocks: 0,
-            steps: 0,
+            blocks: [0; TABLES],
+            steps: [0; TABLES],
         };
         let result = run(&mut sink);
         sink.jobs = None;
-        if !sink.pending.is_empty() {
-            sink.dispatch();
+        for table in 0..TABLES {
+            if !sink.pending[table].is_empty() {
+                sink.dispatch(table);
+            }
         }
         let Sink { inline, steps, .. } = sink;
         drop(jobs);
@@ -229,27 +292,30 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn Steps) -> R) -> (R, B
         for handle in handles {
             lanes.extend(handle.join().expect("a witness worker panicked"));
         }
-        lanes.sort_unstable_by_key(|&(g, _)| g);
-        let lanes = lanes.into_iter().map(|(_, lanes)| lanes).collect();
-        (result, lanes, steps)
+        lanes.sort_unstable_by_key(|&(table, g, _)| (table, g));
+        let mut by_table: [Vec<Vec<u64>>; TABLES] = std::array::from_fn(|_| Vec::new());
+        for (table, _, lanes) in lanes {
+            by_table[table].push(lanes);
+        }
+        (result, by_table, steps)
     });
     (result, Blocks { lanes, steps })
 }
 
 impl Blocks {
-    /// Write the committed states of the `steps` steps these blocks hold, padded with
-    /// all-zero steps. `q_keccak` is the states' part of the committed block, its first [`SLOTS`]
-    /// slots: the spare slots past them belong to the columns that ride there and are written by
-    /// their own fill.
-    pub(crate) fn place(self, steps: usize, q_keccak: &mut [F64]) -> Reduction {
+    /// Write the committed states of the steps these blocks hold, each table completed with its padding steps up to
+    /// `2^kappa`. `q_keccak` is the states' part of the committed block, its first [`SLOTS`] slots: the
+    /// spare slots past them belong to the columns that ride there and are written by their own fill.
+    pub(crate) fn place(self, steps: [usize; TABLES], kappa: usize, q_keccak: &mut [F64]) -> Reduction {
         assert_eq!(self.steps, steps, "the blocks are of another run");
-        let shape = shape(self.steps);
+        let shape = shape(1 << kappa);
         assert_eq!(
             q_keccak.len(),
-            shape.slots() * shape.n(),
+            shape.slots() * shape.n() * TABLES,
             "the committed states are the wrong size"
         );
-        Witness::write_committed(shape, &[ZERO_PAD], &[&self.lanes], q_keccak);
+        let lanes: Vec<&[Vec<u64>]> = self.lanes.iter().map(Vec::as_slice).collect();
+        Witness::write_committed(shape, &pad_inputs(), &lanes, q_keccak);
         Reduction { shape, steps }
     }
 }
@@ -262,12 +328,18 @@ mod tests {
         F64(x)
     }
 
-    /// The committed column for `instances`, padded with all-zero steps, and the reduction's
+    /// The committed column for the tables' `instances`, each padded with its padding steps, and the reduction's
     /// witness.
-    fn build_qkeccak(instances: &[[u64; STATE_LANES]]) -> (Vec<F64>, Witness) {
-        let mut q_keccak = vec![F64::ZERO; 1 << qkeccak_kappa(instances.len())];
-        let states = SLOTS * (1 << n_steps_log(instances.len()));
-        let witness = Witness::generate(shape(instances.len()), instances, &mut q_keccak[..states]);
+    fn build_qkeccak(instances: [&[[u64; STATE_LANES]]; TABLES]) -> (Vec<F64>, Witness) {
+        let kappa = kappa(instances.map(<[_]>::len));
+        let mut q_keccak = vec![F64::ZERO; 1 << qkeccak_log(kappa)];
+        let states = SLOTS * (1 << kappa) * TABLES;
+        let pads = pad_inputs();
+        let tables: [keccak_gkr::TableInputs; TABLES] = std::array::from_fn(|t| keccak_gkr::TableInputs {
+            inputs: instances[t],
+            pad: pads[t],
+        });
+        let witness = Witness::generate_tables(shape(1 << kappa), &tables, &mut q_keccak[..states]);
         (q_keccak, witness)
     }
 
@@ -282,33 +354,57 @@ mod tests {
     /// partial one, or leave blocks of the batch with no step at all.
     #[test]
     fn blocks_built_while_executing_match_one_pass() {
-        for n in [0, 1, 511, 512, 513, 1500, 4099] {
-            let instances = sample_instances(n);
-            let (expected, reference) = build_qkeccak(&instances);
+        for (n, m) in [
+            (0, 0),
+            (1, 700),
+            (511, 3),
+            (512, 0),
+            (513, 513),
+            (1500, 2),
+            (4099, 1500),
+        ] {
+            let (k_steps, t_steps) = (sample_instances(n), sample_instances(m));
+            let (expected, reference) = build_qkeccak([&k_steps, &t_steps]);
+            // The two tables' steps interleave, as the interpreter reports them.
+            let mut steps: Vec<Step> = Vec::new();
+            for i in 0..n.max(m) {
+                if i < n {
+                    steps.push((0, k_steps[i]));
+                }
+                if i < m {
+                    steps.push((1, t_steps[i]));
+                }
+            }
             // One at a time, then in runs that start and end anywhere in a block.
-            let ((), blocks) = while_executing(|steps| {
-                let (first, rest) = instances.split_at(n.min(7));
-                first.iter().for_each(|state| steps.step(state));
+            let ((), blocks) = while_executing(|sink| {
+                let (first, rest) = steps.split_at(steps.len().min(7));
+                first.iter().for_each(|step| sink.step(step));
                 let runs: Vec<_> = rest
                     .chunks(700)
                     .flat_map(|c| [&c[..c.len() / 3], &c[c.len() / 3..]])
                     .collect();
-                steps.steps(&runs);
+                sink.steps(&runs);
             });
+            let kappa = kappa([n, m]);
             let mut q_keccak = vec![f(0xdead_beef); expected.len()];
-            let states = SLOTS * (1 << n_steps_log(n));
-            let witness = blocks.place(n, &mut q_keccak[..states]);
-            assert_eq!(q_keccak[..states], expected[..states], "{n} steps");
+            let states = SLOTS * (1 << kappa) * TABLES;
+            let witness = blocks.place([n, m], kappa, &mut q_keccak[..states]);
+            assert_eq!(q_keccak[..states], expected[..states], "{n} and {m} steps");
             // What the columns riding the spare slots left there is none of the reduction's
             // business, but both openings fold it, so the two runs have to see the same.
             q_keccak[states..].fill(f(0x5151_5151));
-            let point = (0..n_steps_log(n)).map(|i| F128::new(3 + i as u64, 5)).collect();
-            let output = OutputClaim::of_inputs(shape(n), &instances, point);
+            let point = (0..kappa).map(|i| F128::new(3 + i as u64, 5)).collect();
+            let pads = pad_inputs();
+            let tables: [keccak_gkr::TableInputs; TABLES] = std::array::from_fn(|t| keccak_gkr::TableInputs {
+                inputs: [&k_steps[..], &t_steps[..]][t],
+                pad: pads[t],
+            });
+            let output = OutputClaim::of_tables(shape(1 << kappa), &tables, point);
             let mut ps = ProverState::from_label(b"blocks");
             let deferred = (witness.prove(&mut ps, &q_keccak, &output), ps.into_proof());
             let mut ps = ProverState::from_label(b"blocks");
             let one_pass = (reference.prove(&mut ps, &q_keccak, &output), ps.into_proof());
-            assert!(deferred == one_pass, "{n} steps");
+            assert!(deferred == one_pass, "{n} and {m} steps");
         }
     }
 
@@ -358,13 +454,41 @@ mod tests {
     /// have no slot.
     #[test]
     fn qkeccak_words_match_layout() {
-        let instances = sample_instances(5);
-        let (q_keccak, _) = build_qkeccak(&instances);
-        let n = 1usize << n_steps_log(instances.len());
-        for (j, input) in instances.iter().enumerate() {
-            for i in 0..STATE_LANES {
-                assert_eq!(q_keccak[i * n + j], f(input[i]));
+        let (k_steps, t_steps) = (sample_instances(5), sample_instances(9));
+        let (q_keccak, _) = build_qkeccak([&k_steps, &t_steps]);
+        let n = 1usize << kappa([5, 9]);
+        for (t, instances) in [&k_steps, &t_steps].into_iter().enumerate() {
+            for (j, input) in instances.iter().enumerate() {
+                for i in 0..STATE_LANES {
+                    assert_eq!(q_keccak[(i * TABLES + t) * n + j], f(input[i]));
+                }
             }
         }
+        // The rows past a table's own hold its padding step.
+        let pad = pad_inputs();
+        for i in 0..STATE_LANES {
+            assert_eq!(q_keccak[i * TABLES * n + 5], f(pad[0][i]));
+            assert_eq!(q_keccak[(i * TABLES + 1) * n + 9], f(pad[1][i]));
+        }
+    }
+
+    /// `KECCAK64`'s state is the state of the `KECCAK` with the same four cells and the padding constants in the others.
+    #[test]
+    fn keccak64_state_is_the_padded_message() {
+        let cells: [F128; 4] = std::array::from_fn(|i| F128::new(0x1234 * (i as u64 + 1), 0x9abc * (i as u64 + 7)));
+        let keccak64 = keccak64_state(|c| cells[c]);
+        let mut input = [F128::ZERO; STATE_CELLS];
+        input[..4].copy_from_slice(&cells);
+        input[4] = F128::new(primitives::hash::PAD_FIRST as u64, 0);
+        input[8] = F128::new(primitives::hash::END_BIT, 0xdead);
+        assert_eq!(state_of_cells(false, |c| input[c]), keccak64);
+        let bytes: Vec<u8> = cells
+            .iter()
+            .flat_map(|c| [c.c0, c.c1])
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let mut state = keccak64;
+        primitives::hash::keccak_f(&mut state);
+        assert_eq!(primitives::hash::digest_of(&state), primitives::hash::hash(&bytes));
     }
 }

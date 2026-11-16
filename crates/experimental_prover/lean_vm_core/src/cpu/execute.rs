@@ -40,8 +40,8 @@ impl std::hash::Hasher for Fold {
     }
 }
 
-/// The lanes a `KECCAK` row reads.
-pub(super) type Lanes = [u64; primitives::hash::STATE_LANES];
+/// A step the reduction proves: the half of `q_keccak` it belongs to, and the lanes it reads.
+pub(super) type Lanes = crate::keccak::Step;
 
 pub struct Execution {
     pub mem: Memory,     // data memory after the run, write-once (size cells, power of two)
@@ -173,6 +173,8 @@ pub enum Fault {
     NotAGPower { what: &'static str, value: F64 },
     /// A `MUL` asked to solve `a·x = c` for `x` with `a = 0`.
     BackSolveThroughZero,
+    /// An instruction the machine does not run: a `KECCAK64` whose scale is zero.
+    BadInstruction,
     /// The advice does not fit the program: a witness stream is missing, given
     /// twice or exhausted, or an entry has the wrong length.
     Witness(String),
@@ -238,6 +240,7 @@ impl std::fmt::Display for Fault {
             Self::NotInK { what, value } => write!(f, "{what} is not a K-valued word ({})", word(*value)),
             Self::NotAGPower { what, value } => write!(f, "{what} is not a g-power in range (0x{:016x})", value.0),
             Self::BackSolveThroughZero => write!(f, "cannot back-solve MUL through a zero operand"),
+            Self::BadInstruction => write!(f, "a KECCAK64 with a zero scale is not an instruction"),
             Self::Witness(problem) => write!(f, "{problem}"),
             Self::OutOfMemory => write!(
                 f,
@@ -738,7 +741,8 @@ pub fn execute(
     execute_with(program, witness, public_input, &mut |_: &Lanes| {})
 }
 
-/// [`execute`], handing `keccak_step` the lanes each `KECCAK` row reads, in row order. A loop that pops a witness stream once per iteration may run as parallel
+/// [`execute`], handing `keccak_step` the half of `q_keccak` and the lanes each `KECCAK` and `KECCAK64` row reads, in
+/// row order. A loop that pops a witness stream once per iteration may run as parallel
 /// segments ([`super::segments`]); the result is the serial run's either way.
 pub(crate) fn execute_with(
     program: &Program,
@@ -778,7 +782,7 @@ pub(super) fn execute_as(
     Ok(rerun.expect("a serial run has no segment to fail"))
 }
 
-/// One run, or the `KECCAK` steps it handed on before a segment's check failed.
+/// One run, or the `KECCAK` and `KECCAK64` steps it handed on before a segment's check failed.
 fn execute_once(
     program: &Program,
     witness: &[(String, Vec<Vec<F128>>)],
@@ -824,7 +828,7 @@ fn execute_once(
     // A profile and a print see every step in serial order.
     if segments && run.prof.is_none() && !plan.printing {
         if !super::segments::run(&plan, &mut m, &mut run, keccak_step)? {
-            return Ok(Err(run.rows.keccak.len()));
+            return Ok(Err(run.rows.keccak_steps()));
         }
     } else {
         walk(&plan, &mut m, &mut run, keccak_step, Stop::Never)?;
@@ -919,6 +923,7 @@ pub(super) fn walk<M: Machine>(
         mut deref,
         mut jump,
         mut keccak,
+        mut keccak64,
     } = std::mem::replace(&mut r.rows, RowSet::new());
     let stopped = loop {
         if pc >= ending_pc {
@@ -1360,7 +1365,7 @@ pub(super) fn walk<M: Machine>(
                 // by the Keccak reduction, §keccak); the interpreter still computes it so
                 // the output cells are consistent for any later read.
                 let mut lanes = crate::keccak::state_of_cells(k.in_odd, |c| input[c]);
-                keccak_step.step(&lanes);
+                keccak_step.step(&(crate::keccak::KECCAK_HALF, lanes));
                 primitives::hash::keccak_f(&mut lanes);
                 let written = STATE_CELLS + k.out_cells.cells();
                 let output = crate::keccak::cells_of_state(&lanes, k.out_odd);
@@ -1369,6 +1374,43 @@ pub(super) fn walk<M: Machine>(
                 }
                 m.row(Table::Keccak, keccak.len());
                 keccak.push(Krow {
+                    pc,
+                    fp,
+                    r,
+                    bytecode_read,
+                });
+                pc += 1;
+            }
+            Op::Keccak64 { .. } => {
+                use crate::keccak::KECCAK64_ROW_CELLS;
+                let k = crate::tables::Keccak64Op::of(&op);
+                // A zero scale would leave `in_2` free: the instruction is not run.
+                if !k.well_formed() {
+                    return Err(fail(Fault::BadInstruction));
+                }
+                let written = k.cells();
+                let mut cells = [0; KECCAK64_ROW_CELLS];
+                for (c, cell) in cells[..written].iter_mut().enumerate() {
+                    let (offset, step) = k.cell_parts(c);
+                    *cell = at(at(fp, offset)?, step)?;
+                }
+                // The counts in flush order, so a cell two operands alias still pairs each
+                // access with its own count. The second output cell keeps count 0 when it is not written.
+                let mut r = [0; KECCAK64_ROW_CELLS];
+                let mut input = [F128::ZERO; 4];
+                for c in 0..4 {
+                    (input[c], r[c]) = m.read(cells[c]);
+                }
+                let message = k.message(input);
+                let mut lanes = crate::keccak::keccak64_state(|c| message[c]);
+                keccak_step.step(&(crate::keccak::KECCAK64_HALF, lanes));
+                primitives::hash::keccak_f(&mut lanes);
+                r[4] = m.put_counted(cells[4], F128::new(lanes[0], lanes[1]))?;
+                if k.out_two {
+                    r[5] = m.put_counted(cells[5], F128::new(lanes[2], lanes[3]))?;
+                }
+                m.row(Table::Keccak64, keccak64.len());
+                keccak64.push(Trow {
                     pc,
                     fp,
                     r,
@@ -1388,6 +1430,7 @@ pub(super) fn walk<M: Machine>(
         deref,
         jump,
         keccak,
+        keccak64,
     };
     Ok(stopped)
 }

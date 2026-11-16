@@ -820,7 +820,12 @@ pub(crate) fn prove_products(leaves: [Leaves; N_BUS_TREES], ps: &mut ProverState
     let identities = leaves.each_ref().map(|lane| lane.ones.clone());
     let mut layers = leaves.map(|lane| build_layers(lane, mu));
     let roots: [F128; N_BUS_TREES] = std::array::from_fn(|tree| layers[tree][mu][0]);
-    assert_eq!(roots[0], roots[1], "push and pull products must agree");
+    // A test that forges the witness lets the prover go on, to show the verifier refuses what it sends.
+    #[cfg(test)]
+    let forged = crate::cpu::forge::active();
+    #[cfg(not(test))]
+    let forged = false;
+    assert!(forged || roots[0] == roots[1], "push and pull products must agree");
     ps.add_scalar(roots[0]);
     ps.add_scalar(roots[2]);
     let mut point = Vec::new();
