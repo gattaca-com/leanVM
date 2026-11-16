@@ -11,7 +11,9 @@ use crate::batch_bench::{batch_instance, batch_transcript, commit_stack, open_co
 use crate::open::state_words;
 use crate::protocol::{Claim, first_claim};
 use crate::prover::prove_layer;
-use crate::witness::{BLOCK, BLOCK_LEN, BLOCK_WORDS, Extent, Shape, TableInputs, Witness, ZERO_PAD, block};
+use crate::witness::{
+    BLOCK, BLOCK_LEN, BLOCK_WORDS, Extent, Shape, TableInputs, TableWitness, Witness, ZERO_PAD, block,
+};
 use verifier::keccak::PRODUCT_BITS;
 
 /// The sliced state after `round` rounds, of table `table`.
@@ -321,7 +323,7 @@ fn proof_verifies_against_the_commitment() {
 
 /// The witness of every block run, the padding ones included.
 fn dense(shape: Shape, inputs: &[[u64; STATE_LANES]]) -> Witness {
-    let mut extent = Extent::new(0, shape.n_blocks());
+    let mut extent = Extent::new(0, shape.n_blocks(), shape.depth());
     for g in 0..shape.n_blocks() {
         let inputs = &inputs[(g * BLOCK).min(inputs.len())..((g + 1) * BLOCK).min(inputs.len())];
         // SAFETY: each block's slot, written once.
@@ -349,6 +351,101 @@ fn padding_proves_as_the_blocks_it_stands_for() {
             (openings, ps.into_proof())
         };
         assert!(stream(&padded) == stream(&dense(shape, &inputs)), "{n} instances");
+    }
+}
+
+/// The witness of `tables` that stores every `every`-th round, with a padding block to each table that needs one.
+fn stored_every(shape: Shape, tables: &[TableInputs], every: usize) -> Witness {
+    let witnesses = tables
+        .iter()
+        .map(|table| {
+            let written = table.inputs.len().div_ceil(BLOCK);
+            let mut extent = Extent::with_every(0, written, shape.depth(), every);
+            for g in 0..written {
+                let inputs = &table.inputs[g * BLOCK..((g + 1) * BLOCK).min(table.inputs.len())];
+                // SAFETY: each block's slot, written once.
+                unsafe { block(shape.depth(), &table.pad, inputs, Some(extent.slot(g)), |_, _, _| {}) };
+            }
+            let padding = (written < shape.n_blocks()).then(|| {
+                let mut padding = Extent::with_every(written, 1, shape.depth(), every);
+                // SAFETY: the one slot, written once.
+                unsafe {
+                    block(
+                        shape.depth(),
+                        &table.pad,
+                        &[],
+                        Some(padding.slot(written)),
+                        |_, _, _| {},
+                    )
+                };
+                padding
+            });
+            // SAFETY: every block of the extents was run just above.
+            unsafe { TableWitness::from_extents(shape, vec![extent], written, padding) }
+        })
+        .collect();
+    Witness::from_tables(shape, witnesses)
+}
+
+/// Storing every second, fourth or sixth round proves what storing every round does, and a
+/// recomputed state is the stored one, for one table and for several of different heights and paddings.
+#[test]
+fn checkpointed_witnesses_prove_alike() {
+    let mut rng = Rng::new(80);
+    // 1100 and 2600 instances leave a padding block.
+    let cases: [(&[usize], usize); 6] = [
+        (&[1100], 12),
+        (&[2600], 24),
+        (&[700], 6),
+        (&[1100, 2600], 12),
+        (&[700, 0], 6),
+        (&[512, 3000, 40, 1100], 12),
+    ];
+    for (rows, depth) in cases {
+        let inputs: Vec<Vec<[u64; STATE_LANES]>> = rows
+            .iter()
+            .map(|&n| (0..n).map(|_| std::array::from_fn(|_| rng.next_u64())).collect())
+            .collect();
+        let tables: Vec<TableInputs> = inputs
+            .iter()
+            .enumerate()
+            .map(|(t, inputs)| TableInputs {
+                inputs,
+                pad: std::array::from_fn(|l| if t == 0 { 0 } else { 0x0101 * (l as u64 + t as u64) }),
+            })
+            .collect();
+        let shape = Shape::with_tables(*rows.iter().max().unwrap(), depth, rows.len().ilog2() as usize);
+        let mut committed = vec![primitives::field::F64(0); 1 << shape.stack_log()];
+        Witness::generate_tables(shape, &tables, &mut committed);
+        let stream = |witness: &Witness| {
+            let mut ps = ProverState::from_label(LABEL);
+            let output = crate::OutputClaim::of_tables(shape, &tables, batch_instance(&mut ps, shape));
+            for lanes in &output.lanes {
+                ps.add_scalars(lanes);
+            }
+            let openings = witness.prove(&mut ps, &committed, &output);
+            (openings, ps.into_proof())
+        };
+        let every_round = stored_every(shape, &tables, 1);
+        let want = stream(&every_round);
+        for every in [2, 4, 6].into_iter().filter(|e| depth % e == 0) {
+            let witness = stored_every(shape, &tables, every);
+            let (mut a, mut b) = (crate::witness::Recompute::new(), crate::witness::Recompute::new());
+            for t in 0..shape.tables() {
+                for round in 0..=shape.depth() * shape.round_segments() {
+                    for g in [0, shape.n_blocks() - 1] {
+                        assert!(
+                            witness.table(t).state(&mut a, round, g) == every_round.table(t).state(&mut b, round, g),
+                            "{rows:?} every {every} table {t} round {round} block {g}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                stream(&witness) == want,
+                "{rows:?} instances, depth {depth}, every {every}"
+            );
+        }
     }
 }
 
@@ -380,5 +477,5 @@ fn a_broken_committed_state_is_rejected() {
 #[test]
 #[should_panic(expected = "fit in memory")]
 fn an_extent_too_large_to_address_is_refused() {
-    Extent::new(0, 1 << 55);
+    Extent::new(0, 1 << 55, 12);
 }

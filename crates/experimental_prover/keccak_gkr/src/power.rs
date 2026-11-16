@@ -172,6 +172,33 @@ impl PowerField {
         )
     }
 
+    /// Fold rows indexed by `x + 2y`, with challenges `[r, s, r*s]`, sharing one reduction:
+    /// `dst[j] = rows[0][j] + r * (rows[0][j] + rows[1][j]) + s * (rows[0][j] + rows[2][j])
+    /// + r * s * (rows[0][j] + rows[1][j] + rows[2][j] + rows[3][j])`.
+    pub fn fold_quad(&self, dst: &mut [u64], rows: [&[u64]; 4], challenges: &[Element; 3], width: usize) {
+        assert!(dst.len() >= 2 * width && rows.iter().all(|row| row.len() >= 2 * width));
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+        if width.is_multiple_of(x86::STEP) {
+            // SAFETY: the features are enabled at compile time, and the rows are bounded above.
+            unsafe { x86::fold_quad(self, dst, rows, challenges, width) };
+            return;
+        }
+        self.fold_quad_portable(dst, rows, challenges, width);
+    }
+
+    /// [`Self::fold_quad`] one entry at a time.
+    pub fn fold_quad_portable(&self, dst: &mut [u64], rows: [&[u64]; 4], challenges: &[Element; 3], width: usize) {
+        for j in 0..width {
+            let [a, b, c, d] = rows.map(|row| get(row, width, j));
+            let differences = [add(&a, &b), add(&a, &c), add(&add(&a, &b), &add(&c, &d))];
+            let mut wide = [0; 4];
+            for (delta, r) in differences.iter().zip(challenges) {
+                add_mul(&mut wide, delta, r);
+            }
+            set(dst, width, j, &add(&a, &self.reduce(&wide)));
+        }
+    }
+
     /// `dst[j] = wide[j]` reduced, for a row of three-word polynomials laid out by word.
     pub fn reduce_row(&self, dst: &mut [u64], wide: &[u64], width: usize) {
         assert!(dst.len() >= 2 * width && wide.len() >= 3 * width);
@@ -379,6 +406,35 @@ mod x86 {
                 &karatsuba(&delta, delta[0].xor(delta[1]), &challenge, challenge_sum),
             );
             unsafe { store2(dst, width, j, xor2(&l, &folded)) };
+        }
+    }
+
+    pub unsafe fn fold_quad(
+        field: &PowerField,
+        dst: &mut [u64],
+        rows: [&[u64]; 4],
+        challenges: &[Element; 3],
+        width: usize,
+    ) {
+        let challenges: [[V; 2]; 3] = challenges.map(|r| r.map(V::splat));
+        for j in (0..width).step_by(STEP) {
+            // SAFETY: the caller bounds every row.
+            let [a, b, c, d] = rows.map(|row| unsafe { load2(row, width, j) });
+            let dx = xor2(&a, &b);
+            let dy = xor2(&a, &c);
+            let dxy = xor2(&dx, &xor2(&c, &d));
+            let mut wide = [[V::zero(); 3]; 2];
+            for (delta, r) in [dx, dy, dxy].iter().zip(&challenges) {
+                let product = partial(delta, r);
+                for (wide, product) in wide.iter_mut().zip(product) {
+                    for (w, p) in wide.iter_mut().zip(product) {
+                        *w = w.xor(p);
+                    }
+                }
+            }
+            let folded = reduce_pair(field, &wide);
+            // SAFETY: the caller bounds every row.
+            unsafe { store2(dst, width, j, xor2(&a, &folded)) };
         }
     }
 }

@@ -19,7 +19,7 @@ use crate::basis::{PolyEval, add_mul};
 use crate::kernels::{GROUP, MIXED, PACKS, SKIP, SkipBlock, TERNARY, embed, mixed_points, products, slot};
 use crate::power::{Element, PowerField, get, set};
 use crate::protocol::{Claim, chi_weights, mu_at};
-use crate::witness::{Shape, TableWitness, Witness, transpose64, words};
+use crate::witness::{Recompute, Shape, TableWitness, Witness, transpose64, words};
 use verifier::keccak::PRODUCT_BITS;
 
 /// The pattern index of a binary assignment.
@@ -237,11 +237,15 @@ impl<'a> Layer<'a> {
         self.held[segment + 1] - self.held[segment]
     }
 
-    /// Task `held[segment] + g`, as `(segment, g, block)`.
-    fn block(&self, task: usize) -> (usize, usize, &[u64]) {
+    /// Task `held[segment] + g`, as `(segment, g, block)`: stored, or recomputed into `scratch`.
+    fn block<'b>(&'b self, scratch: &'b mut Recompute, task: usize) -> (usize, usize, &'b [u64]) {
         let segment = self.held.partition_point(|&start| start <= task) - 1;
         let g = task - self.held[segment];
-        (segment, g, self.table_of(segment).layer(self.rounds[segment], g))
+        (
+            segment,
+            g,
+            self.table_of(segment).state(scratch, self.rounds[segment], g),
+        )
     }
 
     fn n_tasks(&self) -> usize {
@@ -298,10 +302,10 @@ impl<'a> Layer<'a> {
         let kernel = ProductSums::new(&claim.weights);
         let sums = parallel::map_reduce_with_state(
             self.n_tasks(),
-            || kernel.scratch(),
+            || (kernel.scratch(), Recompute::new()),
             || vec![F128Unreduced::ZERO; PAYLOAD_BITS],
-            |scratch, sums, task| {
-                let (_, _, block) = self.block(task);
+            |(scratch, recompute), sums, task| {
+                let (_, _, block) = self.block(recompute, task);
                 kernel.block_sums(scratch, block);
                 for (sum, v) in sums.iter_mut().zip(scratch.out.iter()) {
                     *sum ^= weights[task].mul_unreduced(F128::from_limbs(*v));
@@ -335,11 +339,12 @@ impl<'a> Layer<'a> {
                     vec![[Part::ZERO; BITS]; PACKS / PART],
                     vec![[Part::ZERO; 128]; PACKS / PART],
                     Box::new([Part::ZERO; 1 << DIGIT_BITS]),
+                    Recompute::new(),
                 )
             },
             || vec![F128Unreduced::ZERO; PAYLOAD_BITS],
-            |(payloads, rows, digit_sums), sums, task| {
-                let (_, _, block) = self.block(task);
+            |(payloads, rows, digit_sums, recompute), sums, task| {
+                let (_, _, block) = self.block(recompute, task);
                 for r in 0..5 {
                     for z in 0..64 {
                         let js = row_positions(r, z);
@@ -405,11 +410,14 @@ impl<'a> Layer<'a> {
         let nb = self.witness.shape.n_blocks();
         let mixed = parallel::map_reduce_with_state(
             self.n_written_tasks(),
-            || SkipBlock::new(weights),
+            || (SkipBlock::new(weights), Recompute::new()),
             || vec![[0u64; 5]; MIXED],
-            |skip, total, task| {
+            |(skip, recompute), total, task| {
                 let (segment, g) = self.written_task(task);
-                let (row, block) = (g + nb * segment, self.table_of(segment).layer(self.rounds[segment], g));
+                let (row, block) = (
+                    g + nb * segment,
+                    self.table_of(segment).state(recompute, self.rounds[segment], g),
+                );
                 skip.run(block);
                 for half in 0..2 {
                     for (i, total) in total.iter_mut().enumerate() {
@@ -450,17 +458,8 @@ impl<'a> Layer<'a> {
         table: &mut [u64],
         pads: &mut [u64],
     ) -> (F128, F128) {
-        let field = round.field;
-        let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
-        let fold: [[u64; GROUP]; 2] = std::array::from_fn(|k| std::array::from_fn(|q| fold[q][k]));
+        let builder = RowBuilder::new(round.field, challenges);
         let weights = self.task_weights(eq);
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw",
-            target_feature = "gfni"
-        ))]
-        let row_maps = crate::table_gfni::RowMaps::new(field, &fold);
         // Segments that do not exist have no live row, and their padding row is zero, and so is their product.
         pads[self.rounds.len() * ROW..].fill(0);
         let (ptr, pads) = (
@@ -469,19 +468,10 @@ impl<'a> Layer<'a> {
         );
         let sums = parallel::map_reduce_with_state(
             self.n_tasks(),
-            || {
-                // The GFNI rows need no wide scratch.
-                let gfni = cfg!(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "avx512bw",
-                    target_feature = "gfni"
-                ));
-                (vec![0u64; if gfni { 0 } else { 6 * BITS }], vec![0u64; 2 * ROW])
-            },
+            || (builder.scratch(), vec![0u64; 2 * ROW], Recompute::new()),
             RoundSums::default,
-            |(wide, rows), sums, task| {
-                let (segment, g, block) = self.block(task);
+            |(wide, rows, recompute), sums, task| {
+                let (segment, g, block) = self.block(recompute, task);
                 // SAFETY: each task owns its rows: a written block's two, or its segment's padding row.
                 let out = unsafe {
                     if 2 * g < layout.live[segment] {
@@ -491,36 +481,96 @@ impl<'a> Layer<'a> {
                     }
                 };
                 let rows = &mut rows[..out.len()];
-                let halves = rows.len() / ROW;
-                cfg_select! {
-                    all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni") => {
-                        // Each group's value by affine byte maps (`table_gfni`).
-                        let _ = wide;
-                        row_maps.rows(block, rows, halves);
-                    }
-                    _ => {
-                        // Both groups' unreduced sums, three words each and laid out by word, then reduced.
-                        for j in 0..BITS {
-                            let sums = crate::kernels::fold_groups(&embed(words(block, j)), &fold);
-                            for (wide, sum) in wide.as_chunks_mut::<{ 3 * BITS }>().0[..halves].iter_mut().zip(&sums) {
-                                let sum: [u64; 3] = crate::basis::carry(sum);
-                                for (k, &word) in sum.iter().enumerate() {
-                                    wide[k * BITS + j] = word;
-                                }
-                            }
-                        }
-                        for (t, wide) in rows.as_chunks_mut::<ROW>().0.iter_mut().zip(wide.as_chunks::<{ 3 * BITS }>().0) {
-                            field.reduce_row(t, wide, BITS);
-                        }
-                    }
-                }
+                builder.rows(wide, block, rows);
                 round.add_pair(sums, &rows[..ROW], &rows[rows.len() - ROW..], weights[task]);
                 // Built in cache for the round values, then published: the next round reads them.
-                primitives::stream::Stream::new().copy(out, rows);
+                // A normal copy, not a non-temporal one: the next pass reads these rows from cache.
+                out.copy_from_slice(rows);
             },
             RoundSums::merge,
         );
         round.finish(&sums)
+    }
+}
+
+/// The rows of one block's groups: `T[j]`, the value at `s` of position `j`'s embeddings, folded
+/// over a group's packs at the bit-level rounds' challenges.
+struct RowBuilder<'a> {
+    // The GFNI rows reduce nothing.
+    #[cfg_attr(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "gfni"
+        ),
+        allow(dead_code)
+    )]
+    field: &'a PowerField,
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "gfni"
+    )))]
+    fold: [[u64; GROUP]; 2],
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "gfni"
+    ))]
+    row_maps: crate::table_gfni::RowMaps,
+}
+
+impl<'a> RowBuilder<'a> {
+    fn new(field: &'a PowerField, challenges: &[F128]) -> Self {
+        let fold: Vec<Element> = eq_table(challenges).iter().map(|&e| field.to_poly(e)).collect();
+        let fold: [[u64; GROUP]; 2] = std::array::from_fn(|k| std::array::from_fn(|q| fold[q][k]));
+        cfg_select! {
+            all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni") => {
+                Self { field, row_maps: crate::table_gfni::RowMaps::new(field, &fold) }
+            }
+            _ => { Self { field, fold } }
+        }
+    }
+
+    /// A worker's wide scratch: the GFNI rows need none.
+    fn scratch(&self) -> Vec<u64> {
+        let gfni = cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "gfni"
+        ));
+        vec![0u64; if gfni { 0 } else { 6 * BITS }]
+    }
+
+    /// The rows of `block`: one per half in `rows`, which holds a row or two.
+    fn rows(&self, wide: &mut [u64], block: &[u64], rows: &mut [u64]) {
+        let halves = rows.len() / ROW;
+        cfg_select! {
+            all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni") => {
+                // Each group's value by affine byte maps (`table_gfni`).
+                let _ = wide;
+                self.row_maps.rows(block, rows, halves);
+            }
+            _ => {
+                // Both groups' unreduced sums, three words each and laid out by word, then reduced.
+                for j in 0..BITS {
+                    let sums = crate::kernels::fold_groups(&embed(words(block, j)), &self.fold);
+                    for (wide, sum) in wide.as_chunks_mut::<{ 3 * BITS }>().0[..halves].iter_mut().zip(&sums) {
+                        let sum: [u64; 3] = crate::basis::carry(sum);
+                        for (k, &word) in sum.iter().enumerate() {
+                            wide[k * BITS + j] = word;
+                        }
+                    }
+                }
+                for (t, wide) in rows.as_chunks_mut::<ROW>().0.iter_mut().zip(wide.as_chunks::<{ 3 * BITS }>().0) {
+                    self.field.reduce_row(t, wide, BITS);
+                }
+            }
+        }
     }
 }
 
@@ -545,6 +595,8 @@ struct Round<'a> {
     eval: PolyEval,
     weights: Vec<u64>,
     constant: Vec<u64>,
+    /// The constant of a difference of rows, which is linear in them: none.
+    linear: Vec<u64>,
 }
 
 impl<'a> Round<'a> {
@@ -561,7 +613,16 @@ impl<'a> Round<'a> {
             eval: PolyEval::new(s, 48),
             weights,
             constant,
+            linear: vec![0u64; ROW],
         }
+    }
+
+    /// The values at `0` and at infinity of `sum over positions of B[j] * T[j + 2]`, unreduced,
+    /// over a pair of rows, where `B[j] = weights[j] * T[j + 1] + constant[j]`.
+    fn pair_sums(&self, constant: &[u64], rows: [&[u64]; 2]) -> ([u64; 4], [u64; 4]) {
+        // A lane is 64 positions, five lanes to a row.
+        let shifted: [_; BITS / 64] = std::array::from_fn(|i| (along(64 * i, 1), along(64 * i, 2)));
+        self.field.pair_sums(&self.weights, constant, rows, BITS, 64, &shifted)
     }
 
     /// Add one pair of rows to a round's sums: the values at `0` and at infinity of
@@ -569,11 +630,7 @@ impl<'a> Round<'a> {
     /// `B[j] = weights[j] * (kappa + T[j + 1]) + kappa * weights[j + 2]`, which is
     /// `weights[j] * T[j + 1] + constant[j]`.
     fn add_pair(&self, sums: &mut RoundSums, low: &[u64], high: &[u64], eq: F128) {
-        // A lane is 64 positions, five lanes to a row.
-        let shifted: [_; BITS / 64] = std::array::from_fn(|i| (along(64 * i, 1), along(64 * i, 2)));
-        let (zero, infinity) = self
-            .field
-            .pair_sums(&self.weights, &self.constant, [low, high], BITS, 64, &shifted);
+        let (zero, infinity) = self.pair_sums(&self.constant, [low, high]);
         let weight = self.field.to_poly(eq);
         add_mul(&mut sums.0, &zero, &weight);
         add_mul(&mut sums.1, &infinity, &weight);
@@ -650,7 +707,8 @@ impl<'a> Round<'a> {
                 // SAFETY: each task owns its rows of `dst`.
                 let out = unsafe { ptr.slice((to.start(segment) + 2 * t) * ROW, n * ROW) };
                 // Built in cache for the round values, then published: the next round reads them.
-                primitives::stream::Stream::new().copy(out, rows);
+                // A normal copy, not a non-temporal one: the next pass reads these rows from cache.
+                out.copy_from_slice(rows);
             },
             RoundSums::merge,
         );
@@ -718,6 +776,287 @@ impl Rows {
             &table[(self.start(segment) + r) * ROW..][..ROW]
         } else {
             &pads[segment * ROW..][..ROW]
+        }
+    }
+}
+
+// The paired tail: a pass over the table binds two variables, which reads it half as often. A
+// pass folds four rows to one with one reduction, and its messages are the same as two single
+// rounds'. It takes a third more row sums than single rounds do: where those are cheap, with
+// AVX-512, it wins; with AVX2 it did not.
+
+const PAIRED_TAIL: bool = cfg!(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+));
+
+impl Rows {
+    fn paired(&self) -> bool {
+        PAIRED_TAIL && self.m >= 4
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PairSums([[u64; 6]; 8]);
+
+impl PairSums {
+    fn merge(mut self, other: Self) -> Self {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            for (a, b) in a.iter_mut().zip(b) {
+                *a ^= b;
+            }
+        }
+        self
+    }
+}
+
+/// The eight bivariate values needed to send two ordinary round messages: chi at
+/// `(0, 0), (inf, 0), (0, 1), (inf, 1), (1, 0), (1, inf), (0, inf), (inf, inf)`, infinity
+/// selecting the leading coefficient in that variable.
+struct RoundPair([F128; 8]);
+
+impl RoundPair {
+    /// The first message's values at `0` and infinity, the second variable summed at `eta`.
+    fn first(&self, eta: F128) -> (F128, F128) {
+        let q = &self.0;
+        (q[0] + eta * (q[0] + q[2]), q[1] + eta * (q[1] + q[3]))
+    }
+
+    /// The second message's values, the first variable bound to `r`.
+    fn second(&self, r: F128) -> (F128, F128) {
+        let q = &self.0;
+        let r2 = r.square() + r;
+        (
+            q[0] + r * (q[0] + q[4]) + r2 * q[1],
+            q[6] + r * (q[6] + q[5]) + r2 * q[7],
+        )
+    }
+}
+
+enum TailMessage {
+    Single(F128, F128),
+    Pair(RoundPair),
+}
+
+impl TailMessage {
+    fn first(&self, eta: F128) -> (F128, F128) {
+        match self {
+            Self::Single(zero, infinity) => (*zero, *infinity),
+            Self::Pair(pair) => pair.first(eta),
+        }
+    }
+}
+
+impl Layer<'_> {
+    /// [`Layer::table`], summing the values of the first two rounds over each four rows.
+    fn table_pair(
+        &self,
+        round: &Round,
+        challenges: &[F128],
+        eq: &[F128],
+        layout: Rows,
+        table: &mut [u64],
+        pads: &mut [u64],
+    ) -> RoundPair {
+        let builder = RowBuilder::new(round.field, challenges);
+        // Segments that do not exist have no live row, and their padding row is zero, and so is their product.
+        pads[self.rounds.len() * ROW..].fill(0);
+        {
+            let (mut recompute, mut wide) = (Recompute::new(), builder.scratch());
+            for (segment, &round) in self.rounds.iter().enumerate() {
+                let written = self.written_of(segment);
+                if written < self.witness.shape.n_blocks() {
+                    let block = self.table_of(segment).state(&mut recompute, round, written);
+                    builder.rows(&mut wide, block, &mut pads[segment * ROW..][..ROW]);
+                }
+            }
+        }
+        let pads = &*pads;
+        let ptr = parallel::SendPtr(table.as_mut_ptr());
+        // Task `quad_starts[segment] + q` owns rows `4q ..` of its segment, as in `Round::fold`.
+        let mut quad_starts = vec![0];
+        for segment in 0..self.rounds.len() {
+            quad_starts.push(quad_starts[segment] + layout.live[segment].div_ceil(4));
+        }
+        let mut sums = parallel::map_reduce_with_state(
+            quad_starts[self.rounds.len()],
+            || {
+                (
+                    builder.scratch(),
+                    vec![0u64; 4 * ROW],
+                    vec![0u64; 2 * ROW],
+                    Recompute::new(),
+                )
+            },
+            PairSums::default,
+            |(wide, rows, diffs, recompute), sums, task| {
+                let segment = quad_starts.partition_point(|&start| start <= task) - 1;
+                let q = task - quad_starts[segment];
+                // A ragged last quad has two rows written, the others are the padding row.
+                let n = (layout.live[segment] - 4 * q).min(4);
+                let rows = &mut rows[..n * ROW];
+                for (i, rows) in rows.chunks_mut(2 * ROW).enumerate() {
+                    let block = self.table_of(segment).state(recompute, self.rounds[segment], 2 * q + i);
+                    builder.rows(wide, block, rows);
+                }
+                round.add_quad(
+                    sums,
+                    diffs,
+                    std::array::from_fn(|i| {
+                        if i < n {
+                            &rows[i * ROW..][..ROW]
+                        } else {
+                            &pads[segment * ROW..][..ROW]
+                        }
+                    }),
+                    eq[layout.m / 4 * segment + q],
+                );
+                // SAFETY: each task owns its rows.
+                let out = unsafe { ptr.slice((layout.start(segment) + 4 * q) * ROW, n * ROW) };
+                // Built in cache for the round values, then published: the next round reads them.
+                // A normal copy, not a non-temporal one: the next pass reads these rows from cache.
+                out.copy_from_slice(rows);
+            },
+            PairSums::merge,
+        );
+        round.add_padding_quad(&mut sums, layout, pads, eq);
+        round.finish_pair(&sums)
+    }
+}
+
+impl Round<'_> {
+    /// Add four rows, indexed `x + 2y`, to a pair round's sums, weighted by `eq`: each of the eight
+    /// values of [`RoundPair`] is a dot product of [`Self::pair_sums`]'s kind, the last two over
+    /// the sums of rows `0` and `2`, and `1` and `3`.
+    fn add_quad(&self, sums: &mut PairSums, diffs: &mut [u64], rows: [&[u64]; 4], eq: F128) {
+        let (d0, d1) = diffs.split_at_mut(ROW);
+        for (k, d) in d0.iter_mut().enumerate() {
+            *d = rows[0][k] ^ rows[2][k];
+        }
+        for (k, d) in d1[..ROW].iter_mut().enumerate() {
+            *d = rows[1][k] ^ rows[3][k];
+        }
+        let values = [
+            self.pair_sums(&self.constant, [rows[0], rows[1]]),
+            self.pair_sums(&self.constant, [rows[2], rows[3]]),
+            self.pair_sums(&self.constant, [rows[1], rows[3]]),
+            self.pair_sums(&self.linear, [d0, &d1[..ROW]]),
+        ];
+        let weight = self.field.to_poly(eq);
+        for (sum, (zero, infinity)) in sums.0.chunks_mut(2).zip(values) {
+            add_mul(&mut sum[0], &zero, &weight);
+            add_mul(&mut sum[1], &infinity, &weight);
+        }
+    }
+
+    fn finish_pair(&self, sums: &PairSums) -> RoundPair {
+        RoundPair(sums.0.map(|sum| self.eval.eval(&sum)))
+    }
+
+    /// [`Round::fold`] of two variables at once.
+    fn fold_pair(
+        &self,
+        src: &[u64],
+        from: Rows,
+        dst: &mut [u64],
+        pads: &[u64],
+        challenges: &[Element; 2],
+        eq: &[F128],
+    ) -> TailMessage {
+        let to = from.next().next();
+        let challenges = [
+            challenges[0],
+            challenges[1],
+            self.field.mul(&challenges[0], &challenges[1]),
+        ];
+        let fold = |out: &mut [u64], segment: usize, r: usize| {
+            self.field.fold_quad(
+                out,
+                std::array::from_fn(|i| from.row(src, pads, segment, 4 * r + i)),
+                &challenges,
+                BITS,
+            );
+        };
+        if to.m < 4 {
+            // Few enough rows to fold in place, the padding rows being their own folds.
+            for segment in 0..to.segments {
+                for r in 0..to.live[segment] {
+                    fold(&mut dst[(to.start(segment) + r) * ROW..][..ROW], segment, r);
+                }
+            }
+            let mut sums = RoundSums::default();
+            if to.m == 1 {
+                for (pair, &eq) in dst[..to.len() * ROW].as_chunks::<{ 2 * ROW }>().0.iter().zip(eq) {
+                    self.add_pair(&mut sums, &pair[..ROW], &pair[ROW..], eq);
+                }
+            } else {
+                for (segment, &eq) in eq.iter().enumerate() {
+                    self.add_pair(
+                        &mut sums,
+                        to.row(dst, pads, segment, 0),
+                        to.row(dst, pads, segment, 1),
+                        eq,
+                    );
+                }
+            }
+            let (zero, infinity) = self.finish(&sums);
+            return TailMessage::Single(zero, infinity);
+        }
+        // A task per quad of rows written, the last of a segment possibly ragged. Task
+        // `quad_starts[segment] + q` owns rows `4q ..` of its segment, which may have none.
+        let half = to.m / 4;
+        let mut quad_starts = vec![0];
+        for segment in 0..to.segments {
+            quad_starts.push(quad_starts[segment] + to.live[segment].div_ceil(4));
+        }
+        let ptr = parallel::SendPtr(dst.as_mut_ptr());
+        let mut sums = parallel::map_reduce_with_state(
+            quad_starts[to.segments],
+            || (vec![0u64; 4 * ROW], vec![0u64; 2 * ROW]),
+            PairSums::default,
+            |(rows, diffs), sums, task| {
+                let segment = quad_starts.partition_point(|&start| start <= task) - 1;
+                let q = task - quad_starts[segment];
+                let n = (to.live[segment] - 4 * q).min(4);
+                let rows = &mut rows[..n * ROW];
+                for (i, row) in rows.as_chunks_mut::<ROW>().0.iter_mut().enumerate() {
+                    fold(row, segment, 4 * q + i);
+                }
+                self.add_quad(
+                    sums,
+                    diffs,
+                    std::array::from_fn(|i| {
+                        if i < n {
+                            &rows[i * ROW..][..ROW]
+                        } else {
+                            &pads[segment * ROW..][..ROW]
+                        }
+                    }),
+                    eq[half * segment + q],
+                );
+                // SAFETY: each task owns its rows of `dst`.
+                let out = unsafe { ptr.slice((to.start(segment) + 4 * q) * ROW, n * ROW) };
+                // Built in cache for the round values, then published: the next round reads them.
+                // A normal copy, not a non-temporal one: the next pass reads these rows from cache.
+                out.copy_from_slice(rows);
+            },
+            PairSums::merge,
+        );
+        self.add_padding_quad(&mut sums, to, pads, eq);
+        TailMessage::Pair(self.finish_pair(&sums))
+    }
+
+    /// Add the quads of four padding rows of a table laid out as `layout`, weighted by `eq`: each
+    /// segment's padding row, once, at the sum of their weights.
+    fn add_padding_quad(&self, sums: &mut PairSums, layout: Rows, pads: &[u64], eq: &[F128]) {
+        let quads = layout.m / 4;
+        let mut diffs = vec![0u64; 2 * ROW];
+        for (segment, (pad, eq)) in pads.as_chunks::<ROW>().0.iter().zip(eq.chunks_exact(quads)).enumerate() {
+            let first = layout.live[segment].div_ceil(4);
+            if first != quads {
+                self.add_quad(sums, &mut diffs, [pad; 4], eq[first..].iter().sum());
+            }
         }
     }
 }
@@ -837,17 +1176,49 @@ pub fn prove_layer(
     assert!(layout.segments <= MAX_SEGMENTS);
     let (mut src, mut dst) = scratch.table.split_at_mut(layout.m * layout.segments * ROW);
     let pads = &mut scratch.pads;
-    let mut values = tracing::info_span!("Tables").in_scope(|| {
-        let eq = eq_table(&claim.point[SKIP + 1..]);
-        layer.table(&round, &point, &eq, layout, src, pads)
+    let mut message = tracing::info_span!("Tables").in_scope(|| {
+        if layout.paired() {
+            let eq = eq_table(&claim.point[SKIP + 2..]);
+            TailMessage::Pair(layer.table_pair(&round, &point, &eq, layout, src, pads))
+        } else {
+            let eq = eq_table(&claim.point[SKIP + 1..]);
+            let (zero, infinity) = layer.table(&round, &point, &eq, layout, src, pads);
+            TailMessage::Single(zero, infinity)
+        }
     });
     let tail = tracing::info_span!("Tail").entered();
-    for i in SKIP..claim.point.len() {
+    let mut i = SKIP;
+    while i < claim.point.len() {
+        let values = message.first(claim.point.get(i + 1).copied().unwrap_or(F128::ZERO));
         let coeffs = round_coefficients(values.0, values.1, value, claim.point[i]);
         let challenge = bind(ps, &coeffs, &mut value, &mut point);
-        let later = eq_table(claim.point.get(i + 2..).unwrap_or(&[]));
-        values = round.fold(src, layout, dst, pads, &field.to_poly(challenge), &later);
-        layout = layout.next();
+        match message {
+            TailMessage::Pair(pair) => {
+                let values = pair.second(challenge);
+                let coeffs = round_coefficients(values.0, values.1, value, claim.point[i + 1]);
+                let second = bind(ps, &coeffs, &mut value, &mut point);
+                let to = layout.next().next();
+                i += 2;
+                let skipped = if to.paired() { 2 } else { 1 };
+                let later = eq_table(claim.point.get(i + skipped..).unwrap_or(&[]));
+                message = round.fold_pair(
+                    src,
+                    layout,
+                    dst,
+                    pads,
+                    &[field.to_poly(challenge), field.to_poly(second)],
+                    &later,
+                );
+                layout = to;
+            }
+            TailMessage::Single(..) => {
+                let later = eq_table(claim.point.get(i + 2..).unwrap_or(&[]));
+                let (zero, infinity) = round.fold(src, layout, dst, pads, &field.to_poly(challenge), &later);
+                message = TailMessage::Single(zero, infinity);
+                layout = layout.next();
+                i += 1;
+            }
+        }
         (src, dst) = (dst, src);
     }
     let table = &src[..ROW];
@@ -904,6 +1275,74 @@ fn round_coefficients(zero: F128, infinity: F128, value: F128, r: F128) -> [F128
     // value = c0 + r (c1 + c2).
     let c1 = (value + c0) * r.inv() + c2;
     [c0, c1, c2]
+}
+
+#[cfg(test)]
+mod paired_tests {
+    use primitives::test_rng::Rng;
+    use verifier::keccak::PACK;
+
+    use super::*;
+
+    /// A pair round's two messages are those of two single rounds, whether its four rows differ,
+    /// repeat, or are all one padding row.
+    #[test]
+    fn paired_messages_match_successive_rounds() {
+        let mut rng = Rng::new(47);
+        let s = rng.ext();
+        let field = PowerField::new(s).unwrap();
+        let weights = rng.ext_vec(BITS);
+        let polys: Vec<Element> = weights.iter().map(|&w| field.to_poly(w)).collect();
+        let claim = Claim {
+            value: F128::ZERO,
+            mu: [F128::ZERO; PACK],
+            point: Vec::new(),
+            weights,
+        };
+        let round = Round::new(&field, &claim, &polys, s, rng.ext());
+        let rows: [Vec<u64>; 4] = std::array::from_fn(|_| (0..ROW).map(|_| rng.next_u64()).collect());
+        let mut diffs = vec![0u64; 2 * ROW];
+        for input in [
+            rows.each_ref().map(Vec::as_slice),
+            [&rows[0][..], &rows[1], &rows[2], &rows[2]],
+            [&rows[0][..]; 4],
+        ] {
+            let (eq, eta, r) = (rng.ext(), rng.ext(), rng.ext());
+            let mut sums = PairSums::default();
+            round.add_quad(&mut sums, &mut diffs, input, eq);
+            let pair = round.finish_pair(&sums);
+            let mut first = RoundSums::default();
+            round.add_pair(&mut first, input[0], input[1], eq * (F128::ONE + eta));
+            round.add_pair(&mut first, input[2], input[3], eq * eta);
+            assert_eq!(pair.first(eta), round.finish(&first));
+
+            let (mut low, mut high) = (vec![0; ROW], vec![0; ROW]);
+            field.fold_row_portable(&mut low, input[0], input[1], &field.to_poly(r), BITS);
+            field.fold_row_portable(&mut high, input[2], input[3], &field.to_poly(r), BITS);
+            let mut second = RoundSums::default();
+            round.add_pair(&mut second, &low, &high, eq);
+            assert_eq!(pair.second(r), round.finish(&second));
+        }
+    }
+
+    /// One fold of four rows is two folds in a row.
+    #[test]
+    fn a_quad_fold_equals_two_single_folds() {
+        let mut rng = Rng::new(48);
+        let field = PowerField::new(rng.ext()).unwrap();
+        let rows: [Vec<u64>; 4] = std::array::from_fn(|_| (0..ROW).map(|_| rng.next_u64()).collect());
+        let (r, s) = (field.to_poly(rng.ext()), field.to_poly(rng.ext()));
+        let (mut low, mut high, mut want) = (vec![0; ROW], vec![0; ROW], vec![0; ROW]);
+        field.fold_row_portable(&mut low, &rows[0], &rows[1], &r, BITS);
+        field.fold_row_portable(&mut high, &rows[2], &rows[3], &r, BITS);
+        field.fold_row_portable(&mut want, &low, &high, &s, BITS);
+        let mut got = vec![0; ROW];
+        let rows = rows.each_ref().map(Vec::as_slice);
+        field.fold_quad(&mut got, rows, &[r, s, field.mul(&r, &s)], BITS);
+        assert!(got == want);
+        field.fold_quad_portable(&mut got, rows, &[r, s, field.mul(&r, &s)], BITS);
+        assert!(got == want);
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64", target_feature = "avx2", target_feature = "gfni"))]
