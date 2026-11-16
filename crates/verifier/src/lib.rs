@@ -47,9 +47,11 @@ use bus::{ColumnClaim, N_TREES, table_sumcheck, verify_bus_balance};
 use field::{ZERO, powers};
 use hash::{ROUNDS, STATE_LANES};
 use keccak::{KeccakShape, verify_keccak};
-use layout::{GLOBAL_COLUMN_BASES, KECCAK_OUT, MEMORY_0, MEMORY_1, N_TABLES, OP_KECCAK, QKECCAK, build_layout};
+use layout::{
+    GLOBAL_COLUMN_BASES, HASH_TABLES, K_BITS, KECCAK_OUT, MEMORY_0, MEMORY_1, N_TABLES, QKECCAK, build_layout,
+};
 use multilinear::{dot, eq_eval, multilinear_eval};
-use ring_switch::ring_switch;
+use ring_switch::{ring_switch, ring_switch_many};
 use std::ops::Range;
 use transcript::Transcript;
 use whir::verify_whir;
@@ -348,16 +350,36 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         });
     }
 
-    // 6] KECCAK validity, by GKR over the rounds. The table's claims on its output lanes are the reduction's claim on
-    // the permutation's output: they leave the batch, their columns having no placement.
-    let (point, values) = &evaluations[OP_KECCAK];
+    // 6] KECCAK and KECCAK64 validity, by GKR over the rounds. The tables' claims on their output lanes are the reduction's
+    // claim on the permutations' output: they leave the batch, their columns having no placement. Each table's claim
+    // is at a prefix of the tallest's point, so a shorter table is completed with its padding step: the claim at the
+    // tallest's point is `eq(0) claim + (1 + eq(0)) padding`. `KECCAK64` claims its output lanes 0 to 3, and the prover
+    // sends the others, which only the reduction reads.
     let keccak_start = transcript.stream_offset();
-    let openings = verify_keccak(
-        &mut transcript,
-        layout.keccak,
-        point,
-        &values[KECCAK_OUT..KECCAK_OUT + STATE_LANES],
-    )?;
+    let kappa = layout.keccak.log_steps;
+    let tallest = HASH_TABLES
+        .iter()
+        .copied()
+        .find(|&table| layout.table_log_heights[table] == kappa)
+        .expect("a tallest hash table");
+    let rho = evaluations[tallest].0.clone();
+    let keccak64_rest = transcript.next_scalars(STATE_LANES - layout::KECCAK64_OUT_LANES)?;
+    let mut output = Vec::with_capacity(HASH_TABLES.len() * STATE_LANES);
+    for (half, (&table, padding)) in HASH_TABLES.iter().zip(layout::hash_padding_outputs()).enumerate() {
+        let (_, values) = &evaluations[table];
+        let uncovered = rho[layout.table_log_heights[table]..]
+            .iter()
+            .fold(field::ONE, |e, &x| e * (field::ONE + x));
+        for (lane, &pad) in padding.iter().enumerate() {
+            let claimed = match (half, lane) {
+                (0, lane) => values[KECCAK_OUT + lane],
+                (_, lane) if lane < layout::KECCAK64_OUT_LANES => values[layout::KECCAK64_OUT + lane],
+                (_, lane) => keccak64_rest[lane - layout::KECCAK64_OUT_LANES],
+            };
+            output.push(uncovered * claimed + (field::ONE + uncovered) * E::new(pad, 0));
+        }
+    }
+    let openings = verify_keccak(&mut transcript, layout.keccak, &rho, &output)?;
     let keccak_scalars = keccak_start..transcript.stream_offset();
     if let Some((point, value)) = openings.outputs {
         claims.push(ColumnClaim {
@@ -367,21 +389,59 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         });
     }
 
-    // 7] Ring-switching
+    // 7] Ring-switching. A claim is supported on q_keccak's block of the stack, so its weight carries the
+    // placement's selector; the claims lead the batch, taking the first powers. A truncated q_keccak is pieces,
+    // each a claim of its own: the prover sends the slices of all but the last, which the reduction's slices fix.
     let (point, slices) = openings.inputs;
-    let (point, slices) = match &layout.qt {
-        Some(qt) => qt.ring_inputs(point, slices),
-        None => (point, slices),
-    };
-    let (ringswitch_target, ringswitch_weight) = ring_switch(point, &slices, &mut transcript)?;
-    // That claim is supported on q_keccak's region of the stack, so its weight carries the
-    // placement's selector, and it leads the batch, taking the first power.
-    let qkeccak = layout.placements[QKECCAK].expect("q_keccak is committed");
-    let ringswitch: StackClaim = (
-        Box::new(move |x| qkeccak.eq_above(x) * ringswitch_weight(&x[..qkeccak.variables])),
-        ringswitch_target,
-    );
-    let mut stack_claims = vec![ringswitch];
+    let mut stack_claims: Vec<StackClaim> = Vec::new();
+    match &layout.qt {
+        None => {
+            let (target, weight) = ring_switch(point, &slices, &mut transcript)?;
+            let qkeccak = layout.placements[QKECCAK].expect("q_keccak is committed");
+            stack_claims.push((
+                Box::new(move |x| qkeccak.eq_above(x) * weight(&x[..qkeccak.variables])),
+                target,
+            ));
+        }
+        Some(qt) => {
+            let split = qt.ring_split(&point);
+            let pieces = split.len();
+            let share = qt.pad_share(&point);
+            // The derived piece is the largest, the first of them.
+            let derived = (0..pieces)
+                .max_by_key(|&j| (qt.pieces[j].b(), std::cmp::Reverse(j)))
+                .expect("a piece");
+            let sent = transcript.next_scalars(K_BITS * (pieces - 1))?;
+            let mut slices_of: Vec<Vec<E>> = Vec::with_capacity(pieces);
+            let mut sent_chunks = sent.chunks(K_BITS);
+            for j in 0..pieces {
+                slices_of.push(if j == derived {
+                    Vec::new()
+                } else {
+                    sent_chunks.next().expect("a piece's slices").to_vec()
+                });
+            }
+            let mut last: Vec<E> = slices.iter().zip(&share).map(|(&s, &pad)| s + pad).collect();
+            for ((_, coefficient), own) in split.iter().zip(&slices_of) {
+                for (slice, &value) in last.iter_mut().zip(own) {
+                    *slice += *coefficient * value;
+                }
+            }
+            let coefficient = split[derived].1;
+            require(coefficient != ZERO, VerifierError::KeccakInputOpening)?;
+            let inverse = coefficient.inv();
+            slices_of[derived] = last.into_iter().map(|slice| slice * inverse).collect();
+            let all = split.into_iter().map(|(point, _)| point).zip(slices_of).collect();
+            let rings = ring_switch_many(all, &mut transcript)?;
+            for (piece, (target, weight)) in qt.pieces.iter().zip(rings) {
+                let placement = piece.placement;
+                stack_claims.push((
+                    Box::new(move |x| placement.eq_above(x) * weight(&x[..placement.variables])),
+                    target,
+                ));
+            }
+        }
+    }
     stack_claims.extend(claims.iter().filter_map(|claim| claim.on_stack(&layout)));
     stack_claims.push(ood);
     verify_stacked_opening(

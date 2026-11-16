@@ -78,12 +78,34 @@ pub fn ring_switch(
     s: &[E],
     transcript: &mut Transcript,
 ) -> Result<(E, impl Fn(&[E]) -> E + use<>), VerifierError> {
+    let mut claims = ring_switch_many(vec![(point, s.to_vec())], transcript)?;
+    let (target, weight) = claims.pop().expect("one claim");
+    Ok((target, weight))
+}
+
+/// A ring claim's weight, which the opening evaluates at its terminal point.
+pub type RingWeight = Box<dyn Fn(&[E]) -> E>;
+
+/// A claim's target and weight.
+pub type RingClaim = (E, RingWeight);
+
+/// [`ring_switch`] of several claims, `(point, slices)` each, under one draw of the map.
+pub fn ring_switch_many(
+    claims: Vec<(Vec<E>, Vec<E>)>,
+    transcript: &mut Transcript,
+) -> Result<Vec<RingClaim>, VerifierError> {
     transcript.grind_check(BATCH_GRINDING_BITS)?;
     let challenges = transcript.samples(2 * RING_MAP_WIDTH);
     let (f, g) = challenges.split_at(RING_MAP_WIDTH);
-    let coefficients = ring_coefficients(f, g);
-    let target = ring_target(s, f, g);
-    Ok((target, move |r_prime: &[E]| ring_weight(&point, r_prime, &coefficients)))
+    let coefficients = std::rc::Rc::new(ring_coefficients(f, g));
+    Ok(claims
+        .into_iter()
+        .map(|(point, s)| {
+            let coefficients = coefficients.clone();
+            let weight: RingWeight = Box::new(move |r_prime| ring_weight(&point, r_prime, &coefficients));
+            (ring_target(&s, f, g), weight)
+        })
+        .collect())
 }
 
 #[cfg(test)]

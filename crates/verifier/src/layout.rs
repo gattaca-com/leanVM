@@ -131,21 +131,37 @@ pub struct Piece {
     pub placement: Placement,
 }
 
-/// The truncated q_keccak ("QT"): only its first `c` chunks of `2^(g_log)` steps are committed, as a region of
-/// `2^(6 + tau)` words at `offset`, laid out `(steplo, slot, chunk)`. The rest of each slot is the public `pad`.
-pub struct Qt {
-    pub offset: u64,
-    pub tau: usize,
-    pub g_log: usize,
-    pub c: u64,
-    pub pad: [u64; 64],
+/// One piece of the truncated q_keccak: rows `off..off + 2^b` of every slot of one table half, laid out `(row, slot)`
+/// in `2^(b + 6)` words at `placement`.
+#[derive(Clone, Debug)]
+pub struct QtPiece {
+    pub half: usize,
+    pub off: u64,
+    pub placement: Placement,
 }
 
-/// What a padding step holds in each slot: zero but for slots `25..50`, lane `l` of the state after `KECCAK_DEPTH`
-/// rounds on the zero state, at slot `25 + l`.
-pub fn qt_pad() -> [u64; 64] {
+impl QtPiece {
+    /// The piece's log rows.
+    pub fn b(&self) -> usize {
+        self.placement.variables - 6
+    }
+}
+
+/// The truncated q_keccak ("QT"): each table half is committed as the pieces of its covered rows, cut as a truncated
+/// column is, each piece all 64 slots of its rows. Past its covered rows a half is its public `pad`, a row of 64 words.
+pub struct Qt {
+    /// `log2` of the steps each table is completed to.
+    pub log_steps: usize,
+    pub pieces: Vec<QtPiece>,
+    pub pads: [[u64; 64]; 2],
+}
+
+/// What a padding step of table half `half` holds in each slot: its input state in slots `0..25`, and slot `25 + l`
+/// the lane `l` of the state after `KECCAK_DEPTH` rounds on it. Zero in the spare slots.
+pub fn qt_pad(half: usize) -> [u64; 64] {
     let mut pad = [0u64; 64];
-    let mut state = [0u64; STATE_LANES];
+    let mut state = if half == 0 { [0u64; STATE_LANES] } else { keccak64_pad() };
+    pad[..STATE_LANES].copy_from_slice(&state);
     keccak_rounds(&mut state, KECCAK_DEPTH);
     pad[STATE_LANES..2 * STATE_LANES].copy_from_slice(&state);
     pad
@@ -156,60 +172,126 @@ fn bits(value: u64, len: usize) -> Vec<E> {
 }
 
 impl Qt {
-    pub fn placement(&self) -> Placement {
-        Placement {
-            variables: 6 + self.tau,
-            index: self.offset,
-        }
+    /// The pieces of a half.
+    fn half_pieces(&self, half: usize) -> impl Iterator<Item = &QtPiece> {
+        self.pieces.iter().filter(move |piece| piece.half == half)
     }
 
-    /// `1 + sum_{i < c} eq(bits(i), y)`: the weight of the uncovered chunks at `y`.
-    fn uncovered(&self, y: &[E]) -> E {
-        ONE + E::sum(eq_kernel(y)[..self.c as usize].iter().copied())
+    /// `e_j` of a piece at the row point `zeta`: the weight of its rows in the column.
+    fn weight(&self, piece: &QtPiece, zeta: &[E]) -> E {
+        (piece.b()..self.log_steps).fold(ONE, |e, i| {
+            e * if piece.off >> i & 1 == 1 {
+                zeta[i]
+            } else {
+                ONE + zeta[i]
+            }
+        })
     }
 
-    /// `sum_s pad[s] eq(bits(s), x)`.
-    fn pad_mle(&self, x: &[E]) -> E {
-        E::sum(eq_kernel(x).into_iter().zip(self.pad).map(|(eq, p)| eq * K(p)))
+    /// `1 + sum_j e_j`, the weight of the rows past a half's pieces.
+    fn uncovered(&self, half: usize, zeta: &[E]) -> E {
+        ONE + E::sum(self.half_pieces(half).map(|piece| self.weight(piece, zeta)))
     }
 
-    /// The region point of a point `(steplo, chunk, slot)` of the full layout: `(steplo, slot, chunk)`.
-    fn rotate(&self, point: &[E]) -> Vec<E> {
-        let (steplo, rest) = point.split_at(self.g_log);
-        let (chunk, slot) = rest.split_at(self.tau - self.g_log);
-        [steplo, slot, chunk].concat()
+    /// `sum_s pad[half][s] eq(bits(s), slot)`.
+    fn pad_mle(&self, half: usize, slot: &[E]) -> E {
+        E::sum(
+            eq_kernel(slot)
+                .into_iter()
+                .zip(self.pads[half])
+                .map(|(eq, p)| eq * K(p)),
+        )
     }
 
-    /// The stack point and value of a claim on q_keccak's output (`QKECCAK`) or on one of its slot columns.
-    fn claim(&self, column: usize, point: &[E], value: E, stack_log: usize) -> Option<(Vec<E>, E)> {
-        let (region_point, value) = if column == QKECCAK {
-            let (chunk, slot) = point[self.g_log..].split_at(self.tau - self.g_log);
-            (self.rotate(point), value + self.pad_mle(slot) * self.uncovered(chunk))
+    /// `zeta` padded with zeros to the rows of a half: the point of the same column in the completed table.
+    fn extend(&self, zeta: &[E]) -> Vec<E> {
+        let mut point = zeta.to_vec();
+        point.resize(self.log_steps, ZERO);
+        point
+    }
+
+    /// The stack claim and value of a claim on q_keccak's output (`QKECCAK`, at `(row, table, slot)`) or on one of its
+    /// slot columns (at the rows of its table).
+    fn claim(&self, column: usize, point: &[E], value: E, stack_log: usize) -> Option<StackClaimParts> {
+        let mut parts = Vec::new();
+        let value = if column == QKECCAK {
+            let (row, rest) = point.split_at(self.log_steps);
+            let (table, slot) = rest.split_at(TABLE_BITS);
+            let mut value = value;
+            for half in 0..HASH_TABLES.len() {
+                // The tables' weights are the table coordinates' eq.
+                let eq = table
+                    .iter()
+                    .enumerate()
+                    .fold(ONE, |eq, (bit, &x)| eq * if half >> bit & 1 == 1 { x } else { ONE + x });
+                value += eq * self.pad_mle(half, slot) * self.uncovered(half, row);
+                for piece in self.half_pieces(half) {
+                    let at = [&row[..piece.b()], slot].concat();
+                    parts.push((
+                        eq * self.weight(piece, row),
+                        piece.placement.stack_point(&at, stack_log),
+                    ));
+                }
+            }
+            value
         } else {
-            let slot = qkeccak_slot(column)?;
-            let (low, chunk) = point.split_at(self.g_log);
-            let region = [low, &bits(slot as u64, 6), chunk].concat();
-            (region, value + self.uncovered(chunk) * K(self.pad[slot]))
+            let (half, slot) = qkeccak_slot(column)?;
+            let row = self.extend(point);
+            for piece in self.half_pieces(half) {
+                let at = [&row[..piece.b()], &bits(slot as u64, 6)].concat();
+                parts.push((self.weight(piece, &row), piece.placement.stack_point(&at, stack_log)));
+            }
+            value + self.uncovered(half, &row) * K(self.pads[half][slot])
         };
-        Some((self.placement().stack_point(&region_point, stack_log), value))
+        Some((parts, value))
     }
 
-    /// The ring switch's inputs for the committed region: the point rotated, the slices less the pad's share.
-    pub fn ring_inputs(&self, point: Vec<E>, mut slices: Vec<E>) -> (Vec<E>, Vec<E>) {
-        let (chunk, slot) = point[self.g_log..].split_at(self.tau - self.g_log);
-        let (u, eq) = (self.uncovered(chunk), eq_kernel(slot));
-        for (i, slice) in slices.iter_mut().enumerate() {
-            let share = E::sum(
-                eq.iter()
-                    .zip(self.pad)
-                    .filter(|(_, p)| p >> i & 1 == 1)
-                    .map(|(e, _)| *e),
-            );
-            *slice += u * share;
+    /// The ring claims the reduction's input opening splits into, one per piece: the piece's point, and the weight `c_j` the
+    /// piece's slices have in the opening's `slices`. With them, `slices_z = sum_j c_j s_{j,z} + pad share`, where
+    /// the pad share is returned.
+    pub fn ring_split(&self, point: &[E]) -> Vec<(Vec<E>, E)> {
+        let (row, rest) = point.split_at(self.log_steps);
+        let (table, slot) = rest.split_at(TABLE_BITS);
+        self.pieces
+            .iter()
+            .map(|piece| {
+                let eq = table.iter().enumerate().fold(ONE, |eq, (bit, &x)| {
+                    eq * if piece.half >> bit & 1 == 1 { x } else { ONE + x }
+                });
+                ([&row[..piece.b()], slot].concat(), eq * self.weight(piece, row))
+            })
+            .collect()
+    }
+
+    /// The bit `i` of the pad's share of the opening's slice: `sum_t eq_t sum_s pad[t][s]_i eq(bits(s), slot) (1 + sum_j e_tj)`.
+    pub fn pad_share(&self, point: &[E]) -> Vec<E> {
+        let (row, rest) = point.split_at(self.log_steps);
+        let (table, slot) = rest.split_at(TABLE_BITS);
+        let eq_slot = eq_kernel(slot);
+        let mut share = vec![ZERO; K_BITS];
+        for half in 0..HASH_TABLES.len() {
+            let eq = table
+                .iter()
+                .enumerate()
+                .fold(ONE, |eq, (bit, &x)| eq * if half >> bit & 1 == 1 { x } else { ONE + x });
+            let u = eq * self.uncovered(half, row);
+            for (i, slice) in share.iter_mut().enumerate() {
+                let mass = E::sum(
+                    eq_slot
+                        .iter()
+                        .zip(self.pads[half])
+                        .filter(|(_, p)| p >> i & 1 == 1)
+                        .map(|(e, _)| *e),
+                );
+                *slice += u * mass;
+            }
         }
-        (self.rotate(&point), slices)
+        share
     }
 }
+
+/// A claim on the stack as parts `(weight, point)`, and its value.
+pub type StackClaimParts = (Vec<(E, Vec<E>)>, E);
 
 pub struct Layout<'a> {
     pub log_memory: usize,
@@ -232,8 +314,8 @@ pub struct Layout<'a> {
 }
 
 impl Layout<'_> {
-    /// A claim on q_keccak or one of its slot columns under QT, as a stack point and value; `None` otherwise.
-    pub fn qt_claim(&self, column: usize, point: &[E], value: E) -> Option<(Vec<E>, E)> {
+    /// A claim on q_keccak or one of its slot columns under QT, as weighted stack points and a value; `None` otherwise.
+    pub fn qt_claim(&self, column: usize, point: &[E], value: E) -> Option<StackClaimParts> {
         self.qt.as_ref()?.claim(column, point, value, self.stack_log)
     }
 }
@@ -510,7 +592,94 @@ pub const OP_SET: usize = 2;
 pub const OP_DEREF: usize = 3;
 pub const OP_JUMP: usize = 4;
 pub const OP_KECCAK: usize = 5;
-pub const N_TABLES: usize = 6;
+pub const OP_KECCAK64: usize = 6;
+pub const N_TABLES: usize = 7;
+
+/// The tables the Keccak reduction proves, in the order of the table bit: half `h` of q_keccak is table `HASH_TABLES[h]`.
+pub const HASH_TABLES: [usize; 2] = [OP_KECCAK, OP_KECCAK64];
+/// `log2` of the number of hash tables.
+pub const TABLE_BITS: usize = 1;
+
+/// `KECCAK64`'s columns (the table is named `KECCAK64`): these, then the input lanes `in_l`, its output lanes 0 to 3 `out_l`, a
+/// count `cnt_c` for each of the four cells read and the one or two written, `cnt_bc`, and the three immediates
+/// `s_a`, `k_a` and `k_y`. The twenty-nine value lanes are not committed in the table: an input lane is one of
+/// q_keccak's slots, and the output lanes' claims are the Keccak reduction's claim on the output.
+#[rustfmt::skip]
+const KECCAK64_HEAD: &[&str] = &["pc", "fp", "o_a", "o_b", "o_c", "o_d", "o_out", "out_two"];
+pub const KECCAK64_OUT_LANES: usize = 4;
+const KECCAK64_CELLS: usize = 6; // four read, then the one or two written
+pub const KECCAK64_IN: usize = KECCAK64_HEAD.len();
+pub const KECCAK64_OUT: usize = KECCAK64_IN + STATE_LANES;
+const KECCAK64_CNT: usize = KECCAK64_OUT + KECCAK64_OUT_LANES;
+const KECCAK64_CNT_BC: usize = KECCAK64_CNT + KECCAK64_CELLS;
+const KECCAK64_S_A: usize = KECCAK64_CNT_BC + 1;
+const KECCAK64_K_A: usize = KECCAK64_S_A + 1;
+const KECCAK64_K_Y: usize = KECCAK64_K_A + 1;
+const KECCAK64_WIDTH: usize = KECCAK64_K_Y + 1;
+/// The lanes of the message: the four cells' eight.
+const KECCAK64_MESSAGE_LANES: usize = 8;
+
+/// The state a 64-byte message leaves but for its own lanes: the padding's first byte in lane 8, its last at the end of
+/// the rate.
+pub fn keccak64_pad() -> [u64; STATE_LANES] {
+    const PAD_FIRST: u64 = 0x01;
+    const END_BIT: u64 = 0x80 << 56;
+    const RATE_LANES: usize = 17;
+    let mut pad = [0u64; STATE_LANES];
+    pad[KECCAK64_MESSAGE_LANES] = PAD_FIRST;
+    pad[RATE_LANES - 1] = END_BIT;
+    pad
+}
+
+/// What a padding step of each hash table outputs: the permutation of its input, zeros for KECCAK and a message of
+/// zeros for KECCAK64.
+pub fn hash_padding_outputs() -> [[u64; STATE_LANES]; 2] {
+    let mut outputs = [[0u64; STATE_LANES], keccak64_pad()];
+    outputs.iter_mut().for_each(keccak_f);
+    outputs
+}
+
+fn flushes_keccak64() -> Flushes {
+    let [pc, fp, o_a, o_b, o_c, o_d, o_out, out_two] = std::array::from_fn(|i| i);
+    let mut flushes = Flushes::default();
+    flushes.state_step(pc, fp);
+    let operands = vec![
+        col(o_a, 0),
+        col(o_b, 0),
+        col(o_c, 0),
+        col(o_d, 0),
+        col(o_out, 0),
+        col(out_two, 0),
+        col(KECCAK64_S_A, 0),
+        col(KECCAK64_K_A, 0),
+        col(KECCAK64_K_Y, 0),
+    ];
+    flushes.bytecode(pc, KECCAK64_CNT_BC, OP_KECCAK64, operands);
+    // The four cells read, two lanes each in order, then output cell 0, then output cell 1 when `out_two` is 1.
+    // The second cell holds `s_a * in_2 + k_a` in its low limb, and the fourth `in_6 + k_y`.
+    for (cell, o) in [o_a, o_b, o_c, o_d].into_iter().enumerate() {
+        let lo = col(KECCAK64_IN + 2 * cell, 0);
+        let lo = match cell {
+            1 => prod(KECCAK64_IN + 2, KECCAK64_S_A, 0) + col(KECCAK64_K_A, 0),
+            3 => lo + col(KECCAK64_K_Y, 0),
+            _ => lo,
+        };
+        let values = [lo, col(KECCAK64_IN + 2 * cell + 1, 0)];
+        flushes.memory(prod(fp, o, 0), KECCAK64_CNT + cell, &values);
+    }
+    flushes.memory_cols(prod(fp, o_out, 0), KECCAK64_CNT + 4, &[KECCAK64_OUT, KECCAK64_OUT + 1]);
+    let values = [col(KECCAK64_OUT + 2, 0), col(KECCAK64_OUT + 3, 0)];
+    flushes.memory_if(out_two, prod(fp, o_out, 1), KECCAK64_CNT + 5, &values);
+    flushes
+}
+
+/// `in_l = PAD_l` for the lanes 8 to 24 the message leaves to the padding.
+fn keccak64_constraints(columns: &[E]) -> Vec<E> {
+    let pad = keccak64_pad();
+    (KECCAK64_MESSAGE_LANES..STATE_LANES)
+        .map(|lane| columns[KECCAK64_IN + lane] + E::new(pad[lane], 0))
+        .collect()
+}
 
 #[rustfmt::skip]
 const ARITH_COLUMNS: &[&str] = &["pc", "fp", "o_a", "o_b", "o_c", "va_0", "va_1", "vb_0", "vb_1", "cnt_a", "cnt_b", "cnt_c", "cnt_bc"];
@@ -530,11 +699,15 @@ pub const KECCAK_OUT: usize = KECCAK_IN + STATE_LANES;
 pub const KECCAK_CNT: usize = KECCAK_OUT + STATE_LANES;
 const KECCAK_CNT_BC: usize = KECCAK_CNT + 2 * KECCAK_CELLS;
 
-/// The local KECCAK column riding spare slot `k` (`cpu::keccak_value` in the prover): its
-/// committed columns in local order, the ones before the value lanes then the read counts
-/// after them.
-pub const fn spare_local(k: usize) -> usize {
-    if k < KECCAK_IN { k } else { KECCAK_CNT + (k - KECCAK_IN) }
+/// The local column of hash table `half` riding spare slot `k` (`cpu::keccak_value` in the prover): the table's
+/// committed columns in local order, the ones before the value lanes then the read counts after them.
+pub const fn spare_local(half: usize, k: usize) -> usize {
+    let (head, counts) = if half == 0 {
+        (KECCAK_IN, KECCAK_CNT)
+    } else {
+        (KECCAK64_IN, KECCAK64_CNT)
+    };
+    if k < head { k } else { counts + (k - head) }
 }
 
 /// Slots of the run the committed states occupy, and the ones they leave over.
@@ -544,25 +717,46 @@ pub const QKECCAK_SPARE: usize = (1 << log2_ceil(QKECCAK_SLOTS as u64)) - QKECCA
 // of the table to put in it, distinct from the others and not one of the value lanes. It holds
 // at this depth, not at every divisor of 24, and the two sides must refuse together.
 const _: () = {
-    let mut k = 0;
-    while k < QKECCAK_SPARE {
-        let local = spare_local(k);
-        assert!(k == 0 || spare_local(k - 1) < local);
-        assert!(local < KECCAK_IN || (local >= KECCAK_CNT && local < TABLE_WIDTHS[OP_KECCAK]));
-        k += 1;
+    let mut half = 0;
+    while half < 2 {
+        let (head, counts, end) = if half == 0 {
+            (KECCAK_IN, KECCAK_CNT, TABLE_WIDTHS[OP_KECCAK])
+        } else {
+            (KECCAK64_IN, KECCAK64_CNT, TABLE_WIDTHS[OP_KECCAK64])
+        };
+        let mut k = 0;
+        while k < QKECCAK_SPARE {
+            let local = spare_local(half, k);
+            assert!(k == 0 || spare_local(half, k - 1) < local);
+            assert!(local < head || (local >= counts && local < end));
+            k += 1;
+        }
+        half += 1;
     }
 };
 
-/// The slot of `q_keccak` the global column `column` IS, if it is one: an input lane (slot =
-/// lane), or one of the KECCAK table's own columns riding a slot past the committed states.
-/// The reduction weighs nothing on those spare slots, so the stack carries those columns
-/// there rather than a block of zeros and a block of its own.
-pub fn qkeccak_slot(column: usize) -> Option<usize> {
-    let local = column.checked_sub(GLOBAL_COLUMN_BASES[OP_KECCAK])?;
-    if let Some(k) = (0..QKECCAK_SPARE).find(|&k| spare_local(k) == local) {
-        return Some(QKECCAK_SLOTS + k);
+/// The half of q_keccak (the table bit) and slot of it the global column `column` IS, if it is one: an input lane
+/// (slot = lane), or one of a hash table's own columns riding a slot past the committed states. The reduction
+/// weighs nothing on those spare slots, so the stack carries those columns there rather than a block of zeros and a
+/// block of its own.
+pub fn qkeccak_slot(column: usize) -> Option<(usize, usize)> {
+    let half = HASH_TABLES
+        .iter()
+        .position(|&t| column >= GLOBAL_COLUMN_BASES[t] && column < GLOBAL_COLUMN_BASES[t] + TABLE_WIDTHS[t])?;
+    let local = column - GLOBAL_COLUMN_BASES[HASH_TABLES[half]];
+    if let Some(k) = (0..QKECCAK_SPARE).find(|&k| spare_local(half, k) == local) {
+        return Some((half, QKECCAK_SLOTS + k));
     }
-    (KECCAK_IN..KECCAK_OUT).contains(&local).then(|| local - KECCAK_IN)
+    let in_lanes = if half == 0 { KECCAK_IN } else { KECCAK64_IN };
+    (in_lanes..in_lanes + STATE_LANES)
+        .contains(&local)
+        .then(|| (half, local - in_lanes))
+}
+
+/// Where slot `slot` of table half `half` starts in q_keccak, laid out `(step, table, slot)` over `2^log_steps` steps a
+/// table.
+pub fn qkeccak_slot_start(log_steps: usize, half: usize, slot: usize) -> u64 {
+    (((slot << TABLE_BITS) + half) as u64) << log_steps
 }
 
 fn keccak_columns() -> Vec<String> {
@@ -573,6 +767,17 @@ fn keccak_columns() -> Vec<String> {
         .chain(lanes("out"))
         .chain(counts)
         .chain(["cnt_bc".to_string()])
+        .collect()
+}
+
+fn keccak64_columns() -> Vec<String> {
+    let lanes = |prefix: &'static str, n: usize| (0..n).map(move |lane| format!("{prefix}_{lane}"));
+    let counts = (0..KECCAK64_CELLS).map(|cell| format!("cnt_{cell}"));
+    let head = KECCAK64_HEAD.iter().map(|name| name.to_string());
+    head.chain(lanes("in", STATE_LANES))
+        .chain(lanes("out", KECCAK64_OUT_LANES))
+        .chain(counts)
+        .chain(["cnt_bc", "s_a", "k_a", "k_y"].map(|name| name.to_string()))
         .collect()
 }
 
@@ -592,6 +797,28 @@ pub fn tables() -> Vec<Table> {
     for (padding, lane) in keccak.padding[KECCAK_OUT..].iter_mut().zip(output) {
         *padding = E::new(lane, 0);
     }
+    // A padding row of KECCAK64 holds the padding's lanes and permutes the state they make, with a message of zeros.
+    let mut keccak64 = table(
+        OP_KECCAK64,
+        keccak64_columns(),
+        flushes_keccak64(),
+        keccak64_constraints,
+    );
+    let pad = keccak64_pad();
+    let mut output = pad;
+    keccak_f(&mut output);
+    for (padding, lane) in keccak64.padding[KECCAK64_IN..KECCAK64_IN + STATE_LANES]
+        .iter_mut()
+        .zip(pad)
+    {
+        *padding = E::new(lane, 0);
+    }
+    for (padding, lane) in keccak64.padding[KECCAK64_OUT..KECCAK64_OUT + KECCAK64_OUT_LANES]
+        .iter_mut()
+        .zip(output)
+    {
+        *padding = E::new(lane, 0);
+    }
     vec![
         table(OP_XOR, named(ARITH_COLUMNS), flushes_arith(OP_XOR, false), |_| vec![]),
         table(OP_MUL, named(ARITH_COLUMNS), flushes_arith(OP_MUL, true), |_| vec![]),
@@ -599,6 +826,7 @@ pub fn tables() -> Vec<Table> {
         table(OP_DEREF, named(DEREF_COLUMNS), flushes_deref(), |_| vec![]),
         table(OP_JUMP, named(JUMP_COLUMNS), flushes_jump(), jump_constraints),
         keccak,
+        keccak64,
     ]
 }
 
@@ -609,6 +837,7 @@ pub const TABLE_WIDTHS: [usize; N_TABLES] = [
     DEREF_COLUMNS.len(),
     JUMP_COLUMNS.len(),
     KECCAK_CNT_BC + 1,
+    KECCAK64_WIDTH,
 ];
 pub const GLOBAL_COLUMN_BASES: [usize; N_TABLES] = {
     let mut bases = [NUM_GLOBAL_COLUMNS; N_TABLES];
@@ -621,13 +850,18 @@ pub const GLOBAL_COLUMN_BASES: [usize; N_TABLES] = {
 };
 
 /// Each table's least log height: 0, but the Keccak reduction's block of steps for KECCAK.
-pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, KECCAK_MIN_STEPS_LOG];
+pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, KECCAK_MIN_STEPS_LOG, KECCAK_MIN_STEPS_LOG];
 
+/// The reduction's shape: each hash table is completed with its padding step to the tallest's height.
 fn keccak_shape(table_log_heights: &[usize]) -> KeccakShape {
     KeccakShape {
-        log_steps: table_log_heights[OP_KECCAK],
+        log_steps: HASH_TABLES
+            .iter()
+            .map(|&t| table_log_heights[t])
+            .max()
+            .expect("hash tables"),
         depth: KECCAK_DEPTH,
-        table_bits: 0,
+        table_bits: TABLE_BITS,
     }
 }
 
@@ -639,7 +873,7 @@ fn column_kappas(tables: &[Table], log_memory: usize, log_bytecode: usize, table
         log_memory,
         log_memory,
         log_bytecode,
-        keccak.log_steps + keccak.slot_bits(),
+        keccak.log_steps + keccak.table_bits + keccak.slot_bits(),
     ];
     for table in tables {
         kappas.extend(vec![table_log_heights[table.opcode]; table.width()]);
@@ -651,10 +885,13 @@ fn column_kappas(tables: &[Table], log_memory: usize, log_bytecode: usize, table
 /// one of its slots, 2^height words, whether an input lane or a KECCAK column riding a spare slot (`qkeccak_slot`). An
 /// output lane is not committed at all, nothing ever opening it.
 fn stacked_blocks(columns: usize) -> Vec<usize> {
-    let base = GLOBAL_COLUMN_BASES[OP_KECCAK];
-    let outputs = base + KECCAK_OUT..base + KECCAK_OUT + STATE_LANES;
+    let (keccak, keccak64) = (GLOBAL_COLUMN_BASES[OP_KECCAK], GLOBAL_COLUMN_BASES[OP_KECCAK64]);
+    let outputs = [
+        keccak + KECCAK_OUT..keccak + KECCAK_OUT + STATE_LANES,
+        keccak64 + KECCAK64_OUT..keccak64 + KECCAK64_OUT + KECCAK64_OUT_LANES,
+    ];
     (0..columns)
-        .filter(|column| qkeccak_slot(*column).is_none() && !outputs.contains(column))
+        .filter(|column| qkeccak_slot(*column).is_none() && !outputs.iter().any(|range| range.contains(column)))
         .collect()
 }
 
@@ -744,33 +981,42 @@ pub fn build_layout<'a>(
             None => items.push((column, 0, kappas[column])),
         }
     }
-    let stack = |items: &[(usize, u64, usize)]| {
-        let item_kappas: Vec<usize> = items.iter().map(|&(.., kappa)| kappa).collect();
-        stack_offsets(&item_kappas)
-    };
-    let (mut item_offsets, total_log) = stack(&items);
-    let mut stack_log = MIN_STACKED_LOG.max(total_log); // Floor at the PCS minimum
-    // A truncated proof may announce q_keccak as a region instead (QT), after the other items.
-    let mut qt = None;
+    // A truncated proof may announce q_keccak as the pieces of its halves instead (QT): they are stacked like any other
+    // item, in place of the column.
+    let mut qt_pieces: Vec<(usize, u64, usize)> = Vec::new(); // (half, first row, log rows)
     if truncation.is_some_and(|t| t.qt) {
-        let tau = table_log_heights[OP_KECCAK];
-        let g_log = tau.min(tau.saturating_sub(TRUNC_D).max(MIN_PIECE_LOG));
-        let g_rows = 1u64 << g_log;
-        let c = table_rows[OP_KECCAK].max(1).div_ceil(g_rows).min(1 << (tau - g_log));
-        let others: Vec<_> = items.iter().copied().filter(|item| item.0 != QKECCAK).collect();
-        let (other_offsets, _) = stack(&others);
-        let other_words: u64 = others.iter().map(|&(.., kappa)| 1u64 << kappa).sum();
-        let offset = other_words.next_multiple_of(1 << (6 + tau));
-        let qt_log = MIN_STACKED_LOG.max(log2_ceil(offset + (1 << (6 + tau))));
-        qt = Some(Qt {
-            offset,
-            tau,
-            g_log,
-            c,
-            pad: qt_pad(),
-        });
-        (items, item_offsets, stack_log) = (others, other_offsets, qt_log);
+        items.retain(|item| item.0 != QKECCAK);
+        for (half, &table) in HASH_TABLES.iter().enumerate() {
+            for (off, b) in pieces(keccak.log_steps, table_rows[table]) {
+                qt_pieces.push((half, off, b));
+            }
+        }
     }
+    let item_count = items.len();
+    let all_kappas: Vec<usize> = items
+        .iter()
+        .map(|&(.., kappa)| kappa)
+        .chain(qt_pieces.iter().map(|&(_, _, b)| b + 6))
+        .collect();
+    let (mut item_offsets, total_log) = stack_offsets(&all_kappas);
+    let stack_log = MIN_STACKED_LOG.max(total_log); // Floor at the PCS minimum
+    let qt_offsets = item_offsets.split_off(item_count);
+    let qt = truncation.is_some_and(|t| t.qt).then(|| Qt {
+        log_steps: keccak.log_steps,
+        pieces: qt_pieces
+            .iter()
+            .zip(qt_offsets)
+            .map(|(&(half, off, b), index)| QtPiece {
+                half,
+                off,
+                placement: Placement {
+                    variables: b + 6,
+                    index,
+                },
+            })
+            .collect(),
+        pads: [qt_pad(0), qt_pad(1)],
+    });
     let mut offsets: BTreeMap<usize, u64> = BTreeMap::new();
     let mut piece_list = Vec::new();
     for (&(column, off, kappa), index) in items.iter().zip(item_offsets) {
@@ -786,12 +1032,13 @@ pub fn build_layout<'a>(
             });
         }
     }
-    if let Some(qt) = &qt {
-        offsets.insert(QKECCAK, qt.offset);
+    if qt.is_some() {
+        // The column has no placement of its own: its pieces carry it.
+        offsets.insert(QKECCAK, 0);
     }
     let placement = |(column, &kappa): (usize, &usize)| {
         let index = match qkeccak_slot(column) {
-            Some(slot) => offsets[&QKECCAK] + ((slot as u64) << kappa),
+            Some((half, slot)) => offsets[&QKECCAK] + qkeccak_slot_start(keccak.log_steps, half, slot),
             None => *offsets.get(&column)?,
         };
         Some(Placement {
@@ -824,14 +1071,17 @@ mod tests {
 
     #[test]
     fn qt_pad_is_the_state_after_the_first_rounds() {
-        let pad = qt_pad();
-        assert!(pad[..25].iter().chain(&pad[50..]).all(|&word| word == 0));
-        assert_ne!(pad[25], 0);
-        let mut state = [0u64; STATE_LANES];
-        keccak_rounds(&mut state, crate::hash::ROUNDS);
-        let mut full = [0u64; STATE_LANES];
-        keccak_f(&mut full);
-        assert_eq!(state, full);
+        let (zero, keccak64) = (qt_pad(0), qt_pad(1));
+        assert!(zero[..25].iter().chain(&zero[50..]).all(|&word| word == 0));
+        assert_ne!(zero[25], 0);
+        assert_eq!(keccak64[..25], keccak64_pad());
+        assert!(keccak64[50..].iter().all(|&word| word == 0));
+        for (half, mut state) in [[0u64; STATE_LANES], keccak64_pad()].into_iter().enumerate() {
+            keccak_rounds(&mut state, crate::hash::ROUNDS);
+            let mut full = if half == 0 { [0u64; STATE_LANES] } else { keccak64_pad() };
+            keccak_f(&mut full);
+            assert_eq!(state, full);
+        }
     }
 
     #[test]
@@ -843,49 +1093,84 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let (tau, g_log, c) = (12, 10, 2u64);
-        let mut pad = [0u64; 64];
-        pad.iter_mut().for_each(|p| *p = next());
+        // Two tables of 2^12 steps, the first with 2500 covered rows and the second with 1500: three pieces and one.
+        let (kappa, rows) = (12usize, [2500u64, 1500]);
+        let mut pads = [[0u64; 64]; 2];
+        pads.iter_mut().flatten().for_each(|p| *p = next());
+        let mut stack_pieces = Vec::new();
+        for (half, &real) in rows.iter().enumerate() {
+            for (off, b) in pieces(kappa, real) {
+                stack_pieces.push((half, off, b));
+            }
+        }
+        assert_eq!(stack_pieces.len(), 3);
+        let sizes: Vec<usize> = stack_pieces.iter().map(|&(_, _, b)| b + 6).collect();
+        let (offsets, total_log) = stack_offsets(&sizes);
         let qt = Qt {
-            offset: 0,
-            tau,
-            g_log,
-            c,
-            pad,
+            log_steps: kappa,
+            pieces: stack_pieces
+                .iter()
+                .zip(&offsets)
+                .map(|(&(half, off, b), &index)| QtPiece {
+                    half,
+                    off,
+                    placement: Placement {
+                        variables: b + 6,
+                        index,
+                    },
+                })
+                .collect(),
+            pads,
         };
-        let g = 1usize << g_log;
-        // The full layout, index step + 2^tau * slot, and the region, index steplo + g * (slot + 64 * chunk).
-        let mut full = vec![0u64; 64 << tau];
-        let mut region = vec![0u64; 64 << tau];
-        for slot in 0..64 {
-            for step in 0..1usize << tau {
-                let chunk = step / g;
-                let word = if (chunk as u64) < c { next() } else { pad[slot] };
-                full[step + (slot << tau)] = word;
-                region[step % g + g * (slot + 64 * chunk)] = if (chunk as u64) < c { word } else { 0 };
+        // The full layout, index `row + 2^kappa (table + 2 slot)`, and the stack of pieces.
+        let covered = |half: usize| qt.half_pieces(half).map(|p| p.off + (1 << p.b())).max().unwrap() as usize;
+        let mut full = vec![0u64; 128 << kappa];
+        let mut stack = vec![0u64; 1 << total_log];
+        for half in 0..2 {
+            for slot in 0..64 {
+                for row in 0..1usize << kappa {
+                    let word = if row < covered(half) { next() } else { pads[half][slot] };
+                    full[row + (((slot << 1) + half) << kappa)] = word;
+                    if let Some(p) = qt
+                        .half_pieces(half)
+                        .find(|p| (p.off as usize..p.off as usize + (1 << p.b())).contains(&row))
+                    {
+                        stack[p.placement.index as usize + (row - p.off as usize) + (slot << p.b())] = word;
+                    }
+                }
             }
         }
         let mut random = || E::new(next(), next());
-        let rho: Vec<E> = (0..6 + tau).map(|_| random()).collect();
-        let (chunk, slot) = rho[g_log..].split_at(tau - g_log);
         let at = |words: &[u64], point: &[E]| {
             let words: Vec<K> = words.iter().map(|&w| K(w)).collect();
             multilinear_eval(&words, point).unwrap()
         };
-        let rotated = qt.rotate(&rho);
-        let expected = at(&full, &rho);
-        assert_eq!(expected, at(&region, &rotated) + qt.pad_mle(slot) * qt.uncovered(chunk));
-        // A slot column at zeta: the same identity on one slot's `2^tau` words.
-        let zeta = &rho[..tau];
-        let slot_id = 7;
-        let region_point = [&zeta[..g_log], &bits(slot_id as u64, 6), &zeta[g_log..]].concat();
-        let column = at(&full[slot_id << tau..(slot_id + 1) << tau], zeta);
-        let shift = qt.uncovered(&zeta[g_log..]) * K(pad[slot_id]);
-        assert_eq!(column, at(&region, &region_point) + shift);
-        // The ring switch: bit `i` of the full layout's words at `rho` is the region's at `rotated`, less the pad's share.
-        let (_, corrected) = qt.ring_inputs(rho.clone(), (0..64).map(|i| at_bit(&full, &rho, i)).collect());
-        for (i, slice) in corrected.into_iter().enumerate() {
-            assert_eq!(slice, at_bit(&region, &rotated, i));
+        let on_stack = |parts: &[(E, Vec<E>)]| E::sum(parts.iter().map(|(scale, point)| *scale * at(&stack, point)));
+        // The reduction's output claim, at `(row, table, slot)`.
+        let rho: Vec<E> = (0..kappa + 1 + 6).map(|_| random()).collect();
+        let (parts, value) = qt.claim(QKECCAK, &rho, at(&full, &rho), total_log).unwrap();
+        assert_eq!(on_stack(&parts), value);
+        // A slot column of each table, at the rows of its own height.
+        for (half, tau, slot) in [(0, 11, 5), (1, 9, 20), (1, 12, 3)] {
+            let zeta: Vec<E> = (0..tau).map(|_| random()).collect();
+            let start = ((slot << 1) + half) << kappa;
+            let column = at(&full[start..][..1 << tau], &zeta);
+            let global =
+                GLOBAL_COLUMN_BASES[HASH_TABLES[half]] + if half == 0 { KECCAK_IN } else { KECCAK64_IN } + slot;
+            assert_eq!(qkeccak_slot(global), Some((half, slot)));
+            let (parts, value) = qt.claim(global, &zeta, column, total_log).unwrap();
+            assert_eq!(on_stack(&parts), value, "half {half} slot {slot}");
+        }
+        // The ring switch: bit `i` of the full layout's words at `rho` is the pieces' weighted slices, and the pad's share.
+        let share = qt.pad_share(&rho);
+        let split = qt.ring_split(&rho);
+        for i in 0..64 {
+            let mut sum = share[i];
+            for (piece, (point, coefficient)) in qt.pieces.iter().zip(&split) {
+                let words = &stack[piece.placement.index as usize..][..1 << piece.placement.variables];
+                sum += *coefficient * at_bit(words, point, i);
+            }
+            assert_eq!(sum, at_bit(&full, &rho, i), "bit {i}");
         }
     }
 
