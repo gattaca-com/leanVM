@@ -115,6 +115,58 @@ pub enum Op {
         out_odd: bool,
         out_cells: OutCells,
     },
+    /// `KECCAK64`: one Keccak-f\[1600\] permutation of a 64-byte message `P | A' | X | Y'`, two lanes a cell in the even
+    /// layout. `P`, `A`, `X`, `Y` are the four cells `o`, and the message differs from them in two lanes only:
+    /// `A'.lo = (A.lo + k_a) / s_a` and `Y'.lo = Y.lo + k_y`, the high lanes being the cells'. The other lanes are the
+    /// constants a 64-byte message leaves there under the padding (`verifier::layout::keccak64_pad`). It writes the
+    /// cell at `out` with output lanes 0 and 1, and with `out_two` the cell after it with lanes 2 and 3.
+    ///
+    /// With `s_a = 1`, `k_a = 0` and `k_y = 0` it equals the `KECCAK` of the same four cells with those constants in
+    /// `tail`, `b8` and `cap`, written in the even layout to one or two cells. In general it equals that after a
+    /// `MUL` and `XOR` on each of two cells, without writing the temporaries.
+    ///
+    /// `s_a` is not zero, and `s_inv` is its inverse: build the instruction with [`Op::keccak64`], which returns an
+    /// error on a zero `s_a`. The interpreter refuses an instruction where `s_a * s_inv` is not one.
+    Keccak64 {
+        o: [u32; 4],
+        out: u32,
+        out_two: bool,
+        s_a: K,
+        s_inv: K,
+        k_a: K,
+        k_y: K,
+    },
+}
+
+/// A `KECCAK64` was asked for with `s_a = 0`: it would leave `A'.lo` free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZeroScale;
+
+impl std::fmt::Display for ZeroScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a KECCAK64 scale s_a is zero")
+    }
+}
+
+impl std::error::Error for ZeroScale {}
+
+impl Op {
+    /// A `KECCAK64` with the scale `s_a` and the offsets `k_a` and `k_y`: `A'.lo = (A.lo + k_a) / s_a`,
+    /// `Y'.lo = Y.lo + k_y`. Fails for `s_a = 0`.
+    pub fn keccak64(o: [u32; 4], out: u32, out_two: bool, s_a: K, k_a: K, k_y: K) -> Result<Self, ZeroScale> {
+        if s_a == K(0) {
+            return Err(ZeroScale);
+        }
+        Ok(Self::Keccak64 {
+            o,
+            out,
+            out_two,
+            s_a,
+            s_inv: s_a.inv(),
+            k_a,
+            k_y,
+        })
+    }
 }
 
 /// How many of a `KECCAK`'s thirteen output cells it writes, from `out` on: the first, the first two (a
