@@ -144,6 +144,7 @@ fn table_spans() -> TableSpans {
 /// [`xi_form_base`]).
 fn airs<'a>(
     taus: &[usize; tables::N_TABLES],
+    rows: &[usize; tables::N_TABLES],
     bus: &leaf::BusProof,
     cols: &'a [&'a [F64]],
     spans: &[(usize, usize)],
@@ -154,13 +155,15 @@ fn airs<'a>(
     let offsets = constraints::xi_offsets(tables::tables().iter().map(|t| t.n_constraints()));
     tables::tables()
         .iter()
-        .zip(taus.iter().zip(spans))
+        .zip(spans)
         .enumerate()
-        .map(|(t, (&table, (&tau, &(start, n))))| {
+        .map(|(t, (&table, &(start, n)))| {
             let identities = table.constraint(&pows[offsets[t]..][..table.n_constraints()]);
             let bus_forms = (0..verifier::N_BUS_TREES).map(|s| bus.forms[s][t].scaled(pows[base + s]));
             constraints::Air {
-                tau,
+                tau: taus[t],
+                rows: rows[t],
+                padding: table.padding(),
                 cols: &cols[start..start + n],
                 form: leaf::BusForm::sum(bus_forms.chain([identities])),
                 public: table.public_columns().into_iter().map(|(column, _)| column).collect(),
@@ -356,7 +359,7 @@ pub fn prove(
             // batch settle the bus forms alongside the constraints.
             ps.grind(fiat_shamir::grinding_bits(n_xi_powers() as u128 - 1));
             let xi = ps.sample();
-            constraints::prove(&airs(&l.taus, &bus, &cols, &spans, xi), &bus.point, &mut ps)
+            constraints::prove(&airs(&l.taus, &l.rows, &bus, &cols, &spans, xi), &bus.point, &mut ps)
         });
         (bus, table_claims)
     };
@@ -624,6 +627,44 @@ mod tests {
         prog.push(Op::Xor { a: 0, b: 0, c: 0 }); // sentinel
         assert_eq!(prog.len(), 16);
         from_bytecode(prog, 64)
+    }
+
+    /// Every committed column holds its table's padding value in every row past the table's rows: the table
+    /// sumcheck takes those rows from [`tables::Table::padding`] and never reads them.
+    #[test]
+    fn padding_rows_hold_the_padding_values() {
+        let a = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        let pad = F128::new(primitives::hash::PAD_FIRST as u64, 0);
+        let end = F128::new(primitives::hash::END_BIT, 0x5555);
+        let programs = [
+            keccak_program(a, w(5), [pad, F128::ZERO, F128::ZERO, F128::ZERO], end),
+            partial_keccak_program(),
+            keccak64_mix_program([a, w(1), w(2), w(3)], 3, 2, true, false).0,
+            keccak64_mix_program([a, w(1), w(2), w(3)], 5, 0, false, false).0,
+        ];
+        let pi = [w(7), w(11)];
+        for program in programs {
+            let (exec, blocks) = crate::keccak::while_executing(|step| execute::execute_with(&program, &[], pi, step));
+            let exec = exec.unwrap();
+            let layout = layout_of(
+                crate::log2_strict_usize(program.prog.len()),
+                crate::log2_strict_usize(exec.mem.len()),
+                exec.trace.row_counts(),
+                pi,
+            );
+            let witness = build(&program, &exec, layout, blocks);
+            let cols = witness.columns();
+            for (t, table) in tables::tables().iter().enumerate() {
+                let (start, n) = (schema().base[t], table.n_committed_columns());
+                let (rows, padding) = (witness.layout.rows[t], table.padding());
+                for c in 0..n {
+                    assert!(
+                        cols[start + c][rows..].iter().all(|&v| v == padding[c]),
+                        "table {t} column {c}"
+                    );
+                }
+            }
+        }
     }
 
     /// A KECCAK writes the output cells its bytecode requests and no other, and the proof verifies.
