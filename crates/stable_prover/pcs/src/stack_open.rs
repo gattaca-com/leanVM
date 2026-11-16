@@ -7,11 +7,11 @@
 //!
 //! - **point claims** ([`StackClaim`]): multilinear evaluations of aligned slices of the stack, the weight
 //!   `eq(low_point, .)` on `[offset, offset + 2^|low_point|)`, which may reach past the committed lanes;
-//! - **ring-switched claims** ([`RingSwitchOpen`]): the bit slices of the slice `q_keccak` at a suffix point, each
-//!   reduced by [`crate::ring_switch`] to the claim `<q_keccak, Phi(eq(point, .))>`.
+//! - **the ring-switched claim** ([`RingSwitchOpen`]): the bit slices of `q_keccak`, or of the sum of its pieces, at
+//!   suffix points, reduced by [`crate::ring_switch`] to the claim `sum_blocks <Phi(scale * eq(point, .)), block>`.
 //!
 //! After one grind, the prover samples the ring switch's map and then one batching challenge `lambda`, of which the
-//! ring claims take the first powers and the point claims the next: the weight is `W = sum_k lambda^k W_k` (the
+//! ring claim takes the first power and the point claims the next: the weight is `W = sum_k lambda^k W_k` (the
 //! batching step of `thm:rbr`). The caller bound every claim's slices and value through the transcript already, so
 //! none is observed here. `W` stays factored (`basis`), and level 0's fold rounds run on its terms (`whir_lanes`).
 
@@ -79,17 +79,20 @@ fn flatten(claims: &[StackClaim], lambdas: &[F128]) -> (Vec<StackClaim>, Vec<F12
     (points, coefficients)
 }
 
-/// One ring-switched claim: the 64 bit slices of the block of `2^|point|` words that starts at `offset` from the
-/// [`RingSwitchOpen`]'s, at `point`. The block is aligned to its length, and is `q_keccak` or a piece of it.
+/// One block of the ring-switched claim: the weight `Phi(scale * eq(point, .))` on the block of `2^|point|` words that
+/// starts at `offset` from the [`RingSwitchOpen`]'s. The block is aligned to its length, and is `q_keccak` or a piece
+/// of it.
 #[derive(Clone, Debug)]
 pub struct RingSwitchClaim {
     pub offset: usize,
     pub point: Vec<F128>,
+    /// One for `q_keccak` whole; a piece's `c_j` for its pieces.
+    pub scale: F128,
 }
 
-/// The ring-switched claims, on blocks of the stack that lie from `offset` on. The caller sends and checks the slices
-/// itself (the Keccak reduction checks them against its last claim), so the opening only binds them to the
-/// commitment.
+/// The one ring-switched claim, `sum_blocks <Phi(scale * eq(point, .)), block> = T(slices)`, on blocks of the stack that
+/// lie from `offset` on. The caller sends and checks the slices itself (the Keccak reduction checks them against its
+/// last claim), so the opening only binds them to the commitment.
 #[derive(Clone, Debug)]
 pub struct RingSwitchOpen {
     pub offset: usize,
@@ -161,20 +164,22 @@ pub fn open(
         point_claims.iter().all(|claim| claim.fits(1 << log_n)),
         "every claim lies inside the stack"
     );
-    assert!(ring.claims.len() + point_claims.len() <= MAX_STACKED_CLAIMS);
+    // The blocks make one ring claim, so they count once.
+    let n_ring = usize::from(!ring.claims.is_empty());
+    assert!(n_ring + point_claims.len() <= MAX_STACKED_CLAIMS);
     // One grind covers the map's challenges and lambda: one verifier message.
     ps.grind(BATCH_GRINDING_BITS);
     let phi = ring_switch::coordinate_weights(&std::array::from_fn(|_| ps.sample()));
-    let lambdas = powers(ps.sample(), ring.claims.len() + point_claims.len());
-    let (ring_lambdas, point_lambdas) = lambdas.split_at(ring.claims.len());
+    let lambdas = powers(ps.sample(), n_ring + point_claims.len());
+    let (ring_lambdas, point_lambdas) = lambdas.split_at(n_ring);
     let rings: Vec<(usize, RingWeight)> = ring
         .claims
         .iter()
-        .zip(ring_lambdas)
-        .map(|(claim, &lambda)| {
+        .map(|claim| {
             let weight = RingWeight {
-                phi: phi.map(|w| lambda * w),
+                phi: phi.map(|w| ring_lambdas[0] * w),
                 point: claim.point.clone(),
+                scale: claim.scale,
             };
             (ring.offset + claim.offset, weight)
         })
@@ -190,7 +195,6 @@ pub fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ring_switch::RingFold;
     use crate::whir::{Dense, FoldChallenges, FoldRounds};
     use primitives::test_rng::Rng;
 
@@ -249,11 +253,14 @@ mod tests {
                 if offset + qkeccak_len > stack.len() {
                     continue;
                 }
+                // Two blocks of one claim, the second scaled.
+                let phi: [F128; 128] = std::array::from_fn(|_| rng.ext());
                 let rings: Vec<(usize, RingWeight)> = (0..2)
-                    .map(|_| {
+                    .map(|i| {
                         let weight = RingWeight {
-                            phi: std::array::from_fn(|_| rng.ext()),
+                            phi,
                             point: rng.ext_vec(qkeccak_vars),
+                            scale: if i == 0 { F128::ONE } else { rng.ext() },
                         };
                         (offset, weight)
                     })
@@ -295,7 +302,12 @@ mod tests {
                 // Oracle: the dense weight written out naively, one eq entry at a time.
                 let mut dense = vec![F128::ZERO; lane_block << LANE_ROUNDS];
                 for (_, ring) in &rings {
-                    RingFold::new(ring.phi, &ring.point).add_chunk(0, &mut dense[offset..offset + qkeccak_len]);
+                    for (entry, eq) in dense[offset..offset + qkeccak_len]
+                        .iter_mut()
+                        .zip(primitives::multilinear::eq_table_serial(&ring.point))
+                    {
+                        *entry += ring.apply(ring.scale * eq);
+                    }
                 }
                 for (claim, &lambda) in claims.iter().zip(&lambdas) {
                     let StackClaim::Point { offset, low_point } = claim else {

@@ -54,28 +54,6 @@ fn eq_bits(i: usize, point: &[F128]) -> F128 {
         .product()
 }
 
-/// The 64 bit slices of a block of words at a point: bit `z` of every word, as a multilinear, evaluated.
-fn slices(block: &[F64], point: &[F128]) -> Vec<F128> {
-    let eq = primitives::multilinear::eq_table(point);
-    parallel::fold_reduce(
-        block.len(),
-        || vec![F128::ZERO; 64],
-        |sums, i| {
-            let mut bits = block[i].0;
-            while bits != 0 {
-                sums[bits.trailing_zeros() as usize] += eq[i];
-                bits &= bits - 1;
-            }
-        },
-        |mut a, b| {
-            for (a, b) in a.iter_mut().zip(b) {
-                *a += b;
-            }
-            a
-        },
-    )
-}
-
 /// `q_keccak` as pieces: those of each half are items of the compact stack, after the columns'.
 struct Region {
     /// `log2` of the steps each table is completed to.
@@ -96,16 +74,6 @@ impl Region {
                 }
             })
             .product()
-    }
-
-    /// `1 + sum_j e_j`, the weight of the rows past a half's pieces.
-    fn uncovered(&self, pieces: &[Item], half: usize, zeta: &[F128]) -> F128 {
-        F128::ONE
-            + pieces
-                .iter()
-                .filter(|p| p.half == half)
-                .map(|p| self.weight(p, zeta))
-                .sum::<F128>()
     }
 
     /// Asserts that `q_keccak` holds each half's pad past its covered rows.
@@ -326,9 +294,9 @@ impl Compact {
     }
 
     /// Every claim on the full stack as a claim on the compact one, in the same order, and the ring-switched claim the
-    /// reduction leaves as the claims of `q_keccak`'s pieces, with the slices of those the verifier does not derive,
-    /// which the prover sends. `input_slices` are the reduction's slices of `q_keccak` at the ring claim's point, and
-    /// `compact` is the compact stack.
+    /// reduction leaves as one claim over `q_keccak`'s pieces: `sum_j c_j piece_j` has the reduction's slices less the
+    /// pad's share, so the claim's slices are those plus the share, and each piece weighs its block by `c_j`. Nothing is
+    /// sent, and the opening needs no slices.
     ///
     /// A claim on `q_keccak` and on an untruncated column moves with its column. A claim `C(zeta)` on a truncated
     /// column is the weighted sum `sum_j e_j * piece_j(zeta[..b_j])`, with `e_j = prod_{i >= b_j} (bit_i(off_j) ?
@@ -340,71 +308,21 @@ impl Compact {
         l: &super::Layout,
         claims: Vec<StackClaim>,
         mut ring: RingSwitchOpen,
-        input_slices: &[F128],
-        compact: &[F64],
-    ) -> (Vec<StackClaim>, RingSwitchOpen, Vec<Vec<F128>>) {
+    ) -> (Vec<StackClaim>, RingSwitchOpen) {
         let qk = l.placements[QKECCAK];
-        let mut sent = Vec::new();
         if let Some(r) = &self.region {
             let [input] = <[RingSwitchClaim; 1]>::try_from(std::mem::take(&mut ring.claims)).expect("one claim");
             let (row, rest) = input.point.split_at(r.kappa);
             let (table, slot) = rest.split_at(crate::keccak::TABLE_BITS);
-            let pieces = self.region_items();
-            // The derived piece is the largest, the first of them: its slices are the reduction's less the others'.
-            let derived = (0..pieces.len())
-                .max_by_key(|&j| (pieces[j].b, std::cmp::Reverse(j)))
-                .expect("a piece");
-            let coefficient = |piece: &Item| eq_bits(piece.half, table) * r.weight(piece, row);
-            // The pad's share of the reduction's slices: bit `i` of every pad word, weighed by its slot, half and rows.
-            let mut pad_share = vec![F128::ZERO; 64];
-            let eq_slot: Vec<F128> = (0..64).map(|s| eq_bits(s, slot)).collect();
-            for half in 0..HASH_TABLES.len() {
-                let u = eq_bits(half, table) * r.uncovered(pieces, half, row);
-                for (i, share) in pad_share.iter_mut().enumerate() {
-                    let mass: F128 = (0..64)
-                        .filter(|&s| r.pads[half][s].0 >> i & 1 == 1)
-                        .map(|s| eq_slot[s])
-                        .sum();
-                    *share += u * mass;
-                }
-            }
-            let mut slices_of: Vec<Vec<F128>> = pieces
-                .iter()
-                .enumerate()
-                .map(|(j, piece)| {
-                    if j == derived {
-                        Vec::new()
-                    } else {
-                        slices(
-                            &compact[piece.dst..][..1 << piece.log_len()],
-                            &[&row[..piece.b], slot].concat(),
-                        )
-                    }
-                })
-                .collect();
-            // The derived piece: `S = sum_j c_j s_j + pad share`.
-            let mut rest_sum: Vec<F128> = input_slices.iter().zip(&pad_share).map(|(&s, &pad)| s + pad).collect();
-            for (piece, own) in pieces.iter().zip(&slices_of) {
-                let c = coefficient(piece);
-                for (acc, &s) in rest_sum.iter_mut().zip(own) {
-                    *acc += c * s;
-                }
-            }
-            let inverse = coefficient(&pieces[derived]).inv();
-            slices_of[derived] = rest_sum.into_iter().map(|s| s * inverse).collect();
             ring.offset = 0;
-            ring.claims = pieces
+            ring.claims = self
+                .region_items()
                 .iter()
                 .map(|piece| RingSwitchClaim {
                     offset: piece.dst,
                     point: [&row[..piece.b], slot].concat(),
+                    scale: eq_bits(piece.half, table) * r.weight(piece, row),
                 })
-                .collect();
-            sent = slices_of
-                .into_iter()
-                .enumerate()
-                .filter(|&(j, _)| j != derived)
-                .map(|(_, own)| own)
                 .collect();
         } else {
             ring.offset = self.qkeccak_offset(l, ring.offset);
@@ -502,7 +420,7 @@ impl Compact {
                 )
             })
             .collect();
-        (mapped, ring, sent)
+        (mapped, ring)
     }
 }
 

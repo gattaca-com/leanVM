@@ -21,7 +21,10 @@ use std::time::Instant;
 use bench::{Plan, Timing, env_usize};
 use isa::pretty_integer;
 use pcs::{RingSwitchClaim, RingSwitchOpen, StackClaim, commit, open};
-use primitives::{field::F64, test_rng::Rng};
+use primitives::{
+    field::{F64, F128},
+    test_rng::Rng,
+};
 use verifier::MIN_LOG_INV_RATE;
 
 #[global_allocator]
@@ -57,6 +60,7 @@ fn main() {
             .map(|_| RingSwitchClaim {
                 offset: 0,
                 point: rng.ext_vec(log_n - 1),
+                scale: F128::ONE,
             })
             .collect(),
     };

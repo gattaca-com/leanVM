@@ -367,7 +367,8 @@ pub(super) fn initial_basis(
         ring_lanes.push(table(&factors[lane_vars..]));
     }
 
-    // `A(l, c) = lambda_c L_c(l)`, and a ring's `A(l, w) = Phi(b_w s(l))`.
+    // `A(l, c) = lambda_c L_c(l)`, and a ring's `A(l, w) = Phi(b_w scale s(l))`: `Phi(scale e(x) s(l))` is linear in
+    // the bits of `e(x)`, so the block's scale joins its lane weight.
     let claim_lanes: Vec<Vec<F128>> = factors.iter().map(|factors| table(&factors[lane_vars..])).collect();
     let n_terms = terms.n_terms();
     let mut a = vec![F128::ZERO; n_terms << (log_n - lane_vars)];
@@ -378,7 +379,7 @@ pub(super) fn initial_basis(
         for ((ring, (_, weight)), lanes) in terms.rings.iter().zip(rings).zip(&ring_lanes) {
             if lanes[l] != F128::ZERO {
                 for (w, term) in row[ring.first..][..DEGREE_E].iter_mut().enumerate() {
-                    *term = weight.apply(F128::from(1u128 << w) * lanes[l]);
+                    *term = weight.apply(F128::from(1u128 << w) * lanes[l] * weight.scale);
                 }
             }
         }

@@ -306,18 +306,13 @@ pub fn prove(
     let openings = crate::stage!("Keccak reduction", || {
         w.keccak_reduction.prove(&mut ps, q_keccak, &output)
     });
-    let input_slices = openings.input_slices.clone();
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
     // The reduction was the last reader of the full stack: a truncated proof opens the compact one.
     let (q, slots, ring) = match (compact.as_ref(), compact_q) {
         (Some(c), Some(compact_q)) => {
             drop(w.q);
-            let (slots, ring, sent) = c.map_claims(&w.layout, slots, ring, &input_slices, &compact_q);
-            // The slices of the pieces of `q_keccak` the verifier does not derive.
-            for slices in &sent {
-                ps.add_scalars(slices);
-            }
+            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
             (compact_q, slots, ring)
         }
         _ => (w.q, slots, ring),

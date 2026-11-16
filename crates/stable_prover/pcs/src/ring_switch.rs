@@ -85,11 +85,13 @@ pub(crate) fn transpose_s_hat(s_hat_v: &[F128; 64]) -> [F64; DEGREE_E] {
     s_hat_u
 }
 
-/// A ring claim's weight `Phi(eq(point, y))` over its suffix domain, `Phi` an F_2-linear map given by its images of
-/// the coordinate basis, the claim's batching scalar included.
+/// A ring block's weight `Phi(scale * eq(point, y))` over its suffix domain, `Phi` an F_2-linear map given by its images
+/// of the coordinate basis, the claim's batching scalar included.
 pub(crate) struct RingWeight {
     pub(crate) phi: [F128; DEGREE_E],
     pub(crate) point: Vec<F128>,
+    /// The factor on `eq(point, .)` inside `Phi`.
+    pub(crate) scale: F128,
 }
 
 impl RingWeight {
@@ -175,6 +177,7 @@ mod tests {
             let weight = RingWeight {
                 phi: std::array::from_fn(|_| rng.ext()),
                 point: rng.ext_vec(vars),
+                scale: F128::ONE,
             };
             let want: Vec<F128> = eq_table_serial(&weight.point)
                 .iter()

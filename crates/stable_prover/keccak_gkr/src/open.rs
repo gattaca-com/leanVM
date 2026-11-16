@@ -39,6 +39,7 @@ impl Openings {
             claims: vec![RingSwitchClaim {
                 offset: 0,
                 point: self.inputs,
+                scale: F128::ONE,
             }],
         };
         let outputs = self.outputs.map(|low_point| StackClaim::Point { offset, low_point });
