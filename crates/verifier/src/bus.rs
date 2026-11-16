@@ -315,7 +315,8 @@ pub fn table_sumcheck(
 
     let mut rows = Vec::with_capacity(tables.len());
     for (table, &height) in tables.iter().zip(table_log_heights) {
-        rows.push((point[..height].to_vec(), transcript.next_scalars(table.width())?));
+        let sent = transcript.next_scalars(table.sent_width())?;
+        rows.push((point[..height].to_vec(), table.with_public(sent)));
     }
     if transcript.checked() {
         let mut terminal = ZERO;

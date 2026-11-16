@@ -271,11 +271,11 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     // 1] memory log-size, table row counts, and log-inv-rate in WHIR
     let announced = transcript.next_scalars(2 + N_TABLES)?;
     // The last word is `(rate, (mem_count << 2) | flag)`. Flag 1 announces a truncated proof over `mem_count`
-    // memory cells. Flag 2 announces one whose q_keccak is a region (QT). Flag 3 is refused.
+    // memory cells. Flags 2 and 3 are refused: q_keccak is the pieces of its halves in every proof.
     let rate_word = announced[1 + N_TABLES];
     let flag = rate_word.c1 & 3;
     require(
-        announced[..1 + N_TABLES].iter().all(|value| value.c1 == 0) && flag != 3 && (flag != 0 || rate_word.c1 == 0),
+        announced[..1 + N_TABLES].iter().all(|value| value.c1 == 0) && flag < 2 && (flag != 0 || rate_word.c1 == 0),
         VerifierError::AnnouncedHighLimb,
     )?;
     let log_memory = announced[0].c0;
@@ -287,7 +287,6 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     )?;
     let truncation = (flag != 0).then_some(Truncation {
         mem_count: rate_word.c1 >> 2,
-        qt: flag == 2,
     });
     let layout = build_layout(bytecode, log_memory, &table_rows, truncation)?;
     require(
@@ -325,12 +324,20 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         &mut transcript,
     )?;
     let mut claims = bus.claims;
-    for (base, (point, values)) in GLOBAL_COLUMN_BASES.into_iter().zip(&evaluations) {
-        claims.extend(values.iter().enumerate().map(|(local, &value)| ColumnClaim {
-            column: base + local,
-            point: point.clone(),
-            value,
-        }));
+    for ((base, (point, values)), table) in GLOBAL_COLUMN_BASES.into_iter().zip(&evaluations).zip(&layout.tables) {
+        // A public column is a constant: no evaluation was sent and nothing is claimed of the stack.
+        let constant = |local: usize| table.public.iter().any(|&(public, _)| public == local);
+        claims.extend(
+            values
+                .iter()
+                .enumerate()
+                .filter(|&(local, _)| !constant(local))
+                .map(|(local, &value)| ColumnClaim {
+                    column: base + local,
+                    point: point.clone(),
+                    value,
+                }),
+        );
     }
 
     // 5] binding the public input: each memory limb's claim is that limb's public line at the challenge, which the verifier
@@ -387,40 +394,30 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         });
     }
 
-    // 7] Ring-switching. A claim is supported on q_keccak's block of the stack, so its weight carries the
-    // placement's selector; the claim leads the batch, taking the first power. A truncated q_keccak is pieces,
-    // one claim over all of them.
+    // 7] Ring-switching. q_keccak is pieces, one ring claim over all of them: `sum_j c_j piece_j` has the reduction's
+    // slices less the share of everything the pieces leave out (the row pad and the public slots), so its slices are
+    // those plus the share, and each piece weighs its block by `c_j`. Nothing is sent. The claim leads the batch,
+    // taking the first power.
     let (point, slices) = openings.inputs;
     let mut stack_claims: Vec<StackClaim> = Vec::new();
-    match &layout.qt {
-        None => {
-            let (target, weight) = ring_switch(point, &slices, &mut transcript)?;
-            let qkeccak = layout.placements[QKECCAK].expect("q_keccak is committed");
-            stack_claims.push((
-                Box::new(move |x| qkeccak.eq_above(x) * weight(&x[..qkeccak.variables])),
-                target,
-            ));
-        }
-        Some(qt) => {
-            // The pieces are one ring claim: `sum_j c_j piece_j` has the reduction's slices less the pad's share,
-            // so its slices are those plus the share, and each piece weighs its block by `c_j`. Nothing is sent.
-            let split = qt.ring_split(&point);
-            let share = qt.pad_share(&point);
-            let combined: Vec<E> = slices.iter().zip(&share).map(|(&s, &pad)| s + pad).collect();
-            let (target, weights) = ring_switch_blocks(split, &combined, &mut transcript)?;
-            let placements: Vec<_> = qt.pieces.iter().map(|piece| piece.placement).collect();
-            stack_claims.push((
-                Box::new(move |x| {
-                    E::sum(
-                        placements
-                            .iter()
-                            .zip(&weights)
-                            .map(|(placement, weight)| placement.eq_above(x) * weight(&x[..placement.variables])),
-                    )
-                }),
-                target,
-            ));
-        }
+    {
+        let qt = &layout.qt;
+        let split = qt.ring_split(&point);
+        let share = qt.pad_share(&point);
+        let combined: Vec<E> = slices.iter().zip(&share).map(|(&s, &pad)| s + pad).collect();
+        let (target, weights) = ring_switch_blocks(split, &combined, &mut transcript)?;
+        let placements: Vec<_> = qt.pieces.iter().map(|piece| piece.placement).collect();
+        stack_claims.push((
+            Box::new(move |x| {
+                E::sum(
+                    placements
+                        .iter()
+                        .zip(&weights)
+                        .map(|(placement, weight)| placement.eq_above(x) * weight(&x[..placement.variables])),
+                )
+            }),
+            target,
+        ));
     }
     stack_claims.extend(claims.iter().filter_map(|claim| claim.on_stack(&layout)));
     stack_claims.push(ood);

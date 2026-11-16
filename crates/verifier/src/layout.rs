@@ -97,11 +97,10 @@ pub const MAX_STACKED_LOG: usize = 30;
 pub const TRUNC_D: usize = 4;
 pub const MIN_PIECE_LOG: usize = 10;
 
-/// What the rate word announces of a truncated proof: its memory cells, and whether q_keccak is a region (QT).
+/// What the rate word announces of a truncated proof: its memory cells. Every proof commits q_keccak as pieces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Truncation {
     pub mem_count: u64,
-    pub qt: bool,
 }
 
 /// The pieces, `(offset in the column, log size)` by increasing offset, that commit the first `real` rows of a
@@ -131,11 +130,13 @@ pub struct Piece {
     pub placement: Placement,
 }
 
-/// One piece of the truncated q_keccak: rows `off..off + 2^b` of every slot of one table half, laid out `(row, slot)`
-/// in `2^(b + 6)` words at `placement`.
+/// One piece of q_keccak: rows `off..off + 2^b` of the slots of one slot block of one table half, laid out
+/// `(row, slot within the block)` in `2^(b + block log)` words at `placement`.
 #[derive(Clone, Debug)]
 pub struct QtPiece {
     pub half: usize,
+    /// The slot block the piece holds: its first slot, and the log of its slots.
+    pub block: (usize, usize),
     pub off: u64,
     pub placement: Placement,
 }
@@ -143,15 +144,17 @@ pub struct QtPiece {
 impl QtPiece {
     /// The piece's log rows.
     pub fn b(&self) -> usize {
-        self.placement.variables - 6
+        self.placement.variables - self.block.1
     }
 }
 
-/// The truncated q_keccak ("QT"): each table half is committed as the pieces of its covered rows, cut as a truncated
-/// column is, each piece all 64 slots of its rows. Past its covered rows a half is its public `pad`, a row of 64 words.
+/// q_keccak as pieces ("QT"): each table half is committed as the pieces of its covered rows, cut as a truncated
+/// column is, times the slot blocks of the half ([`slot_blocks`]). Past its covered rows a half is its public `pad`, a
+/// row of 64 words, in the committed slots. The slots no block holds are public constants on every row.
 pub struct Qt {
     /// `log2` of the steps each table is completed to.
     pub log_steps: usize,
+    /// By half, then slot block, then row piece.
     pub pieces: Vec<QtPiece>,
     pub pads: [[u64; 64]; 2],
 }
@@ -171,10 +174,23 @@ fn bits(value: u64, len: usize) -> Vec<E> {
     (0..len).map(|bit| E::new(value >> bit & 1, 0)).collect()
 }
 
+/// `eq` of the slot bits above a block against the slot point: the bits the block fixes, at the point's coordinates.
+fn fixed_slot_factor(block: (usize, usize), slot: &[E]) -> E {
+    (block.1..slot.len()).fold(ONE, |e, i| {
+        e * if block.0 >> i & 1 == 1 { slot[i] } else { ONE + slot[i] }
+    })
+}
+
 impl Qt {
-    /// The pieces of a half.
+    /// The pieces of a half, a slot block after another.
     fn half_pieces(&self, half: usize) -> impl Iterator<Item = &QtPiece> {
         self.pieces.iter().filter(move |piece| piece.half == half)
+    }
+
+    /// The row pieces of a half: those of its first slot block, the same in every block.
+    fn row_pieces(&self, half: usize) -> impl Iterator<Item = &QtPiece> {
+        let first = slot_blocks(half)[0];
+        self.half_pieces(half).filter(move |piece| piece.block == first)
     }
 
     /// `e_j` of a piece at the row point `zeta`: the weight of its rows in the column.
@@ -190,16 +206,28 @@ impl Qt {
 
     /// `1 + sum_j e_j`, the weight of the rows past a half's pieces.
     fn uncovered(&self, half: usize, zeta: &[E]) -> E {
-        ONE + E::sum(self.half_pieces(half).map(|piece| self.weight(piece, zeta)))
+        ONE + E::sum(self.row_pieces(half).map(|piece| self.weight(piece, zeta)))
     }
 
-    /// `sum_s pad[half][s] eq(bits(s), slot)`.
+    /// `sum_s pad[half][s] eq(bits(s), slot)` over the committed slots: the row pad of a half.
     fn pad_mle(&self, half: usize, slot: &[E]) -> E {
         E::sum(
             eq_kernel(slot)
                 .into_iter()
                 .zip(self.pads[half])
-                .map(|(eq, p)| eq * K(p)),
+                .enumerate()
+                .filter(|&(s, _)| public_slot(half, s).is_none())
+                .map(|(_, (eq, p))| eq * K(p)),
+        )
+    }
+
+    /// `sum_s const_s eq(bits(s), slot)` over the public slots of a half, the constants every row holds.
+    fn public_mle(&self, half: usize, slot: &[E]) -> E {
+        E::sum(
+            eq_kernel(slot)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(s, eq)| public_slot(half, s).map(|word| eq * K(word))),
         )
     }
 
@@ -224,11 +252,13 @@ impl Qt {
                     .iter()
                     .enumerate()
                     .fold(ONE, |eq, (bit, &x)| eq * if half >> bit & 1 == 1 { x } else { ONE + x });
-                value += eq * self.pad_mle(half, slot) * self.uncovered(half, row);
+                // The virtual column is its pieces, the row pad past them in the committed slots, and the public
+                // slots' constants on every row, whose rows' weights sum to one.
+                value += eq * (self.pad_mle(half, slot) * self.uncovered(half, row) + self.public_mle(half, slot));
                 for piece in self.half_pieces(half) {
-                    let at = [&row[..piece.b()], slot].concat();
+                    let at = [&row[..piece.b()], &slot[..piece.block.1]].concat();
                     parts.push((
-                        eq * self.weight(piece, row),
+                        eq * self.weight(piece, row) * fixed_slot_factor(piece.block, slot),
                         piece.placement.stack_point(&at, stack_log),
                     ));
                 }
@@ -236,9 +266,14 @@ impl Qt {
             value
         } else {
             let (half, slot) = qkeccak_slot(column)?;
+            // A public slot is a constant: nothing claims it.
+            public_slot(half, slot).is_none().then_some(())?;
             let row = self.extend(point);
-            for piece in self.half_pieces(half) {
-                let at = [&row[..piece.b()], &bits(slot as u64, 6)].concat();
+            let block = *slot_blocks(half)
+                .iter()
+                .find(|&&(start, log)| (start..start + (1 << log)).contains(&slot))?;
+            for piece in self.half_pieces(half).filter(|piece| piece.block == block) {
+                let at = [&row[..piece.b()], &bits((slot - block.0) as u64, block.1)].concat();
                 parts.push((self.weight(piece, &row), piece.placement.stack_point(&at, stack_log)));
             }
             value + self.uncovered(half, &row) * K(self.pads[half][slot])
@@ -258,12 +293,17 @@ impl Qt {
                 let eq = table.iter().enumerate().fold(ONE, |eq, (bit, &x)| {
                     eq * if piece.half >> bit & 1 == 1 { x } else { ONE + x }
                 });
-                ([&row[..piece.b()], slot].concat(), eq * self.weight(piece, row))
+                (
+                    [&row[..piece.b()], &slot[..piece.block.1]].concat(),
+                    eq * self.weight(piece, row) * fixed_slot_factor(piece.block, slot),
+                )
             })
             .collect()
     }
 
-    /// The bit `i` of the pad's share of the opening's slice: `sum_t eq_t sum_s pad[t][s]_i eq(bits(s), slot) (1 + sum_j e_tj)`.
+    /// The bit `i` of the pad's share of the opening's slice: `sum_t eq_t sum_s pad[t][s]_i eq(bits(s), slot) (1 + sum_j e_tj)`
+    /// over the committed slots, and `eq_t sum_s const_s_i eq(bits(s), slot)` over the public ones, which have no
+    /// row factor: the rows sum to one.
     pub fn pad_share(&self, point: &[E]) -> Vec<E> {
         let (row, rest) = point.split_at(self.log_steps);
         let (table, slot) = rest.split_at(TABLE_BITS);
@@ -276,14 +316,23 @@ impl Qt {
                 .fold(ONE, |eq, (bit, &x)| eq * if half >> bit & 1 == 1 { x } else { ONE + x });
             let u = eq * self.uncovered(half, row);
             for (i, slice) in share.iter_mut().enumerate() {
-                let mass = E::sum(
-                    eq_slot
-                        .iter()
-                        .zip(self.pads[half])
-                        .filter(|(_, p)| p >> i & 1 == 1)
-                        .map(|(e, _)| *e),
-                );
-                *slice += u * mass;
+                let mass = |public: bool| {
+                    E::sum(
+                        eq_slot
+                            .iter()
+                            .zip(self.pads[half])
+                            .enumerate()
+                            .filter(|&(s, (_, p))| {
+                                (public_slot(half, s).is_some() == public) && {
+                                    // The constant of a public slot, the pad of a committed one.
+                                    let word = public_slot(half, s).unwrap_or(p);
+                                    word >> i & 1 == 1
+                                }
+                            })
+                            .map(|(_, (e, _))| *e),
+                    )
+                };
+                *slice += u * mass(false) + eq * mass(true);
             }
         }
         share
@@ -309,14 +358,15 @@ pub struct Layout<'a> {
     pub stack_log: usize,
     pub table_log_heights: Vec<usize>,
     pub keccak: KeccakShape,
-    /// Set when a truncated proof commits q_keccak as a region (`placements[QKECCAK]` is then the region's).
-    pub qt: Option<Qt>,
+    /// q_keccak as pieces, in every proof (`placements[QKECCAK]` is the zero offset, a column with no words of its own).
+    pub qt: Qt,
 }
 
 impl Layout<'_> {
-    /// A claim on q_keccak or one of its slot columns under QT, as weighted stack points and a value; `None` otherwise.
+    /// A claim on q_keccak or one of its slot columns, as weighted stack points and a value; `None` for a column that
+    /// is not one of its slots, or a public one.
     pub fn qt_claim(&self, column: usize, point: &[E], value: E) -> Option<StackClaimParts> {
-        self.qt.as_ref()?.claim(column, point, value, self.stack_log)
+        self.qt.claim(column, point, value, self.stack_log)
     }
 }
 
@@ -408,9 +458,29 @@ pub struct Table {
     pub padding: Vec<E>, // the row a padding row holds
     pub flushes: Flushes,
     pub constraints: fn(&[E]) -> Vec<E>,
+    /// The columns that hold one constant on every row, by local index ascending: the table sumcheck sends no
+    /// evaluation of them, and a verifier takes the constant.
+    pub public: Vec<(usize, E)>,
 }
 
 impl Table {
+    /// The evaluations a table sumcheck sends: every column's but the public ones'.
+    pub fn sent_width(&self) -> usize {
+        self.width() - self.public.len()
+    }
+
+    /// A table's columns' evaluations from the ones sent, the public columns' constants in place.
+    pub fn with_public(&self, sent: Vec<E>) -> Vec<E> {
+        let mut sent = sent.into_iter();
+        let mut next_public = self.public.iter().peekable();
+        (0..self.width())
+            .map(|column| match next_public.next_if(|&&(p, _)| p == column) {
+                Some(&(_, constant)) => constant,
+                None => sent.next().expect("the sent evaluations cover the other columns"),
+            })
+            .collect()
+    }
+
     pub fn n_constraints(&self) -> usize {
         (self.constraints)(&vec![ZERO; self.width()]).len()
     }
@@ -673,12 +743,28 @@ fn flushes_keccak64() -> Flushes {
     flushes
 }
 
-/// `in_l = PAD_l` for the lanes 8 to 24 the message leaves to the padding.
+/// `in_24 = PAD_24`. Lanes 8 to 23, the rest of what the message leaves to the padding, are public constants.
 fn keccak64_constraints(columns: &[E]) -> Vec<E> {
     let pad = keccak64_pad();
-    (KECCAK64_MESSAGE_LANES..STATE_LANES)
-        .map(|lane| columns[KECCAK64_IN + lane] + E::new(pad[lane], 0))
-        .collect()
+    vec![columns[KECCAK64_IN + STATE_LANES - 1] + E::new(pad[STATE_LANES - 1], 0)]
+}
+
+/// The slots of q_keccak a `KECCAK64` row does not commit: its input lanes 8 to 23, the padding.
+pub const KECCAK64_PUBLIC_SLOTS: std::ops::Range<usize> = KECCAK64_MESSAGE_LANES..KECCAK64_MESSAGE_LANES + 16;
+
+/// The slot blocks a half of q_keccak commits, `(first slot, log slots)`, aligned cubes of the slot index: KECCAK's one
+/// block of all 64 slots, and the three of KECCAK64 that leave out the public slots 8 to 23.
+pub const fn slot_blocks(half: usize) -> &'static [(usize, usize)] {
+    if half == 0 {
+        &[(0, 6)]
+    } else {
+        &[(0, 3), (24, 3), (32, 5)]
+    }
+}
+
+/// The constant slot `slot` of table half `half` holds on every row, if it is public.
+fn public_slot(half: usize, slot: usize) -> Option<u64> {
+    (half == 1 && KECCAK64_PUBLIC_SLOTS.contains(&slot)).then(|| keccak64_pad()[slot])
 }
 
 #[rustfmt::skip]
@@ -788,6 +874,7 @@ pub fn tables() -> Vec<Table> {
         columns,
         flushes,
         constraints,
+        public: Vec::new(),
     };
     let named = |columns: &[&str]| columns.iter().map(|name| name.to_string()).collect();
     let mut keccak = table(OP_KECCAK, keccak_columns(), flushes_keccak(), |_| vec![]);
@@ -805,6 +892,9 @@ pub fn tables() -> Vec<Table> {
         keccak64_constraints,
     );
     let pad = keccak64_pad();
+    keccak64.public = KECCAK64_PUBLIC_SLOTS
+        .map(|lane| (KECCAK64_IN + lane, E::new(pad[lane], 0)))
+        .collect();
     let mut output = pad;
     keccak_f(&mut output);
     for (padding, lane) in keccak64.padding[KECCAK64_IN..KECCAK64_IN + STATE_LANES]
@@ -895,10 +985,31 @@ fn stacked_blocks(columns: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The stack of columns of these log sizes: each stacked column's offset, and its log size, floored at the PCS minimum.
-fn stack(kappas: &[usize]) -> (BTreeMap<usize, u64>, usize) {
-    let blocks = stacked_blocks(kappas.len());
-    let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();
+/// The pieces of q_keccak, as `(half, slot block, first row, log rows)`: for each half, each of its slot blocks, the row
+/// pieces covering the half's rows, cut as a truncated column is. `log_steps` is the steps each table is completed to.
+pub fn qt_piece_shapes(log_steps: usize, table_rows: &[u64]) -> Vec<(usize, (usize, usize), u64, usize)> {
+    let mut shapes = Vec::new();
+    for (half, &table) in HASH_TABLES.iter().enumerate() {
+        for &block in slot_blocks(half) {
+            for (off, b) in pieces(log_steps, table_rows[table]) {
+                shapes.push((half, block, off, b));
+            }
+        }
+    }
+    shapes
+}
+
+/// The stack of columns of these log sizes, q_keccak as the pieces of tables of `table_rows` rows: each stacked
+/// column's offset, and its log size, floored at the PCS minimum. q_keccak's column has no offset of its own.
+fn stack(kappas: &[usize], log_steps: usize, table_rows: &[u64]) -> (BTreeMap<usize, u64>, usize) {
+    let blocks: Vec<usize> = stacked_blocks(kappas.len())
+        .into_iter()
+        .filter(|&column| column != QKECCAK)
+        .collect();
+    let qt_kappas = qt_piece_shapes(log_steps, table_rows)
+        .into_iter()
+        .map(|(_, block, _, b)| b + block.1);
+    let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).chain(qt_kappas).collect();
     let (block_offsets, total_log) = stack_offsets(&block_kappas);
     (
         blocks.into_iter().zip(block_offsets).collect(),
@@ -909,13 +1020,10 @@ fn stack(kappas: &[usize]) -> (BTreeMap<usize, u64>, usize) {
 /// The stack of the smallest execution of a bytecode of `2^log_bytecode` instructions: the least memory, every table at
 /// its floor. A recursion guest, whose children are proofs of its own bytecode, need open no smaller one.
 pub fn min_execution_stacked_log(log_bytecode: usize) -> usize {
-    stack(&column_kappas(
-        &tables(),
-        MIN_LOG_MEMORY,
-        log_bytecode,
-        &TABLE_LOG_FLOORS,
-    ))
-    .1
+    let kappas = column_kappas(&tables(), MIN_LOG_MEMORY, log_bytecode, &TABLE_LOG_FLOORS);
+    let log_steps = keccak_shape(&TABLE_LOG_FLOORS).log_steps;
+    // A table at its floor is at most one block of steps, a column below the truncation's least piece: one piece each.
+    stack(&kappas, log_steps, &[0; N_TABLES]).1
 }
 
 pub fn build_layout<'a>(
@@ -981,42 +1089,36 @@ pub fn build_layout<'a>(
             None => items.push((column, 0, kappas[column])),
         }
     }
-    // A truncated proof may announce q_keccak as the pieces of its halves instead (QT): they are stacked like any other
-    // item, in place of the column.
-    let mut qt_pieces: Vec<(usize, u64, usize)> = Vec::new(); // (half, first row, log rows)
-    if truncation.is_some_and(|t| t.qt) {
-        items.retain(|item| item.0 != QKECCAK);
-        for (half, &table) in HASH_TABLES.iter().enumerate() {
-            for (off, b) in pieces(keccak.log_steps, table_rows[table]) {
-                qt_pieces.push((half, off, b));
-            }
-        }
-    }
+    // q_keccak is the pieces of its halves, each a row piece times a slot block: they are stacked like any other item, in
+    // place of the column, in the order of the halves, then the blocks, then the row pieces.
+    items.retain(|item| item.0 != QKECCAK);
+    let qt_pieces = qt_piece_shapes(keccak.log_steps, table_rows);
     let item_count = items.len();
     let all_kappas: Vec<usize> = items
         .iter()
         .map(|&(.., kappa)| kappa)
-        .chain(qt_pieces.iter().map(|&(_, _, b)| b + 6))
+        .chain(qt_pieces.iter().map(|&(_, block, _, b)| b + block.1))
         .collect();
     let (mut item_offsets, total_log) = stack_offsets(&all_kappas);
     let stack_log = MIN_STACKED_LOG.max(total_log); // Floor at the PCS minimum
     let qt_offsets = item_offsets.split_off(item_count);
-    let qt = truncation.is_some_and(|t| t.qt).then(|| Qt {
+    let qt = Qt {
         log_steps: keccak.log_steps,
         pieces: qt_pieces
             .iter()
             .zip(qt_offsets)
-            .map(|(&(half, off, b), index)| QtPiece {
+            .map(|(&(half, block, off, b), index)| QtPiece {
                 half,
+                block,
                 off,
                 placement: Placement {
-                    variables: b + 6,
+                    variables: b + block.1,
                     index,
                 },
             })
             .collect(),
         pads: [qt_pad(0), qt_pad(1)],
-    });
+    };
     let mut offsets: BTreeMap<usize, u64> = BTreeMap::new();
     let mut piece_list = Vec::new();
     for (&(column, off, kappa), index) in items.iter().zip(item_offsets) {
@@ -1032,10 +1134,8 @@ pub fn build_layout<'a>(
             });
         }
     }
-    if qt.is_some() {
-        // The column has no placement of its own: its pieces carry it.
-        offsets.insert(QKECCAK, 0);
-    }
+    // The column has no placement of its own: its pieces carry it.
+    offsets.insert(QKECCAK, 0);
     let placement = |(column, &kappa): (usize, &usize)| {
         let index = match qkeccak_slot(column) {
             Some((half, slot)) => offsets[&QKECCAK] + qkeccak_slot_start(keccak.log_steps, half, slot),
@@ -1093,104 +1193,189 @@ mod tests {
             state ^= state << 17;
             state
         };
-        // Two tables of 2^12 steps, the first with 2500 covered rows and the second with 1500: three pieces and one.
-        let (kappa, rows) = (12usize, [2500u64, 1500]);
-        let mut pads = [[0u64; 64]; 2];
-        pads.iter_mut().flatten().for_each(|p| *p = next());
-        let mut stack_pieces = Vec::new();
-        for (half, &real) in rows.iter().enumerate() {
-            for (off, b) in pieces(kappa, real) {
-                stack_pieces.push((half, off, b));
+        // Two tables of 2^12 steps. `KECCAK` has 1500 covered rows, one row piece, and `KECCAK64` 2500, two: with three slot
+        // blocks, six pieces. Then both with two row pieces, and both whole.
+        let kappa = 12usize;
+        for rows in [[1500u64, 2500], [2500, 2500], [1 << 12, 1 << 12], [700, 900]] {
+            let mut table_rows = [0u64; N_TABLES];
+            (table_rows[OP_KECCAK], table_rows[OP_KECCAK64]) = (rows[0], rows[1]);
+            let shapes = qt_piece_shapes(kappa, &table_rows);
+            let sizes: Vec<usize> = shapes.iter().map(|&(_, block, _, b)| b + block.1).collect();
+            let (offsets, total_log) = stack_offsets(&sizes);
+            // The words a half commits: 64 a covered row for KECCAK, 48 for KECCAK64.
+            for (half, per_row) in [(0, 64u64), (1, 48)] {
+                let committed: u64 = shapes
+                    .iter()
+                    .zip(&sizes)
+                    .filter(|(shape, _)| shape.0 == half)
+                    .map(|(_, &size)| 1u64 << size)
+                    .sum();
+                let covered: u64 = pieces(kappa, rows[half]).iter().map(|&(_, b)| 1u64 << b).sum();
+                assert_eq!(committed, per_row * covered, "half {half}, rows {rows:?}");
             }
-        }
-        assert_eq!(stack_pieces.len(), 3);
-        let sizes: Vec<usize> = stack_pieces.iter().map(|&(_, _, b)| b + 6).collect();
-        let (offsets, total_log) = stack_offsets(&sizes);
-        let qt = Qt {
-            log_steps: kappa,
-            pieces: stack_pieces
-                .iter()
-                .zip(&offsets)
-                .map(|(&(half, off, b), &index)| QtPiece {
-                    half,
-                    off,
-                    placement: Placement {
-                        variables: b + 6,
-                        index,
-                    },
-                })
-                .collect(),
-            pads,
-        };
-        // The full layout, index `row + 2^kappa (table + 2 slot)`, and the stack of pieces.
-        let covered = |half: usize| qt.half_pieces(half).map(|p| p.off + (1 << p.b())).max().unwrap() as usize;
-        let mut full = vec![0u64; 128 << kappa];
-        let mut stack = vec![0u64; 1 << total_log];
-        for half in 0..2 {
-            for slot in 0..64 {
-                for row in 0..1usize << kappa {
-                    let word = if row < covered(half) { next() } else { pads[half][slot] };
-                    full[row + (((slot << 1) + half) << kappa)] = word;
-                    if let Some(p) = qt
-                        .half_pieces(half)
-                        .find(|p| (p.off as usize..p.off as usize + (1 << p.b())).contains(&row))
-                    {
-                        stack[p.placement.index as usize + (row - p.off as usize) + (slot << p.b())] = word;
+            let mut pads = [[0u64; 64]; 2];
+            pads.iter_mut().flatten().for_each(|p| *p = next());
+            let qt = Qt {
+                log_steps: kappa,
+                pieces: shapes
+                    .iter()
+                    .zip(&offsets)
+                    .map(|(&(half, block, off, b), &index)| QtPiece {
+                        half,
+                        block,
+                        off,
+                        placement: Placement {
+                            variables: b + block.1,
+                            index,
+                        },
+                    })
+                    .collect(),
+                pads,
+            };
+            // The full layout, index `row + 2^kappa (table + 2 slot)`, and the stack of pieces. A public slot holds its
+            // constant on every row; another slot holds a random word on a covered row and its pad past them.
+            let covered = |half: usize| qt.row_pieces(half).map(|p| p.off + (1 << p.b())).max().unwrap() as usize;
+            let mut full = vec![0u64; 128 << kappa];
+            let mut stack = vec![0u64; 1 << total_log];
+            for half in 0..2 {
+                for slot in 0..64 {
+                    for row in 0..1usize << kappa {
+                        let word = match public_slot(half, slot) {
+                            Some(constant) => constant,
+                            None if row < covered(half) => next(),
+                            None => pads[half][slot],
+                        };
+                        full[row + (((slot << 1) + half) << kappa)] = word;
+                        let held = qt.half_pieces(half).find(|p| {
+                            (p.off as usize..p.off as usize + (1 << p.b())).contains(&row)
+                                && (p.block.0..p.block.0 + (1 << p.block.1)).contains(&slot)
+                        });
+                        match (held, public_slot(half, slot)) {
+                            (Some(p), None) => {
+                                stack[p.placement.index as usize
+                                    + (row - p.off as usize)
+                                    + ((slot - p.block.0) << p.b())] = word;
+                            }
+                            // No block holds a public slot, and no piece holds a row past the covered ones.
+                            (None, _) => {}
+                            (Some(_), Some(_)) => panic!("a block holds a public slot"),
+                        }
                     }
                 }
             }
-        }
-        let mut random = || E::new(next(), next());
-        let at = |words: &[u64], point: &[E]| {
-            let words: Vec<K> = words.iter().map(|&w| K(w)).collect();
-            multilinear_eval(&words, point).unwrap()
-        };
-        let on_stack = |parts: &[(E, Vec<E>)]| E::sum(parts.iter().map(|(scale, point)| *scale * at(&stack, point)));
-        // The reduction's output claim, at `(row, table, slot)`.
-        let rho: Vec<E> = (0..kappa + 1 + 6).map(|_| random()).collect();
-        let (parts, value) = qt.claim(QKECCAK, &rho, at(&full, &rho), total_log).unwrap();
-        assert_eq!(on_stack(&parts), value);
-        // A slot column of each table, at the rows of its own height.
-        for (half, tau, slot) in [(0, 11, 5), (1, 9, 20), (1, 12, 3)] {
-            let zeta: Vec<E> = (0..tau).map(|_| random()).collect();
-            let start = ((slot << 1) + half) << kappa;
-            let column = at(&full[start..][..1 << tau], &zeta);
-            let global =
-                GLOBAL_COLUMN_BASES[HASH_TABLES[half]] + if half == 0 { KECCAK_IN } else { KECCAK64_IN } + slot;
-            assert_eq!(qkeccak_slot(global), Some((half, slot)));
-            let (parts, value) = qt.claim(global, &zeta, column, total_log).unwrap();
-            assert_eq!(on_stack(&parts), value, "half {half} slot {slot}");
-        }
-        // The ring switch: bit `i` of the full layout's words at `rho` is the pieces' weighted slices, and the pad's share.
-        let share = qt.pad_share(&rho);
-        let split = qt.ring_split(&rho);
-        for i in 0..64 {
-            let mut sum = share[i];
-            for (piece, (point, coefficient)) in qt.pieces.iter().zip(&split) {
-                let words = &stack[piece.placement.index as usize..][..1 << piece.placement.variables];
-                sum += *coefficient * at_bit(words, point, i);
+            let mut random = || E::new(next(), next());
+            let at = |words: &[u64], point: &[E]| {
+                let words: Vec<K> = words.iter().map(|&w| K(w)).collect();
+                multilinear_eval(&words, point).unwrap()
+            };
+            let on_stack =
+                |parts: &[(E, Vec<E>)]| E::sum(parts.iter().map(|(scale, point)| *scale * at(&stack, point)));
+            // The reduction's output claim, at `(row, table, slot)`.
+            let rho: Vec<E> = (0..kappa + 1 + 6).map(|_| random()).collect();
+            let (parts, value) = qt.claim(QKECCAK, &rho, at(&full, &rho), total_log).unwrap();
+            assert_eq!(on_stack(&parts), value, "{rows:?}");
+            // A slot column of each table, at the rows of its own height: an input lane (slots 0 to 24), or a table
+            // column riding a spare slot (50 to 63), in every block that holds columns.
+            for (half, tau, slot) in [
+                (0, 11, 5),
+                (0, 12, 24),
+                (0, 12, 50),
+                (0, 10, 63),
+                (1, 9, 2),
+                (1, 12, 7),
+                (1, 12, 24),
+                (1, 10, 50),
+                (1, 12, 63),
+                (1, 11, 57),
+            ] {
+                let zeta: Vec<E> = (0..tau).map(|_| random()).collect();
+                let start = ((slot << 1) + half) << kappa;
+                let column = at(&full[start..][..1 << tau], &zeta);
+                let local = if slot < STATE_LANES {
+                    [KECCAK_IN, KECCAK64_IN][half] + slot
+                } else {
+                    spare_local(half, slot - QKECCAK_SLOTS)
+                };
+                let global = GLOBAL_COLUMN_BASES[HASH_TABLES[half]] + local;
+                assert_eq!(qkeccak_slot(global), Some((half, slot)));
+                let (parts, value) = qt.claim(global, &zeta, column, total_log).unwrap();
+                assert_eq!(on_stack(&parts), value, "{rows:?}, half {half} slot {slot}");
             }
-            assert_eq!(sum, at_bit(&full, &rho, i), "bit {i}");
-        }
-        // A verifier that took each half's pad to be the other's has a share that breaks the identity.
-        let swapped = Qt {
-            log_steps: kappa,
-            pieces: qt.pieces.clone(),
-            pads: [pads[1], pads[0]],
-        };
-        let wrong = swapped.pad_share(&rho);
-        let broken = (0..64).filter(|&i| {
-            let mut sum = wrong[i];
-            for (piece, (point, coefficient)) in qt.pieces.iter().zip(&split) {
-                let words = &stack[piece.placement.index as usize..][..1 << piece.placement.variables];
-                sum += *coefficient * at_bit(words, point, i);
+            // A public slot is a constant and nothing claims it.
+            for slot in KECCAK64_PUBLIC_SLOTS {
+                let global = GLOBAL_COLUMN_BASES[OP_KECCAK64] + KECCAK64_IN + slot;
+                assert!(qt.claim(global, &[], ZERO, total_log).is_none(), "slot {slot}");
             }
-            sum != at_bit(&full, &rho, i)
-        });
-        assert!(
-            broken.count() > 0,
-            "the pad share must depend on which half's pad it is"
-        );
+            // The ring switch: bit `i` of the full layout's words at `rho` is the pieces' weighted slices, and the
+            // share of the row pad and of the public slots.
+            let share = qt.pad_share(&rho);
+            let split = qt.ring_split(&rho);
+            let ring_sum = |share: &[E], i: usize| {
+                let mut sum = share[i];
+                for (piece, (point, coefficient)) in qt.pieces.iter().zip(&split) {
+                    let words = &stack[piece.placement.index as usize..][..1 << piece.placement.variables];
+                    sum += *coefficient * at_bit(words, point, i);
+                }
+                sum
+            };
+            for i in 0..64 {
+                assert_eq!(ring_sum(&share, i), at_bit(&full, &rho, i), "{rows:?}, bit {i}");
+            }
+            // A verifier that took each half's pad to be the other's has a share that breaks the identity.
+            let swapped = Qt {
+                log_steps: kappa,
+                pieces: qt.pieces.clone(),
+                pads: [pads[1], pads[0]],
+            };
+            let wrong = swapped.pad_share(&rho);
+            // (With every row covered there is no pad past the pieces to swap.)
+            if rows.iter().any(|&covered| covered < 1 << kappa) {
+                assert!(
+                    (0..64).any(|i| ring_sum(&wrong, i) != at_bit(&full, &rho, i)),
+                    "the pad share must depend on which half's pad it is"
+                );
+            }
+            // A share of the public slots without the table's `eq(theta, KECCAK64)` breaks it: here the share has the
+            // factor `1 + eq` of the other half in its place.
+            let (_, rest) = rho.split_at(kappa);
+            let (table, slot) = rest.split_at(TABLE_BITS);
+            let eq_keccak64 = table[0];
+            let eq_slot = eq_kernel(slot);
+            let mut no_theta = share.clone();
+            for (i, bit) in no_theta.iter_mut().enumerate() {
+                let mass = E::sum(
+                    KECCAK64_PUBLIC_SLOTS
+                        .filter(|&s| keccak64_pad()[s] >> i & 1 == 1)
+                        .map(|s| eq_slot[s]),
+                );
+                *bit += (ONE + eq_keccak64) * mass;
+            }
+            assert!(
+                (0..64).any(|i| ring_sum(&no_theta, i) != at_bit(&full, &rho, i)),
+                "the public share must carry eq(theta, KECCAK64)"
+            );
+            // Two blocks of one row piece that change places in the stack have claims that do not hold.
+            let mut shuffled = stack.clone();
+            let swap: Vec<&QtPiece> = qt
+                .pieces
+                .iter()
+                .filter(|p| p.half == 1 && p.off == 0 && (p.block == (0, 3) || p.block == (24, 3)))
+                .collect();
+            assert_eq!(swap.len(), 2);
+            let words = 1usize << swap[0].placement.variables;
+            for w in 0..words {
+                shuffled.swap(
+                    swap[0].placement.index as usize + w,
+                    swap[1].placement.index as usize + w,
+                );
+            }
+            // A claim on slot 2, which one of the blocks holds: the two stacks give it different values.
+            let zeta: Vec<E> = (0..kappa).map(|_| random()).collect();
+            let global = GLOBAL_COLUMN_BASES[OP_KECCAK64] + KECCAK64_IN + 2;
+            let (parts, _) = qt.claim(global, &zeta, ZERO, total_log).unwrap();
+            let read = |stack: &[u64]| E::sum(parts.iter().map(|(scale, point)| *scale * at(stack, point)));
+            assert_ne!(read(&stack), read(&shuffled), "swapped blocks read other slots");
+        }
     }
 
     fn at_bit(words: &[u64], point: &[E], i: usize) -> E {
