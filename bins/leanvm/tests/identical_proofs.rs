@@ -8,9 +8,9 @@
 
 use aggregation::{AggregateClaims, AggregateError, AggregateProof, OutputClaims, signers_cache};
 use experimental_lean_vm_core::ExperimentalProver;
-use isa::{Program, Prover};
+use isa::{CompiledProgram, Op, OutCells, Program, Prover};
 use stable_lean_vm_core::StableProver;
-use verifier::E;
+use verifier::{E, K};
 
 /// The proofs `P` gives, the three leaves' and, with `nodes`, the node's and the second-level node's, then why it
 /// refuses a forged signature.
@@ -83,6 +83,108 @@ fn prove<P: Prover>(
 ) -> Result<verifier::Proof, String> {
     P::init();
     P::prove(program, witness, public_input, log_inv_rate).map(|(proof, _)| proof)
+}
+
+/// A straight-line program of `keccak64` `KECCAK64` rows and `keccak` `KECCAK` rows on the same four message cells
+/// (2..6), the `KECCAK`s with the constants a 64-byte message leaves in `tail` (6..10), `b8` (10) and `cap` (11..15).
+/// Odd `KECCAK64` rows hash the message rotated by a cell, and carry the immediates `(s_a, k_a, k_y)`. The last slot is
+/// the sentinel, and `truncate` makes the proof a truncated one.
+fn keccak64_mix_program(
+    message: [E; 4],
+    (keccak64, keccak, out_two): (usize, usize, bool),
+    (s_a, k_a, k_y): (K, K, K),
+    truncate: bool,
+) -> Program {
+    let set = |o: u32, k: E| Op::Set { o, k };
+    let pad = verifier::layout::keccak64_pad();
+    let (base, kbase) = (64u32, 64 + 2 * keccak64 as u32 + 8);
+    let mut prog = Vec::new();
+    prog.extend(message.iter().enumerate().map(|(c, &m)| set(2 + c as u32, m)));
+    prog.push(set(6, E::new(pad[8], 0)));
+    prog.extend([7, 8, 9].map(|o| set(o, E::new(0, 0))));
+    prog.push(set(10, E::new(pad[16], 0x5555)));
+    prog.extend((11..15).map(|o| set(o, E::new(0, 0))));
+    prog.extend((16..20u32).enumerate().map(|(c, o)| set(o, message[(c + 1) % 4])));
+    for i in 0..keccak64 as u32 {
+        let cells = if i % 2 == 0 { [2, 3, 4, 5] } else { [16, 17, 18, 19] };
+        let (s_a, k_a, k_y) = if i % 2 == 0 {
+            (K(1), K(0), K(0))
+        } else {
+            (s_a, k_a, k_y)
+        };
+        prog.push(Op::keccak64(cells, base + 2 * i, out_two, s_a, k_a, k_y).expect("a nonzero scale"));
+    }
+    for i in 0..keccak as u32 {
+        prog.push(Op::Keccak {
+            m: [2, 3, 4, 5],
+            tail: 6,
+            b8: 10,
+            cap: 11,
+            out: kbase + 13 * i,
+            in_odd: false,
+            out_odd: false,
+            out_cells: OutCells::Two,
+        });
+    }
+    // Filler SETs, then the sentinel in the last slot.
+    let mut spare = kbase + 13 * keccak as u32 + 16;
+    let len = (prog.len() + 2).next_power_of_two();
+    while prog.len() < len - 1 {
+        prog.push(set(spare, E::new(1, 0)));
+        spare += 1;
+    }
+    prog.push(Op::Xor { a: 0, b: 0, c: 0 });
+    let mut program = Program::from(CompiledProgram {
+        prog,
+        hints: Default::default(),
+        main_frame: spare + 1,
+        fn_ranges: Vec::new(),
+        src_lines: Vec::new(),
+    });
+    program.truncate = truncate;
+    program
+}
+
+/// Programs with only `KECCAK64` rows, only `KECCAK` rows, and both at different heights, the truncated ones with
+/// `q_keccak` in pieces, and `KECCAK64` rows with immediates: both trees prove the same bytes, and they verify.
+#[test]
+fn keccak64_programs_prove_identically() {
+    let message: [E; 4] = std::array::from_fn(|i| E::new(0x1111 * (i as u64 + 1), 0x7777 * (i as u64 + 3)));
+    let public_input = [E::new(7, 0), E::new(11, 0)];
+    let plain = (K(1), K(0), K(0));
+    let shifted = (
+        K(0x1234_5678_9abc_def1),
+        K(0xfeed_face_dead_beef),
+        K(0x0bad_f00d_cafe_babe),
+    );
+    for (rows, immediates, truncate) in [
+        ((3, 0, true), plain, false),
+        ((3, 0, false), plain, false),
+        ((0, 3, true), plain, false),
+        ((3, 3, true), plain, false),
+        ((600, 20, true), plain, false),
+        ((20, 600, false), plain, false),
+        ((70_000, 40, true), plain, true),
+        ((40, 70_000, true), plain, true),
+        ((70_000, 70_000, false), plain, true),
+        ((6, 2, true), shifted, false),
+        ((600, 20, false), shifted, true),
+    ] {
+        let program = keccak64_mix_program(message, rows, immediates, truncate);
+        let what = format!(
+            "{} KECCAK64 and {} KECCAK rows, out_two {}, {immediates:?}, truncate {truncate}",
+            rows.0, rows.1, rows.2
+        );
+        let rate = 1;
+        let (experimental, stable) = (
+            prove::<ExperimentalProver>(&program, public_input, &[], rate),
+            prove::<StableProver>(&program, public_input, &[], rate),
+        );
+        let proof = stable.unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(experimental.as_ref() == Ok(&proof), "{what}: the provers disagree");
+        let bytes = verifier::Digest::from_halves(public_input[0], public_input[1]).0;
+        verifier::verify_execution(program.bytecode(), &bytes, &proof).unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
 }
 
 /// The compiler suite runs on stable alone; this runs its programs, with their annotated inputs (`# public_input:`,
