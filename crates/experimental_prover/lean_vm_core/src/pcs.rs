@@ -30,7 +30,7 @@ use primitives::field::F64;
 
 use ::pcs::ood::ood_sample;
 use ::pcs::stack_open::open_batch_mixed_whir_stacked;
-pub use ::pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim};
+pub use ::pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim, StackPart};
 use ::pcs::whir::ProverConfig;
 use ::pcs::whir::{ProverData, commit as whir_commit, config_for_rate};
 
