@@ -51,36 +51,20 @@ pub enum KeccakLane {
 /// which is `QKECCAK_SPARE` columns the stack does not have to hold twice.
 pub const QKECCAK_SPARE: usize = (1 << crate::keccak::SLOT_LOG) - crate::keccak::SLOTS;
 
+pub(crate) use verifier::HALF_COLUMNS;
+
 /// The local column of table half `half` riding spare slot `k`: the table's committed columns in local order,
 /// the ones before the value lanes, then the read counts after them. `KECCAK64`'s last count, `r_bc`, rides none:
 /// the table has one column fewer than there are spare slots.
 const fn spare_local(half: usize, k: usize) -> usize {
-    if half == crate::keccak::KECCAK_HALF {
-        if k < tables::keccakt::V_IN {
-            k
-        } else {
-            tables::keccakt::R0 + (k - tables::keccakt::V_IN)
-        }
-    } else if k < tables::keccak64::V_IN {
-        k
-    } else {
-        tables::keccak64::R0 + (k - tables::keccak64::V_IN)
-    }
-}
-
-/// The first local column of a half's table that is not a head column, the value lanes, and the end of its columns.
-const fn half_columns(half: usize) -> (usize, usize, usize) {
-    if half == crate::keccak::KECCAK_HALF {
-        (tables::keccakt::V_IN, tables::keccakt::R0, tables::keccakt::N)
-    } else {
-        (tables::keccak64::V_IN, tables::keccak64::R0, tables::keccak64::N)
-    }
+    let (head, counts, ..) = HALF_COLUMNS[half];
+    if k < head { k } else { counts + (k - head) }
 }
 
 const _: () = {
     let mut half = 0;
     while half < crate::keccak::TABLES {
-        let (head, counts, end) = half_columns(half);
+        let (head, counts, end, ..) = HALF_COLUMNS[half];
         let mut k = 0;
         while k < QKECCAK_SPARE {
             let local = spare_local(half, k);
@@ -117,16 +101,8 @@ pub fn keccak_value(col: usize) -> Option<(usize, KeccakLane)> {
     if let Some(k) = (0..QKECCAK_SPARE).find(|&k| spare_local(half, k) == local) {
         return Some((half, KeccakLane::Slot(crate::keccak::SLOTS + k)));
     }
-    let lane = if half == crate::keccak::KECCAK_HALF {
-        local.checked_sub(tables::keccakt::V_IN)?
-    } else {
-        local.checked_sub(tables::keccak64::V_IN)?
-    };
-    let outputs = if half == crate::keccak::KECCAK_HALF {
-        STATE_LANES
-    } else {
-        tables::keccak64::OUT_LANES
-    };
+    let (head, .., outputs) = HALF_COLUMNS[half];
+    let lane = local.checked_sub(head)?;
     match lane {
         0..STATE_LANES => Some((half, KeccakLane::Slot(lane))),
         _ if lane < STATE_LANES + outputs => Some((half, KeccakLane::Output(lane - STATE_LANES))),
@@ -135,7 +111,7 @@ pub fn keccak_value(col: usize) -> Option<(usize, KeccakLane)> {
 }
 
 /// `log2` of the steps the hash tables are each completed to: the tallest's height.
-pub(crate) fn hash_kappa(taus: &[usize; tables::N_TABLES]) -> usize {
+pub fn hash_kappa(taus: &[usize; tables::N_TABLES]) -> usize {
     verifier::layout::HASH_TABLES
         .iter()
         .map(|&t| taus[t])
@@ -146,7 +122,7 @@ pub(crate) fn hash_kappa(taus: &[usize; tables::N_TABLES]) -> usize {
 /// Where the slot `slot` of table half `half` starts in `q_keccak`, laid out `(step, table, slot)` over `2^kappa` steps
 /// a table: the half's slot is a run of `2^kappa` words, of which its table's first `2^tau` are its column.
 pub(crate) fn qkeccak_slot_start(kappa: usize, half: usize, slot: usize) -> usize {
-    ((slot << crate::keccak::TABLE_BITS) + half) << kappa
+    verifier::qkeccak_slot_start(kappa, half, slot) as usize
 }
 
 /// Offset a table's local flush coordinates to global column indices.

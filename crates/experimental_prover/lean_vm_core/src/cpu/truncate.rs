@@ -10,32 +10,13 @@
 //! constants on every row.
 
 use super::layout::{hash_kappa, qkeccak_slot_start};
-use super::{BYTECODE_FINAL_COUNTERS, MEMORY_FINAL_COUNTERS, ProveError, QKECCAK, schema};
-use crate::keccak::{public_slot, slot_blocks};
+use super::{BYTECODE_FINAL_COUNTERS, MEMORY_FINAL_COUNTERS, ProveError, QKECCAK, from_scalar, schema, to_scalar};
+use crate::keccak::public_slot;
 use crate::pcs::{self, RingSwitchClaim, RingSwitchOpen, StackClaim, StackPart};
 use crate::tables;
 use crate::witness::{self, Placement, StackShape};
 use primitives::field::{F64, F128};
-use primitives::hash::{PI, RC, RHO, STATE_LANES};
-
-/// A column keeps its rows to within `2^TRUNC_D` of its real count, in pieces of at least `2^MIN_PIECE_LOG` rows.
-const TRUNC_D: usize = 4;
-const MIN_PIECE_LOG: usize = 10;
-
-/// The pieces `(offset in the column, log size)`, by increasing offset, that commit the first `real` rows of
-/// a column of `2^k` rows: the prefix rounded up to a multiple of `2^max(k - TRUNC_D, MIN_PIECE_LOG)`, cut by
-/// its binary digits. A column of at most `2^MIN_PIECE_LOG` rows, or one fully covered, is one piece.
-fn pieces(k: usize, real: usize) -> impl Iterator<Item = (usize, usize)> {
-    let g_log = (k.saturating_sub(TRUNC_D)).max(MIN_PIECE_LOG).min(k);
-    let covered = (real.max(1).div_ceil(1 << g_log) << g_log).min(1 << k);
-    let mask = if k <= MIN_PIECE_LOG { 1 << k } else { covered };
-    let mut off = 0;
-    (g_log..=k).rev().filter(move |&b| mask >> b & 1 == 1).map(move |b| {
-        let piece = (off, b);
-        off += 1 << b;
-        piece
-    })
-}
+use verifier::Qt;
 
 /// One stacked piece of a column: `2^b` rows from row `off`, at `dst` in the compact stack. A piece of `q_keccak`
 /// (`col` is [`REGION`], `half` its table) holds one slot block of its rows, `block = (first slot, log slots)`:
@@ -57,161 +38,14 @@ impl Item {
     }
 }
 
-/// Keccak-f's first `n` rounds on `a`.
-pub(super) fn keccak_rounds(a: &mut [u64; STATE_LANES], n: usize) {
-    for &rc in &RC[..n] {
-        let c: [u64; 5] = std::array::from_fn(|x| a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]);
-        let mut b = [0u64; STATE_LANES];
-        for i in 0..STATE_LANES {
-            let d = c[(i % 5 + 4) % 5] ^ c[(i % 5 + 1) % 5].rotate_left(1);
-            b[PI[i]] = (a[i] ^ d).rotate_left(RHO[i]);
-        }
-        for i in 0..STATE_LANES {
-            let row = i / 5 * 5;
-            a[i] = b[i] ^ (!b[row + (i % 5 + 1) % 5] & b[row + (i % 5 + 2) % 5]);
-        }
-        a[0] ^= rc;
-    }
-}
-
-/// What a padding step of table half `half` holds in each slot of `q_keccak`: its input state in slots `0..25`, the
-/// state after the first `keccak::DEPTH` rounds on it in slots `25..50`, and zero in the others.
-pub fn qt_pad(half: usize) -> [u64; 64] {
-    let mut pad = [0u64; 64];
-    let mut state = crate::keccak::pad_inputs()[half];
-    pad[..STATE_LANES].copy_from_slice(&state);
-    keccak_rounds(&mut state, crate::keccak::DEPTH);
-    pad[STATE_LANES..2 * STATE_LANES].copy_from_slice(&state);
-    pad
-}
-
 /// The pieces' digits of a column of `2^k` rows whose first `real` rows are real: bit `j` of the result says a piece
 /// of `2^(k - j)` rows, `j = 0` being the whole column.
 pub fn piece_digits(k: usize, real: usize) -> [bool; 5] {
     let mut digits = [false; 5];
-    for (_, b) in pieces(k, real) {
+    for (_, b) in verifier::pieces(k, real as u64) {
         digits[k - b] = true;
     }
     digits
-}
-
-/// `eq(bits(i), point)`, bit 0 first.
-fn eq_bits(i: usize, point: &[F128]) -> F128 {
-    point
-        .iter()
-        .enumerate()
-        .map(|(j, &x)| if i >> j & 1 == 1 { x } else { F128::ONE + x })
-        .product()
-}
-
-/// The factor a slot block puts on a claim at slot point `slot`: `eq` of the slot bits the block fixes, at the point's
-/// coordinates above the block's own.
-fn fixed_slot_factor(block: (usize, usize), slot: &[F128]) -> F128 {
-    (block.1..slot.len())
-        .map(|i| {
-            if block.0 >> i & 1 == 1 {
-                slot[i]
-            } else {
-                F128::ONE + slot[i]
-            }
-        })
-        .product()
-}
-
-/// `q_keccak` as pieces: those of each half are items of the compact stack, after the columns'.
-struct Region {
-    /// `log2` of the steps each table is completed to.
-    kappa: usize,
-    /// What a padding step holds in each slot of each half.
-    pads: [[F64; 64]; verifier::layout::HASH_TABLES.len()],
-}
-
-impl Region {
-    /// `e_j` of a piece at the row point `zeta`: the weight of its rows in the column.
-    fn weight(&self, piece: &Item, zeta: &[F128]) -> F128 {
-        (piece.b..self.kappa)
-            .map(|i| {
-                if piece.off >> i & 1 == 1 {
-                    zeta[i]
-                } else {
-                    F128::ONE + zeta[i]
-                }
-            })
-            .product()
-    }
-
-    /// The row pieces of a half: its pieces in its first slot block, the same in every block.
-    fn row_pieces(pieces: &[Item], half: usize) -> impl Iterator<Item = &Item> {
-        let first = slot_blocks(half)[0];
-        pieces.iter().filter(move |p| p.half == half && p.block == first)
-    }
-
-    /// `1 + sum_j e_j`, the weight of the rows past a half's row pieces.
-    fn uncovered(&self, pieces: &[Item], half: usize, zeta: &[F128]) -> F128 {
-        F128::ONE
-            + Self::row_pieces(pieces, half)
-                .map(|p| self.weight(p, zeta))
-                .sum::<F128>()
-    }
-
-    /// `sum_s pad[half][s] eq(bits(s), slot)` over the committed slots: the row pad of a half.
-    fn pad_mle(&self, half: usize, slot: &[F128]) -> F128 {
-        (0..64)
-            .filter(|&s| public_slot(half, s).is_none())
-            .map(|s| F128::from(self.pads[half][s]) * eq_bits(s, slot))
-            .sum()
-    }
-
-    /// `sum_s const_s eq(bits(s), slot)` over the public slots of a half: the constants every row holds.
-    fn public_mle(&self, half: usize, slot: &[F128]) -> F128 {
-        (0..64)
-            .filter_map(|s| public_slot(half, s).map(|word| F128::from(F64(word)) * eq_bits(s, slot)))
-            .sum()
-    }
-
-    /// Asserts that `q_keccak` holds each half's pad past its covered rows in the committed slots, and the constants of
-    /// the public slots on every row.
-    fn check_pad(&self, qk: &[F64], pieces: &[Item]) {
-        for half in 0..verifier::layout::HASH_TABLES.len() {
-            let covered = pieces
-                .iter()
-                .filter(|p| p.half == half)
-                .map(|p| p.off + (1 << p.b))
-                .max()
-                .expect("a half has a piece");
-            for (s, &want) in self.pads[half].iter().enumerate() {
-                let start = qkeccak_slot_start(self.kappa, half, s);
-                let col = &qk[start..][..1 << self.kappa];
-                if let Some(constant) = public_slot(half, s) {
-                    assert!(
-                        col.iter().all(|&x| x.0 == constant),
-                        "q_keccak half {half} slot {s} is public and is not its constant {constant:x}"
-                    );
-                    continue;
-                }
-                if covered == 1 << self.kappa {
-                    continue;
-                }
-                assert!(
-                    col[col.len() - 1] == want && col[covered] == want,
-                    "q_keccak half {half} slot {s} does not end in the pad: held {:x} and {:x}, expected {:x}",
-                    col[covered].0,
-                    col[col.len() - 1].0,
-                    want.0
-                );
-                debug_assert!(
-                    col[covered..].iter().all(|&x| x == want),
-                    "half {half} slot {s} has data past the pad"
-                );
-            }
-        }
-    }
-}
-
-/// Test-only: how a forging prover maps its claims (see `forge`).
-#[cfg(test)]
-fn public_share_without_theta() -> bool {
-    matches!(super::forge::current(), Some(super::forge::Forge::PublicShareNoTheta))
 }
 
 /// The compact stack's layout: the items of every committed column, in increasing column then offset, then those of
@@ -225,7 +59,8 @@ pub(super) struct Compact {
     pub(super) shape: StackShape,
     /// Words the items occupy.
     pub(super) placed: usize,
-    region: Region,
+    /// `q_keccak`'s items as the verifier's pieces, at their offsets in this stack.
+    pub(super) qt: Qt,
     /// The memory cells the memory columns' pieces cover.
     mem_count: usize,
     /// Whether the memory and the table columns are cut: the rate word announces it.
@@ -254,14 +89,18 @@ impl Compact {
                     .find(|&t| c >= sch.base[t])
                     .expect("a table column")]
             };
-            items.extend(pieces(p.n_vars, real).map(|(off, b)| Item {
-                col: c,
-                half: 0,
-                block: (0, 0),
-                off,
-                b,
-                dst: 0,
-            }));
+            items.extend(
+                verifier::pieces(p.n_vars, real as u64)
+                    .into_iter()
+                    .map(|(off, b)| Item {
+                        col: c,
+                        half: 0,
+                        block: (0, 0),
+                        off: off as usize,
+                        b,
+                        dst: 0,
+                    }),
+            );
         }
         starts.push(items.len());
         let n_columns = items.len();
@@ -272,18 +111,15 @@ impl Compact {
             "q_keccak is 64 slots of each hash table"
         );
         // `q_keccak`: for each half, each of its slot blocks, the row pieces covering the half's rows.
-        for (half, &table) in verifier::layout::HASH_TABLES.iter().enumerate() {
-            for &block in slot_blocks(half) {
-                items.extend(pieces(kappa, l.rows[table]).map(|(off, b)| Item {
-                    col: REGION,
-                    half,
-                    block,
-                    off,
-                    b,
-                    dst: 0,
-                }));
-            }
-        }
+        let shapes = verifier::qt_piece_shapes(kappa, &l.rows.map(|rows| rows as u64));
+        items.extend(shapes.iter().map(|&(half, block, off, b)| Item {
+            col: REGION,
+            half,
+            block,
+            off: off as usize,
+            b,
+            dst: 0,
+        }));
         let kappas: Vec<Option<usize>> = items.iter().map(|it| Some(it.log_len())).collect();
         let (placements, shape) = witness::placements_of(&kappas);
         for (it, p) in items.iter_mut().zip(&placements) {
@@ -295,14 +131,14 @@ impl Compact {
                 log_committed: shape.mu,
             });
         }
-        let pads = [0, 1].map(|half| qt_pad(half).map(F64));
+        let offsets = items[n_columns..].iter().map(|it| it.dst as u64).collect();
         Ok(Self {
+            qt: Qt::new(kappa, &shapes, offsets),
             items,
             starts,
             n_columns,
             shape,
             placed,
-            region: Region { kappa, pads },
             mem_count: mem_used,
             truncated,
         })
@@ -334,62 +170,6 @@ impl Compact {
         &self.items[self.n_columns..]
     }
 
-    /// Test-only forgery: flips the first word of `q_keccak`'s second piece in the compact stack `q`.
-    #[cfg(test)]
-    pub(super) fn flip_piece_word(&self, q: &mut [F64]) {
-        let piece = self.region_items().get(1).expect("q_keccak has a second piece");
-        q[piece.dst].0 ^= 1;
-    }
-
-    /// Test-only forgery: flips the first word of the first row piece of `KECCAK64`'s slot block `block` in the compact
-    /// stack `q`.
-    #[cfg(test)]
-    pub(super) fn flip_block_word(&self, q: &mut [F64], block: (usize, usize)) {
-        let piece = self
-            .region_items()
-            .iter()
-            .find(|it| it.half == crate::keccak::KECCAK64_HALF && it.block == block)
-            .expect("KECCAK64 has a piece of the block");
-        q[piece.dst].0 ^= 1;
-    }
-
-    /// Test-only forgery: the blocks `[0, 8)` and `[24, 32)` of the first row piece of `KECCAK64` change places in the
-    /// compact stack `q`: two windows of one size.
-    #[cfg(test)]
-    pub(super) fn swap_blocks(&self, q: &mut [F64]) {
-        let keccak64 = || {
-            self.region_items()
-                .iter()
-                .filter(|it| it.half == crate::keccak::KECCAK64_HALF)
-        };
-        let first_piece = keccak64().next().expect("KECCAK64 has a piece").off;
-        let [a, b] = [(0, 3), (24, 3)].map(|block| {
-            keccak64()
-                .find(|it| it.block == block && it.off == first_piece)
-                .expect("a block of the first row piece")
-        });
-        assert_eq!(a.b, b.b);
-        for i in 0..1usize << (a.b + 3) {
-            q.swap(a.dst + i, b.dst + i);
-        }
-    }
-
-    /// Test-only forgery: the block `[24, 32)` of the first row piece of `KECCAK64` starts with the second row piece's.
-    #[cfg(test)]
-    pub(super) fn borrow_block(&self, q: &mut [F64]) {
-        let block = |n: usize| {
-            self.region_items()
-                .iter()
-                .filter(|it| it.half == crate::keccak::KECCAK64_HALF && it.block == (24, 3))
-                .nth(n)
-                .expect("KECCAK64 has two row pieces")
-        };
-        let (own, other) = (block(0), block(1));
-        for i in 0..1usize << (other.b + 3) {
-            q[own.dst + i] = q[other.dst + i];
-        }
-    }
-
     /// The public value of a truncated column past its prefix.
     fn pad(c: usize) -> F64 {
         if c == MEMORY_FINAL_COUNTERS {
@@ -400,23 +180,27 @@ impl Compact {
     }
 
     /// The compact stack: each item copied from the full stack `q`, the tail zero.
-    /// Asserts first that every truncated column holds its pad past the prefix.
+    /// Asserts first that every truncated column holds its pad past the prefix, and so does each slot of `q_keccak`, a
+    /// column of `2^kappa` rows: its half's pad past the half's covered rows, or a public slot's constant on all rows.
     pub(super) fn copy(&self, q: &[F64], l: &super::Layout) -> Vec<F64> {
+        let check = |words: &[F64], end: usize, pad: F64, what: std::fmt::Arguments| {
+            if end < words.len() {
+                assert!(
+                    words[end] == pad && words[words.len() - 1] == pad,
+                    "{what} is not its pad past row {end}"
+                );
+                debug_assert!(words[end..].iter().all(|&x| x == pad), "{what} has data past row {end}");
+            }
+        };
         for (c, p) in l.placements.iter().enumerate() {
             let Some(last) = self.column(c).last() else { continue };
-            let end = last.off + (1 << last.b);
-            if end < 1 << p.n_vars {
-                let column = &q[p.offset..][..1 << p.n_vars];
-                let pad = Self::pad(c);
-                assert!(
-                    column[end] == pad && column[column.len() - 1] == pad,
-                    "column {c} is not its pad past row {end}"
-                );
-                debug_assert!(
-                    column[end..].iter().all(|&x| x == pad),
-                    "column {c} has data past row {end}"
-                );
-            }
+            let column = &q[p.offset..][..1 << p.n_vars];
+            check(
+                column,
+                last.off + (1 << last.b),
+                Self::pad(c),
+                format_args!("column {c}"),
+            );
         }
         let qk = l.placements[QKECCAK];
         let qk_words = &q[qk.offset..][..1 << qk.n_vars];
@@ -425,8 +209,23 @@ impl Compact {
         let checks = !super::forge::active();
         #[cfg(not(test))]
         let checks = true;
+        let kappa = self.qt.log_steps;
         if checks {
-            self.region.check_pad(qk_words, self.region_items());
+            for (half, pads) in self.qt.pads.iter().enumerate() {
+                let items = self.region_items().iter().filter(|it| it.half == half);
+                let covered = items.map(|it| it.off + (1 << it.b)).max().expect("a half has a piece");
+                for (s, &pad) in pads.iter().enumerate() {
+                    let words = &qk_words[qkeccak_slot_start(kappa, half, s)..][..1 << kappa];
+                    match public_slot(half, s) {
+                        // The verifier fills a public slot in itself, so every row is checked, in release too.
+                        Some(constant) => assert!(
+                            words.iter().all(|&x| x.0 == constant),
+                            "q_keccak half {half} slot {s} is public and is not its constant {constant:x}"
+                        ),
+                        None => check(words, covered, F64(pad), format_args!("q_keccak half {half} slot {s}")),
+                    }
+                }
+            }
         }
         let placements: Vec<Placement> = self
             .items
@@ -442,7 +241,6 @@ impl Compact {
         for (it, window) in self.items.iter().zip(witness::split_stack(&mut compact, &placements)) {
             if it.col == REGION {
                 // Slot `j` of the piece's block, for its rows: `2^b` words, at `j * 2^b` of the piece.
-                let kappa = self.region.kappa;
                 parallel::chunks_mut(window, 1 << it.b, |j, dst| {
                     let src = &qk_words[qkeccak_slot_start(kappa, it.half, it.block.0 + j) + it.off..][..dst.len()];
                     // The fence lands when the stream drops, before this task returns.
@@ -476,44 +274,20 @@ impl Compact {
         mut ring: RingSwitchOpen,
     ) -> (Vec<StackClaim>, RingSwitchOpen) {
         let qk = l.placements[QKECCAK];
-        let r = &self.region;
-        let pieces = self.region_items();
+        let qt = &self.qt;
+        let kappa = qt.log_steps;
         let [input] = <[RingSwitchClaim; 1]>::try_from(std::mem::take(&mut ring.claims)).expect("one claim");
-        let (row, rest) = input.suffix_point.split_at(r.kappa);
-        let (table, slot) = rest.split_at(crate::keccak::TABLE_BITS);
-        // The share of what the pieces leave out: the row pad of each half in its committed slots, and the public
-        // slots' constants of `KECCAK64`, which have no row factor because the rows' weights sum to one.
-        let mut pads = vec![F128::ZERO; 64];
-        let eq_slot: Vec<F128> = (0..64).map(|s| eq_bits(s, slot)).collect();
-        for half in 0..verifier::layout::HASH_TABLES.len() {
-            let eq = eq_bits(half, table);
-            let u = eq * r.uncovered(pieces, half, row);
-            for (i, pad) in pads.iter_mut().enumerate() {
-                let bit = |s: usize| r.pads[half][s].0 >> i & 1 == 1;
-                let committed: F128 = (0..64)
-                    .filter(|&s| public_slot(half, s).is_none() && bit(s))
-                    .map(|s| eq_slot[s])
-                    .sum();
-                let public: F128 = (0..64)
-                    .filter(|&s| public_slot(half, s).is_some_and(|word| word >> i & 1 == 1))
-                    .map(|s| eq_slot[s])
-                    .sum();
-                // Test-only forgery: the public share without the table's `eq`.
-                #[cfg(test)]
-                let eq = if public_share_without_theta() { F128::ONE } else { eq };
-                *pad += u * committed + eq * public;
-            }
-        }
+        let point: Vec<_> = input.suffix_point.iter().map(to_scalar).collect();
         // `S' = S + pad share` (the field has characteristic 2) is `sum_j c_j s_j`, `s_j` the slices of piece `j`.
         let slices = ring.s_hat_v.take().expect("the reduction sends its slices");
-        ring.s_hat_v = Some(slices.iter().zip(&pads).map(|(&s, &pad)| s + pad).collect());
+        let share = qt.pad_share(&point).into_iter().map(from_scalar);
+        ring.s_hat_v = Some(slices.iter().zip(share).map(|(&s, pad)| s + pad).collect());
         ring.offset = 0;
-        ring.claims = pieces
-            .iter()
-            .map(|piece| RingSwitchClaim {
-                offset: piece.dst,
-                suffix_point: [&row[..piece.b], &slot[..piece.block.1]].concat(),
-                scale: eq_bits(piece.half, table) * r.weight(piece, row) * fixed_slot_factor(piece.block, slot),
+        ring.claims = (qt.pieces.iter().zip(qt.ring_split(&point)))
+            .map(|(piece, (suffix_point, scale))| RingSwitchClaim {
+                offset: piece.placement.index as usize,
+                suffix_point: suffix_point.into_iter().map(from_scalar).collect(),
+                scale: from_scalar(scale),
             })
             .collect();
         let mapped = claims
@@ -528,58 +302,31 @@ impl Compact {
                     unreachable!("the prover builds Point claims")
                 };
                 if (qk.offset..qk.offset + (1 << qk.n_vars)).contains(&offset) {
-                    let mut parts = Vec::new();
-                    let mut value = value;
-                    if zeta.len() <= r.kappa {
+                    let (zeta, value) = (zeta.iter().map(to_scalar).collect::<Vec<_>>(), to_scalar(&value));
+                    let (parts, value) = if zeta.len() <= kappa {
                         // A slot claim: the slot's column of its half, at the rows of its table, on the pieces of
                         // the slot's block.
                         let rel = offset - qk.offset;
-                        let (half, slot) = ((rel >> r.kappa) & (crate::keccak::TABLES - 1), rel >> (r.kappa + 1));
-                        let block = *slot_blocks(half)
-                            .iter()
-                            .find(|&&(start, log)| (start..start + (1 << log)).contains(&slot))
-                            .expect("a claim on a committed slot");
-                        let mut row = zeta;
-                        row.resize(r.kappa, F128::ZERO);
-                        let bits: Vec<F128> = (0..block.1)
-                            .map(|j| {
-                                if (slot - block.0) >> j & 1 == 1 {
-                                    F128::ONE
-                                } else {
-                                    F128::ZERO
-                                }
-                            })
-                            .collect();
-                        for piece in pieces.iter().filter(|p| p.half == half && p.block == block) {
-                            parts.push(StackPart {
-                                offset: piece.dst,
-                                low_point: [&row[..piece.b], &bits[..]].concat(),
-                                scale: r.weight(piece, &row),
-                            });
-                        }
-                        value += F128::from(r.pads[half][slot]) * r.uncovered(pieces, half, &row);
+                        let (half, slot) = ((rel >> kappa) & (crate::keccak::TABLES - 1), rel >> (kappa + 1));
+                        qt.slot_claim(half, slot, &zeta, value)
+                            .expect("a claim on a committed slot")
                     } else {
                         // The Keccak output claim, at the whole of `q_keccak`.
                         assert!(
-                            offset == qk.offset && zeta.len() == r.kappa + crate::keccak::TABLE_BITS + 6,
+                            offset == qk.offset && zeta.len() == kappa + crate::keccak::TABLE_BITS + 6,
                             "the output claim covers q_keccak"
                         );
-                        let (row, rest) = zeta.split_at(r.kappa);
-                        let (table, slot) = rest.split_at(crate::keccak::TABLE_BITS);
-                        for half in 0..verifier::layout::HASH_TABLES.len() {
-                            let eq = eq_bits(half, table);
-                            value += eq
-                                * (r.pad_mle(half, slot) * r.uncovered(pieces, half, row) + r.public_mle(half, slot));
-                            for piece in pieces.iter().filter(|p| p.half == half) {
-                                parts.push(StackPart {
-                                    offset: piece.dst,
-                                    low_point: [&row[..piece.b], &slot[..piece.block.1]].concat(),
-                                    scale: eq * r.weight(piece, row) * fixed_slot_factor(piece.block, slot),
-                                });
-                            }
-                        }
-                    }
-                    return StackClaim::Sum { value, parts };
+                        qt.output_claim(&zeta, value)
+                    };
+                    let part = |(piece, at, scale): (&verifier::QtPiece, Vec<_>, _)| StackPart {
+                        offset: piece.placement.index as usize,
+                        low_point: at.into_iter().map(from_scalar).collect(),
+                        scale: from_scalar(scale),
+                    };
+                    return StackClaim::Sum {
+                        value: from_scalar(value),
+                        parts: parts.into_iter().map(part).collect(),
+                    };
                 }
                 let c = l
                     .placements
@@ -652,16 +399,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rounds_match_the_permutation() {
-        let mut rng = Rng::new(7);
-        let mut a: [u64; STATE_LANES] = std::array::from_fn(|_| rng.next_u64());
-        let mut expected = a;
-        keccak_rounds(&mut a, primitives::hash::ROUNDS);
-        primitives::hash::keccak_f(&mut expected);
-        assert_eq!(a, expected);
-    }
-
     /// The compact stack has exactly the committed lanes' words, and holds the full stack's pieces: each item of a
     /// column, each piece of `q_keccak` slot by slot over its block, then zeros. A `KECCAK64` half commits 48 words a covered
     /// row.
@@ -700,12 +437,11 @@ mod tests {
                     words.iter_mut().for_each(|w| *w = F64(rng.next_u64()));
                 }
                 let qk = layout.placements[QKECCAK];
-                let r = &compact.region;
+                let kappa = compact.qt.log_steps;
                 for half in 0..verifier::layout::HASH_TABLES.len() {
-                    for (s, &pad) in r.pads[half].iter().enumerate() {
-                        let start = qk.offset + qkeccak_slot_start(r.kappa, half, s);
-                        let word = public_slot(half, s).map_or(pad, F64);
-                        q[start..][..1 << r.kappa].fill(word);
+                    for (s, &pad) in compact.qt.pads[half].iter().enumerate() {
+                        let start = qk.offset + qkeccak_slot_start(kappa, half, s);
+                        q[start..][..1 << kappa].fill(public_slot(half, s).map_or(F64(pad), F64));
                     }
                 }
                 for it in compact.region_items() {
@@ -713,7 +449,7 @@ mod tests {
                         if public_slot(it.half, s).is_some() {
                             continue;
                         }
-                        let start = qk.offset + qkeccak_slot_start(r.kappa, it.half, s) + it.off;
+                        let start = qk.offset + qkeccak_slot_start(kappa, it.half, s) + it.off;
                         q[start..][..1 << it.b]
                             .iter_mut()
                             .for_each(|w| *w = F64(rng.next_u64()));
@@ -725,7 +461,7 @@ mod tests {
                 for it in &compact.items {
                     if it.col == REGION {
                         for j in 0..1 << it.block.1 {
-                            let src = &q[qk.offset + qkeccak_slot_start(r.kappa, it.half, it.block.0 + j) + it.off..]
+                            let src = &q[qk.offset + qkeccak_slot_start(kappa, it.half, it.block.0 + j) + it.off..]
                                 [..1 << it.b];
                             let dst = &stack[it.dst + (j << it.b)..][..1 << it.b];
                             assert!(
@@ -755,7 +491,9 @@ mod tests {
                         .sum::<usize>()
                 };
                 let covered = |half: usize| {
-                    Region::row_pieces(compact.region_items(), half)
+                    let first = crate::keccak::slot_blocks(half)[0];
+                    (compact.region_items().iter())
+                        .filter(|it| it.half == half && it.block == first)
                         .map(|it| 1usize << it.b)
                         .sum::<usize>()
                 };
@@ -770,50 +508,5 @@ mod tests {
                 assert_eq!(compact.announced().is_some(), truncated);
             }
         }
-    }
-
-    #[test]
-    fn pieces_follow_the_verifier_rule() {
-        let cut = |k, real| pieces(k, real).collect::<Vec<_>>();
-        assert_eq!(cut(19, 280940), [(0, 18), (262144, 15)]);
-        assert_eq!(cut(22, 2374000), [(0, 21), (2097152, 19)]);
-        assert_eq!(cut(10, 5), [(0, 10)]);
-        assert_eq!(cut(7, 5), [(0, 7)]);
-        assert_eq!(cut(19, 1 << 19), [(0, 19)]);
-        assert_eq!(cut(19, 0), [(0, 15)]);
-    }
-
-    /// The pad of a half is its padding step: the state it permutes in slots `0..25`, the middle state next.
-    #[test]
-    fn qt_pad_is_the_padding_step() {
-        let [zero, keccak64] = [qt_pad(0), qt_pad(1)];
-        assert!(zero[..25].iter().chain(&zero[50..]).all(|&w| w == 0));
-        assert_ne!(zero[25], 0);
-        assert_eq!(keccak64[..25], crate::keccak::keccak64_pad());
-        assert!(keccak64[50..].iter().all(|&w| w == 0));
-    }
-
-    /// The slot blocks tile the committed slots of a half and leave out the public ones of `KECCAK64` alone.
-    #[test]
-    fn slot_blocks_leave_out_exactly_the_public_slots() {
-        for half in 0..verifier::layout::HASH_TABLES.len() {
-            let mut held = [false; 64];
-            for &(start, log) in slot_blocks(half) {
-                assert_eq!(start % (1 << log), 0, "a block is an aligned cube of the slot index");
-                for s in start..start + (1 << log) {
-                    assert!(!held[s], "slot {s} is in two blocks");
-                    held[s] = true;
-                }
-            }
-            for (s, &in_a_block) in held.iter().enumerate() {
-                assert_eq!(in_a_block, public_slot(half, s).is_none(), "half {half} slot {s}");
-            }
-        }
-        // The public slots are the padding of lanes 8 to 23, whose values `keccak64_pad` fixes.
-        let pad = crate::keccak::keccak64_pad();
-        for s in crate::keccak::KECCAK64_PUBLIC_SLOTS {
-            assert_eq!(public_slot(crate::keccak::KECCAK64_HALF, s), Some(pad[s]));
-        }
-        assert_eq!(crate::keccak::KECCAK64_PUBLIC_SLOTS.len(), 16);
     }
 }

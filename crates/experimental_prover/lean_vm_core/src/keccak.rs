@@ -25,8 +25,8 @@ use verifier::layout::keccak_cell_lanes;
 
 /// Rounds between two committed states.
 pub const DEPTH: usize = 12;
-/// `log2` of the tables the reduction proves together: `KECCAK` is half 0 of the committed column, `KECCAK64` half 1.
-pub const TABLE_BITS: usize = 1;
+/// The layout's constants the verifier owns: `KECCAK` is half 0 of the committed column, `KECCAK64` half 1.
+pub use verifier::{KECCAK64_PUBLIC_SLOTS, TABLE_BITS, keccak64_pad, public_slot, slot_blocks};
 /// The tables the reduction proves together.
 pub const TABLES: usize = 1 << TABLE_BITS;
 /// The half of the committed column, and the table bit, of `KECCAK` and of `KECCAK64`.
@@ -63,35 +63,6 @@ pub fn qkeccak_log(kappa: usize) -> usize {
 
 /// Cells one `KECCAK64` row flushes: four read, then the one or two written (the second cancelled when it is not).
 pub const KECCAK64_ROW_CELLS: usize = 6;
-
-/// The state a 64-byte message leaves, but for the message's own eight lanes: the padding's first byte in lane 8
-/// and its last in lane 16, the end of the rate. A `KECCAK64` row holds these in lanes 8 to 24.
-pub fn keccak64_pad() -> [u64; STATE_LANES] {
-    let mut pad = [0; STATE_LANES];
-    pad[8] = u64::from(primitives::hash::PAD_FIRST);
-    pad[primitives::hash::RATE / 8 - 1] = primitives::hash::END_BIT;
-    pad
-}
-
-/// The slots of `q_keccak` a `KECCAK64` row does not commit: lanes 8 to 23 of its input state hold the padding on every row,
-/// executed or not. They are public constants, [`keccak64_pad`]'s.
-pub const KECCAK64_PUBLIC_SLOTS: std::ops::Range<usize> = 8..24;
-
-/// The slot blocks a half of `q_keccak` commits, `(first slot, log slots)`, each an aligned cube of the slot index. A
-/// piece of a half is a row piece times a block. `KECCAK` commits all 64 slots in one block. `KECCAK64` leaves out the public
-/// slots 8 to 23: slots 0 to 7, 24 to 31 (lane 24 and the middle state's first seven lanes), and 32 to 63.
-pub const fn slot_blocks(half: usize) -> &'static [(usize, usize)] {
-    if half == KECCAK_HALF {
-        &[(0, 6)]
-    } else {
-        &[(0, 3), (24, 3), (32, 5)]
-    }
-}
-
-/// The constant slot `slot` of a half holds on every row, if it is public.
-pub fn public_slot(half: usize, slot: usize) -> Option<u64> {
-    (half == KECCAK64_HALF && KECCAK64_PUBLIC_SLOTS.contains(&slot)).then(|| keccak64_pad()[slot])
-}
 
 /// The input every padding step of each table holds: zeros for `KECCAK`, a message of zeros for `KECCAK64`.
 pub fn pad_inputs() -> [[u64; STATE_LANES]; TABLES] {
@@ -346,6 +317,31 @@ mod tests {
 
     fn f(x: u64) -> F64 {
         F64(x)
+    }
+
+    /// The constants and rounds the prover takes from the verifier are the prover's own.
+    #[test]
+    fn the_verifier_layout_is_the_provers() {
+        use crate::tables::{keccak64 as th, keccakt as kt};
+        use verifier::layout::{HASH_TABLES, OP_KECCAK, OP_KECCAK64};
+        assert_eq!(HASH_TABLES, [OP_KECCAK, OP_KECCAK64]);
+        assert_eq!(
+            verifier::HALF_COLUMNS,
+            [
+                (kt::V_IN, kt::R0, kt::N, kt::V_OUT, STATE_LANES),
+                (th::V_IN, th::R0, th::N, th::V_OUT, th::OUT_LANES)
+            ]
+        );
+        let mut pad = [0; STATE_LANES];
+        pad[8] = u64::from(primitives::hash::PAD_FIRST);
+        pad[primitives::hash::RATE / 8 - 1] = primitives::hash::END_BIT;
+        assert_eq!(keccak64_pad(), pad);
+        let mut state: [u64; STATE_LANES] =
+            std::array::from_fn(|l| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(l as u64 + 1));
+        let mut expected = state;
+        verifier::keccak_rounds(&mut state, primitives::hash::ROUNDS);
+        primitives::hash::keccak_f(&mut expected);
+        assert_eq!(state, expected);
     }
 
     /// The committed column for the tables' `instances`, each padded with its padding steps, and the reduction's

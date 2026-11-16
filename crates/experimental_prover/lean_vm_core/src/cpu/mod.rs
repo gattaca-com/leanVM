@@ -31,7 +31,8 @@ use isa::Program;
 pub use isa::{DerefMode, Op, OutCells, Stats, ZeroScale};
 pub use layout::*;
 pub(crate) use trace::{Drow, Jrow, Krow, Rows, Srow, Trace, Trow, Xrow};
-pub use truncate::{piece_digits, qt_pad};
+pub use truncate::piece_digits;
+pub use verifier::qt_pad;
 
 /// Announce the prover's sizes (`log_mem`, every table's row count, the PCS rate) by
 /// writing them onto the scalar stream, which binds them into the state and lets the
@@ -203,28 +204,19 @@ fn keccak_output_claim(
         .find(|&&t| taus[t] == kappa)
         .expect("a tallest hash table");
     let rho = table_claims[*tallest].chi[..kappa].to_vec();
-    let pad = crate::keccak::pad_inputs();
-    let lanes: Vec<_> = verifier::layout::HASH_TABLES
-        .iter()
-        .enumerate()
-        .map(|(half, &t)| {
-            let claims = &table_claims[t];
-            let at = |l: usize| -> F128 {
-                if half == crate::keccak::KECCAK_HALF {
-                    claims.evals[tables::keccakt::V_OUT + l]
-                } else if l < tables::keccak64::OUT_LANES {
-                    claims.evals[tables::keccak64::V_OUT + l]
-                } else {
-                    keccak64_rest[l - tables::keccak64::OUT_LANES]
-                }
-            };
-            let mut padding = pad[half];
-            primitives::hash::keccak_f(&mut padding);
-            let uncovered: F128 = rho[taus[t]..].iter().map(|&x| F128::ONE + x).product();
-            std::array::from_fn(|l| uncovered * at(l) + (F128::ONE + uncovered) * F128::from(F64(padding[l])))
-        })
-        .collect();
-    keccak_gkr::OutputClaim { instance: rho, lanes }
+    let scalars = |values: &[F128]| values.iter().map(to_scalar).collect::<Vec<_>>();
+    let evals = verifier::layout::HASH_TABLES.map(|t| scalars(&table_claims[t].evals));
+    let heights = verifier::layout::HASH_TABLES.map(|t| taus[t]);
+    let lanes = verifier::hash_output_claims(
+        &scalars(&rho),
+        heights,
+        evals.each_ref().map(Vec::as_slice),
+        &scalars(keccak64_rest),
+    );
+    keccak_gkr::OutputClaim {
+        instance: rho,
+        lanes: lanes.map(|half| half.map(from_scalar)).to_vec(),
+    }
 }
 
 /// The lanes of `KECCAK64`'s output the table's claims leave out: 4 to 24.
@@ -1113,9 +1105,6 @@ mod tests {
     /// one): the one ring claim over them refuses a word of a piece changed in the committed stack, a pad taken from
     /// the other half, two slot blocks of one row piece that change places, and a block that holds another row
     /// piece's.
-    ///
-    /// The public share of the padding lanes is not sent: a prover that forms it without the table's `eq` writes the
-    /// same proof, and the verifier's own share decides. The verifier's side of that is `qt_claims_equal_the_full_layout`.
     #[test]
     fn forged_pieces_of_q_keccak_are_rejected() {
         use super::forge::{Forge, set};
@@ -1126,11 +1115,11 @@ mod tests {
         let (honest, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &pi, &honest).expect("the honest proof verifies");
         for forge in [
-            Forge::PieceWord,
-            // A word in each of `KECCAK64`'s three slot blocks.
-            Forge::BlockWord { first: 0, log: 3 },
-            Forge::BlockWord { first: 24, log: 3 },
-            Forge::BlockWord { first: 32, log: 5 },
+            // A word in `KECCAK`'s block, and in each of `KECCAK64`'s three slot blocks.
+            Forge::PieceWord(crate::keccak::KECCAK_HALF, (0, 6), 0),
+            Forge::PieceWord(crate::keccak::KECCAK64_HALF, (0, 3), 0),
+            Forge::PieceWord(crate::keccak::KECCAK64_HALF, (24, 3), 0),
+            Forge::PieceWord(crate::keccak::KECCAK64_HALF, (32, 5), 0),
             Forge::SwapPads,
             Forge::SwapBlocks,
             Forge::BorrowBlock,
@@ -1141,14 +1130,6 @@ mod tests {
             let (proof, _) = forged.unwrap_or_else(|e| panic!("{forge:?}: no proof: {e}"));
             assert!(verify(&program, &pi, &proof).is_err(), "{forge:?} is accepted");
         }
-        set(Some(Forge::PublicShareNoTheta));
-        let forged = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE);
-        set(None);
-        let (proof, _) = forged.expect("a proof");
-        assert!(
-            proof.stream == honest.stream,
-            "the prover's share enters no byte of the proof"
-        );
     }
 
     /// The last slot in a frame other than main's is an ordinary slot: the machine halts in the

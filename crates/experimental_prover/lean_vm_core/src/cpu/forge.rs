@@ -22,20 +22,16 @@ pub(crate) enum Forge {
     Keccak64PaddingRowIsReal,
     /// Row 0 of `KECCAK64`'s `out_two` column holds `to`, whatever the bytecode says.
     Keccak64OutTwo(bool),
+    /// The first word of row piece `piece` of slot block `block` of table half `half`, as `(half, block, piece)`, changes
+    /// in the committed stack, not in the reduction's witness.
+    PieceWord(usize, (usize, usize), usize),
+    /// Past its rows each half of `q_keccak` holds the padding step of the other half.
+    SwapPads,
     /// Lane `lane` of the first `KECCAK64` row's input state is `value`, and the rest of the row follows the permutation:
     /// its state after the first rounds and its output lanes are those of the state it now holds.
     Keccak64Lane { lane: usize, value: u64 },
     /// The column `column` (`tables::keccak64::S_A`, `K_A` or `K_Y`) of the first `KECCAK64` row holds `xor` more than the bytecode.
     Keccak64Column { column: usize, xor: u64 },
-    /// A word of the second piece of `q_keccak` changes in the stack that is committed, not in the reduction's witness.
-    PieceWord,
-    /// Past its rows each half of `q_keccak` holds the padding step of the other half.
-    SwapPads,
-    /// A word of the first row piece of `KECCAK64`'s slot block `[first slot, first slot + 2^log)` changes in the committed
-    /// stack, not in the reduction's witness.
-    BlockWord { first: usize, log: usize },
-    /// The prover's share of the public slots in the ring claim leaves out the table's `eq`.
-    PublicShareNoTheta,
     /// The blocks `[0, 8)` and `[24, 32)` of the first row piece of `KECCAK64` change places in the committed stack.
     SwapBlocks,
     /// The block `[24, 32)` of the first row piece of `KECCAK64` holds the second row piece's, in the committed stack.
@@ -96,6 +92,19 @@ pub(crate) fn tamper(w: &mut Witness) {
                 }
             }
         }
+        Forge::SwapPads => {
+            // Past its rows each half holds the other's padding step. The reduction proves what is there.
+            let kappa = hash_kappa(&w.layout.taus);
+            for (half, &table) in verifier::layout::HASH_TABLES.iter().enumerate() {
+                let rows = w.layout.rows[table];
+                let other = super::qt_pad(1 - half);
+                for (s, &word) in other.iter().enumerate() {
+                    let word = crate::keccak::public_slot(1 - half, s).unwrap_or(word);
+                    let start = slot(w, half, s);
+                    w.q[start + rows..start + (1 << kappa)].fill(F64(word));
+                }
+            }
+        }
         Forge::Keccak64Lane { lane, value } => {
             let half = crate::keccak::KECCAK64_HALF;
             let mut state: [u64; STATE_LANES] = std::array::from_fn(|l| w.q[slot(w, half, l)].0);
@@ -107,7 +116,7 @@ pub(crate) fn tamper(w: &mut Witness) {
             // The state the reduction commits after its first rounds, and the output lanes the bus carries.
             let mut output = state;
             primitives::hash::keccak_f(&mut output);
-            super::truncate::keccak_rounds(&mut state, crate::keccak::DEPTH);
+            verifier::keccak_rounds(&mut state, crate::keccak::DEPTH);
             for (l, &word) in state.iter().enumerate() {
                 let at = slot(w, half, STATE_LANES + l);
                 w.q[at] = F64(word);
@@ -128,24 +137,7 @@ pub(crate) fn tamper(w: &mut Witness) {
             let at = w.layout.placements[col].offset;
             w.q[at].0 ^= xor;
         }
-        Forge::SwapPads => {
-            // Past its rows each half holds the other's padding step. The reduction proves what is there.
-            let kappa = hash_kappa(&w.layout.taus);
-            for (half, &table) in verifier::layout::HASH_TABLES.iter().enumerate() {
-                let rows = w.layout.rows[table];
-                let other = super::truncate::qt_pad(1 - half);
-                for (s, &word) in other.iter().enumerate() {
-                    let start = slot(w, half, s);
-                    w.q[start + rows..start + (1 << kappa)].fill(F64(word));
-                }
-            }
-        }
-        Forge::SentLane
-        | Forge::PieceWord
-        | Forge::BlockWord { .. }
-        | Forge::PublicShareNoTheta
-        | Forge::SwapBlocks
-        | Forge::BorrowBlock => {}
+        Forge::SentLane | Forge::PieceWord(..) | Forge::SwapBlocks | Forge::BorrowBlock => {}
         Forge::Keccak64PaddingRowIsReal => {
             for lane in 0..8 {
                 let at = slot(w, crate::keccak::KECCAK64_HALF, lane);
@@ -165,11 +157,41 @@ pub(crate) fn tamper(w: &mut Witness) {
 
 /// Apply the forgery to the compact stack the prover commits, which the reduction never reads.
 pub(super) fn tamper_compact(compact: &super::truncate::Compact, q: &mut [F64]) {
+    let keccak64 = || {
+        compact
+            .qt
+            .pieces
+            .iter()
+            .filter(|p| p.half == crate::keccak::KECCAK64_HALF)
+    };
+    let dst = |p: &verifier::QtPiece| p.placement.index as usize;
     match current() {
-        Some(Forge::PieceWord) => compact.flip_piece_word(q),
-        Some(Forge::BlockWord { first, log }) => compact.flip_block_word(q, (first, log)),
-        Some(Forge::SwapBlocks) => compact.swap_blocks(q),
-        Some(Forge::BorrowBlock) => compact.borrow_block(q),
+        Some(Forge::PieceWord(half, block, piece)) => {
+            let it = (compact.qt.pieces.iter())
+                .filter(|p| p.half == half && p.block == block)
+                .nth(piece)
+                .expect("a row piece of the block");
+            q[dst(it)].0 ^= 1;
+        }
+        Some(Forge::SwapBlocks) => {
+            let first_piece = keccak64().next().expect("KECCAK64 has a piece").off;
+            let [a, b] = [(0, 3), (24, 3)].map(|block| {
+                keccak64()
+                    .find(|p| p.block == block && p.off == first_piece)
+                    .expect("a block of the first row piece")
+            });
+            assert_eq!(a.b(), b.b());
+            for i in 0..1usize << (a.b() + 3) {
+                q.swap(dst(a) + i, dst(b) + i);
+            }
+        }
+        Some(Forge::BorrowBlock) => {
+            let block = |n: usize| keccak64().filter(|p| p.block == (24, 3)).nth(n);
+            let [own, other] = [0, 1].map(|n| block(n).expect("KECCAK64 has two row pieces"));
+            for i in 0..1usize << (other.b() + 3) {
+                q[dst(own) + i] = q[dst(other) + i];
+            }
+        }
         _ => {}
     }
 }
