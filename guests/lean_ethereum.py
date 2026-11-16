@@ -225,6 +225,18 @@ KECCAK_LOCAL_BITS = KECCAK_Z_BITS + KECCAK_LANE_BITS
 LANE_OFF = 2 ** KECCAK_LANE_BITS - 2  # where a frame eqtree's last level starts
 KECCAK_IOTA_BITS = 7   # iota flips slices 2^i - 1 of lane 0 only
 QKECCAK_SLOT_LOG = QKECCAK_SLOT_LOG_PLACEHOLDER
+# A q_keccak coordinate is its step, then its table's bit and its slot: these many bits past the steps.
+QKECCAK_EXTRA_BITS = QKECCAK_EXTRA_BITS_PLACEHOLDER
+# A segment of the reduction is a run of KECCAK_DEPTH rounds of one table: its index's low KECCAK_RUN_LOG bits
+# name the run, the next KECCAK_TABLE_BITS the table.
+KECCAK_RUNS = KECCAK_RUNS_PLACEHOLDER
+KECCAK_RUN_LOG = KECCAK_RUN_LOG_PLACEHOLDER
+KECCAK_TABLE_BITS = KECCAK_TABLE_BITS_PLACEHOLDER
+# Each hash table's padding step's output lanes, KECCAK's 25 then KECCAK64's, and KECCAK64's input padding.
+KECCAK_PAD_OUT = KECCAK_PAD_OUT_PLACEHOLDER
+KECCAK64_PAD = KECCAK64_PAD_PLACEHOLDER
+KECCAK64_IN = KECCAK64_IN_PLACEHOLDER
+KECCAK64_OUT_LANES = 4
 # A claim's record: its value, the sum of its instance weights, pointers to its
 # point, its lane table, the local point whose slice coordinates' eq is its slice
 # table, and its weight on each position iota can flip (slice 2^i - 1 of lane 0),
@@ -261,6 +273,7 @@ LIG_N_RATES = LIG_N_RATES_PLACEHOLDER
 # Committed-column kappa sources (0 = const COL_KAPPA_ADJ, 1 = log_mem, 2+t = tau_t)
 # and the PCS floor for the stacked size.
 N_COMMITTED_COLS = N_COMMITTED_COLS_PLACEHOLDER
+N_NATIVE_COLS = N_NATIVE_COLS_PLACEHOLDER  # the columns before the two halves of q_keccak
 N_COLUMN_LOGS = N_COLUMN_LOGS_PLACEHOLDER
 COL_KAPPA_SRC = COL_KAPPA_SRC_PLACEHOLDER
 COL_KAPPA_ADJ = COL_KAPPA_ADJ_PLACEHOLDER
@@ -278,6 +291,10 @@ MIN_PIECE_LOG = 10
 PIECE_REC = 2 * N_PIECES + 1
 PIECE_AT = N_PIECES
 PIECE_G = 2 * N_PIECES
+# Under QT q_keccak is the pieces of its two halves, the hash tables', whose records follow those of the
+# kappa sources, N_TABLES + 2 and N_TABLES + 3: KECCAK's half then KECCAK64's.
+N_HALVES = 2
+QT_PIECES = N_HALVES * N_PIECES
 COL_CUT = COL_CUT_PLACEHOLDER
 COL_GROUP_PIECED = COL_GROUP_PIECED_PLACEHOLDER
 N_SLOTS = N_SLOTS_PLACEHOLDER
@@ -326,7 +343,7 @@ HIGH_BITS_CAP = 3
 MAX_STACK_LOG = LIG_MIN_LOG_SIZE + LIG_N_LOG_SIZES - 1
 SEL_NIBBLES = (MAX_STACK_LOG + 3) // 4  # four selector bits share one table lookup
 SEL_EQ_STRIDE = 64                      # a nibble's eq tables over its top 1..4 coords, strided
-EQ_CHAIN_ARMS = SIZE_BITS + QKECCAK_SLOT_LOG + 1  # eq prefix chain lengths
+EQ_CHAIN_ARMS = SIZE_BITS + QKECCAK_EXTRA_BITS + 1  # eq prefix chain lengths
 SEL_TAB_NIBBLES = (SIZE_BITS + 3) // 4  # nibbles of a bus selector run
 SEL_TAB_EQ_STRIDE = 32                  # a nibble's eq tables over its low 1..4 coords, padded
 RANK_KEYS_AT = SIZE_BITS + 16 * SEL_TAB_NIBBLES  # where exponent_tables keeps the rank keys
@@ -372,6 +389,7 @@ POINT_BUF_PI = 2
 POINT_BUF_QKECCAK_RHO = 3
 POINT_BUF_KECCAK_OUT = 4
 KECCAK_OUT_POOL = KECCAK_OUT_POOL_PLACEHOLDER
+KECCAK64_OUT_POOL = KECCAK64_OUT_POOL_PLACEHOLDER
 # A claim on a cut column weighs its pieces by its point's eq on their offsets: one set per point
 # buffer and source, its combo (NO_COMBO for a claim on a column not cut). Under QT a slot claim
 # adds its slot's pad past the covered chunks, CLAIM_QT_PAD; QT_PAD is every slot's.
@@ -867,22 +885,42 @@ def source_pieces(g_real, k: Const):
     return digits[0], digits[1], digits[2], digits[3], digits[4], g_chunk
 
 
-def all_pieces(kappa_base, trunc, g_mem, table_rows, g_squares):
+def all_pieces(kappa_base, trunc, qt, g_mem, table_rows, g_squares):
     # Every cut source's piece record (source 1 the memory's, over g_mem = g^(its count), 2 + t
     # table t's, over its rows): its digits; the coordinate piece j's eq reads, k - j while a
     # piece at or past j is present, else 0, so that none past the point is ever read; and
-    # g^g. A full proof (trunc = 0) commits each column whole.
-    pieces = HeapBuf(PIECE_REC * (N_TABLES + 2))
-    for s in unroll(1, N_TABLES + 2):
+    # g^g. A full proof (trunc = 0) commits each column whole. The last two sources, N_TABLES + 2
+    # and N_TABLES + 3, are the halves of q_keccak: its hash tables' rows, up to the common kappa. They
+    # have pieces only in a QT proof, so their digits are zero in another.
+    pieces = HeapBuf(PIECE_REC * (N_TABLES + 4))
+    # g^rows of each source, which a half of q_keccak shares with the hash table it covers.
+    reals = StackBuf(N_TABLES + 4)
+    for s in unroll(1, N_TABLES + 4):
         kg = kappa_base[GEN ** s]
         assert log(kg) < N_COLUMN_LOGS
         if const(s == 1):
             real = g_mem
-        else:
+        elif const(s // (N_TABLES + 2) == 0):
             real = g_power_of_count(table_rows[GEN ** (s - 2)], g_squares)
-        g_real = trunc * real + (1 + trunc) * g_squares[kg]
+        elif const(s == N_TABLES + 2):
+            real = reals[2 + TABLE_KECCAK]
+        else:
+            real = reals[2 + TABLE_KECCAK64]
+        reals[s] = real
+        if const(s // (N_TABLES + 2) == 0):
+            cut_here = trunc
+            keep = 1
+        else:
+            cut_here = qt
+            keep = qt
+        g_real = cut_here * real + (1 + cut_here) * g_squares[kg]
         rec = pieces * GEN ** (PIECE_REC * s)
         p0, p1, p2, p3, p4, g_chunk = match(log(kg), range(0, N_COLUMN_LOGS), lambda k: source_pieces(g_real, k))
+        p0 = keep * p0
+        p1 = keep * p1
+        p2 = keep * p2
+        p3 = keep * p3
+        p4 = keep * p4
         rec[GEN ** 0] = p0
         rec[GEN ** 1] = p1
         rec[GEN ** 2] = p2
@@ -920,26 +958,6 @@ def piece_eqs(coords, pieces, out, src: Const, zero: Const):
         if const(j != N_PIECES - 1):
             run *= 1 + rec[GEN ** j] + z
     return pad
-
-
-def region_offset(g_placed, kappa_g, g_squares):
-    # g^O for O the least multiple of 2^kappa at or above the placed words, kappa <
-    # SIZE_BITS: placed + 2^kappa - 1 less its bits below kappa, whose advice bits tie back
-    # to the whole.
-    x = g_placed * g_squares[kappa_g] * INV_GEN
-    bits = HeapBuf(SIZE_BITS)
-    hint_decompose_bits_exponent(bits, x, SIZE_BITS)
-    rebuilt = GEN ** 0
-    for i in unroll(0, SIZE_BITS):
-        bit = bits[GEN ** i]
-        bits[GEN ** i] = bit * bit
-        rebuilt *= 1 + bit * (1 + g_squares[GEN ** i])
-    assert rebuilt == x
-    low = HeapBuf(SIZE_BITS + 1)
-    low[1] = GEN ** 0
-    for i in mul_range(1, kappa_g):
-        low[i * GEN] = low[i] * (1 + bits[i] * (1 + g_squares[i]))
-    return x / low[kappa_g]
 
 
 def assert_small_g_power(x, g_squares):
@@ -1905,8 +1923,8 @@ def open_stacked(m_idx: Const, rate_sel, fs0, fs1, fs2, fs3, fs4, target, commit
     lane_folds = LIG_FOLDS[m_idx * LIG_MAX_LEVELS]
     fold_head = n_folds - lane_folds
     # point1 = 1 + point, the form every eq factor reads.
-    point = HeapBuf(SIZE_BITS + QKECCAK_SLOT_LOG)
-    point1 = HeapBuf(SIZE_BITS + QKECCAK_SLOT_LOG)
+    point = HeapBuf(SIZE_BITS + QKECCAK_EXTRA_BITS)
+    point1 = HeapBuf(SIZE_BITS + QKECCAK_EXTRA_BITS)
     for j in unroll(0, fold_head):
         point[GEN ** j] = fold_challenges[GEN ** (lane_folds + j)]
         point1[GEN ** j] = 1 + fold_challenges[GEN ** (lane_folds + j)]
@@ -1916,7 +1934,7 @@ def open_stacked(m_idx: Const, rate_sel, fs0, fs1, fs2, fs3, fs4, target, commit
     for j in unroll(0, lane_folds):
         point[GEN ** (fold_head + yr_log + j)] = fold_challenges[GEN ** j]
         point1[GEN ** (fold_head + yr_log + j)] = 1 + fold_challenges[GEN ** j]
-    for j in unroll(n_folds + yr_log, SIZE_BITS + QKECCAK_SLOT_LOG):
+    for j in unroll(n_folds + yr_log, SIZE_BITS + QKECCAK_EXTRA_BITS):
         point[GEN ** j] = 0
         point1[GEN ** j] = 1
 
@@ -2414,10 +2432,11 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
     # count need offsets (pull's slots go unread).
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
     rate = StackBuf(8)
-    kb = StackBuf(N_TABLES + 3)  # kappa_base, in the frame
+    kb = StackBuf(N_TABLES + 4)  # kappa_base, in the frame
     kb[0] = 1
     for t in unroll(0, N_TABLES + 2):
         kb[1 + t] = dims_g[GEN ** t]
+    kb[N_TABLES + 3] = dims_g[GEN ** (N_TABLES + 1)]  # the second half of q_keccak's kappa source
     # A block group, a run of a side's blocks sharing one kappa source, is consecutive
     # in its side's order, so a hinted order of the groups, certified strictly
     # descending in its rank key (descending κ, then ascending first index: a side's
@@ -2798,6 +2817,11 @@ def verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, d
             b = col_evals[13]
             constraint_eval = zc_xi_pows[ETA_OFFSET[t] + 0] * (b + c * col_evals[12])
             constraint_eval += zc_xi_pows[ETA_OFFSET[t] + 1] * (c * (b + 1))
+        if t == TABLE_KECCAK64:
+            # The lanes a 64-byte message leaves to the padding: `in_l = KECCAK64_PAD[l]` for l = 8 .. 24,
+            # identity l - 8 at its own power (tables.rs ThTable::constraint).
+            for lane in unroll(8, KECCAK_LANES):
+                constraint_eval += zc_xi_pows[ETA_OFFSET[t] + lane - 8] * (col_evals[KECCAK64_IN + lane] + KECCAK64_PAD[lane])
         # The table's bus coordinates, evaluated at the SAME column evaluations, each
         # the sum of its terms over this table's column evaluations (a product term, an
         # address or an arithmetic result, is degree 2, which the batch's round
@@ -3239,32 +3263,56 @@ def keccak_slot_lanes(slot, segment_point, out, first: Const, count: Const):
     # The weight an opening's slot point puts on each lane, into the frame cells
     # out[0..25): the states it speaks of start at `first`, one per segment, for the
     # first `count` segments.
+    # Only the run's coordinates weigh: the table's are coordinates of the point the opening ends on.
     slot_weights = StackBuf(2 ** (QKECCAK_SLOT_LOG + 1) - 2)
-    eqtree_frame(slot, slot_weights, QKECCAK_SLOT_LOG, KECCAK_LANES * KECCAK_SEGMENTS)
-    seg_weights = StackBuf(2 ** (KECCAK_SEG_LOG + 1) - 2)
-    eqtree_frame(segment_point, seg_weights, KECCAK_SEG_LOG, 2 ** KECCAK_SEG_LOG)
+    eqtree_frame(slot, slot_weights, QKECCAK_SLOT_LOG, KECCAK_LANES * KECCAK_RUNS)
+    seg_weights = StackBuf(2 ** (KECCAK_RUN_LOG + 1) - 2)
+    eqtree_frame(segment_point, seg_weights, KECCAK_RUN_LOG, 2 ** KECCAK_RUN_LOG)
     for lane in unroll(0, KECCAK_LANES):
         lane_acc = 0
         for m in unroll(0, count):
-            lane_acc += seg_weights[2 ** KECCAK_SEG_LOG - 2 + m] * slot_weights[2 ** QKECCAK_SLOT_LOG - 2 + KECCAK_LANES * (first + m) + lane]
+            lane_acc += seg_weights[2 ** KECCAK_RUN_LOG - 2 + m] * slot_weights[2 ** QKECCAK_SLOT_LOG - 2 + KECCAK_LANES * (first + m) + lane]
         out[lane] = lane_acc
     return
 
 
-def verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_g, chi, output_lanes, z_vals, slices, tabs):
-    # KECCAK validity (verifier::keccak::verify_keccak): a random claim on every segment's output,
-    # KECCAK_DEPTH layers down to the committed inputs, every segment at once. The
-    # last segment's output is the permutation's: the table's claims on its output
-    # lanes, `output_lanes`, at the table's point chi[..tau], give that part of the
-    # claim, and the prover sends the committed outputs' part. It leaves two
-    # openings of q_keccak, at the two points written to `z_vals` (tau +
+def completion_weight(chi, tau_g, kappa_g):
+    # The weight of the steps a table of 2^tau is completed with, up to 2^kappa, at the point chi:
+    # the product of 1 + chi[i] over i from tau to kappa.
+    n = kappa_g / tau_g
+    chain = HeapBuf(n * GEN)
+    chain[GEN ** 0] = 1
+    tail = chi * tau_g
+    for x in mul_range(1, n):
+        chain[x * GEN] = chain[x] * (1 + tail[x])
+    return chain[n]
+
+
+def verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, kappa_g, tau_k_g, tau_t_g, chi, k_claimed, t_claimed, z_vals, slices, tabs):
+    # KECCAK and KECCAK64 validity (verifier::keccak::verify_keccak): a random claim on every segment's
+    # output, KECCAK_DEPTH layers down to the committed inputs, every segment of both tables at
+    # once. The last run's output is the permutation's: each table's claims on its output lanes, at
+    # the table's point chi[..tau], completed with the table's padding step to the taller table's
+    # kappa steps (`k_claimed`: KECCAK's 25 lanes, `t_claimed`: KECCAK64's first four, the prover sends
+    # its other 21), give that part of the claim, and the prover sends the committed outputs' part.
+    # It leaves two openings of q_keccak, at the two points written to `z_vals` (kappa + 1 +
     # QKECCAK_SLOT_LOG coordinates each, QKECCAK_VARS_CAP apart): the committed
     # outputs as words at the first, returned, and the 64 `slices` at the second.
-    # tau >= FLOORS[TABLE_KECCAK] is certified, so the pack count is a real count.
+    # kappa >= FLOORS is certified, so the pack count is a real count.
     # The ring-switching map's challenges are drawn after it, by the caller, under
     # the batch grind.
+    tau_g = kappa_g
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
-    no_rate = StackBuf(8)
+    # The 21 output lanes of KECCAK64 its table does not claim, at the table's point, before the segments are drawn.
+    keccak64_rest = HeapBuf(KECCAK_LANES - KECCAK64_OUT_LANES)
+    rest_rate = StackBuf(8)
+    for i in unroll(0, KECCAK_LANES - KECCAK64_OUT_LANES):
+        if i % 4 == 0:
+            if i != 0:
+                sp = fs_perm(sp, rest_rate, 4)
+                rest_rate = StackBuf(8)
+        rest_word, cursor = fs_next(rest_rate, i % 4, cursor)
+        keccak64_rest[GEN ** i] = rest_word
     pack_g = tau_g * INV_GEN ** KECCAK_PACK_LOG
     y_g = pack_g * GEN ** KECCAK_SEG_LOG
     # A layer runs y = log(y_g) rounds KR_STEP at a time: y_g = step_g^KR_STEP rem_g,
@@ -3293,7 +3341,9 @@ def verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_g, chi, output_lanes, z_v
     # One message, the segment then the lane, after its grind: the first claim is
     # multilinear in them.
     segment = point * pack_g
-    sp, r, cursor = fs_grind_squeeze(sp, no_rate, 0, cursor, tabs, KECCAK_SEG_GRIND_BITS)
+    # The twenty-first lane waits in the sponge: one scalar.
+    sp, r, cursor = fs_grind_squeeze(sp, rest_rate, (KECCAK_LANES - KECCAK64_OUT_LANES - 1) % 4 + 1, cursor, tabs, KECCAK_SEG_GRIND_BITS)
+    no_rate = StackBuf(8)
     segment[GEN ** 0] = r
     for i in unroll(1, KECCAK_SEG_LOG):
         sp, r = squeeze(sp, no_rate, 0)
@@ -3324,13 +3374,28 @@ def verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_g, chi, output_lanes, z_v
     eqtree(r_lane, lane_tree, KECCAK_LANE_BITS)
     first_lanes = lane_tree * GEN ** (2 ** KECCAK_LANE_BITS - 2)
     claims[GEN ** KC_LANES] = first_lanes
-    # `value` is the committed outputs' part; the last segment's is the table's.
+    # `value` is the committed outputs' part; the last run's of each table is that table's output
+    # lanes, completed with its padding step to kappa steps: `uncovered * claim + (1 + uncovered) * padding`.
     segment_tree = HeapBuf(2 ** (KECCAK_SEG_LOG + 1) - 2)
     eqtree(segment, segment_tree, KECCAK_SEG_LOG)
     output = 0
-    for lane in unroll(0, KECCAK_LANES):
-        output += first_lanes[GEN ** lane] * output_lanes[GEN ** lane]
-    claims[GEN ** KC_VALUE] = value + segment_tree[GEN ** (2 ** KECCAK_SEG_LOG - 2 + KECCAK_SEGMENTS - 1)] * output
+    for table in unroll(0, 2 ** KECCAK_TABLE_BITS):
+        if const(table == 0):
+            uncovered = completion_weight(chi, tau_k_g, kappa_g)
+        else:
+            uncovered = completion_weight(chi, tau_t_g, kappa_g)
+        table_output = 0
+        for lane in unroll(0, KECCAK_LANES):
+            if const(table == 0):
+                claimed = k_claimed[GEN ** lane]
+            elif const(lane // KECCAK64_OUT_LANES == 0):
+                claimed = t_claimed[GEN ** lane]
+            else:
+                claimed = keccak64_rest[GEN ** (lane - KECCAK64_OUT_LANES)]
+            completed = uncovered * claimed + (1 + uncovered) * KECCAK_PAD_OUT[KECCAK_LANES * table + lane]
+            table_output += first_lanes[GEN ** lane] * completed
+        output += segment_tree[GEN ** (2 ** KECCAK_SEG_LOG - 2 + KECCAK_RUNS - 1 + KECCAK_RUNS * table)] * table_output
+    claims[GEN ** KC_VALUE] = value + output
 
     for step in unroll(0, KECCAK_DEPTH):
         claim = claims * GEN ** (step * KC_SIZE)
@@ -3368,12 +3433,16 @@ def verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_g, chi, output_lanes, z_v
     # ---- the outputs, whose instance weights are an eq already ----
     # Their position weights are a word's, so the 64 slices are only needed as
     # the word they add up to: q_keccak itself at the point.
-    out_slot = out_point * tau_g
+    # The point is the instance's, the table's coordinates (the first claim's), then the slot.
+    out_table = out_point * tau_g
+    for j in unroll(0, KECCAK_TABLE_BITS):
+        out_table[GEN ** j] = segment[GEN ** (KECCAK_RUN_LOG + j)]
+    out_slot = out_table * GEN ** KECCAK_TABLE_BITS
     fs0, fs1, fs2, fs3, fs4, cursor, out_value = keccak_plain_rounds(fs0, fs1, fs2, fs3, fs4, 0, 0, cursor, value, out_slot, tabs, QKECCAK_SLOT_LOG, 0)
     word_rate = StackBuf(8)
     word, cursor = fs_next(word_rate, 0, cursor)
     out_lanes = StackBuf(KECCAK_LANES)
-    keccak_slot_lanes(out_slot, point * pack_g, out_lanes, 1, KECCAK_SEGMENTS - 1)
+    keccak_slot_lanes(out_slot, point * pack_g, out_lanes, 1, KECCAK_RUNS - 1)
     lanes_sum = 0
     for lane in unroll(0, KECCAK_LANES):
         lanes_sum += out_lanes[lane] * first_lanes[GEN ** lane]
@@ -3390,7 +3459,12 @@ def verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_g, chi, output_lanes, z_v
     mu_at_low = 0
     for i in unroll(0, KECCAK_PACK):
         mu_at_low += low_tree[GEN ** (2 ** KECCAK_PACK_LOG - 2 + i)] * last[GEN ** (KC_MU + i)]
-    in_slot = in_point * tau_g
+    # The last claim's table coordinates, after its pack's, are coordinates of the opening's point.
+    last_seg = last[GEN ** KC_POINT] * pack_g
+    in_table = in_point * tau_g
+    for j in unroll(0, KECCAK_TABLE_BITS):
+        in_table[GEN ** j] = last_seg[GEN ** (KECCAK_RUN_LOG + j)]
+    in_slot = in_table * GEN ** KECCAK_TABLE_BITS
     fs0, fs1, fs2, fs3, fs4, cursor, in_value = keccak_plain_rounds(fs0, fs1, fs2, fs3, fs4, 0, 0, cursor, low_value, in_slot, tabs, QKECCAK_SLOT_LOG, 0)
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
     rate = StackBuf(8)
@@ -3404,7 +3478,7 @@ def verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_g, chi, output_lanes, z_v
     sp = fs_perm(sp, rate, 4)
     last_point = last[GEN ** KC_POINT]
     in_lanes = StackBuf(KECCAK_LANES)
-    keccak_slot_lanes(in_slot, last_point * pack_g, in_lanes, 0, KECCAK_SEGMENTS)
+    keccak_slot_lanes(in_slot, last_point * pack_g, in_lanes, 0, KECCAK_RUNS)
     # shifts[r] = sum_z slices[z] eq(a, z + r), a the last layer's slice point:
     # folded a bit at a time for every r at once.
     last_local = last[GEN ** KC_LOCAL]
@@ -3486,11 +3560,12 @@ def certify_placement(kappa_base, g_squares, pieces, qt):
     # j, or a group whole), is consecutive in it. An absent piece, and q_keccak under QT,
     # fill no words: a hinted order of the slots, the present ones strictly descending in
     # their rank key and the absent ones after them in slot order, places every piece.
-    # Under QT q_keccak's region follows the other items at the next multiple of its size.
+    # Under QT the pieces of q_keccak's two halves, the last two columns, take its place:
+    # each piece holds all the slots of its rows, 2^(b + 6) words, and is placed as any other.
     # Returns g^(the words placed), and each piece's g^offset and g^kappa, at
     # N_PIECES c + j for piece j of column c.
-    kb = StackBuf(N_TABLES + 3)
-    for i in unroll(0, N_TABLES + 3):
+    kb = StackBuf(N_TABLES + 4)
+    for i in unroll(0, N_TABLES + 4):
         kb[i] = kappa_base[GEN ** i]
     rank_keys = g_squares * GEN ** RANK_KEYS_AT
     slot_key = HeapBuf(N_SLOTS)
@@ -3503,7 +3578,7 @@ def certify_placement(kappa_base, g_squares, pieces, qt):
         present = 1
         if const(COL_GROUP_PIECED[gi] == 1):
             present = pieces[GEN ** (PIECE_REC * COL_KAPPA_SRC[c0] + SLOT_PIECE[sl])]
-            kappa_g = pieces[GEN ** (PIECE_REC * COL_KAPPA_SRC[c0] + PIECE_AT + SLOT_PIECE[sl])]
+            kappa_g = pieces[GEN ** (PIECE_REC * COL_KAPPA_SRC[c0] + PIECE_AT + SLOT_PIECE[sl])] * GEN ** COL_KAPPA_ADJ[c0]
         if const(c0 == QKECCAK_COMMITTED_COL):
             present = 1 + qt
         # g_squares spans SIZE_BITS, and every kappa is under it: a certified log
@@ -3538,25 +3613,14 @@ def certify_placement(kappa_base, g_squares, pieces, qt):
         step = g_squares[slot_kappa[sl]]
         off = slot_base[GEN ** sl]
         if const(c0 == QKECCAK_COMMITTED_COL):
-            qk_base = off
-            qk_kappa = slot_kappa[sl]
-        else:
-            for c in unroll(c0, COL_GROUP_START[gi + 1]):
-                col_off_g[GEN ** (N_PIECES * c + SLOT_PIECE[sl])] = off
-                col_kappa_g[GEN ** (N_PIECES * c + SLOT_PIECE[sl])] = slot_kappa[sl]
-                if const(c + 1 != COL_GROUP_START[gi + 1]):
-                    off *= step
-    qk = StackBuf(2)
-    if qt == 1:
-        region = region_offset(g_total, qk_kappa, g_squares)
-        qk[0] = region
-        qk[1] = region * g_squares[qk_kappa]
-    else:
-        qk[0] = qk_base
-        qk[1] = g_total
-    col_off_g[GEN ** (N_PIECES * QKECCAK_COMMITTED_COL)] = qk[0]
-    col_kappa_g[GEN ** (N_PIECES * QKECCAK_COMMITTED_COL)] = qk_kappa
-    return qk[1], col_off_g, col_kappa_g
+            # Absent under QT, where its offset is the zero one, which no alignment is asked of.
+            off = (1 + qt) * off + qt
+        for c in unroll(c0, COL_GROUP_START[gi + 1]):
+            col_off_g[GEN ** (N_PIECES * c + SLOT_PIECE[sl])] = off
+            col_kappa_g[GEN ** (N_PIECES * c + SLOT_PIECE[sl])] = slot_kappa[sl]
+            if const(c + 1 != COL_GROUP_START[gi + 1]):
+                off *= step
+    return g_total, col_off_g, col_kappa_g
 
 
 def column_selector(offset, sel_eq, sel_g, kappa: Const):
@@ -3612,30 +3676,42 @@ def selector_tables(point, point1):
     return sel_eq
 
 
-def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem, tau_keccak_g, kappa_base, lam_cl, col_offsets, col_kappas, pieces, combo_eq, gq_g, z_vals, c_table, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z, gmv):
+def zero_run(point1, tau_g, kappa_g):
+    # The eq of zeros against the opening point at the step coordinates from tau to kappa:
+    # the product of point1[i], point1 = 1 + point.
+    n = kappa_g / tau_g
+    chain = HeapBuf(n * GEN)
+    chain[GEN ** 0] = 1
+    tail = point1 * tau_g
+    for x in mul_range(1, n):
+        chain[x * GEN] = chain[x] * tail[x]
+    return chain[n]
+
+
+def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem, hash_kappa_g, tau_k_g, tau_t_g, kappa_base, lam_cl, col_offsets, col_kappas, pieces, combo_eq, z_vals, c_table, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z, gmv, qt, cf, slot_w, out_w, us):
     # Evaluate each transparent weight at the complete point in witness order.
     # A claim is its low point followed by the certified column's selector bits;
     # a q_keccak lane puts its slot's bits between the two. A claim on a cut column
     # sums its pieces', each its low point's prefix and the piece's selector, weighed
-    # by the piece's eq (combo_eq). Under QT q_keccak is its region (steplo, slot,
-    # chunk), steplo gq coordinates, and z_vals hold its points so rotated.
+    # by the piece's eq (combo_eq). Under QT q_keccak is the pieces of its halves, each
+    # a column cut of its own, laid (row, slot): a claim on a slot of a half, the output
+    # claim and each piece's ring claim sum over its pieces, each weighed by its rows' eq
+    # and the eq of the claim's point on the piece's variables (slot_w, out_w, us).
     # point1 = 1 + point holds each coordinate's eq factor against a zero bit.
     zeta_eq_chain = HeapBuf(SIZE_BITS + 1)
     eq_prefix_chain(zeta_eq_chain, 1, zeta, point1, g_bus_mu)
     chi_eq_chain = HeapBuf(SIZE_BITS + 1)
     eq_prefix_chain(chi_eq_chain, 1, chi, point1, g_zc_n)
-    slot_point = point * gq_g
-    slot_point1 = point1 * gq_g
-    # A slot claim's chunk coordinates, chi's from gq to tau, sit past its slot's.
-    hi_chain = HeapBuf(TRUNC_D + 1)
-    hi_chain[GEN ** 0] = 1
-    n_hi = tau_keccak_g / gq_g
-    assert log(n_hi) < TRUNC_D + 1
-    chi_hi = chi * gq_g
-    point_hi = point1 * gq_g * GEN ** QKECCAK_SLOT_LOG
-    for i in mul_range(1, n_hi):
-        hi_chain[i * GEN] = hi_chain[i] * (chi_hi[i] + point_hi[i])
-    slot_low_eq = chi_eq_chain[gq_g] * hi_chain[n_hi]
+    # A slot claim of a hash table of 2^tau steps is made on the first 2^tau of the 2^kappa steps of its
+    # slot in its half of q_keccak: its point is chi[..tau], then the zero of every step coordinate up to
+    # kappa, then the bits of its table and its slot, then the column's selector.
+    # `table_point` is the opening point from the table's coordinate on, `slot_point` from the slot's.
+    table_point = point * hash_kappa_g
+    table_point1 = point1 * hash_kappa_g
+    slot_point = table_point * GEN ** KECCAK_TABLE_BITS
+    slot_point1 = table_point1 * GEN ** KECCAK_TABLE_BITS
+    zero_keccak = zero_run(point1, kappa_base[GEN ** (2 + TABLE_KECCAK)], hash_kappa_g)
+    zero_keccak64 = zero_run(point1, kappa_base[GEN ** (2 + TABLE_KECCAK64)], hash_kappa_g)
     pi_chain = HeapBuf(SIZE_BITS + 1)
     pi_chain[GEN ** 0] = 1
     pi_chain[GEN ** 1] = rm + point1[GEN ** 0]
@@ -3644,8 +3720,8 @@ def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem
 
     # Every low dimension here is a certified log at a baked kappa source, as
     # certify_placement derives the columns'.
-    kb = StackBuf(N_TABLES + 3)
-    for i in unroll(0, N_TABLES + 3):
+    kb = StackBuf(N_TABLES + 4)
+    for i in unroll(0, N_TABLES + 4):
         kb[i] = kappa_base[GEN ** i]
     sel_eq = selector_tables(point, point1)
     sel_g = g_squares * GEN ** SIZE_BITS  # exponent_tables' constant nibble shares
@@ -3678,8 +3754,26 @@ def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem
                 low = pi_chain[at]
             combo_w[N_PIECES * cb + jj] = combo_eq[GEN ** (N_PIECES * cb + jj)] * low
 
+    # A slot claim's weight on a piece, less the factors of its slot: the piece's rows' weight at the
+    # zero-extended point, the piece's selector and the point's eq on the piece's rows.
+    ext_k = zero_extend(chi, tau_k_g, hash_kappa_g)
+    ext_t = zero_extend(chi, tau_t_g, hash_kappa_g)
+    chain_k = HeapBuf(SIZE_BITS + 1)
+    eq_prefix_chain(chain_k, 1, ext_k, point1, hash_kappa_g)
+    chain_t = HeapBuf(SIZE_BITS + 1)
+    eq_prefix_chain(chain_t, 1, ext_t, point1, hash_kappa_g)
+    piece_w = HeapBuf(QT_PIECES)
+    for i in unroll(0, QT_PIECES):
+        rec = pieces * GEN ** (PIECE_REC * (N_TABLES + 2 + i // N_PIECES))
+        at = rec[GEN ** (PIECE_AT + i % N_PIECES)]
+        if const(i // N_PIECES == 0):
+            rows_eq = chain_k[at]
+        else:
+            rows_eq = chain_t[at]
+        piece_w[GEN ** i] = slot_w[GEN ** i] * selectors[N_PIECES * (N_NATIVE_COLS + i // N_PIECES) + i % N_PIECES] * rows_eq
+
     inner_sum = inner_total
-    lam_pow = lam_cl  # the pool's powers, as verify_sub batched it
+    lam_pow = lam_cl  # the pool's powers, as verify_sub batched it: the ring claim took lam_cl^0
     for j in unroll(0, N_CLAIMS):
         if CLAIM_POINT_BUF[j] != POINT_BUF_KECCAK_OUT:
             col = CLAIM_COMMITTED_COL[j]
@@ -3697,7 +3791,7 @@ def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem
                 slot_eq = GEN ** 0
                 for kk in unroll(0, QKECCAK_SLOT_LOG):
                     k = QKECCAK_SLOT_LOG - 1 - kk
-                    if CLAIM_QKECCAK_SLOT_BITS[QKECCAK_SLOT_LOG * j + k] == 1:
+                    if CLAIM_QKECCAK_SLOT_BITS[QKECCAK_EXTRA_BITS * j + k] == 1:
                         slot_factor = slot_point[GEN ** k]
                     else:
                         slot_factor = slot_point1[GEN ** k]
@@ -3705,15 +3799,42 @@ def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem
                         slot_eq = slot_factor
                     else:
                         slot_eq *= slot_factor
-                low_eq = slot_eq * slot_low_eq
-                nlow_adj = CLAIM_KAPPA_ADJ[j] + QKECCAK_SLOT_LOG
-            # The claim's low dimension is its column's kappa: by construction when
-            # the two share a kappa source, else checked.
-            if const(CLAIM_KAPPA_SRC[j] != COL_KAPPA_SRC[col]):
-                assert kb[CLAIM_KAPPA_SRC[j]] * GEN ** nlow_adj == kb[COL_KAPPA_SRC[col]] * GEN ** COL_KAPPA_ADJ[col]
+                for jj in unroll(0, KECCAK_TABLE_BITS):
+                    if CLAIM_QKECCAK_SLOT_BITS[QKECCAK_EXTRA_BITS * j + QKECCAK_SLOT_LOG + jj] == 1:
+                        slot_eq *= table_point[GEN ** jj]
+                    else:
+                        slot_eq *= table_point1[GEN ** jj]
+                # The claim's 2^tau steps, then zeros up to kappa.
+                if const(CLAIM_KAPPA_SRC[j] == 2 + TABLE_KECCAK):
+                    low_eq = slot_eq * chi_eq_chain[cplen_g] * zero_keccak
+                    half_at = 0
+                else:
+                    low_eq = slot_eq * chi_eq_chain[cplen_g] * zero_keccak64
+                    half_at = 1
+                # Under QT the column is its halves' pieces instead: the claim sums those of its half,
+                # each weighed by the eq of the claim's slot on the piece's slot variables, above its rows.
+                piece_sum = 0
+                for p in unroll(0, N_PIECES):
+                    rec = pieces * GEN ** (PIECE_REC * (N_TABLES + 2 + half_at))
+                    base = point * rec[GEN ** (PIECE_AT + p)]
+                    base1 = point1 * rec[GEN ** (PIECE_AT + p)]
+                    term = piece_w[GEN ** (N_PIECES * half_at + p)]
+                    for s in unroll(0, QKECCAK_SLOT_LOG):
+                        if CLAIM_QKECCAK_SLOT_BITS[QKECCAK_EXTRA_BITS * j + s] == 1:
+                            term *= base[GEN ** s]
+                        else:
+                            term *= base1[GEN ** s]
+                    piece_sum += term
+                inner_sum += lam_pow * qt * piece_sum
+                low_eq = (1 + qt) * low_eq
             else:
-                if const(nlow_adj != COL_KAPPA_ADJ[col]):
+                # The claim's low dimension is its column's kappa: by construction when
+                # the two share a kappa source, else checked.
+                if const(CLAIM_KAPPA_SRC[j] != COL_KAPPA_SRC[col]):
                     assert kb[CLAIM_KAPPA_SRC[j]] * GEN ** nlow_adj == kb[COL_KAPPA_SRC[col]] * GEN ** COL_KAPPA_ADJ[col]
+                else:
+                    if const(nlow_adj != COL_KAPPA_ADJ[col]):
+                        assert kb[CLAIM_KAPPA_SRC[j]] * GEN ** nlow_adj == kb[COL_KAPPA_SRC[col]] * GEN ** COL_KAPPA_ADJ[col]
             if const(CLAIM_COMBO[j] == NO_COMBO):
                 inner_sum += lam_pow * low_eq * selectors[N_PIECES * col]
             else:
@@ -3728,16 +3849,46 @@ def check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem
     # the ring-switched one leads the batch at lam_cl^0, the plain one closes it.
     # A lane claim's low point is tau_keccak long, the kappa check above holding it
     # to this column.
-    qkeccakv_g = tau_keccak_g * GEN ** QKECCAK_SLOT_LOG
-    if const(COL_KAPPA_SRC[QKECCAK_COMMITTED_COL] != TABLE_KECCAK + 2):
+    qkeccakv_g = hash_kappa_g * GEN ** QKECCAK_EXTRA_BITS
+    if const(COL_KAPPA_SRC[QKECCAK_COMMITTED_COL] != N_TABLES + 2):
         assert qkeccakv_g == kb[COL_KAPPA_SRC[QKECCAK_COMMITTED_COL]] * GEN ** COL_KAPPA_ADJ[QKECCAK_COMMITTED_COL]
     else:
-        if const(COL_KAPPA_ADJ[QKECCAK_COMMITTED_COL] != QKECCAK_SLOT_LOG):
+        if const(COL_KAPPA_ADJ[QKECCAK_COMMITTED_COL] != QKECCAK_EXTRA_BITS):
             assert qkeccakv_g == kb[COL_KAPPA_SRC[QKECCAK_COMMITTED_COL]] * GEN ** COL_KAPPA_ADJ[QKECCAK_COMMITTED_COL]
-    out_eq_chain = HeapBuf(SIZE_BITS + QKECCAK_SLOT_LOG + 1)
+    out_eq_chain = HeapBuf(SIZE_BITS + QKECCAK_EXTRA_BITS + 1)
     eq_prefix_chain(out_eq_chain, 1, z_vals, point1, qkeccakv_g)
-    rs_weight = ring_switch_weight(z_vals * GEN ** QKECCAK_VARS_CAP, point1, c_table, qkeccakv_g)
-    inner_sum += (rs_weight + lam_out * out_eq_chain[qkeccakv_g]) * selectors[N_PIECES * QKECCAK_COMMITTED_COL]
+    # A plain proof's ring weight, on q_keccak whole; under QT its pieces' share one chain, below.
+    plain_rs = HeapBuf(1)
+    if qt == 0:
+        plain_rs[GEN ** 0] = ring_switch_weight(z_vals * GEN ** QKECCAK_VARS_CAP, point1, c_table, qkeccakv_g)
+    else:
+        plain_rs[GEN ** 0] = 0
+    inner_sum += (plain_rs[GEN ** 0] + (1 + qt) * lam_out * out_eq_chain[qkeccakv_g]) * selectors[N_PIECES * QKECCAK_COMMITTED_COL]
+    # Under QT, each present piece's part of the one ring claim and of the output claim: the piece's selector
+    # times the ring weight of its block, scaled by `cf`, at the opening (qt_ring_weights), and the
+    # output claim's rows' weight, eq on the piece's rows and eq of the output point's slot on its slot variables.
+    rs_point = z_vals * GEN ** QKECCAK_VARS_CAP
+    rs_slot = rs_point * qkeccakv_g * INV_GEN ** QKECCAK_SLOT_LOG
+    out_slot = z_vals * qkeccakv_g * INV_GEN ** QKECCAK_SLOT_LOG
+    qt_ring_w = HeapBuf(QT_PIECES)
+    if qt == 1:
+        qt_ring_weights(pieces, cf, rs_point, rs_slot, point1, c_table, hash_kappa_g, qt_ring_w)
+    else:
+        for i in unroll(0, QT_PIECES):
+            qt_ring_w[GEN ** i] = 0
+    qt_terms = HeapBuf(QT_PIECES)
+    for i in unroll(0, QT_PIECES):
+        rec = pieces * GEN ** (PIECE_REC * (N_TABLES + 2 + i // N_PIECES))
+        if rec[GEN ** (i % N_PIECES)] == 1:
+            b_g = rec[GEN ** (PIECE_AT + i % N_PIECES)]
+            out_base = point * b_g
+            out_part = out_w[GEN ** i] * us[GEN ** (5 * (i // N_PIECES) + 4)] * out_eq_chain[b_g]
+            for s in unroll(0, QKECCAK_SLOT_LOG):
+                out_part *= 1 + out_slot[GEN ** s] + out_base[GEN ** s]
+            qt_terms[GEN ** i] = selectors[N_PIECES * (N_NATIVE_COLS + i // N_PIECES) + i % N_PIECES] * (qt_ring_w[GEN ** i] + lam_out * out_part)
+        else:
+            qt_terms[GEN ** i] = 0
+        inner_sum += qt_terms[GEN ** i]
     # The OOD sample's claim, after the output word's: eq(z, .) over the stack's m variables.
     ood_chain = HeapBuf(MAX_STACK_LOG + 1)
     eq_prefix_chain(ood_chain, lam_out * lam_cl, ood_z, point1, gmv)
@@ -3750,20 +3901,18 @@ def bus_grind_check(word, tabs, d: Const):
     return 0
 
 
-def rotate_qkeccak(src, dst, gq_g, tau_g):
-    # A point (steplo, chunk, slot) of q_keccak, steplo gq coordinates and slot
-    # QKECCAK_SLOT_LOG, as its QT region's point (steplo, slot, chunk).
-    for i in mul_range(1, gq_g):
-        dst[i] = src[i]
-    src_slot = src * tau_g
-    dst_slot = dst * gq_g
-    for s in unroll(0, QKECCAK_SLOT_LOG):
-        dst_slot[GEN ** s] = src_slot[GEN ** s]
-    src_chunk = src * gq_g
-    dst_chunk = dst_slot * GEN ** QKECCAK_SLOT_LOG
-    for t in mul_range(1, tau_g / gq_g):
-        dst_chunk[t] = src_chunk[t]
-    return
+def half_eq(half: Const, table):
+    # eq(bits(half), x) over the table coordinates at `table`: the weight of a half in a point of q_keccak.
+    for b in unroll(0, KECCAK_TABLE_BITS):
+        if const((half // 2 ** b) % 2 == 1):
+            f = table[GEN ** b]
+        else:
+            f = 1 + table[GEN ** b]
+        if const(b == 0):
+            e = f
+        else:
+            e *= f
+    return e
 
 
 def qt_pad_leaves(slot_point):
@@ -3773,27 +3922,107 @@ def qt_pad_leaves(slot_point):
     return tree * GEN ** (2 ** QKECCAK_SLOT_LOG - 2)
 
 
-def qt_pad_word(slot_point):
-    # The pad's word at a point's slot coordinates: sum_s pad_s eq(s, slot).
-    leaves = qt_pad_leaves(slot_point)
+def qt_pad_word(leaves, half: Const):
+    # A half's pad word at a point's slot coordinates, whose eq leaves are given: sum_s pad_s eq(s, slot).
     total = 0
     for s in unroll(0, 2 ** QKECCAK_SLOT_LOG):
-        if const(QT_PAD[s] != 0):
-            total += leaves[GEN ** s] * QT_PAD[s]
+        if const(QT_PAD[2 ** QKECCAK_SLOT_LOG * half + s] != 0):
+            total += leaves[GEN ** s] * QT_PAD[2 ** QKECCAK_SLOT_LOG * half + s]
     return total
 
 
-def qt_ring_slices(slices, out, u, slot_point):
-    # The ring switch's slices on the QT region: each slice i plus u times bit i of the
-    # pad's word at the point's slot coordinates, u the uncovered chunks' weight.
-    leaves = qt_pad_leaves(slot_point)
+def qt_ring_slices(slices, out, u_0, u_1, leaves):
+    # The pad's share of the reduction's slices under QT: each slice i plus, for each half, its weight u
+    # (the eq of the half and the rows its pieces leave uncovered) times bit i of its pad's word at
+    # the point's slot coordinates.
     for i in unroll(0, BASE_FIELD_BITS):
-        share = 0
+        mass_0 = 0
+        mass_1 = 0
         for s in unroll(0, 2 ** QKECCAK_SLOT_LOG):
             if const((QT_PAD[s] // 2 ** i) % 2 == 1):
-                share += leaves[GEN ** s]
-        out[GEN ** i] = slices[GEN ** i] + u * share
+                mass_0 += leaves[GEN ** s]
+            if const((QT_PAD[2 ** QKECCAK_SLOT_LOG + s] // 2 ** i) % 2 == 1):
+                mass_1 += leaves[GEN ** s]
+        out[GEN ** i] = slices[GEN ** i] + u_0 * mass_0 + u_1 * mass_1
     return
+
+
+def zero_extend(src, tau_g, kappa_g):
+    # The point src[..tau] followed by zeros up to kappa: the same table column's point in the table
+    # completed to kappa steps.
+    out = HeapBuf(kappa_g)
+    for i in mul_range(1, tau_g):
+        out[i] = src[i]
+    tail = out * tau_g
+    for i in mul_range(1, kappa_g / tau_g):
+        tail[i] = 0
+    return out
+
+
+def qt_half_weights(h: Const, pieces, chi, tau_h_g, kappa_g, rs_point, z_vals, rs_w, out_w, slot_w, us):
+    # Half h's pieces at the three points that claim on it, each piece's p_j e_j, its rows' weight in
+    # the half (piece_eqs), written to its half's run of rs_w at the reduction's input point,
+    # of out_w at its output point, and of slot_w at the zero-extended point of a slot claim,
+    # the table's chi[..tau] and zeros to kappa. us holds five cells a half: the weight of the half's
+    # uncovered rows (1 + sum p_j e_j), times the half's eq, at the input point and at the output point,
+    # then at the slot claim's point, and then the two eqs of the half alone.
+    src = N_TABLES + 2 + h
+    ext = zero_extend(chi, tau_h_g, kappa_g)
+    pad_rs = piece_eqs(rs_point, pieces, rs_w * GEN ** (N_PIECES * h), src, 0)
+    pad_out = piece_eqs(z_vals, pieces, out_w * GEN ** (N_PIECES * h), src, 0)
+    pad_slot = piece_eqs(ext, pieces, slot_w * GEN ** (N_PIECES * h), src, 0)
+    e_rs = half_eq(h, rs_point * kappa_g)
+    e_out = half_eq(h, z_vals * kappa_g)
+    us[GEN ** (5 * h)] = e_rs * pad_rs
+    us[GEN ** (5 * h + 1)] = e_out * pad_out
+    us[GEN ** (5 * h + 2)] = pad_slot
+    us[GEN ** (5 * h + 3)] = e_rs
+    us[GEN ** (5 * h + 4)] = e_out
+    return
+
+
+def qt_ring_weights(pieces, cf, rs_point, rs_slot, point1, c_table, kappa_g, out):
+    # Each present piece's ring weight at the opening, written to out[i] (zero for an absent piece):
+    # sum_k c_k * cf^(2^k) * prod_n (z_n^(2^k) + 1 + r_n), over the piece's point z, its b rows of the
+    # reduction's input point then its six slot coordinates, against the opening's first b + 6 coordinates r.
+    # Piece j of a half has kappa - j rows (source_pieces), so the pieces share the row products:
+    # one chain over the first kappa - N_PIECES + 1 coordinates, then one coordinate at a time up to kappa,
+    # five rows of 64 products, each piece taking the row of its b.
+    chain = HeapBuf((kappa_g * GEN) ** BASE_FIELD_BITS)
+    for k in unroll(0, BASE_FIELD_BITS):
+        chain[GEN ** k] = 1
+    base_g = kappa_g * INV_GEN ** (N_PIECES - 1)
+    first_row = rs_eq_run(chain, rs_point, point1, base_g)
+    for t in unroll(0, N_PIECES - 1):
+        done = rs_eq_rows(first_row * GEN ** (BASE_FIELD_BITS * t), rs_point * base_g * GEN ** t, point1 * base_g * GEN ** t, 1)
+    # The slot coordinates' Frobenius powers, for all the pieces: slot_pow[64 s + k] = rs_slot_s^(2^k).
+    slot_pow = HeapBuf(QKECCAK_SLOT_LOG * BASE_FIELD_BITS)
+    for s in unroll(0, QKECCAK_SLOT_LOG):
+        slot_pow[GEN ** (BASE_FIELD_BITS * s)] = rs_slot[GEN ** s]
+        for k in unroll(1, BASE_FIELD_BITS):
+            slot_pow[GEN ** (BASE_FIELD_BITS * s + k)] = slot_pow[GEN ** (BASE_FIELD_BITS * s + k - 1)] * slot_pow[GEN ** (BASE_FIELD_BITS * s + k - 1)]
+    for i in unroll(0, QT_PIECES):
+        rec = pieces * GEN ** (PIECE_REC * (N_TABLES + 2 + i // N_PIECES))
+        if rec[GEN ** (i % N_PIECES)] == 1:
+            out[GEN ** i] = qt_piece_weight(first_row * GEN ** (BASE_FIELD_BITS * (N_PIECES - 1 - i % N_PIECES)), cf[GEN ** i], slot_pow, point1 * rec[GEN ** (PIECE_AT + i % N_PIECES)], c_table)
+        else:
+            out[GEN ** i] = 0
+    return
+
+
+def qt_piece_weight(row, scale, slot_pow, slot_at, c_table):
+    # One piece's ring weight: sum_k c_k * scale^(2^k) * row_k * prod_s (slot_s^(2^k) + slot_at_s), `row` the
+    # piece's 64 row products, `slot_at` the opening's coordinates its six slot coordinates meet.
+    total = 0
+    power = scale
+    for k in unroll(0, BASE_FIELD_BITS):
+        product = row[GEN ** k] * power
+        for s in unroll(0, QKECCAK_SLOT_LOG):
+            product *= slot_pow[GEN ** (BASE_FIELD_BITS * s + k)] + slot_at[GEN ** s]
+        total += c_table[GEN ** k] * product
+        if const(k != BASE_FIELD_BITS - 1):
+            power = power * power
+    return total
 
 
 def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
@@ -3872,13 +4101,15 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # = const via the baked adj). Each block's kappa then DERIVES from its
     # structural source as a compile-time offset off a certified log: no hint, and
     # nothing left free.
-    kappa_base = HeapBuf(N_TABLES + 3)
-    kb = StackBuf(N_TABLES + 3)  # the same, in the frame
+    # Source N_TABLES + 2 is that kappa, q_keccak's; N_TABLES + 3 is the same again, the second half's of it.
+    kappa_base = HeapBuf(N_TABLES + 4)
+    kb = StackBuf(N_TABLES + 4)  # the same, in the frame
     kb[0] = 1
     kb[1] = g_log_mem
     for t in unroll(0, N_TABLES + 1):
         kb[2 + t] = dims_g[GEN ** (t + 1)]
-    for i in unroll(0, N_TABLES + 3):
+    kb[N_TABLES + 3] = kappa_g
+    for i in unroll(0, N_TABLES + 4):
         kappa_base[GEN ** i] = kb[i]
     # The ONE bus depth, COMPUTED (not hinted): mu = log2_ceil(Σ_b 2^κ_b) over
     # PUSH's blocks; pull matches by pairing, the count tree is padded to it.
@@ -3902,7 +4133,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # ---- the committed size: placement, then g^m, m = max(log2_ceil(sum_cols 2^kappa), PCS_MIN_MU) ----
     # g_total is g^(sum 2^kappa) from the certified placement walk, over a truncated
     # proof's pieces: the pieces depend on the announcement alone.
-    pieces = all_pieces(kappa_base, trunc, g_mem, table_rows, g_squares)
+    pieces = all_pieces(kappa_base, trunc, qt, g_mem, table_rows, g_squares)
     g_total, col_offsets, col_kappas = certify_placement(kappa_base, g_squares, pieces, qt)
     gmv = log2_ceil_in_the_exponent(g_total, g_squares, PCS_MIN_MU, SIZE_BITS)  # g^m
     size_sel = gmv * LIG_MIN_SHIFT_INV  # g^(m - MIN)
@@ -3944,11 +4175,42 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     fs0, fs1, fs2, fs3, fs4, cursor, g_zc_n, bc_value, rm, col_eval_words = verify_tables(fs0, fs1, fs2, fs3, fs4, cursor, pi_0, pi_1, zeta, g_bus_mu, dims_g, table_rows, g_squares, fp_w, beta, claim_pool, chi, gkr_leaves, tabs, bc_point)
 
     # ---- KECCAK validity, by GKR over the rounds ----
-    tau_keccak_g = dims_g[GEN ** (TABLE_KECCAK + 1)]  # the KECCAK table's certified tau
+    tau_k_g = dims_g[GEN ** (TABLE_KECCAK + 1)]  # the KECCAK table's certified tau
+    tau_t_g = dims_g[GEN ** (TABLE_KECCAK64 + 1)]  # KECCAK64's
+    tau_keccak_g = dims_g[GEN ** (N_TABLES + 1)]  # kappa, the height both are completed to
     z_vals = HeapBuf(2 * QKECCAK_VARS_CAP)
     slices = HeapBuf(BASE_FIELD_BITS)
-    fs0, fs1, fs2, fs3, fs4, cursor, keccak_word = verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_keccak_g, chi, col_eval_words * GEN ** (KECCAK_OUT_POOL - N_BUS_CLAIMS), z_vals, slices, tabs)
+    fs0, fs1, fs2, fs3, fs4, cursor, keccak_word = verify_keccak(fs0, fs1, fs2, fs3, fs4, cursor, tau_keccak_g, tau_k_g, tau_t_g, chi, col_eval_words * GEN ** (KECCAK_OUT_POOL - N_BUS_CLAIMS), col_eval_words * GEN ** (KECCAK64_OUT_POOL - N_BUS_CLAIMS), z_vals, slices, tabs)
+
+    # ---- under QT, the pieces of q_keccak are one ring claim ----
+    # The reduction's input opening is on q_keccak, whose pieces are the claims of the stack: they make
+    # one ring claim over the reduction's slices and the pad's share. The prover sends nothing more.
+    rs_point = z_vals * GEN ** QKECCAK_VARS_CAP
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
+
+    # ---- under QT, the pieces' weights on the reduction's openings ----
+    # Per half, the eq of the half and of each piece's rows at the reduction's input point, the output point
+    # and the zero-extended point of a slot claim, and the weights of the rows past the pieces.
+    us = HeapBuf(5 * N_HALVES)
+    rs_w = HeapBuf(QT_PIECES)
+    out_w = HeapBuf(QT_PIECES)
+    slot_w = HeapBuf(QT_PIECES)
+    qt_half_weights(0, pieces, chi, tau_k_g, tau_keccak_g, rs_point, z_vals, rs_w, out_w, slot_w, us)
+    qt_half_weights(1, pieces, chi, tau_t_g, tau_keccak_g, rs_point, z_vals, rs_w, out_w, slot_w, us)
+    # The input opening's slices are those of its pieces, each weighed by its half's eq and rows', and the pad's
+    # share: so the ring claim is on the slices `share_slices` the pad's share completes, and each piece weighs its
+    # block by that scale `cf`. Absent pieces have zero rows' weight, so a plain proof's `cf` is zero.
+    cf = HeapBuf(QT_PIECES)
+    for i in unroll(0, QT_PIECES):
+        cf[GEN ** i] = us[GEN ** (5 * (i // N_PIECES) + 3)] * rs_w[GEN ** i]
+    rs_slot = rs_point * (tau_keccak_g * GEN ** KECCAK_TABLE_BITS)
+    share_slices = HeapBuf(BASE_FIELD_BITS)
+    rs_leaves = qt_pad_leaves(rs_slot)
+    qt_ring_slices(slices, share_slices, qt * us[GEN ** 0], qt * us[GEN ** 5], rs_leaves)
+    # The output claim's pad: each half's eq, pad word at the output's slot and uncovered rows.
+    out_slot = z_vals * (tau_keccak_g * GEN ** KECCAK_TABLE_BITS)
+    out_leaves = qt_pad_leaves(out_slot)
+    qt_out = qt * (us[GEN ** 1] * qt_pad_word(out_leaves, 0) + us[GEN ** 6] * qt_pad_word(out_leaves, 1))
 
     # ---- a truncated proof's pads' weights on the claims ----
     combo_eq = HeapBuf(N_PIECES * N_COMBOS + N_COMBOS)  # each combo's p_j e_j, then its pad's weight
@@ -3960,32 +4222,6 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
             combo_pad[GEN ** cb] = piece_eqs(chi, pieces, combo_eq * GEN ** (N_PIECES * cb), COMBO_SRC[cb], 0)
         if const(COMBO_BUF[cb] == POINT_BUF_PI):
             combo_pad[GEN ** cb] = piece_eqs(chi, pieces, combo_eq * GEN ** (N_PIECES * cb), COMBO_SRC[cb], 1)
-    # Under QT (verifier::layout::Qt) q_keccak is a region (steplo, slot, chunk), steplo gq
-    # coordinates: the chunks the KECCAK table's pieces cover, then each slot's pad. A slot
-    # claim, the output claim and the ring switch's slices add the pad's share, weighed by
-    # the uncovered chunks, and the opening reads the region's points.
-    kq_rec = pieces * GEN ** (PIECE_REC * (TABLE_KECCAK + 2))
-    gq_g = qt * kq_rec[GEN ** PIECE_G] + (1 + qt) * tau_keccak_g
-    rs_point = z_vals * GEN ** QKECCAK_VARS_CAP
-    qtv = StackBuf(4)  # a slot claim's pad weight, the output claim's pad, the slices, the points
-    if qt == 1:
-        scratch = HeapBuf(3 * N_PIECES)
-        qtv[0] = piece_eqs(chi, pieces, scratch, TABLE_KECCAK + 2, 0)
-        u_out = piece_eqs(z_vals, pieces, scratch * GEN ** N_PIECES, TABLE_KECCAK + 2, 0)
-        qtv[1] = u_out * qt_pad_word(z_vals * tau_keccak_g)
-        u_rs = piece_eqs(rs_point, pieces, scratch * GEN ** (2 * N_PIECES), TABLE_KECCAK + 2, 0)
-        region_slices = HeapBuf(BASE_FIELD_BITS)
-        qt_ring_slices(slices, region_slices, u_rs, rs_point * tau_keccak_g)
-        qtv[2] = region_slices
-        region_points = HeapBuf(2 * QKECCAK_VARS_CAP)
-        rotate_qkeccak(z_vals, region_points, gq_g, tau_keccak_g)
-        rotate_qkeccak(rs_point, region_points * GEN ** QKECCAK_VARS_CAP, gq_g, tau_keccak_g)
-        qtv[3] = region_points
-    else:
-        qtv[0] = 0
-        qtv[1] = 0
-        qtv[2] = slices
-        qtv[3] = z_vals
 
     # ---- stacked mixed opening: ring-switch front + claim combination ----
     # The input opening's slices were read and bound above; this block only binds
@@ -4012,17 +4248,19 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
             if const(p + 1 != RING_MAP_WIDTH):
                 for t in unroll(0, RING_MAP_WIDTH):
                     power = power * power
-    target_in = ring_switch_target(qtv[2], map_challenges)
+    # The ring claim: one, on the slices `share_slices`, a plain proof's on q_keccak, or under QT over all
+    # the pieces of its halves.
+    ring_tgt = ring_switch_target(share_slices, map_challenges)
     # ONE batching challenge for the whole pool: N_CLAIMS - 1 fewer Fiat-Shamir
     # hashes than a challenge per claim, and none for the values themselves,
     # `fs_next` having bound every one it read and the public-input ones deriving
     # from the seeded statement and rm, so `lam_cl` already depends on all of
     # them. Disjoint power ranges, as for the zc_xi-powers above:
-    # the ring-switch claim takes lam_cl^0, the pool lam_cl^1 onward (bar the output
+    # the ring-switch claim takes lam_cl^0; the pool the powers after it (bar the output
     # lanes' claims, which the Keccak reduction consumed), and the Keccak reduction's
     # claim on its committed outputs the power after the pool's last.
     sp, lam_cl = squeeze(sp, rate, 0)
-    target = target_in
+    target = ring_tgt
     lam_pow = lam_cl
     for j in unroll(0, N_CLAIMS):
         if CLAIM_POINT_BUF[j] != POINT_BUF_KECCAK_OUT:
@@ -4037,9 +4275,13 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
             if const(CLAIM_COMMITTED_COL[j] == MFCNT_COMMITTED_COL):
                 target += lam_pow * combo_pad[GEN ** CLAIM_COMBO[j]]
             if const(CLAIM_QT_PAD[j] != 0):
-                target += lam_pow * qtv[0] * CLAIM_QT_PAD[j]
+                # A slot claim of a half adds its pad past that half's pieces.
+                if const(CLAIM_KAPPA_SRC[j] == 2 + TABLE_KECCAK):
+                    target += lam_pow * qt * us[GEN ** 2] * CLAIM_QT_PAD[j]
+                else:
+                    target += lam_pow * qt * us[GEN ** 7] * CLAIM_QT_PAD[j]
             lam_pow *= lam_cl
-    target += lam_pow * (keccak_word + qtv[1])
+    target += lam_pow * (keccak_word + qt_out)
     # The OOD sample's claim closes the batch.
     target += lam_pow * lam_cl * ood_value[1]
     # One arm per size, the rate passed on. Both are transcript-bound and range-checked
@@ -4051,7 +4293,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # is outside the recursively verified proof and intentionally unconstrained.
 
     # ---- generalized eval_b terminal (runtime claim shapes) ----
-    check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem, tau_keccak_g, kappa_base, lam_cl, col_offsets, col_kappas, pieces, combo_eq, gq_g, qtv[3], c_table, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z, gmv)
+    check_opening_terminal(g_squares, zeta, chi, rm, g_bus_mu, g_zc_n, g_log_mem, tau_keccak_g, tau_k_g, tau_t_g, kappa_base, lam_cl, col_offsets, col_kappas, pieces, combo_eq, z_vals, c_table, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z, gmv, qt, cf, slot_w, out_w, us)
 
     # ---- export this sub-proof's deferred-claim data to the caller (FRESH_*) ----
     for k in unroll(0, BYTECODE_LOG):

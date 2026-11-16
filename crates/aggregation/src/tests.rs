@@ -321,12 +321,114 @@ fn guest_column_selectors_match_native_eq() {
     }
 }
 
+/// The guest's ring weights of the pieces of `q_keccak`, which share their row products, against the definition:
+/// `sum_u Phi(scale * eq(z, u)) eq(r', u)` over each piece's point `z` and the opening's first coordinates `r'`.
+/// Pieces of both halves, at several row counts, some absent.
+#[test]
+fn guest_piece_ring_weights_match_the_definition() {
+    let kbc = 18;
+    let guest = guest_snippet(
+        r#"    rs_point = HeapBuf(40)
+    hint_witness(rs_point[0:40], "rs_point")
+    point1 = HeapBuf(40)
+    hint_witness(point1[0:40], "point1")
+    pieces = HeapBuf(PIECE_REC * (N_TABLES + 4))
+    hint_witness(pieces[0:PIECE_REC * (N_TABLES + 4)], "pieces")
+    cf = HeapBuf(QT_PIECES)
+    hint_witness(cf[0:QT_PIECES], "cf")
+    c_table = HeapBuf(BASE_FIELD_BITS)
+    hint_witness(c_table[0:BASE_FIELD_BITS], "c_table")
+    expected = HeapBuf(QT_PIECES)
+    hint_witness(expected[0:QT_PIECES], "expected")
+    kappa_g = hint_witness("kappa")
+    rs_slot = rs_point * kappa_g * GEN ** KECCAK_TABLE_BITS
+    out = HeapBuf(QT_PIECES)
+    qt_ring_weights(pieces, cf, rs_point, rs_slot, point1, c_table, kappa_g, out)
+    for i in unroll(0, QT_PIECES):
+        assert out[GEN ** i] == expected[GEN ** i]
+    return
+"#,
+        kbc,
+    );
+    let (n_pieces, record) = (5usize, 11usize);
+    let table_bits = lean_vm_core::keccak::TABLE_BITS;
+    let n_tables = verifier::layout::N_TABLES;
+    let sources = n_tables + 4;
+    let mut rng = StdRng::seed_from_u64(0x7157);
+    let mut random = || {
+        let (c0, c1) = rand::Rng::random(&mut rng);
+        F128::new(c0, c1)
+    };
+    for kappa in [9usize, 11] {
+        let challenges: Vec<F128> = (0..16).map(|_| random()).collect();
+        // `Phi(v) = sum_k c_k v^(2^k)`, `c_(8p+b) = f_p g_b^(2^(8p))`.
+        let coefficients: Vec<F128> = (0..64)
+            .map(|k| {
+                let mut g = challenges[8 + k % 8];
+                for _ in 0..8 * (k / 8) {
+                    g = g.square();
+                }
+                challenges[k / 8] * g
+            })
+            .collect();
+        let phi = |value: F128| {
+            let mut power = value;
+            let mut total = F128::ZERO;
+            for &c in &coefficients {
+                total += c * power;
+                power = power.square();
+            }
+            total
+        };
+        let rs_point: Vec<F128> = (0..40).map(|_| random()).collect();
+        let point1: Vec<F128> = (0..40).map(|_| random()).collect();
+        let present = [0usize, 2, 6, 8];
+        let mut pieces = vec![F128::ZERO; record * sources];
+        let mut cf = vec![F128::ZERO; 2 * n_pieces];
+        let mut expected = vec![F128::ZERO; 2 * n_pieces];
+        for &i in &present {
+            let (half, j) = (i / n_pieces, i % n_pieces);
+            let rec = &mut pieces[record * (n_tables + 2 + half)..][..record];
+            rec[j] = F128::ONE;
+            let b = kappa - j;
+            cf[i] = random();
+            // The piece's point: its rows of the input point, then its six slot coordinates.
+            let slot_start = kappa + table_bits;
+            let z: Vec<F128> = rs_point[..b]
+                .iter()
+                .chain(&rs_point[slot_start..slot_start + 6])
+                .copied()
+                .collect();
+            let r: Vec<F128> = point1[..b + 6].iter().map(|&p| F128::ONE + p).collect();
+            let (eq_z, eq_r) = (
+                primitives::multilinear::eq_table(&z),
+                primitives::multilinear::eq_table(&r),
+            );
+            expected[i] = eq_z.iter().zip(&eq_r).map(|(&e, &w)| phi(cf[i] * e) * w).sum();
+        }
+        for source in 0..sources {
+            for j in 0..n_pieces {
+                pieces[record * source + n_pieces + j] = count(kappa - j);
+            }
+        }
+        let mut hints = Hints::default();
+        hints.push("rs_point", rs_point);
+        hints.push("point1", point1);
+        hints.push("pieces", pieces);
+        hints.push("cf", cf);
+        hints.push("c_table", coefficients);
+        hints.push("expected", expected);
+        hints.push("kappa", vec![count(kappa)]);
+        let execution = execute(&guest, &hints.0, [F128::ZERO; 2]).expect("the guest's weights equal the definition");
+        assert!(execution.unconstrained_reads.is_empty());
+    }
+}
+
 /// The right leaf holds more claims than one loop frame of its list hashes
 /// ([`CLAIM_GROUP`]), so that leaf runs the list's group loop and then a
 /// partial last group, while the left leaf's list is a partial group alone.
 /// The leaves share three signers, which the flattened set holds once.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn aggregate_two_to_one() {
     let big = 2 * CLAIM_GROUP + 3;
     let signers = get_signers::<StableProver>(SMALL_LEAF_SIZE + big);
@@ -405,7 +507,6 @@ fn invalid_da_selections_are_rejected_before_building_the_proof() {
 /// root, the first's by default or the one it selects, or none; a node with blobs
 /// publishes their matrix's, whatever its children hold.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn a_node_passes_on_one_childs_da_root() {
     let signers = get_signers::<StableProver>(SMALL_LEAF_SIZE);
     let mut children = vec![prove(&[], &signers, &[])];
@@ -702,7 +803,6 @@ fn raw_signatures_may_go_undeclared() {
 /// different leaf indices, so its claims on B are distinct from those on A; the
 /// left leaf holds one message, the right both, and both leaves cover one claim.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn aggregate_two_messages() {
     let at_a = get_signers::<StableProver>(4);
     let at_b = get_signers_for::<StableProver>(2, MESSAGE_B);
@@ -735,7 +835,6 @@ fn aggregate_two_messages() {
 /// holds once; the root adds a raw signature of each scheme, leanXMSS on a second message, alongside its
 /// children. The root's proof goes over the wire.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn aggregate_three_levels() {
     let xmss = get_signers::<StableProver>(17);
     let sphincs = get_lean_sphincs_signers::<StableProver>(5);
@@ -823,7 +922,6 @@ fn malformed_raw_signatures_are_errors() {
 /// longer matches the proof: the verifier rejects it, on the wire too. A forged child
 /// commitment hint fails in the guest, whose rebuilt child statement matches no proof.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn tampered_claim_tree_is_rejected() {
     let signers = get_signers::<StableProver>(SMALL_LEAF_SIZE + 1);
     let children = [
@@ -917,7 +1015,6 @@ fn wide_claim_trees_are_rejected() {
 /// Every other tree over the same proof is rejected: order, arity, wrapping, flattening,
 /// a claim moved between children or schemes, or repeated at the root. Directly and on the wire.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn other_claim_trees_are_rejected() {
     let signers = get_signers::<StableProver>(5);
     let children = [prove(&[], &signers[..3], &[]), prove(&[], &signers[3..], &[])];
@@ -1069,7 +1166,6 @@ fn uncovered_raw_claims_fail_the_guest() {
 /// One child, three children, a node with children and raw claims of both schemes, a node over
 /// a node: each verifies, directly and over the wire with its tree.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn arities_and_mixed_nodes_verify() {
     let signers = get_signers::<StableProver>(8);
     let sphincs = get_lean_sphincs_signers::<StableProver>(2);
@@ -1097,7 +1193,6 @@ fn arities_and_mixed_nodes_verify() {
 /// What the tree no longer excludes: one claim in two subtrees and again raw at the root, and
 /// one child proof used twice. The flattened set holds each claim once.
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn repeated_claims_are_accepted_and_flattened() {
     let signers = get_signers::<StableProver>(4);
     let left = prove(&[], &signers[..3], &[]);

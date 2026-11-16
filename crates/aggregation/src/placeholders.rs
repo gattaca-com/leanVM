@@ -4,7 +4,7 @@ use super::MAX_RECURSIONS;
 use super::cells::pack_16_bytes;
 use super::child::{
     MU_CAP, QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, block_groups, col_groups, col_slots, cut,
-    merkle_cap_depth, whir_levels,
+    guest_col_sources, merkle_cap_depth, whir_levels,
 };
 use super::claim_pool::{ClaimSite, claim_pool, coord_difference, coord_kind, coord_scale, push_coord_terms};
 use super::deferred::{BATCH_LAM_GRIND_BITS, RECURSION_AGG_LABEL};
@@ -20,14 +20,17 @@ use lean_vm_core::cpu::{
     to_scalar, xi_form_base,
 };
 use lean_vm_core::gkr::{ROUND_GRIND, y_grind};
-use lean_vm_core::keccak::{ONE_TABLE_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG};
+use lean_vm_core::keccak::{MIN_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG, TABLE_BITS, TABLES};
 use lean_vm_core::leaf::{self, Block, Coord};
 use pcs::ntt::AdditiveNttF64;
 use primitives::field::{F64, F128, g_pow};
 use std::collections::BTreeMap;
 use verifier::bus_grinding_bits;
 use verifier::layout::BUS_BITS;
-use verifier::layout::{GLOBAL_COLUMN_BASES, MEMORY_FINAL_COUNTERS, N_TABLES, TABLE_LOG_FLOORS, TABLE_WIDTHS, tables};
+use verifier::layout::{
+    GLOBAL_COLUMN_BASES, MEMORY_FINAL_COUNTERS, N_TABLES, TABLE_LOG_FLOORS, TABLE_WIDTHS, hash_padding_outputs,
+    keccak64_pad, tables,
+};
 use verifier::{BATCH_GRINDING_BITS, FOLD_GRINDING_BITS, OOD_GRINDING_BITS, QUERY_GRINDING_BITS};
 
 /// A value as the guest's literal for it: an integer in decimal, a field element as the integer its limbs spell, a
@@ -266,7 +269,7 @@ fn constants(ph: &mut Placeholders) {
         ("GKR_Y_GRIND_BITS", &y_grind(2, false)),
         ("GKR_Y_LAST_GRIND_BITS", &y_grind(2, true)),
         ("XI_GRIND_BITS", &grinding_bits(n_xi_powers() as u128 - 1)),
-        // The Keccak segment then the lane, 25 lanes in five coordinates.
+        // The Keccak segment (run, then table) then the lane, 25 lanes in five coordinates.
         ("KECCAK_SEG_GRIND_BITS", &grinding_bits((shape.seg_log() + 5) as u128)),
         ("KECCAK_S_GRIND_BITS", &grinding_bits(PRODUCT_BITS as u128 - 1)),
         ("KECCAK_BETA_GRIND_BITS", &grinding_bits(2)),
@@ -282,6 +285,14 @@ fn constants(ph: &mut Placeholders) {
         ("KECCAK_DEPTH", &shape.depth()),
         ("KECCAK_SEGMENTS", &shape.segments()),
         ("KECCAK_SEG_LOG", &shape.seg_log()),
+        // A segment is a run of rounds of one table: the run's bits come first in a segment's index, then the table's.
+        ("KECCAK_RUNS", &shape.round_segments()),
+        ("KECCAK_RUN_LOG", &shape.round_seg_log()),
+        ("KECCAK_TABLE_BITS", &shape.table_bits()),
+        // What a padding step of each hash table outputs, lane by lane: the permutation of its input.
+        ("KECCAK_PAD_OUT", &hash_padding_outputs().concat()),
+        ("KECCAK64_PAD", &keccak64_pad()),
+        ("KECCAK64_IN", &verifier::layout::KECCAK64_IN),
         ("KECCAK_PACK", &PACK),
         ("KECCAK_EMBED_BITS", &EMBED_BITS),
         ("KECCAK_PROD_BITS", &PRODUCT_BITS),
@@ -289,7 +300,9 @@ fn constants(ph: &mut Placeholders) {
         ("KECCAK_RHO", &keccak256::RHO),
         ("KECCAK_STATE", &isa::STATE_CELLS),
         ("QKECCAK_SLOT_LOG", &SLOT_LOG),
-        ("QKECCAK_VARS_CAP", &(33 + SLOT_LOG)),
+        // A `q_keccak` coordinate is its step, then its table's bit and its slot: the bits past the steps.
+        ("QKECCAK_EXTRA_BITS", &(SLOT_LOG + TABLE_BITS)),
+        ("QKECCAK_VARS_CAP", &(33 + SLOT_LOG + TABLE_BITS)),
         // The stacked opening and the statement.
         ("N_COLUMN_LOGS", &(verifier::MAX_STACKED_LOG + 1)),
         ("PCS_MIN_MU", &verifier::MIN_STACKED_LOG),
@@ -443,8 +456,13 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
             // A table column's claim is at its table's chi[..tau].
             ClaimSite::TableColumn { column, table } => match keccak_value(column) {
                 None => (POINT_BUF_RHO, compact_col(column), 0, (2 + table, 0)),
-                // The guest reads one half of `q_keccak`, the KECCAK table's: a slot is named by its bits alone.
-                Some((_, KeccakLane::Slot(slot))) => (POINT_BUF_QKECCAK_RHO, qkeccak, slot, (2 + table, 0)),
+                // The half of `q_keccak` the slot is in rides above the slot's bits.
+                Some((half, KeccakLane::Slot(slot))) => (
+                    POINT_BUF_QKECCAK_RHO,
+                    qkeccak,
+                    slot + (half << SLOT_LOG),
+                    (2 + table, 0),
+                ),
                 Some((_, KeccakLane::Output(_))) => (POINT_BUF_KECCAK_OUT, qkeccak, 0, (2 + table, 0)),
             },
             ClaimSite::MemoryLimb { column } => (POINT_BUF_PI, compact_col(column), 0, (1, 0)),
@@ -465,7 +483,7 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
         "CLAIM_QKECCAK_SLOT_BITS",
         claims
             .iter()
-            .flat_map(|c| (0..SLOT_LOG).map(move |k| (c.qkeccak_slot >> k) & 1)),
+            .flat_map(|c| (0..SLOT_LOG + TABLE_BITS).map(move |k| (c.qkeccak_slot >> k) & 1)),
     );
     // The output lanes' claims, in two runs in the pool, `KECCAK`'s 25 then `KECCAK64`'s 4: the reduction's claim on
     // the output.
@@ -491,9 +509,11 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
             .all(|(lane, &j)| j == keccak64_out_pool + lane)
     );
     ph.set("KECCAK_OUT_POOL", out_pool);
+    ph.set("KECCAK64_OUT_POOL", keccak64_out_pool);
     // The stacked opening batches the ring-switched claim, the pool's on-stack claims and the
     // Keccak reduction's claim on its output word and level 0's OOD claim; the batching is accounted for up to a cap.
-    let stacked = 2 + claims.iter().filter(|c| c.buffer != POINT_BUF_KECCAK_OUT).count() + 1;
+    // A QT proof has one ring claim over all the pieces of q_keccak, as a plain proof has.
+    let stacked = 1 + 1 + claims.iter().filter(|c| c.buffer != POINT_BUF_KECCAK_OUT).count() + 1;
     assert!(stacked <= verifier::MAX_STACKED_CLAIMS, "too many stacked claims");
     ph.set("QKECCAK_COMMITTED_COL", qkeccak);
 
@@ -524,16 +544,17 @@ fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
     ph.list("COMBO_SRC", combos.iter().map(|c| c.1));
     ph.list("CLAIM_COMBO", claim_combo);
     ph.set("MFCNT_COMMITTED_COL", mfcnt);
-    // Under QT a slot's claim adds the pad of its slot past the covered rows: the KECCAK table's half's.
-    let pad = qt_pad(0);
+    // Under QT a slot's claim adds the pad of its slot past the covered rows, in its half.
+    let pads = [qt_pad(0), qt_pad(1)];
+    let slot_mask = (1 << SLOT_LOG) - 1;
     ph.list(
         "CLAIM_QT_PAD",
         claims.iter().map(|c| match c.buffer {
-            POINT_BUF_QKECCAK_RHO => pad[c.qkeccak_slot],
+            POINT_BUF_QKECCAK_RHO => pads[c.qkeccak_slot >> SLOT_LOG][c.qkeccak_slot & slot_mask],
             _ => 0,
         }),
     );
-    ph.list("QT_PAD", pad);
+    ph.list("QT_PAD", pads.concat());
 }
 
 /// The combo of a claim that is not on a cut column.
@@ -818,8 +839,10 @@ fn opening_placeholders(ph: &mut Placeholders, kbc: usize) {
     ph.set("LIG_MIN_LOG_SIZE", minm);
     ph.set("LIG_N_LOG_SIZES", n_log_sizes);
     ph.set("LIG_MIN_SHIFT_INV", F128::from(g_pow(minm).inv()));
-    let cks: Vec<(usize, usize)> = col_kappa_sources(kbc).into_iter().flatten().collect();
+    let cks = guest_col_sources(kbc);
     ph.set("N_COMMITTED_COLS", cks.len());
+    // The columns of the native layout: the guest's own two, the halves of q_keccak, follow them.
+    ph.set("N_NATIVE_COLS", cks.len() - TABLES);
     ph.list("COL_KAPPA_SRC", cks.iter().map(|&(s, _)| s));
     ph.list("COL_KAPPA_ADJ", cks.iter().map(|&(_, a)| a));
     let groups = col_groups(&cks);

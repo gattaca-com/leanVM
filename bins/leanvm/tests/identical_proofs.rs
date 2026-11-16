@@ -69,7 +69,6 @@ fn stable_and_experimental_leaves_are_identical() {
 }
 
 #[test]
-#[ignore = "the recursion guest verifies one hash table's reduction, not the two a node's children prove"]
 fn stable_and_experimental_nodes_are_identical() {
     assert_identical(true);
 }

@@ -7,6 +7,7 @@ use fiat_shamir_prover::merkle::{hash_pair, hash_to_scalars, hash_words};
 use lean_vm_core::cpu::{
     KAPPA_SOURCE, QKECCAK, block_kappa_sources, col_kappa_sources, from_scalar, layout_of, piece_digits,
 };
+use lean_vm_core::keccak::{SLOT_LOG, TABLES};
 use lean_vm_core::leaf::{self, Block};
 use primitives::field::F128;
 use verifier::layout::N_TABLES;
@@ -57,9 +58,27 @@ pub(super) fn col_groups(sources: &[(usize, usize)]) -> Vec<usize> {
         .collect()
 }
 
-/// Whether a truncated proof cuts a column of this kappa source: the memory's and the tables' are.
+/// Whether a truncated proof cuts a column of this kappa source: the memory's and the tables' are, and the
+/// halves of `q_keccak` under QT (see [`guest_col_sources`]).
 pub(super) fn cut(source: (usize, usize)) -> bool {
-    source.0 >= 1 && source.1 == 0
+    source.0 >= 1 && (source.1 == 0 || is_half(source))
+}
+
+/// The adjustment of a half of `q_keccak`: its pieces hold all the slots of their rows.
+pub(super) const HALF_ADJ: usize = SLOT_LOG;
+
+/// Whether a kappa source is a half of `q_keccak` under QT.
+pub(super) fn is_half(source: (usize, usize)) -> bool {
+    source.0 >= KAPPA_SOURCE && source.0 < KAPPA_SOURCE + TABLES && source.1 == HALF_ADJ
+}
+
+/// The committed columns' kappa sources, then those of the two halves of `q_keccak`, which are columns of the
+/// guest alone: their pieces are what a QT proof commits in place of the column, each half cut at its table's rows
+/// like a table column. The guest places them with the others, in this order, a half absent unless the proof is QT.
+pub(super) fn guest_col_sources(kbc: usize) -> Vec<(usize, usize)> {
+    let mut sources: Vec<(usize, usize)> = col_kappa_sources(kbc).into_iter().flatten().collect();
+    sources.extend((0..TABLES).map(|half| (KAPPA_SOURCE + half, HALF_ADJ)));
+    sources
 }
 
 /// A cut column group's slots in the stacked order: piece `j` is `2^(kappa - j)` rows, `j = 0` the whole column.
@@ -144,13 +163,14 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
     let sources = col_kappa_sources(kbc);
     // Compact index to global column.
     let committed: Vec<usize> = (0..sources.len()).filter(|&c| sources[c].is_some()).collect();
-    let cks: Vec<(usize, usize)> = sources.iter().flatten().copied().collect();
+    let cks = guest_col_sources(kbc);
     let groups = col_groups(&cks);
     let truncation = summary.truncation;
     let source_log = |source: usize| match source {
         0 => 0,
         1 => summary.log_memory,
-        KAPPA_SOURCE => verifier::layout::HASH_TABLES
+        // The hash tables are completed to the taller one's height, and so are the halves of `q_keccak`.
+        s if s >= KAPPA_SOURCE => verifier::layout::HASH_TABLES
             .iter()
             .map(|&t| taus[t])
             .max()
@@ -162,7 +182,10 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
         let real = match truncation {
             None => 1 << k,
             Some(t) if source == 1 => t.mem_count as usize,
-            Some(_) if source == KAPPA_SOURCE => 1 << k,
+            // A half of `q_keccak` is cut at the rows of its table.
+            Some(_) if source >= KAPPA_SOURCE => {
+                summary.table_rows[verifier::layout::HASH_TABLES[source - KAPPA_SOURCE]] as usize
+            }
             Some(_) => summary.table_rows[source - 2] as usize,
         };
         piece_digits(k, real)
@@ -173,7 +196,10 @@ fn col_slot_order(kbc: usize, summary: &verifier::Summary, taus: &[usize; N_TABL
         .enumerate()
         .map(|(slot, (g, j))| {
             let (source, adj) = cks[groups[g]];
-            let present = if cut((source, adj)) {
+            let present = if is_half((source, adj)) {
+                // The pieces of `q_keccak` replace the column, in a QT proof only.
+                truncation.is_some_and(|t| t.qt) && digits(source)[j]
+            } else if cut((source, adj)) {
                 digits(source)[j]
             } else {
                 Some(groups[g]) != qkeccak || truncation.is_none_or(|t| !t.qt)
