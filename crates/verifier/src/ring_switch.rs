@@ -50,18 +50,20 @@ fn ring_coefficients(f: &[E], g: &[E]) -> Vec<E> {
     coefficients
 }
 
-/// The weight `W(u) = Phi(eq(r, u))`, extended and evaluated by the opening at
-/// `r_prime`: `sum_k c_k prod_n (1 + r_n^(2^k) + r'_n)`.
-fn ring_weight(r: &[E], r_prime: &[E], coefficients: &[E]) -> E {
+/// The weight `W(u) = Phi(scale * eq(r, u))`, extended and evaluated by the opening at
+/// `r_prime`: `sum_k c_k scale^(2^k) prod_n (1 + r_n^(2^k) + r'_n)`.
+fn ring_weight(r: &[E], r_prime: &[E], coefficients: &[E], scale: E) -> E {
     assert_eq!(r.len(), r_prime.len());
     let mut total = ZERO;
     let mut frobenius = r.to_vec();
+    let mut scale_power = scale;
     for &c in coefficients {
-        let mut product = c;
+        let mut product = c * scale_power;
         for (value, &challenge) in frobenius.iter_mut().zip(r_prime) {
             product *= ONE + *value + challenge;
             *value = value.square();
         }
+        scale_power = scale_power.square();
         total += product;
     }
     total
@@ -78,34 +80,34 @@ pub fn ring_switch(
     s: &[E],
     transcript: &mut Transcript,
 ) -> Result<(E, impl Fn(&[E]) -> E + use<>), VerifierError> {
-    let mut claims = ring_switch_many(vec![(point, s.to_vec())], transcript)?;
-    let (target, weight) = claims.pop().expect("one claim");
+    let (target, mut weights) = ring_switch_blocks(vec![(point, ONE)], s, transcript)?;
+    let weight = weights.pop().expect("one block");
     Ok((target, weight))
 }
 
-/// A ring claim's weight, which the opening evaluates at its terminal point.
+/// One block's weight, which the opening evaluates at its terminal point.
 pub type RingWeight = Box<dyn Fn(&[E]) -> E>;
 
-/// A claim's target and weight.
-pub type RingClaim = (E, RingWeight);
-
-/// [`ring_switch`] of several claims, `(point, slices)` each, under one draw of the map.
-pub fn ring_switch_many(
-    claims: Vec<(Vec<E>, Vec<E>)>,
+/// [`ring_switch`] of one claim over several blocks, `(point, scale)` each: the target `T(s)` of the slices, and for each
+/// block the weight `Phi(scale * eq(point, .))`. The claim is `sum_blocks <weight, block> = T(s)`.
+pub fn ring_switch_blocks(
+    blocks: Vec<(Vec<E>, E)>,
+    s: &[E],
     transcript: &mut Transcript,
-) -> Result<Vec<RingClaim>, VerifierError> {
+) -> Result<(E, Vec<RingWeight>), VerifierError> {
     transcript.grind_check(BATCH_GRINDING_BITS)?;
     let challenges = transcript.samples(2 * RING_MAP_WIDTH);
     let (f, g) = challenges.split_at(RING_MAP_WIDTH);
     let coefficients = std::rc::Rc::new(ring_coefficients(f, g));
-    Ok(claims
+    let weights = blocks
         .into_iter()
-        .map(|(point, s)| {
+        .map(|(point, scale)| {
             let coefficients = coefficients.clone();
-            let weight: RingWeight = Box::new(move |r_prime| ring_weight(&point, r_prime, &coefficients));
-            (ring_target(&s, f, g), weight)
+            let weight: RingWeight = Box::new(move |r_prime| ring_weight(&point, r_prime, &coefficients, scale));
+            weight
         })
-        .collect())
+        .collect();
+    Ok((ring_target(s, f, g), weights))
 }
 
 #[cfg(test)]

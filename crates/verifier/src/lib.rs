@@ -47,11 +47,9 @@ use bus::{ColumnClaim, N_TREES, table_sumcheck, verify_bus_balance};
 use field::{ZERO, powers};
 use hash::{ROUNDS, STATE_LANES};
 use keccak::{KeccakShape, verify_keccak};
-use layout::{
-    GLOBAL_COLUMN_BASES, HASH_TABLES, K_BITS, KECCAK_OUT, MEMORY_0, MEMORY_1, N_TABLES, QKECCAK, build_layout,
-};
+use layout::{GLOBAL_COLUMN_BASES, HASH_TABLES, KECCAK_OUT, MEMORY_0, MEMORY_1, N_TABLES, QKECCAK, build_layout};
 use multilinear::{dot, eq_eval, multilinear_eval};
-use ring_switch::{ring_switch, ring_switch_many};
+use ring_switch::{ring_switch, ring_switch_blocks};
 use std::ops::Range;
 use transcript::Transcript;
 use whir::verify_whir;
@@ -390,8 +388,8 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     }
 
     // 7] Ring-switching. A claim is supported on q_keccak's block of the stack, so its weight carries the
-    // placement's selector; the claims lead the batch, taking the first powers. A truncated q_keccak is pieces,
-    // each a claim of its own: the prover sends the slices of all but the last, which the reduction's slices fix.
+    // placement's selector; the claim leads the batch, taking the first power. A truncated q_keccak is pieces,
+    // one claim over all of them.
     let (point, slices) = openings.inputs;
     let mut stack_claims: Vec<StackClaim> = Vec::new();
     match &layout.qt {
@@ -404,42 +402,24 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
             ));
         }
         Some(qt) => {
+            // The pieces are one ring claim: `sum_j c_j piece_j` has the reduction's slices less the pad's share,
+            // so its slices are those plus the share, and each piece weighs its block by `c_j`. Nothing is sent.
             let split = qt.ring_split(&point);
-            let pieces = split.len();
             let share = qt.pad_share(&point);
-            // The derived piece is the largest, the first of them.
-            let derived = (0..pieces)
-                .max_by_key(|&j| (qt.pieces[j].b(), std::cmp::Reverse(j)))
-                .expect("a piece");
-            let sent = transcript.next_scalars(K_BITS * (pieces - 1))?;
-            let mut slices_of: Vec<Vec<E>> = Vec::with_capacity(pieces);
-            let mut sent_chunks = sent.chunks(K_BITS);
-            for j in 0..pieces {
-                slices_of.push(if j == derived {
-                    Vec::new()
-                } else {
-                    sent_chunks.next().expect("a piece's slices").to_vec()
-                });
-            }
-            let mut last: Vec<E> = slices.iter().zip(&share).map(|(&s, &pad)| s + pad).collect();
-            for ((_, coefficient), own) in split.iter().zip(&slices_of) {
-                for (slice, &value) in last.iter_mut().zip(own) {
-                    *slice += *coefficient * value;
-                }
-            }
-            let coefficient = split[derived].1;
-            require(coefficient != ZERO, VerifierError::KeccakInputOpening)?;
-            let inverse = coefficient.inv();
-            slices_of[derived] = last.into_iter().map(|slice| slice * inverse).collect();
-            let all = split.into_iter().map(|(point, _)| point).zip(slices_of).collect();
-            let rings = ring_switch_many(all, &mut transcript)?;
-            for (piece, (target, weight)) in qt.pieces.iter().zip(rings) {
-                let placement = piece.placement;
-                stack_claims.push((
-                    Box::new(move |x| placement.eq_above(x) * weight(&x[..placement.variables])),
-                    target,
-                ));
-            }
+            let combined: Vec<E> = slices.iter().zip(&share).map(|(&s, &pad)| s + pad).collect();
+            let (target, weights) = ring_switch_blocks(split, &combined, &mut transcript)?;
+            let placements: Vec<_> = qt.pieces.iter().map(|piece| piece.placement).collect();
+            stack_claims.push((
+                Box::new(move |x| {
+                    E::sum(
+                        placements
+                            .iter()
+                            .zip(&weights)
+                            .map(|(placement, weight)| placement.eq_above(x) * weight(&x[..placement.variables])),
+                    )
+                }),
+                target,
+            ));
         }
     }
     stack_claims.extend(claims.iter().filter_map(|claim| claim.on_stack(&layout)));

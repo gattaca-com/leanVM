@@ -246,9 +246,9 @@ impl Qt {
         Some((parts, value))
     }
 
-    /// The ring claims the reduction's input opening splits into, one per piece: the piece's point, and the weight `c_j` the
-    /// piece's slices have in the opening's `slices`. With them, `slices_z = sum_j c_j s_{j,z} + pad share`, where
-    /// the pad share is returned.
+    /// The blocks of the one ring claim the reduction's input opening becomes, one per piece: the piece's point, and the
+    /// scale `c_j` of its weight. With them, `slices_z = sum_j c_j s_{j,z} + pad share`, the pad share being
+    /// [`Self::pad_share`].
     pub fn ring_split(&self, point: &[E]) -> Vec<(Vec<E>, E)> {
         let (row, rest) = point.split_at(self.log_steps);
         let (table, slot) = rest.split_at(TABLE_BITS);
@@ -1172,6 +1172,25 @@ mod tests {
             }
             assert_eq!(sum, at_bit(&full, &rho, i), "bit {i}");
         }
+        // A verifier that took each half's pad to be the other's has a share that breaks the identity.
+        let swapped = Qt {
+            log_steps: kappa,
+            pieces: qt.pieces.clone(),
+            pads: [pads[1], pads[0]],
+        };
+        let wrong = swapped.pad_share(&rho);
+        let broken = (0..64).filter(|&i| {
+            let mut sum = wrong[i];
+            for (piece, (point, coefficient)) in qt.pieces.iter().zip(&split) {
+                let words = &stack[piece.placement.index as usize..][..1 << piece.placement.variables];
+                sum += *coefficient * at_bit(words, point, i);
+            }
+            sum != at_bit(&full, &rho, i)
+        });
+        assert!(
+            broken.count() > 0,
+            "the pad share must depend on which half's pad it is"
+        );
     }
 
     fn at_bit(words: &[u64], point: &[E], i: usize) -> E {
