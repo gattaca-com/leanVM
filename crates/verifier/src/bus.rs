@@ -6,7 +6,7 @@ use crate::layout::{
     MEMORY_FINAL_COUNTERS, SEP_BYTECODE, SEP_MEM, SEP_STATE, Table, constant, gpow,
 };
 use crate::multilinear::{
-    Placement, dot, eq_eval, eq_kernel, index_mle, multilinear_eval, padding_weight, poly_eval, stack_offsets,
+    Placement, dot, eq_bits, eq_eval, eq_kernel, index_mle, multilinear_eval, padding_weight, poly_eval, stack_offsets,
 };
 use crate::transcript::{Transcript, grinding_bits, sumcheck};
 use crate::{StackClaim, VerifierError, require};
@@ -132,13 +132,7 @@ impl ColumnClaim {
         let parts: Vec<(E, Vec<E>)> = pieces
             .map(|piece| {
                 let b = piece.placement.variables;
-                let e = (b..placement.variables).fold(ONE, |e, i| {
-                    e * if piece.off >> i & 1 == 1 {
-                        zeta[i]
-                    } else {
-                        ONE + zeta[i]
-                    }
-                });
+                let e = eq_bits((piece.off >> b) as usize, &zeta[b..placement.variables]);
                 (e, piece.placement.stack_point(&zeta[..b], layout.stack_log))
             })
             .collect();

@@ -4,7 +4,7 @@ use crate::bytecode::Bytecode;
 use crate::field::{E, GEN, K, ONE, ZERO};
 use crate::hash::{STATE_LANES, keccak_f, keccak_rounds};
 use crate::keccak::KeccakShape;
-use crate::multilinear::{Placement, eq_kernel, log2_ceil, log2_strict, stack_offsets};
+use crate::multilinear::{Placement, eq_bits, eq_kernel, log2_ceil, log2_strict, stack_offsets};
 use crate::{VerifierError, require};
 use std::collections::BTreeMap;
 use std::ops::Add;
@@ -160,11 +160,15 @@ pub struct Qt {
 }
 
 /// What a padding step of table half `half` holds in each slot: its input state in slots `0..25`, and slot `25 + l`
-/// the lane `l` of the state after `KECCAK_DEPTH` rounds on it. Zero in the spare slots.
+/// the lane `l` of the state after `KECCAK_DEPTH` rounds on it. Zero in the spare slots, and in the public ones, whose
+/// constants ([`public_slot`]) are no pad.
 pub fn qt_pad(half: usize) -> [u64; 64] {
     let mut pad = [0u64; 64];
     let mut state = if half == 0 { [0u64; STATE_LANES] } else { keccak64_pad() };
     pad[..STATE_LANES].copy_from_slice(&state);
+    (0..STATE_LANES)
+        .filter(|&s| public_slot(half, s).is_some())
+        .for_each(|s| pad[s] = 0);
     keccak_rounds(&mut state, KECCAK_DEPTH);
     pad[STATE_LANES..2 * STATE_LANES].copy_from_slice(&state);
     pad
@@ -176,12 +180,28 @@ fn bits(value: u64, len: usize) -> Vec<E> {
 
 /// `eq` of the slot bits above a block against the slot point: the bits the block fixes, at the point's coordinates.
 fn fixed_slot_factor(block: (usize, usize), slot: &[E]) -> E {
-    (block.1..slot.len()).fold(ONE, |e, i| {
-        e * if block.0 >> i & 1 == 1 { slot[i] } else { ONE + slot[i] }
-    })
+    eq_bits(block.0 >> block.1, &slot[block.1..])
 }
 
 impl Qt {
+    /// q_keccak as the pieces of `shapes` ([`qt_piece_shapes`]), the piece `i` at `offsets[i]` in the stack.
+    pub fn new(log_steps: usize, shapes: &[(usize, (usize, usize), u64, usize)], offsets: Vec<u64>) -> Self {
+        let piece = |(&(half, block, off, b), index)| QtPiece {
+            half,
+            block,
+            off,
+            placement: Placement {
+                variables: b + block.1,
+                index,
+            },
+        };
+        Self {
+            log_steps,
+            pieces: shapes.iter().zip(offsets).map(piece).collect(),
+            pads: [qt_pad(0), qt_pad(1)],
+        }
+    }
+
     /// The pieces of a half, a slot block after another.
     fn half_pieces(&self, half: usize) -> impl Iterator<Item = &QtPiece> {
         self.pieces.iter().filter(move |piece| piece.half == half)
@@ -195,13 +215,7 @@ impl Qt {
 
     /// `e_j` of a piece at the row point `zeta`: the weight of its rows in the column.
     fn weight(&self, piece: &QtPiece, zeta: &[E]) -> E {
-        (piece.b()..self.log_steps).fold(ONE, |e, i| {
-            e * if piece.off >> i & 1 == 1 {
-                zeta[i]
-            } else {
-                ONE + zeta[i]
-            }
-        })
+        eq_bits((piece.off >> piece.b()) as usize, &zeta[piece.b()..self.log_steps])
     }
 
     /// `1 + sum_j e_j`, the weight of the rows past a half's pieces.
@@ -209,15 +223,13 @@ impl Qt {
         ONE + E::sum(self.row_pieces(half).map(|piece| self.weight(piece, zeta)))
     }
 
-    /// `sum_s pad[half][s] eq(bits(s), slot)` over the committed slots: the row pad of a half.
+    /// `sum_s pad[half][s] eq(bits(s), slot)`: the row pad of a half, which is zero on its public slots.
     fn pad_mle(&self, half: usize, slot: &[E]) -> E {
         E::sum(
             eq_kernel(slot)
                 .into_iter()
                 .zip(self.pads[half])
-                .enumerate()
-                .filter(|&(s, _)| public_slot(half, s).is_none())
-                .map(|(_, (eq, p))| eq * K(p)),
+                .map(|(eq, p)| eq * K(p)),
         )
     }
 
@@ -238,47 +250,60 @@ impl Qt {
         point
     }
 
-    /// The stack claim and value of a claim on q_keccak's output (`QKECCAK`, at `(row, table, slot)`) or on one of its
-    /// slot columns (at the rows of its table).
-    fn claim(&self, column: usize, point: &[E], value: E, stack_log: usize) -> Option<StackClaimParts> {
+    /// A claim on q_keccak's output (at `(row, table, slot)`) as parts `(piece, point in the piece, scale)`, and its value.
+    pub fn output_claim(&self, point: &[E], value: E) -> QtParts<'_> {
         let mut parts = Vec::new();
-        let value = if column == QKECCAK {
-            let (row, rest) = point.split_at(self.log_steps);
-            let (table, slot) = rest.split_at(TABLE_BITS);
-            let mut value = value;
-            for half in 0..HASH_TABLES.len() {
-                // The tables' weights are the table coordinates' eq.
-                let eq = table
-                    .iter()
-                    .enumerate()
-                    .fold(ONE, |eq, (bit, &x)| eq * if half >> bit & 1 == 1 { x } else { ONE + x });
-                // The virtual column is its pieces, the row pad past them in the committed slots, and the public
-                // slots' constants on every row, whose rows' weights sum to one.
-                value += eq * (self.pad_mle(half, slot) * self.uncovered(half, row) + self.public_mle(half, slot));
-                for piece in self.half_pieces(half) {
-                    let at = [&row[..piece.b()], &slot[..piece.block.1]].concat();
-                    parts.push((
-                        eq * self.weight(piece, row) * fixed_slot_factor(piece.block, slot),
-                        piece.placement.stack_point(&at, stack_log),
-                    ));
-                }
+        let (row, rest) = point.split_at(self.log_steps);
+        let (table, slot) = rest.split_at(TABLE_BITS);
+        let mut value = value;
+        for half in 0..HASH_TABLES.len() {
+            // The tables' weights are the table coordinates' eq.
+            let eq = eq_bits(half, table);
+            // The virtual column is its pieces, the row pad past them in the committed slots, and the public
+            // slots' constants on every row, whose rows' weights sum to one.
+            value += eq * (self.pad_mle(half, slot) * self.uncovered(half, row) + self.public_mle(half, slot));
+            for piece in self.half_pieces(half) {
+                let at = [&row[..piece.b()], &slot[..piece.block.1]].concat();
+                parts.push((
+                    piece,
+                    at,
+                    eq * self.weight(piece, row) * fixed_slot_factor(piece.block, slot),
+                ));
             }
-            value
+        }
+        (parts, value)
+    }
+
+    /// A claim on slot `slot` of table half `half` (at the rows of its table) as parts, and its value. `None` for a
+    /// slot no block commits: a public one is a constant, and nothing claims it.
+    pub fn slot_claim(&self, half: usize, slot: usize, point: &[E], value: E) -> Option<QtParts<'_>> {
+        let row = self.extend(point);
+        let block = *slot_blocks(half)
+            .iter()
+            .find(|&&(start, log)| (start..start + (1 << log)).contains(&slot))?;
+        let parts = self
+            .half_pieces(half)
+            .filter(|piece| piece.block == block)
+            .map(|piece| {
+                let at = [&row[..piece.b()], &bits((slot - block.0) as u64, block.1)].concat();
+                (piece, at, self.weight(piece, &row))
+            })
+            .collect();
+        Some((parts, value + self.uncovered(half, &row) * K(self.pads[half][slot])))
+    }
+
+    /// The stack claim and value of a claim on q_keccak's output (`QKECCAK`) or on one of its slot columns.
+    fn claim(&self, column: usize, point: &[E], value: E, stack_log: usize) -> Option<StackClaimParts> {
+        let (parts, value) = if column == QKECCAK {
+            self.output_claim(point, value)
         } else {
             let (half, slot) = qkeccak_slot(column)?;
-            // A public slot is a constant: nothing claims it.
-            public_slot(half, slot).is_none().then_some(())?;
-            let row = self.extend(point);
-            let block = *slot_blocks(half)
-                .iter()
-                .find(|&&(start, log)| (start..start + (1 << log)).contains(&slot))?;
-            for piece in self.half_pieces(half).filter(|piece| piece.block == block) {
-                let at = [&row[..piece.b()], &bits((slot - block.0) as u64, block.1)].concat();
-                parts.push((self.weight(piece, &row), piece.placement.stack_point(&at, stack_log)));
-            }
-            value + self.uncovered(half, &row) * K(self.pads[half][slot])
+            self.slot_claim(half, slot, point, value)?
         };
-        Some((parts, value))
+        let stacked = parts
+            .into_iter()
+            .map(|(piece, at, scale)| (scale, piece.placement.stack_point(&at, stack_log)));
+        Some((stacked.collect(), value))
     }
 
     /// The blocks of the one ring claim the reduction's input opening becomes, one per piece: the piece's point, and the
@@ -290,12 +315,9 @@ impl Qt {
         self.pieces
             .iter()
             .map(|piece| {
-                let eq = table.iter().enumerate().fold(ONE, |eq, (bit, &x)| {
-                    eq * if piece.half >> bit & 1 == 1 { x } else { ONE + x }
-                });
                 (
                     [&row[..piece.b()], &slot[..piece.block.1]].concat(),
-                    eq * self.weight(piece, row) * fixed_slot_factor(piece.block, slot),
+                    eq_bits(piece.half, table) * self.weight(piece, row) * fixed_slot_factor(piece.block, slot),
                 )
             })
             .collect()
@@ -310,29 +332,21 @@ impl Qt {
         let eq_slot = eq_kernel(slot);
         let mut share = vec![ZERO; K_BITS];
         for half in 0..HASH_TABLES.len() {
-            let eq = table
-                .iter()
-                .enumerate()
-                .fold(ONE, |eq, (bit, &x)| eq * if half >> bit & 1 == 1 { x } else { ONE + x });
+            let eq = eq_bits(half, table);
             let u = eq * self.uncovered(half, row);
             for (i, slice) in share.iter_mut().enumerate() {
-                let mass = |public: bool| {
+                // The slots whose word has bit `i`: the pad's, zero on the public slots, or the public constants.
+                let mass = |word: &dyn Fn(usize) -> u64| {
                     E::sum(
                         eq_slot
                             .iter()
-                            .zip(self.pads[half])
                             .enumerate()
-                            .filter(|&(s, (_, p))| {
-                                (public_slot(half, s).is_some() == public) && {
-                                    // The constant of a public slot, the pad of a committed one.
-                                    let word = public_slot(half, s).unwrap_or(p);
-                                    word >> i & 1 == 1
-                                }
-                            })
-                            .map(|(_, (e, _))| *e),
+                            .filter(|&(s, _)| word(s) >> i & 1 == 1)
+                            .map(|(_, &e)| e),
                     )
                 };
-                *slice += u * mass(false) + eq * mass(true);
+                let public = |s| public_slot(half, s).unwrap_or(0);
+                *slice += u * mass(&|s| self.pads[half][s]) + eq * mass(&public);
             }
         }
         share
@@ -341,6 +355,9 @@ impl Qt {
 
 /// A claim on the stack as parts `(weight, point)`, and its value.
 pub type StackClaimParts = (Vec<(E, Vec<E>)>, E);
+
+/// A claim on q_keccak as parts `(piece, point in the piece, scale)`, and its value.
+pub type QtParts<'a> = (Vec<(&'a QtPiece, Vec<E>, E)>, E);
 
 pub struct Layout<'a> {
     pub log_memory: usize,
@@ -709,6 +726,26 @@ pub fn hash_padding_outputs() -> [[u64; STATE_LANES]; 2] {
     outputs
 }
 
+/// The hash tables' claims on their output lanes, at `rho`, the point of the tallest. Table `h` has `2^heights[h]` rows and
+/// claims at a prefix of `rho` the lanes of `evals[h]` that `HALF_COLUMNS` places, and `rest` the lanes it does not claim.
+/// Past its rows it holds its padding step, so its claim at `rho` is `eq(0) claim + (1 + eq(0)) padding`, `eq(0)` the
+/// product of `1 + rho_i` over the completed variables.
+pub fn hash_output_claims(rho: &[E], heights: [usize; 2], evals: [&[E]; 2], rest: &[E]) -> [[E; STATE_LANES]; 2] {
+    let padding = hash_padding_outputs();
+    std::array::from_fn(|half| {
+        let uncovered = eq_bits(0, &rho[heights[half]..]);
+        let (.., first, claimed) = HALF_COLUMNS[half];
+        std::array::from_fn(|lane| {
+            let value = if lane < claimed {
+                evals[half][first + lane]
+            } else {
+                rest[lane - claimed]
+            };
+            uncovered * value + (ONE + uncovered) * E::new(padding[half][lane], 0)
+        })
+    })
+}
+
 fn flushes_keccak64() -> Flushes {
     let [pc, fp, o_a, o_b, o_c, o_d, o_out, out_two] = std::array::from_fn(|i| i);
     let mut flushes = Flushes::default();
@@ -763,7 +800,7 @@ pub const fn slot_blocks(half: usize) -> &'static [(usize, usize)] {
 }
 
 /// The constant slot `slot` of table half `half` holds on every row, if it is public.
-fn public_slot(half: usize, slot: usize) -> Option<u64> {
+pub fn public_slot(half: usize, slot: usize) -> Option<u64> {
     (half == 1 && KECCAK64_PUBLIC_SLOTS.contains(&slot)).then(|| keccak64_pad()[slot])
 }
 
@@ -785,14 +822,23 @@ pub const KECCAK_OUT: usize = KECCAK_IN + STATE_LANES;
 pub const KECCAK_CNT: usize = KECCAK_OUT + STATE_LANES;
 const KECCAK_CNT_BC: usize = KECCAK_CNT + 2 * KECCAK_CELLS;
 
+/// The local columns of each hash table half: its first value lane (the columns before are head columns), its first
+/// read count, its column count, its first output lane, and the output lanes the table claims.
+pub const HALF_COLUMNS: [(usize, usize, usize, usize, usize); 2] = [
+    (KECCAK_IN, KECCAK_CNT, TABLE_WIDTHS[OP_KECCAK], KECCAK_OUT, STATE_LANES),
+    (
+        KECCAK64_IN,
+        KECCAK64_CNT,
+        TABLE_WIDTHS[OP_KECCAK64],
+        KECCAK64_OUT,
+        KECCAK64_OUT_LANES,
+    ),
+];
+
 /// The local column of hash table `half` riding spare slot `k` (`cpu::keccak_value` in the prover): the table's
 /// committed columns in local order, the ones before the value lanes then the read counts after them.
 pub const fn spare_local(half: usize, k: usize) -> usize {
-    let (head, counts) = if half == 0 {
-        (KECCAK_IN, KECCAK_CNT)
-    } else {
-        (KECCAK64_IN, KECCAK64_CNT)
-    };
+    let (head, counts, ..) = HALF_COLUMNS[half];
     if k < head { k } else { counts + (k - head) }
 }
 
@@ -804,12 +850,8 @@ pub const QKECCAK_SPARE: usize = (1 << log2_ceil(QKECCAK_SLOTS as u64)) - QKECCA
 // at this depth, not at every divisor of 24, and the two sides must refuse together.
 const _: () = {
     let mut half = 0;
-    while half < 2 {
-        let (head, counts, end) = if half == 0 {
-            (KECCAK_IN, KECCAK_CNT, TABLE_WIDTHS[OP_KECCAK])
-        } else {
-            (KECCAK64_IN, KECCAK64_CNT, TABLE_WIDTHS[OP_KECCAK64])
-        };
+    while half < HALF_COLUMNS.len() {
+        let (head, counts, end, ..) = HALF_COLUMNS[half];
         let mut k = 0;
         while k < QKECCAK_SPARE {
             let local = spare_local(half, k);
@@ -833,7 +875,7 @@ pub fn qkeccak_slot(column: usize) -> Option<(usize, usize)> {
     if let Some(k) = (0..QKECCAK_SPARE).find(|&k| spare_local(half, k) == local) {
         return Some((half, QKECCAK_SLOTS + k));
     }
-    let in_lanes = if half == 0 { KECCAK_IN } else { KECCAK64_IN };
+    let in_lanes = HALF_COLUMNS[half].0;
     (in_lanes..in_lanes + STATE_LANES)
         .contains(&local)
         .then(|| (half, local - in_lanes))
@@ -1102,23 +1144,7 @@ pub fn build_layout<'a>(
     let (mut item_offsets, total_log) = stack_offsets(&all_kappas);
     let stack_log = MIN_STACKED_LOG.max(total_log); // Floor at the PCS minimum
     let qt_offsets = item_offsets.split_off(item_count);
-    let qt = Qt {
-        log_steps: keccak.log_steps,
-        pieces: qt_pieces
-            .iter()
-            .zip(qt_offsets)
-            .map(|(&(half, block, off, b), index)| QtPiece {
-                half,
-                block,
-                off,
-                placement: Placement {
-                    variables: b + block.1,
-                    index,
-                },
-            })
-            .collect(),
-        pads: [qt_pad(0), qt_pad(1)],
-    };
+    let qt = Qt::new(keccak.log_steps, &qt_pieces, qt_offsets);
     let mut offsets: BTreeMap<usize, u64> = BTreeMap::new();
     let mut piece_list = Vec::new();
     for (&(column, off, kappa), index) in items.iter().zip(item_offsets) {
@@ -1174,14 +1200,32 @@ mod tests {
         let (zero, keccak64) = (qt_pad(0), qt_pad(1));
         assert!(zero[..25].iter().chain(&zero[50..]).all(|&word| word == 0));
         assert_ne!(zero[25], 0);
-        assert_eq!(keccak64[..25], keccak64_pad());
-        assert!(keccak64[50..].iter().all(|&word| word == 0));
+        assert!(keccak64[..25].iter().chain(&keccak64[50..]).all(|&word| word == 0));
         for (half, mut state) in [[0u64; STATE_LANES], keccak64_pad()].into_iter().enumerate() {
             keccak_rounds(&mut state, crate::hash::ROUNDS);
             let mut full = if half == 0 { [0u64; STATE_LANES] } else { keccak64_pad() };
             keccak_f(&mut full);
             assert_eq!(state, full);
         }
+    }
+
+    /// The slot blocks tile the committed slots of a half and leave out the public ones of `KECCAK64` alone.
+    #[test]
+    fn slot_blocks_leave_out_exactly_the_public_slots() {
+        for half in 0..HASH_TABLES.len() {
+            let mut held = [false; 64];
+            for &(start, log) in slot_blocks(half) {
+                assert_eq!(start % (1 << log), 0, "a block is an aligned cube of the slot index");
+                for s in start..start + (1 << log) {
+                    assert!(!held[s], "slot {s} is in two blocks");
+                    held[s] = true;
+                }
+            }
+            for (s, &in_a_block) in held.iter().enumerate() {
+                assert_eq!(in_a_block, public_slot(half, s).is_none(), "half {half} slot {s}");
+            }
+        }
+        assert_eq!(KECCAK64_PUBLIC_SLOTS.len(), 16);
     }
 
     #[test]
@@ -1214,24 +1258,13 @@ mod tests {
                 assert_eq!(committed, per_row * covered, "half {half}, rows {rows:?}");
             }
             let mut pads = [[0u64; 64]; 2];
-            pads.iter_mut().flatten().for_each(|p| *p = next());
-            let qt = Qt {
-                log_steps: kappa,
-                pieces: shapes
-                    .iter()
-                    .zip(&offsets)
-                    .map(|(&(half, block, off, b), &index)| QtPiece {
-                        half,
-                        block,
-                        off,
-                        placement: Placement {
-                            variables: b + block.1,
-                            index,
-                        },
-                    })
-                    .collect(),
-                pads,
-            };
+            for (half, pad) in pads.iter_mut().enumerate() {
+                pad.iter_mut()
+                    .enumerate()
+                    .for_each(|(s, p)| *p = if public_slot(half, s).is_some() { 0 } else { next() });
+            }
+            let mut qt = Qt::new(kappa, &shapes, offsets);
+            qt.pads = pads;
             // The full layout, index `row + 2^kappa (table + 2 slot)`, and the stack of pieces. A public slot holds its
             // constant on every row; another slot holds a random word on a covered row and its pad past them.
             let covered = |half: usize| qt.row_pieces(half).map(|p| p.off + (1 << p.b())).max().unwrap() as usize;
@@ -1292,7 +1325,7 @@ mod tests {
                 let start = ((slot << 1) + half) << kappa;
                 let column = at(&full[start..][..1 << tau], &zeta);
                 let local = if slot < STATE_LANES {
-                    [KECCAK_IN, KECCAK64_IN][half] + slot
+                    HALF_COLUMNS[half].0 + slot
                 } else {
                     spare_local(half, slot - QKECCAK_SLOTS)
                 };
@@ -1388,6 +1421,7 @@ mod tests {
         assert_eq!(pieces(19, 280940), [(0, 18), (262144, 15)]);
         assert_eq!(pieces(22, 2374000), [(0, 21), (2097152, 19)]);
         assert_eq!(pieces(10, 5), [(0, 10)]);
+        assert_eq!(pieces(7, 5), [(0, 7)]);
         assert_eq!(pieces(19, 1 << 19), [(0, 19)]);
         assert_eq!(pieces(19, 0), [(0, 15)]);
     }

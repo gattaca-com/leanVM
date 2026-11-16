@@ -76,6 +76,14 @@ pub fn eq_eval(left: &[E], right: &[E]) -> E {
     result
 }
 
+/// `eq(bits(value), point)`, bit 0 first: a coordinate where the bit is one, its complement where it is zero.
+pub fn eq_bits(value: usize, point: &[E]) -> E {
+    point
+        .iter()
+        .enumerate()
+        .fold(ONE, |e, (i, &x)| e * if value >> i & 1 == 1 { x } else { ONE + x })
+}
+
 pub fn dot(left: &[E], right: &[E]) -> E {
     assert_eq!(left.len(), right.len());
     let mut result = ZERO;

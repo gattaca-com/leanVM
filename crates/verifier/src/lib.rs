@@ -24,9 +24,11 @@ mod wire;
 
 pub use bytecode::Bytecode;
 pub use field::{E, K};
+pub use hash::keccak_rounds;
 pub use layout::{
-    MAX_LOG_BYTECODE, MAX_LOG_MEMORY, MAX_STACKED_LOG, MAX_TABLE_LOG, MIN_LOG_MEMORY, MIN_STACKED_LOG, TAG, Truncation,
-    min_execution_stacked_log,
+    HALF_COLUMNS, HASH_TABLES, KECCAK64_PUBLIC_SLOTS, MAX_LOG_BYTECODE, MAX_LOG_MEMORY, MAX_STACKED_LOG, MAX_TABLE_LOG,
+    MIN_LOG_MEMORY, MIN_STACKED_LOG, Qt, QtPiece, TABLE_BITS, TAG, Truncation, hash_output_claims, keccak64_pad,
+    min_execution_stacked_log, pieces, public_slot, qkeccak_slot_start, qt_pad, qt_piece_shapes, slot_blocks,
 };
 pub use merkle::MerklePath;
 pub use transcript::{Proof, RATE_SCALARS, SECURITY_BITS, grinding_bits};
@@ -47,7 +49,7 @@ use bus::{ColumnClaim, N_TREES, table_sumcheck, verify_bus_balance};
 use field::{ZERO, powers};
 use hash::{ROUNDS, STATE_LANES};
 use keccak::{KeccakShape, verify_keccak};
-use layout::{GLOBAL_COLUMN_BASES, HASH_TABLES, KECCAK_OUT, MEMORY_0, MEMORY_1, N_TABLES, QKECCAK, build_layout};
+use layout::{GLOBAL_COLUMN_BASES, MEMORY_0, MEMORY_1, N_TABLES, QKECCAK, build_layout};
 use multilinear::{dot, eq_eval, multilinear_eval};
 use ring_switch::{ring_switch, ring_switch_blocks};
 use std::ops::Range;
@@ -369,22 +371,10 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         .expect("a tallest hash table");
     let rho = evaluations[tallest].0.clone();
     let keccak64_rest = transcript.next_scalars(STATE_LANES - layout::KECCAK64_OUT_LANES)?;
-    let mut output = Vec::with_capacity(HASH_TABLES.len() * STATE_LANES);
-    for (half, (&table, padding)) in HASH_TABLES.iter().zip(layout::hash_padding_outputs()).enumerate() {
-        let (_, values) = &evaluations[table];
-        let uncovered = rho[layout.table_log_heights[table]..]
-            .iter()
-            .fold(field::ONE, |e, &x| e * (field::ONE + x));
-        for (lane, &pad) in padding.iter().enumerate() {
-            let claimed = match (half, lane) {
-                (0, lane) => values[KECCAK_OUT + lane],
-                (_, lane) if lane < layout::KECCAK64_OUT_LANES => values[layout::KECCAK64_OUT + lane],
-                (_, lane) => keccak64_rest[lane - layout::KECCAK64_OUT_LANES],
-            };
-            output.push(uncovered * claimed + (field::ONE + uncovered) * E::new(pad, 0));
-        }
-    }
-    let openings = verify_keccak(&mut transcript, layout.keccak, &rho, &output)?;
+    let heights = HASH_TABLES.map(|table| layout.table_log_heights[table]);
+    let evals = HASH_TABLES.map(|table| evaluations[table].1.as_slice());
+    let output = layout::hash_output_claims(&rho, heights, evals, &keccak64_rest);
+    let openings = verify_keccak(&mut transcript, layout.keccak, &rho, output.as_flattened())?;
     let keccak_scalars = keccak_start..transcript.stream_offset();
     if let Some((point, value)) = openings.outputs {
         claims.push(ColumnClaim {
