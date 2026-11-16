@@ -23,7 +23,8 @@ pub(super) fn ret_binding(b: Option<RetBind>, dst: Off) -> Binding {
     match b {
         Some(RetBind::Stack(base, size)) => Binding::Stack(base, size),
         Some(RetBind::Gaddr(ga)) => Binding::Gaddr(ga),
-        _ => Binding::Scalar(dst),
+        Some(RetBind::Scalar(cell)) => Binding::Scalar(cell),
+        None => Binding::Scalar(dst),
     }
 }
 
@@ -426,8 +427,9 @@ impl FnLower<'_> {
                 } else if let Some(ga) = self.gaddr_of(e) {
                     RetBind::Gaddr(ga)
                 } else {
+                    let d = if d == LAZY_DST { self.fresh() } else { d };
                     self.expr_into(e, d);
-                    RetBind::Scalar
+                    RetBind::Scalar(d)
                 });
             }
             self.inline_stack_ret = Some(binds);
@@ -523,9 +525,20 @@ impl FnLower<'_> {
         };
         self.inline_stack_ret = None;
         if self.defs.get(callee).is_some_and(|d| d.inline) {
-            let dsts: Vec<Off> = (0..n_ret).map(|_| self.fresh()).collect();
-            self.call_into(callee, args, &dsts);
-            return dsts;
+            // The return cells are allocated by the tail return, and only for a scalar it writes.
+            // An aliased return names no cell, so its slot stays `LAZY_DST`: every consumer reads
+            // the binding first and the cell only for a scalar.
+            self.call_into(callee, args, &vec![LAZY_DST; n_ret]);
+            let cells = |binds: &[RetBind]| -> Vec<Off> {
+                binds
+                    .iter()
+                    .map(|b| match b {
+                        RetBind::Scalar(cell) => *cell,
+                        _ => LAZY_DST,
+                    })
+                    .collect()
+            };
+            return self.inline_stack_ret.as_deref().map(cells).unwrap_or_default();
         }
 
         let def = self.defs.get(callee).copied();
@@ -546,7 +559,7 @@ impl FnLower<'_> {
                     let dst = self.fresh();
                     logical.push(dst);
                     physical.push(dst);
-                    binds.push(RetBind::Scalar);
+                    binds.push(RetBind::Scalar(dst));
                 }
                 Shape::StackBuf(size) => {
                     if size == 0 {
@@ -634,7 +647,8 @@ impl FnLower<'_> {
                 // ([`ret_binding`]).
                 base
             }
-            _ => dst,
+            Some(RetBind::Scalar(cell)) => cell,
+            None => dst,
         }
     }
     /// The value a `Const` parameter takes, as the literal that substitutes for

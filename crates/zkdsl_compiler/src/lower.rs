@@ -106,13 +106,17 @@ enum PureOp {
 /// ([`FnLower::inline_stack_ret`]): a `StackBuf` hands over its cell run and a
 /// folded g-address hands over its symbolic pointer, both aliased at zero
 /// copies (so `cvb = obs(cvb, x)` and a fused `fs, x, cur = fs_next(fs, cur)`
-/// stay free); a scalar was already copied into its dst cell.
+/// stay free); a scalar was already copied into its dst cell, which it names.
 #[derive(Clone, Copy)]
 enum RetBind {
     Stack(Off, u32),
     Gaddr(GAddr),
-    Scalar,
+    Scalar(Off),
 }
+
+/// A return cell an inlined call has not allocated yet. A scalar tail return allocates it where it
+/// writes it, so a return that aliases a cell or a g-address reserves nothing.
+const LAZY_DST: Off = Off::MAX;
 
 /// What a name is bound to. The kinds are mutually exclusive: a name has exactly
 /// one of them, which is why they are one enum and not four maps.
@@ -640,7 +644,7 @@ impl FnLower<'_> {
                                     // The run's first cell holds the arm's single returned value.
                                     s.copy(base, rc);
                                 }
-                                RetBind::Scalar => {}
+                                RetBind::Scalar(_) => {}
                             }
                         }
                     }
