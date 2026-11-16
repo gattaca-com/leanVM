@@ -7,8 +7,11 @@
 //! - [`hash`] / [`Hasher`], Keccak-256 over bytes, and [`hash_many`], its batched form over equal-length inputs.
 //! - [`positions`], the permutation one bit position at a time, as `keccak_gkr` proves it.
 //!
+//! - [`GrindTemplate`], the proof-of-work grind's batched search, [`GRIND_LANES`] nonces a call.
+//!
 //! The batched forms permute [`LANES`] states at once in vector registers (AVX-512, AVX2 or NEON, the only
-//! architecture-specific code here) and are byte-identical to the one-input forms.
+//! architecture-specific code here) and are byte-identical to the one-input forms. AVX2 without AVX-512 also has
+//! a kernel that cuts each lane into four bit planes and takes 32 inputs at a time, for hashes and grinds.
 //!
 //! The state is 25 little-endian 64-bit lanes, lane `x + 5y` holding `A[x, y]`. The first `RATE / 8` lanes are the
 //! rate: a message block is XORed into them before each permutation, and the digest is read off the first
@@ -88,10 +91,27 @@ pub const PI: [usize; STATE_LANES] = {
 /// The padding's last bit as it sits in lane 16, the rate's last lane.
 pub const END_BIT: u64 = (PAD_LAST as u64) << 56;
 
+/// Row `y` of the state after ρ and π, one `$f!(i, R)` per lane: the θ output `i`, rotated left by `R`.
+macro_rules! rho_pi_rows {
+    ($f:ident) => {
+        [
+            [$f!(0, 0), $f!(6, 44), $f!(12, 43), $f!(18, 21), $f!(24, 14)],
+            [$f!(3, 28), $f!(9, 20), $f!(10, 3), $f!(16, 45), $f!(22, 61)],
+            [$f!(1, 1), $f!(7, 6), $f!(13, 25), $f!(19, 8), $f!(20, 18)],
+            [$f!(4, 27), $f!(5, 36), $f!(11, 10), $f!(17, 15), $f!(23, 56)],
+            [$f!(2, 62), $f!(8, 55), $f!(14, 39), $f!(15, 41), $f!(21, 2)],
+        ]
+    };
+}
+
 mod lanes;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+mod planes4;
 pub mod positions;
 
-pub use lanes::{LANES, digest_halves_from, hash_many, hash_many_from_state, keccak_f_many};
+pub use lanes::{
+    GRIND_LANES, GrindTemplate, LANES, digest_halves_from, hash_many, hash_many_from_state, keccak_f_many,
+};
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 mod single_avx512;
@@ -310,7 +330,7 @@ mod tests {
     fn batched_hash_matches_one_shot() {
         for zero_blocks in [0usize, 1, 3] {
             let state = zero_prefix_state(zero_blocks);
-            for len in [0usize, 8, 64, 135, 136, 137, 200, 408, 512] {
+            for len in [0usize, 8, 16, 24, 64, 135, 136, 137, 152, 160, 200, 408, 512] {
                 for n in [1, LANES, 2 * LANES + 1] {
                     let data: Vec<u8> = (0..n * len).map(|i| (i * 31 + zero_blocks) as u8).collect();
                     let mut got = vec![0u8; n * OUT_LEN];
@@ -350,6 +370,46 @@ mod tests {
             for (value, got) in values.iter().zip(got) {
                 input[at..at + 16].copy_from_slice(&value.to_le_bytes());
                 assert_eq!(got.to_le_bytes()[..], hash(&input)[..16], "len {len}");
+            }
+        }
+    }
+
+    /// `GrindTemplate::first_hit` tests `GRIND_LANES` nonces and returns the first scalar hit of them, or none,
+    /// for every nonce lane, output lanes, masks and starting nonces.
+    /// The masks include 0, which hits at once, and `u64::MAX`, which never does.
+    /// The starts include two windows that wrap past `u64::MAX`.
+    #[test]
+    fn first_hit_matches_scalar_over_its_window() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let sparse = 0x8000_0000_0001_0421u64;
+        let masks = [0, 1, 0x1f, 0xfff, (1 << 23) - 1, sparse, u64::MAX];
+        for lane in 0..STATE_LANES {
+            let state: [u64; STATE_LANES] = std::array::from_fn(|_| next());
+            for out_lane in [2, 0, 7, 24] {
+                for mask in masks {
+                    let template = GrindTemplate::new(&state, lane, out_lane, mask);
+                    for first in [0, 1, 31, (1 << 32) - 7, u64::MAX - 40, u64::MAX - 17, u64::MAX - 2] {
+                        let want = (0..GRIND_LANES as u64)
+                            .map(|i| {
+                                let mut copy = state;
+                                copy[lane] = first.wrapping_add(i);
+                                keccak_f(&mut copy);
+                                copy[out_lane]
+                            })
+                            .position(|w| w & mask == 0);
+                        assert_eq!(
+                            template.first_hit(first),
+                            want,
+                            "lane {lane}, out lane {out_lane}, mask {mask:#x}, first {first}"
+                        );
+                    }
+                }
             }
         }
     }

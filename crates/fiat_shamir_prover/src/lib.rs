@@ -22,7 +22,7 @@ pub use verifier::{Proof, RATE_SCALARS, SECURITY_BITS, grinding_bits};
 
 use verifier::Digest;
 
-use keccak256::STATE_LANES;
+use keccak256::{GRIND_LANES, GrindTemplate, STATE_LANES};
 
 /// A field element of the challenge field `E`, as its two `K` limbs: what each prover's field implements to run on
 /// this transcript.
@@ -167,29 +167,26 @@ impl<F: Scalar> FiatShamirState<F> {
             return None;
         }
         // Every candidate's input is the state with a zero nonce absorbed, its nonce written into that scalar's
-        // first lane.
+        // first lane. The test reads the output's third lane, as the next challenge's permutation does.
         let mut base = self.clone();
         base.absorb(F::from_limbs([0, 0]), DS_POW_NONCE);
         let (base, lane) = (base.state, 4 * (base.n_pending - 1));
-        // The smallest passing nonce of batch `b`, the nonces `b * BATCH..(b + 1) * BATCH`.
-        const BATCH: u64 = 64;
+        let template = GrindTemplate::new(&base, lane, 2, (1 << bits) - 1);
+        // The smallest passing nonce of batch `b`, the nonces `from + b * BATCH..from + (b + 1) * BATCH`.
+        const BATCH: u64 = 2 * GRIND_LANES as u64;
         let batch = |b: u64| {
-            let mut states = [base; BATCH as usize];
-            for (nonce, state) in (b * BATCH..).zip(&mut states) {
-                state[lane] = nonce;
-            }
-            keccak256::keccak_f_many(&mut states);
-            let pass =
-                |&(nonce, state): &(u64, &[u64; STATE_LANES])| nonce >= from && state[2] & ((1 << bits) - 1) == 0;
-            (b * BATCH..).zip(&states).find(pass).map(|(nonce, _)| nonce)
+            (0..BATCH).step_by(GRIND_LANES).find_map(|at| {
+                let first = from + b * BATCH + at;
+                template.first_hit(first).map(|i| first + i as u64)
+            })
         };
         // A short search, a few batches, is not worth a dispatch to the pool.
         let nonce = if bits < 10 {
-            (from / BATCH..).find_map(batch)
+            (0..).find_map(batch)
         } else {
             // Windows of a quarter of the expected search; the first window holding a hit holds the smallest.
             let window = (1u64 << (bits.min(26) - 2)).div_ceil(BATCH);
-            (from / BATCH..).step_by(window as usize).find_map(|w: u64| {
+            (0..).step_by(window as usize).find_map(|w: u64| {
                 S::find_first(window as usize, &|i| batch(w + i as u64).is_some()).and_then(|i| batch(w + i as u64))
             })
         };
@@ -286,6 +283,60 @@ mod tests {
             expected_state.absorb(E::new(good, 0), DS_POW_NONCE);
             assert_eq!(clone.sample(), expected_state.sample());
             assert_eq!(clone.sample(), expected_state.sample());
+        }
+    }
+
+    /// The nonce lane moves with the number of observed scalars, so every fill finds the scalar grind's nonce.
+    #[test]
+    fn grind_finds_the_scalar_nonce_at_every_fill() {
+        for observed in 0..9 {
+            let mut sp = State::new(Digest(keccak256::hash(b"t")).words(), pi(1));
+            for k in 0..observed {
+                sp.observe(f(k + 3));
+            }
+            let good = sp.clone().grind::<Sequential>(11).unwrap();
+            let expected = (0..=good).find(|&n| pow_bits_ok(&sp, n, 11)).unwrap();
+            assert_eq!(good, expected, "{observed} observed");
+        }
+    }
+
+    /// A 16-bit grind searches many batches and a window, and still ends on the scalar grind's nonce.
+    #[test]
+    fn grind_finds_the_scalar_nonce_over_many_batches() {
+        for observed in [0, 3, 8] {
+            let mut sp = State::new(Digest(keccak256::hash(b"u")).words(), pi(2));
+            for k in 0..observed {
+                sp.observe(f(k + 5));
+            }
+            let good = sp.clone().grind::<Sequential>(16).unwrap();
+            let expected = (0..=good).find(|&n| pow_bits_ok(&sp, n, 16)).unwrap();
+            assert_eq!(good, expected, "{observed} observed");
+            assert!(good > 2 * GRIND_LANES as u64, "the search stayed inside one batch");
+        }
+    }
+
+    /// A grind from `from` finds the smallest passing nonce at least `from`, whatever batch `from` falls in.
+    #[test]
+    fn grind_from_finds_the_smallest_nonce_at_least_from() {
+        let mut sp = State::new(Digest(keccak256::hash(b"v")).words(), pi(3));
+        sp.observe(f(9));
+        for bits in [4, 12] {
+            let first = sp.clone().grind::<Sequential>(bits).unwrap();
+            for from in [
+                0,
+                1,
+                first,
+                first + 1,
+                first + 7,
+                first + 31,
+                first + 32,
+                first + 33,
+                first + 1000,
+            ] {
+                let got = sp.clone().grind_from::<Sequential>(bits, from).unwrap();
+                let expected = (from..).find(|&n| pow_bits_ok(&sp, n, bits)).unwrap();
+                assert_eq!(got, expected, "{bits} bits from {from}");
+            }
         }
     }
 

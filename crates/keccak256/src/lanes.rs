@@ -39,32 +39,35 @@ pub(crate) trait Lane: Copy {
 pub(crate) fn permute<S: Lane>(a: &mut [S; STATE_LANES]) {
     let mut c: [S; 5] = core::array::from_fn(|x| S::xor5(a[x], a[x + 5], a[x + 10], a[x + 15], a[x + 20]));
     for &rc in &RC {
-        let d: [S; 5] = core::array::from_fn(|x| S::theta_d(c[(x + 4) % 5], c[(x + 1) % 5]));
-        let t = |i: usize| a[i].xor(d[i % 5]);
-        // Row `y` holds the lanes π sends there, each rotated by its ρ.
-        #[rustfmt::skip]
-        let rows: [[S; 5]; 5] = [
-            [t(0), t(6).rotl::<44>(), t(12).rotl::<43>(), t(18).rotl::<21>(), t(24).rotl::<14>()],
-            [t(3).rotl::<28>(), t(9).rotl::<20>(), t(10).rotl::<3>(), t(16).rotl::<45>(), t(22).rotl::<61>()],
-            [t(1).rotl::<1>(), t(7).rotl::<6>(), t(13).rotl::<25>(), t(19).rotl::<8>(), t(20).rotl::<18>()],
-            [t(4).rotl::<27>(), t(5).rotl::<36>(), t(11).rotl::<10>(), t(17).rotl::<15>(), t(23).rotl::<56>()],
-            [t(2).rotl::<62>(), t(8).rotl::<55>(), t(14).rotl::<39>(), t(15).rotl::<41>(), t(21).rotl::<2>()],
+        round(a, &mut c, rc);
+    }
+}
+
+/// One round with constant `rc`. `c` holds the column parities of `a` going in and of the result coming out.
+#[inline(always)]
+pub(crate) fn round<S: Lane>(a: &mut [S; STATE_LANES], c: &mut [S; 5], rc: u64) {
+    let d: [S; 5] = core::array::from_fn(|x| S::theta_d(c[(x + 4) % 5], c[(x + 1) % 5]));
+    // Row `y` holds the lanes π sends there, each rotated by its ρ.
+    macro_rules! th_rot {
+        ($i:expr, $r:literal) => {
+            a[$i].xor(d[$i % 5]).rotl::<$r>()
+        };
+    }
+    let rows: [[S; 5]; 5] = rho_pi_rows!(th_rot);
+    for (y, &[b0, b1, b2, b3, b4]) in rows.iter().enumerate() {
+        let mut row = [
+            S::chi(b0, b1, b2),
+            S::chi(b1, b2, b3),
+            S::chi(b2, b3, b4),
+            S::chi(b3, b4, b0),
+            S::chi(b4, b0, b1),
         ];
-        for (y, &[b0, b1, b2, b3, b4]) in rows.iter().enumerate() {
-            let mut row = [
-                S::chi(b0, b1, b2),
-                S::chi(b1, b2, b3),
-                S::chi(b2, b3, b4),
-                S::chi(b3, b4, b0),
-                S::chi(b4, b0, b1),
-            ];
-            if y == 0 {
-                row[0] = row[0].xor(S::splat(rc));
-            }
-            for x in 0..5 {
-                a[5 * y + x] = row[x];
-                c[x] = if y == 0 { row[x] } else { c[x].xor(row[x]) };
-            }
+        if y == 0 {
+            row[0] = row[0].xor(S::splat(rc));
+        }
+        for x in 0..5 {
+            a[5 * y + x] = row[x];
+            c[x] = if y == 0 { row[x] } else { c[x].xor(row[x]) };
         }
     }
 }
@@ -115,7 +118,16 @@ cfg_select! {
 }
 
 /// States the batched entry points permute together. They take any count and permute the remainder one at a time.
+///
+/// AVX2 builds without AVX-512 also have a 32-input kernel, which this width does not count.
 pub const LANES: usize = Backend::WIDTH;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+pub use crate::planes4::{GRIND_NONCES as GRIND_LANES, Grind as GrindTemplate};
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f"))))]
+mod grind;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f"))))]
+pub use grind::{GRIND_LANES, GrindTemplate};
 
 /// Keccak-f\[1600\] of every state in place, [`LANES`] at a time.
 pub fn keccak_f_many(states: &mut [[u64; STATE_LANES]]) {
@@ -143,9 +155,16 @@ pub fn hash_many(data: &[u8], len: usize, out: &mut [u8]) {
 
 /// [`hash_many`] continued from one sponge state shared by every input, which has absorbed whole blocks (see
 /// [`zero_prefix_state`](crate::zero_prefix_state)). Byte-identical to hashing each full image.
+///
+/// AVX2 builds without AVX-512 hash whole sets of 32 word-aligned inputs on another kernel (`planes4`), and the
+/// rest, at most 31 inputs, on the batched path.
 pub fn hash_many_from_state(data: &[u8], len: usize, state: &[u64; STATE_LANES], out: &mut [u8]) {
     let n = out.len() / OUT_LEN;
     assert_eq!((data.len(), out.len()), (n * len, n * OUT_LEN));
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    let (data, out) = crate::planes4::hash_sets_of_32(data, len, state, out);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    let n = out.len() / OUT_LEN;
     for (g, digests) in out.as_chunks_mut::<{ LANES * OUT_LEN }>().0.iter_mut().enumerate() {
         hash_group(&data[g * LANES * len..][..LANES * len], len, state, digests);
     }
