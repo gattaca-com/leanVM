@@ -6,10 +6,11 @@
 //!
 //! ```text
 //!     claim:  lambda * L(l) * gamma(h) * pi(x_lo)
-//!     ring:   Phi(e(x) * s(l)),   e(x) = e_lo(x_lo) * e_hi(h)
+//!     ring:   Phi(scale * e(x) * s(l)),   e(x) = e_lo(x_lo) * e_hi(h)
 //! ```
 //!
-//! `Phi` is F2-linear, so a ring claim is `sum_w bit_w(e(x)) * Phi(basis_w * s(l))`. The weight is then
+//! `Phi` is F2-linear, so a ring claim is `sum_w bit_w(e(x)) * Phi(basis_w * scale * s(l))`: the scale joins the lane
+//! weight and the terms stay those of `e`. The weight is then
 //! `b(l, x) = sum_t A(l, t) * K_t(x)` over one term per claim and 128 per ring claim, and the table
 //! `P(l, t) = sum_x lane(l, x) * K_t(x)` of a `K`-valued lane, the stack's or one derived from it, takes the lane's
 //! place in level 0's fold rounds.
@@ -559,7 +560,8 @@ pub(super) fn initial_basis(
             *slot = weight_of(c);
         }
         for (i, (weight, ring)) in rings.iter().zip(&terms.rings).enumerate() {
-            let s = weight_of(claims.len() + i);
+            // `Phi(scale * e(x) * s(l))` is linear in the bits of `e(x)`, so the claim's scale joins its lane weight.
+            let s = weight_of(claims.len() + i) * weight.scale();
             if s != F128::ZERO {
                 for (w, slot) in row[ring.first..ring.first + DEGREE_E].iter_mut().enumerate() {
                     *slot = weight.apply(coordinate_basis(w) * s);

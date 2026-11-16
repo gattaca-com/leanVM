@@ -211,22 +211,17 @@ pub fn fold_ext_elems_naive(suffix_tensor: &[F128], coordinate_weights: &[F128; 
     })
 }
 
-/// Deferred, lambda-baked ring-switch output used by the stacked opener.
-///
-/// Keeping the claim's point and its map avoids materializing one full
-/// `rs_eq_ind` vector per claim. The map already contains the claim's batching
-/// scalar, so combining several claims needs only additions.
-pub(crate) struct DeferredRingSwitchOutput {
-    pub(crate) batched_sumcheck_claim: F128,
-    pub(crate) weight: RingWeight,
-}
-
-/// `Phi(eq(point, y))` over a claim's suffix domain, for an F_2-linear `Phi` given by its
+/// `Phi(scale * eq(point, y))` over a block's suffix domain, for an F_2-linear `Phi` given by its
 /// value on every coordinate basis element of `E`.
+///
+/// The stacked opener keeps each block as its point, its scale and the map, which avoids materializing one full
+/// `rs_eq_ind` vector per block. The map already contains the claim's batching scalar, so combining blocks needs
+/// only additions.
 #[derive(Clone)]
 pub(crate) struct RingWeight {
     weights: [F128; DEGREE_E],
     point: Vec<F128>,
+    scale: F128,
 }
 
 /// A [`RingWeight`] ready to fill its values: the factored `eq(point, ·)` and `Phi` as bit folds.
@@ -245,12 +240,20 @@ pub(crate) fn coordinate_basis(w: usize) -> F128 {
 
 impl RingWeight {
     pub(crate) fn new(weights: [F128; DEGREE_E], point: Vec<F128>) -> Self {
-        Self { weights, point }
+        Self::scaled(weights, point, F128::ONE)
     }
 
-    /// The tables that fill the weight's values.
+    /// The weight `Phi(scale * eq(point, y))`.
+    pub(crate) fn scaled(weights: [F128; DEGREE_E], point: Vec<F128>, scale: F128) -> Self {
+        Self { weights, point, scale }
+    }
+
+    /// The tables that fill the weight's values: the scale rides on `eq_hi`, which is the shorter table.
     pub(crate) fn fold(&self) -> RingFold {
-        let (eq_lo, eq_hi) = build_eq_split_ext(&self.point);
+        let (eq_lo, mut eq_hi) = build_eq_split_ext(&self.point);
+        if self.scale != F128::ONE {
+            eq_hi.iter_mut().for_each(|e| *e *= self.scale);
+        }
         RingFold {
             eq_lo,
             eq_hi,
@@ -260,6 +263,11 @@ impl RingWeight {
 
     pub(crate) fn point(&self) -> &[F128] {
         &self.point
+    }
+
+    /// The factor on `eq(point, .)` inside `Phi`.
+    pub(crate) fn scale(&self) -> F128 {
+        self.scale
     }
 
     /// `Phi(value)`.
@@ -322,27 +330,31 @@ impl RingFold {
     }
 }
 
-/// Finish a ring-switch claim without materializing its dense weight vector.
-/// The batching scalar is baked into both the target and the map.
-pub(crate) fn prove_finish_deferred(
-    state: RingSwitchProveState,
+/// Finish a ring-switch claim without materializing its dense weight vector. The claim is a sum of weights over
+/// several blocks: its target is `lambda * T(s_hat_v)` and, for each `(point, scale)`, the weight is
+/// `lambda * Phi(scale * eq(point, .))`. The slices are the sum's. The batching scalar is baked into both the target
+/// and the map.
+pub(crate) fn prove_finish_shared(
+    s_hat_v: &[F128; PACKING_WIDTH],
+    parts: Vec<(Vec<F128>, F128)>,
     coordinate_weights: &[F128; DEGREE_E],
     lambda: F128,
-) -> DeferredRingSwitchOutput {
-    let s_hat_u = transpose_s_hat(&state.s_hat_v);
+) -> (F128, Vec<RingWeight>) {
+    let s_hat_u = transpose_s_hat(s_hat_v);
     let sumcheck_claim = inner_product_base_ext(&s_hat_u, coordinate_weights);
     let scaled_weights = coordinate_weights.map(|x| lambda * x);
-    DeferredRingSwitchOutput {
-        batched_sumcheck_claim: lambda * sumcheck_claim,
-        weight: RingWeight::new(scaled_weights, state.point),
-    }
+    let weights = parts
+        .into_iter()
+        .map(|(point, scale)| RingWeight::scaled(scaled_weights, point, scale))
+        .collect();
+    (lambda * sumcheck_claim, weights)
 }
 
-/// The dense weight of several deferred claims, accumulated into `out`: the reference for tests.
+/// The dense weight of several blocks, accumulated into `out`: the reference for tests.
 #[cfg(test)]
-pub(crate) fn combine_deferred_chunk(outputs: &[DeferredRingSwitchOutput], out: &mut [F128]) {
-    for claim in outputs {
-        claim.weight.fold().add_chunk(0, out);
+pub(crate) fn combine_deferred_chunk(weights: &[RingWeight], out: &mut [F128]) {
+    for weight in weights {
+        weight.fold().add_chunk(0, out);
     }
 }
 
@@ -365,16 +377,10 @@ fn build_eq_split_ext(point: &[F128]) -> (Vec<F128>, Vec<F128>) {
 // Prover of the reduction
 // ---------------------------------------------------------------------------
 
-/// Prover-side scratch carried from [`prove_prepare`] into finalization.
-///
-/// The two phases exist because one map is shared by every claim, and it can
-/// only be sampled once all of them have been sent. So each claim's
-/// map-independent work (its slice-MLE vector and its point) has to survive
-/// that barrier.
+/// Prover-side scratch from [`prove_prepare`]: the slice-MLE vector of a block, which does not depend on the map.
 #[derive(Clone)]
 pub struct RingSwitchProveState {
-    s_hat_v: [F128; PACKING_WIDTH],
-    point: Vec<F128>,
+    pub(crate) s_hat_v: [F128; PACKING_WIDTH],
 }
 
 /// Phase 1 of the ring-switch prover: get `s_hat_v`, the 64 bit-slice values at
@@ -406,10 +412,7 @@ pub fn prove_prepare(
             fold_1b_rows(packed_witness, &full)
         }
     };
-    RingSwitchProveState {
-        s_hat_v,
-        point: suffix_point.to_vec(),
-    }
+    RingSwitchProveState { s_hat_v }
 }
 
 #[cfg(test)]
@@ -429,39 +432,48 @@ mod tests {
         let mut rng = Rng::new(0xdec0_de01_2345_6789);
         let point = rng.ext_vec(10);
         let coordinate_weights = std::array::from_fn(|_| rng.ext());
-        let lambdas = [rng.ext(), rng.ext()];
-        let states = (0..2)
-            .map(|_| RingSwitchProveState {
-                s_hat_v: std::array::from_fn(|_| rng.ext()),
-                point: point.clone(),
+        let lambda = rng.ext();
+        let scales = [F128::ONE, rng.ext()];
+        let s_hat_v: [F128; PACKING_WIDTH] = std::array::from_fn(|_| rng.ext());
+
+        // Reference: one dense weight vector, `Phi(scale * eq)` entry by entry, combined afterwards.
+        let eq = eq_table_serial(&point);
+        let expected_target = lambda * inner_product_base_ext(&transpose_s_hat(&s_hat_v), &coordinate_weights);
+        let expected_basis = eq
+            .iter()
+            .map(|&e| {
+                let dense = |scale: F128| fold_ext_elems_naive(&[scale * e], &coordinate_weights)[0];
+                lambda * (dense(scales[0]) + dense(scales[1]))
             })
             .collect::<Vec<_>>();
 
-        // Reference: one dense weight vector per claim, combined afterwards.
-        let dense_basis = fold_ext_elems_naive(&eq_table_serial(&point), &coordinate_weights);
-        let expected_target: F128 = states
-            .iter()
-            .zip(lambdas)
-            .map(|(state, lambda)| {
-                lambda * inner_product_base_ext(&transpose_s_hat(&state.s_hat_v), &coordinate_weights)
-            })
-            .sum();
-        let expected_basis = dense_basis
-            .iter()
-            .map(|&w| (lambdas[0] + lambdas[1]) * w)
-            .collect::<Vec<_>>();
-
-        let deferred = states
-            .into_iter()
-            .zip(lambdas)
-            .map(|(state, lambda)| prove_finish_deferred(state, &coordinate_weights, lambda))
-            .collect::<Vec<_>>();
-        let deferred_target = deferred.iter().map(|out| out.batched_sumcheck_claim).sum::<F128>();
+        let (target, weights) = prove_finish_shared(
+            &s_hat_v,
+            scales.iter().map(|&scale| (point.clone(), scale)).collect(),
+            &coordinate_weights,
+            lambda,
+        );
         let mut deferred_basis = vec![F128::ZERO; expected_basis.len()];
-        combine_deferred_chunk(&deferred, &mut deferred_basis);
+        combine_deferred_chunk(&weights, &mut deferred_basis);
 
-        assert_eq!(deferred_target, expected_target);
+        assert_eq!(target, expected_target);
         assert_eq!(deferred_basis, expected_basis);
+    }
+
+    /// A scaled weight fills `Phi(scale * eq(point, y))`, and several blocks of one claim share the slices' map.
+    #[test]
+    fn scaled_weight_is_phi_of_the_scaled_eq() {
+        let mut rng = Rng::new(0x5CA1_ED01);
+        let point = rng.ext_vec(9);
+        let coordinate_weights: [F128; DEGREE_E] = std::array::from_fn(|_| rng.ext());
+        let scale = rng.ext();
+        let weight = RingWeight::scaled(coordinate_weights, point.clone(), scale);
+        let mut filled = vec![F128::ZERO; 1 << point.len()];
+        weight.fold().add_chunk(0, &mut filled);
+        let plain = RingWeight::new(coordinate_weights, point.clone());
+        for (y, (&got, eq)) in filled.iter().zip(eq_table_serial(&point)).enumerate() {
+            assert_eq!(got, plain.apply(scale * eq), "entry {y}");
+        }
     }
 
     /// The contract between the native opener and every verifier that batches

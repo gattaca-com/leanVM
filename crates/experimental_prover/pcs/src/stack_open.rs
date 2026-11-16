@@ -35,9 +35,11 @@
 //! `qkeccak_vars`, LSB-first) is
 //!
 //! ```text
-//! b(x) = eq(sel, x_hi) * sum_i lambda^i * MLE(rs_eq_ind_i)(x_lo)
+//! b(x) = sum_i eq(sel_i, x_hi) * MLE(Phi(scale_i * eq(point_i, .)))(x_lo)
 //!      + sum_j lambda^(n_rs + j) * eq(claim_j, x)
 //! ```
+//!
+//! The ring blocks are one claim, `n_rs` is 1 for it and 0 with none, at the power 0.
 //!
 //! which is exactly what a dense `b_stack` scatter would produce (each claim's
 //! weight lives on its aligned slice, so scattering the low-dimensional eq /
@@ -128,31 +130,30 @@ fn flatten(claims: &[StackClaim], lambdas: &[F128]) -> (Vec<StackClaim>, Vec<F12
     (points, coefficients)
 }
 
-/// One ring-switched claim on the q_keccak sub-block: the 64 bit-slice MLEs of
-/// q_keccak at `suffix_point` (see [`super::ring_switch`]), which has
-/// `qkeccak_vars` coords, the same for every claim.
-///
-/// `s_hat_v` holds those 64 values. The caller transmits and checks them itself
-/// (the Keccak reduction sends them and checks them against its last claim), so this
-/// layer only binds them to the commitment. `None` asks the prover to fold the slices from the witness.
+/// One block of the ring-switched claim: the weight `Phi(scale * eq(suffix_point, .))` on the aligned block of
+/// `2^|suffix_point|` words at `offset`, so that a block may be a piece of q_keccak.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RingSwitchClaim {
-    /// Where the claim's block starts, relative to [`RingSwitchOpen::offset`]: a multiple of
-    /// `2^|suffix_point|`, the block's length, so that a claim may be on a piece of q_keccak.
+    /// Where the block starts, relative to [`RingSwitchOpen::offset`]: a multiple of `2^|suffix_point|`, its length.
     pub offset: usize,
     pub suffix_point: Vec<F128>,
-    pub s_hat_v: Option<Vec<F128>>,
+    /// The factor on the block's `eq`, inside `Phi`. One for q_keccak whole; a piece's `c_j` for its pieces.
+    pub scale: F128,
 }
 
-/// Prover-side bundle of the ring-switched claims discharged in the same
-/// stacked opening as the [`StackClaim`]s. Each claim may carry its
-/// precomputed `s_hat_v`.
+/// Prover-side bundle of the one ring-switched claim discharged in the same stacked opening as the [`StackClaim`]s:
+/// `sum_blocks <Phi(scale * eq(suffix_point, .)), block> = T(s_hat_v)`, `T` the target of [`super::ring_switch`].
+///
+/// `s_hat_v` holds the 64 slices of the claim. The caller transmits and checks them itself (the Keccak reduction
+/// sends them and checks them against its last claim), so this layer only binds them to the commitment. `None` asks the
+/// prover to fold them from the witness, as `sum_blocks scale * slices(block)`.
 #[derive(Clone, Debug)]
 pub struct RingSwitchOpen {
-    /// Where q_keccak starts inside the `2^log_n`-word stack, the claims' offsets relative to it. A claim's
+    /// Where q_keccak starts inside the `2^log_n`-word stack, the blocks' offsets relative to it. A block's
     /// absolute offset must be a multiple of `2^|suffix_point|` (an aligned slice). A block may end past the
     /// committed lanes, where the stack is zero.
     pub offset: usize,
+    pub s_hat_v: Option<Vec<F128>>,
     pub claims: Vec<RingSwitchClaim>,
 }
 
@@ -193,25 +194,33 @@ pub fn open_batch_mixed_whir_stacked(
         point_claims.iter().all(|c| c.fits(1 << log_n)),
         "every claim must live inside the stack"
     );
+    // The blocks make one ring claim, so they count once.
+    let n_ring = usize::from(!ring.claims.is_empty());
     assert!(
-        ring.claims.len() + point_claims.len() <= MAX_STACKED_CLAIMS,
+        n_ring + point_claims.len() <= MAX_STACKED_CLAIMS,
         "at most MAX_STACKED_CLAIMS stacked claims"
     );
     let span = tracing::info_span!("Ring switch").entered();
 
-    // 1. Ring-switch reduction: prepare every claim's s_hat_v (the caller bound
-    //    them upstream), then sample one shared linear map.
-    let mut rs_states = Vec::with_capacity(ring.claims.len());
-    for claim in &ring.claims {
-        let offset = ring.offset + claim.offset;
-        // The block may reach past the committed lanes, where the stack is zero.
-        let block = &stack[offset.min(stack.len())..(offset + (1usize << claim.suffix_point.len())).min(stack.len())];
-        rs_states.push(ring_switch::prove_prepare(
-            block,
-            &claim.suffix_point,
-            claim.s_hat_v.as_deref(),
-        ));
-    }
+    // 1. Ring-switch reduction: the claim's s_hat_v (the caller bound it upstream, else folded from the blocks),
+    //    then sample one shared linear map.
+    let s_hat_v: [F128; 64] = match &ring.s_hat_v {
+        Some(v) => v.as_slice().try_into().expect("one slice per packing bit"),
+        None => {
+            let mut sum = [F128::ZERO; 64];
+            for claim in &ring.claims {
+                let offset = ring.offset + claim.offset;
+                // The block may reach past the committed lanes, where the stack is zero.
+                let end = (offset + (1usize << claim.suffix_point.len())).min(stack.len());
+                let block = &stack[offset.min(stack.len())..end];
+                let state = ring_switch::prove_prepare(block, &claim.suffix_point, None);
+                for (acc, s) in sum.iter_mut().zip(state.s_hat_v) {
+                    *acc += claim.scale * s;
+                }
+            }
+            sum
+        }
+    };
     // One grind covers the map challenges and the batching challenge below: one verifier message.
     ps.grind(BATCH_GRINDING_BITS);
     let map_challenges = ring_switch::sample_map_challenges(ps);
@@ -220,20 +229,28 @@ pub fn open_batch_mixed_whir_stacked(
     // 2. The ONE batching challenge both families take disjoint power ranges of. Nothing is
     //    observed first: every claim value reached the caller through a binding stream read, so
     //    the challenge already depends on all of them (`lean_vm_core::pcs::open`).
-    let lambdas = powers(ps.sample(), ring.claims.len() + point_claims.len());
-    let (lambdas_rs, lambdas_pd) = lambdas.split_at(ring.claims.len());
+    let lambdas = powers(ps.sample(), n_ring + point_claims.len());
+    let (lambdas_rs, lambdas_pd) = lambdas.split_at(n_ring);
 
-    let rs_outputs: Vec<_> = rs_states
-        .into_iter()
-        .zip(lambdas_rs.iter().copied())
-        .map(|(state, lambda)| ring_switch::prove_finish_deferred(state, &coordinate_weights, lambda))
-        .collect();
+    // The one ring claim, at the first power: every block's weight carries it.
+    let (ring_target, rings) = match lambdas_rs.first() {
+        Some(&lambda) => ring_switch::prove_finish_shared(
+            &s_hat_v,
+            ring.claims
+                .iter()
+                .map(|claim| (claim.suffix_point.clone(), claim.scale))
+                .collect(),
+            &coordinate_weights,
+            lambda,
+        ),
+        None => (F128::ZERO, Vec::new()),
+    };
     drop(span);
 
     // 3. Combined target and lifted stack weight b_stack: the lambda-weighted
     //    rs_eq_ind sum scattered at the q_keccak slice, plus the point-claim
     //    eq tensors scattered at their offsets (the weight itself stays factored).
-    let target = rs_outputs.iter().map(|out| out.batched_sumcheck_claim).sum::<F128>()
+    let target = ring_target
         + point_claims
             .iter()
             .zip(lambdas_pd)
@@ -243,7 +260,6 @@ pub fn open_batch_mixed_whir_stacked(
     // Level 0's fold rounds run on the weight's terms and projections of lanes onto them, so the
     // lifted weight over the stack is never built.
     let lane_vars = log_n - config.initial_k;
-    let rings: Vec<_> = rs_outputs.into_iter().map(|output| output.weight).collect();
     let (points, coefficients) = flatten(point_claims, lambdas_pd);
     let initial_basis = tracing::info_span!("Basis")
         .in_scope(|| basis::initial_basis(&stack, log_n, lane_vars, &points, &coefficients, ring, &rings));
@@ -319,14 +335,17 @@ mod tests {
                 if (pieces && qkeccak_vars < 8) || offset + span > lane_block << LANE_ROUNDS {
                     continue;
                 }
+                // Two blocks of one claim, the second scaled.
                 let ring = RingSwitchOpen {
                     offset,
+                    s_hat_v: None,
                     claims: blocks
                         .iter()
-                        .map(|&(off, vars)| RingSwitchClaim {
+                        .enumerate()
+                        .map(|(i, &(off, vars))| RingSwitchClaim {
                             offset: off,
                             suffix_point: rng.ext_vec(vars),
-                            s_hat_v: None,
+                            scale: if i == 0 { F128::ONE } else { rng.ext() },
                         })
                         .collect(),
                 };
@@ -335,10 +354,13 @@ mod tests {
                     .claims
                     .iter()
                     .map(|claim| {
-                        let (at, len) = (offset + claim.offset, 1usize << claim.suffix_point.len());
-                        let block = &stack[at.min(stack.len())..(at + len).min(stack.len())];
-                        let state = ring_switch::prove_prepare(block, &claim.suffix_point, None);
-                        ring_switch::prove_finish_deferred(state, &coordinates, rng.ext())
+                        let (_, mut weights) = ring_switch::prove_finish_shared(
+                            &[F128::ZERO; 64],
+                            vec![(claim.suffix_point.clone(), claim.scale)],
+                            &coordinates,
+                            rng.ext(),
+                        );
+                        weights.pop().expect("one weight")
                     })
                     .collect();
                 let last_lane = (lanes_count - 1) * lane_block;
@@ -395,7 +417,6 @@ mod tests {
                     }
                 }
 
-                let rings: Vec<_> = rs_outputs.iter().map(|output| output.weight.clone()).collect();
                 let projected = basis::initial_basis(
                     &stack,
                     lane_vars + LANE_ROUNDS,
@@ -403,7 +424,7 @@ mod tests {
                     &claims,
                     &lambdas,
                     &ring,
-                    &rings,
+                    &rs_outputs,
                 );
                 let mut lanes = LaneRounds::new(stack.clone(), projected, lane_block, false);
                 let context = format!(
@@ -446,6 +467,7 @@ mod tests {
         let stack: Vec<F64> = (0..2 << lane_vars).map(|_| F64(rng.next_u64())).collect();
         let ring = RingSwitchOpen {
             offset: 0,
+            s_hat_v: None,
             claims: Vec::new(),
         };
         let (point, value, lambda) = (rng.ext_vec(vars), rng.ext(), rng.ext());

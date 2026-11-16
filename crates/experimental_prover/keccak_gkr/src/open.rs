@@ -47,10 +47,11 @@ impl Openings {
     pub fn into_pcs_claims(self, offset: usize) -> (RingSwitchOpen, Option<StackClaim>) {
         let ring = RingSwitchOpen {
             offset,
+            s_hat_v: Some(self.inputs.slices),
             claims: vec![RingSwitchClaim {
                 offset: 0,
                 suffix_point: self.inputs.point,
-                s_hat_v: Some(self.inputs.slices),
+                scale: F128::ONE,
             }],
         };
         let outputs = self.outputs.map(|outputs| StackClaim::Point {

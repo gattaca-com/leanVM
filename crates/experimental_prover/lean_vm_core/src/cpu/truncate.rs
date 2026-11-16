@@ -166,39 +166,6 @@ impl Region {
     }
 }
 
-/// The 64 bit slices of a block of words at a point: bit `z` of every word, as a multilinear, evaluated.
-fn slices(block: &[F64], point: &[F128]) -> Vec<F128> {
-    let lo = point.len() / 2;
-    let (eq_lo, eq_hi) = (
-        primitives::multilinear::eq_table(&point[..lo]),
-        primitives::multilinear::eq_table(&point[lo..]),
-    );
-    let sums = parallel::fold_reduce(
-        eq_hi.len(),
-        || [F128::ZERO; 64],
-        |acc, h| {
-            let mut part = [F128::ZERO; 64];
-            for (&w, &weight) in block[h << lo..][..1 << lo].iter().zip(&eq_lo) {
-                let mut bits = w.0;
-                while bits != 0 {
-                    part[bits.trailing_zeros() as usize] += weight;
-                    bits &= bits - 1;
-                }
-            }
-            for (acc, part) in acc.iter_mut().zip(part) {
-                *acc += eq_hi[h] * part;
-            }
-        },
-        |mut a, b| {
-            for (a, b) in a.iter_mut().zip(b) {
-                *a += b;
-            }
-            a
-        },
-    );
-    sums.to_vec()
-}
-
 /// The compact stack's layout: the items of every committed column, in increasing column then offset, then those of
 /// `q_keccak` if it is pieces.
 pub(super) struct Compact {
@@ -331,6 +298,13 @@ impl Compact {
         &self.items[self.n_columns..]
     }
 
+    /// Test-only forgery: flips the first word of `q_keccak`'s second piece in the compact stack `q`.
+    #[cfg(test)]
+    pub(super) fn flip_piece_word(&self, q: &mut [F64]) {
+        let piece = self.region_items().get(1).expect("q_keccak has a second piece");
+        q[piece.dst].0 ^= 1;
+    }
+
     /// The public value of a truncated column past its prefix.
     fn pad(c: usize) -> F64 {
         if c == MEMORY_FINAL_COUNTERS {
@@ -361,7 +335,12 @@ impl Compact {
         }
         let qk = l.placements[QKECCAK];
         let qk_words = &q[qk.offset..][..1 << qk.n_vars];
-        if let Some(r) = &self.region {
+        // A forging prover goes on past its own check.
+        #[cfg(test)]
+        let checks = !super::forge::active();
+        #[cfg(not(test))]
+        let checks = true;
+        if let (Some(r), true) = (&self.region, checks) {
             r.check_pad(qk_words, self.region_items());
         }
         let placements: Vec<Placement> = self
@@ -401,8 +380,9 @@ impl Compact {
     }
 
     /// Every claim on the full stack as a claim on the compact one, in the same order, and the ring-switched claim the
-    /// reduction leaves as the claims of `q_keccak`'s pieces, with the slices of those the verifier does not derive,
-    /// which the prover sends.
+    /// reduction leaves as one claim over `q_keccak`'s pieces: `sum_j c_j piece_j` has the reduction's slices less the
+    /// pad's share, so the claim's slices are those plus the share, and each piece weighs its block by `c_j`.
+    /// Nothing is sent.
     ///
     /// A claim on an untruncated column moves with its column. A claim `C(zeta) = v` on a
     /// truncated column becomes `sum_j e_j * piece_j(zeta[..b_j]) = v + pad * (1 + sum_j e_j)`
@@ -414,21 +394,13 @@ impl Compact {
         l: &super::Layout,
         claims: Vec<StackClaim>,
         mut ring: RingSwitchOpen,
-        compact: &[F64],
-    ) -> (Vec<StackClaim>, RingSwitchOpen, Vec<Vec<F128>>) {
+    ) -> (Vec<StackClaim>, RingSwitchOpen) {
         let qk = l.placements[QKECCAK];
-        let mut sent = Vec::new();
         if let Some(r) = &self.region {
             let [input] = <[RingSwitchClaim; 1]>::try_from(std::mem::take(&mut ring.claims)).expect("one claim");
             let (row, rest) = input.suffix_point.split_at(r.kappa);
             let (table, slot) = rest.split_at(crate::keccak::TABLE_BITS);
             let pieces = self.region_items();
-            // The derived piece is the largest, the first of them: its slices are the reduction's less the others'.
-            let derived = (0..pieces.len())
-                .max_by_key(|&j| (pieces[j].b, std::cmp::Reverse(j)))
-                .expect("a piece");
-            let coefficient = |piece: &Item| eq_bits(piece.half, table) * r.weight(piece, row);
-            let mut slices_of: Vec<Vec<F128>> = Vec::with_capacity(pieces.len());
             let mut pads = vec![F128::ZERO; 64];
             for half in 0..verifier::layout::HASH_TABLES.len() {
                 let u = eq_bits(half, table) * r.uncovered(pieces, half, row);
@@ -441,47 +413,17 @@ impl Compact {
                     *pad += u * share;
                 }
             }
-            for (j, piece) in pieces.iter().enumerate() {
-                let point = [&row[..piece.b], slot].concat();
-                let len = 1usize << (piece.b + 6);
-                slices_of.push(if j == derived {
-                    Vec::new()
-                } else {
-                    slices(&compact[piece.dst..][..len], &point)
-                });
-            }
-            // The derived piece: `S = sum_j c_j s_j + pad share`.
-            let mut rest_sum: Vec<F128> = input
-                .s_hat_v
-                .as_ref()
-                .expect("the reduction sends its slices")
-                .iter()
-                .zip(&pads)
-                .map(|(&s, &pad)| s + pad)
-                .collect();
-            for (piece, own) in pieces.iter().zip(&slices_of) {
-                let c = coefficient(piece);
-                for (acc, &s) in rest_sum.iter_mut().zip(own) {
-                    *acc += c * s;
-                }
-            }
-            let inverse = coefficient(&pieces[derived]).inv();
-            slices_of[derived] = rest_sum.into_iter().map(|s| s * inverse).collect();
+            // `S' = S + pad share` (the field has characteristic 2) is `sum_j c_j s_j`, `s_j` the slices of piece `j`.
+            let slices = ring.s_hat_v.take().expect("the reduction sends its slices");
+            ring.s_hat_v = Some(slices.iter().zip(&pads).map(|(&s, &pad)| s + pad).collect());
             ring.offset = 0;
             ring.claims = pieces
                 .iter()
-                .zip(&slices_of)
-                .map(|(piece, own)| RingSwitchClaim {
+                .map(|piece| RingSwitchClaim {
                     offset: piece.dst,
                     suffix_point: [&row[..piece.b], slot].concat(),
-                    s_hat_v: Some(own.clone()),
+                    scale: eq_bits(piece.half, table) * r.weight(piece, row),
                 })
-                .collect();
-            sent = slices_of
-                .iter()
-                .enumerate()
-                .filter(|&(j, _)| j != derived)
-                .map(|(_, own)| own.clone())
                 .collect();
         } else {
             ring.offset = self.qkeccak_offset(l, ring.offset);
@@ -589,7 +531,7 @@ impl Compact {
                 }
             })
             .collect();
-        (mapped, ring, sent)
+        (mapped, ring)
     }
 }
 

@@ -1009,6 +1009,7 @@ mod tests {
                     .collect();
                 let ring = RingSwitchOpen {
                     offset: 0,
+                    s_hat_v: None,
                     claims: Vec::new(),
                 };
 

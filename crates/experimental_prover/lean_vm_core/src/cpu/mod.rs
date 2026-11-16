@@ -328,6 +328,11 @@ pub fn prove(
     let compact_q = compact
         .as_ref()
         .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
+    #[cfg(test)]
+    let compact_q = compact_q.map(|mut q| {
+        forge::tamper_compact(compact.as_ref().expect("a compact stack"), &mut q);
+        q
+    });
     let committed = crate::stage!("Commit", || {
         pcs::commit(
             &mut ps,
@@ -417,11 +422,7 @@ pub fn prove(
     let (q, slots, ring) = match (compact.as_ref(), compact_q) {
         (Some(c), Some(compact_q)) => {
             drop(full_q);
-            let (slots, ring, sent) = c.map_claims(&w.layout, slots, ring, &compact_q);
-            // The slices of the pieces of `q_keccak` the verifier does not derive.
-            for slices in &sent {
-                ps.add_scalars(slices);
-            }
+            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
             (compact_q, slots, ring)
         }
         _ => (full_q, slots, ring),
@@ -1114,6 +1115,27 @@ mod tests {
         // The flag against the bytecode, both ways.
         rejects(Forge::Keccak64OutTwo(true), 3, 2, false, F128::ZERO);
         rejects(Forge::Keccak64OutTwo(false), 3, 2, true, F128::ZERO);
+    }
+
+    /// `q_keccak` as pieces of its halves (70,000 `KECCAK64` rows are two pieces, 40 `KECCAK` rows one): the one ring claim
+    /// over them refuses a word of a piece changed in the committed stack, and a pad taken from the other half.
+    #[test]
+    fn forged_pieces_of_q_keccak_are_rejected() {
+        use super::forge::{Forge, set};
+        let message: [F128; 4] = std::array::from_fn(|i| F128::new(0x1111 * (i as u64 + 1), 0x7777 * (i as u64 + 3)));
+        let pi = [w(7), w(11)];
+        let (program, _, _) = keccak64_mix_program(message, 70_000, 40, true, true);
+        set(None);
+        let (proof, _) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
+        let summary = verify(&program, &pi, &proof).expect("the honest proof verifies");
+        assert!(summary.truncation.is_some_and(|t| t.qt), "q_keccak is pieces");
+        for forge in [Forge::PieceWord, Forge::SwapPads] {
+            set(Some(forge));
+            let forged = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE);
+            set(None);
+            let (proof, _) = forged.unwrap_or_else(|e| panic!("{forge:?}: no proof: {e}"));
+            assert!(verify(&program, &pi, &proof).is_err(), "{forge:?} is accepted");
+        }
     }
 
     /// The last slot in a frame other than main's is an ordinary slot: the machine halts in the

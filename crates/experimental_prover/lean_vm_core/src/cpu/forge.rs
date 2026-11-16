@@ -27,6 +27,10 @@ pub(crate) enum Forge {
     Keccak64Lane { lane: usize, value: u64 },
     /// The column `column` (`tables::keccak64::S_A`, `K_A` or `K_Y`) of the first `KECCAK64` row holds `xor` more than the bytecode.
     Keccak64Column { column: usize, xor: u64 },
+    /// A word of the second piece of `q_keccak` changes in the stack that is committed, not in the reduction's witness.
+    PieceWord,
+    /// Past its rows each half of `q_keccak` holds the padding step of the other half.
+    SwapPads,
 }
 
 thread_local! {
@@ -115,7 +119,19 @@ pub(crate) fn tamper(w: &mut Witness) {
             let at = w.layout.placements[col].offset;
             w.q[at].0 ^= xor;
         }
-        Forge::SentLane => {}
+        Forge::SwapPads => {
+            // Past its rows each half holds the other's padding step. The reduction proves what is there.
+            let kappa = hash_kappa(&w.layout.taus);
+            for (half, &table) in verifier::layout::HASH_TABLES.iter().enumerate() {
+                let rows = w.layout.rows[table];
+                let other = super::truncate::qt_pad(1 - half);
+                for (s, &word) in other.iter().enumerate() {
+                    let start = slot(w, half, s);
+                    w.q[start + rows..start + (1 << kappa)].fill(F64(word));
+                }
+            }
+        }
+        Forge::SentLane | Forge::PieceWord => {}
         Forge::Keccak64PaddingRowIsReal => {
             for lane in 0..8 {
                 let at = slot(w, crate::keccak::KECCAK64_HALF, lane);
@@ -130,6 +146,13 @@ pub(crate) fn tamper(w: &mut Witness) {
             let at = slot(w, half, s);
             w.q[at] = F64(u64::from(to));
         }
+    }
+}
+
+/// Apply the forgery to the compact stack the prover commits, which the reduction never reads.
+pub(super) fn tamper_compact(compact: &super::truncate::Compact, q: &mut [F64]) {
+    if let Some(Forge::PieceWord) = current() {
+        compact.flip_piece_word(q);
     }
 }
 
