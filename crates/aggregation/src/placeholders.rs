@@ -964,19 +964,6 @@ fn signature_placeholders(ph: &mut Placeholders) {
         "LX_GROUP_SIZES",
         (0..lx::V.div_ceil(LX_DIGIT_GROUP)).map(|p| LX_DIGIT_GROUP.min(lx::V - LX_DIGIT_GROUP * p)),
     );
-    // A chain index: zero and the powers of two are cells the guest has, the others a
-    // slot of the tags it carries.
-    let (mut slots, mut logs, mut n_tags) = (Vec::new(), Vec::new(), 0usize);
-    for i in 0..lx::V {
-        let carried = i != 0 && !i.is_power_of_two();
-        n_tags += usize::from(carried);
-        slots.push(if carried { n_tags } else { 0 });
-        logs.push(i.checked_ilog2().unwrap_or(0));
-    }
-    ph.set("LX_TAG_SLOT", slots);
-    ph.set("LX_TAG_LOG", logs);
-    ph.set("LX_N_TAGS", n_tags);
-
     // The leanSPHINCS instance: each address type as A1, the address's second cell,
     // holds it, and the cell bit each address field's low bytes start at.
     // The guest derives the rest of every address from the digest.

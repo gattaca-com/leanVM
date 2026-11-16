@@ -218,6 +218,43 @@ fn forged_lean_xmss_hints_are_rejected() {
     }
 }
 
+/// The addresses of a leanXMSS signature's hashes ride the `KECCAK64` immediates, so no cell carries them: a chain value
+/// hashed as another chain's, a path with an index bit moved, and a top digest at the bottom's address each fail the
+/// guest's run.
+#[test]
+fn forged_lean_xmss_addresses_are_rejected() {
+    let signers = get_signers::<StableProver>(1);
+    let mut forgeries: Vec<(String, Forgery)> = vec![
+        (
+            "a chain value under the next chain's index".into(),
+            Box::new(|hints: &mut Hints| {
+                let first = hints.entry_mut("chain_starts", 0)[0];
+                let second = hints.entry_mut("chain_starts", 1)[0];
+                hints.entry_mut("chain_starts", 0)[0] = second;
+                hints.entry_mut("chain_starts", 1)[0] = first;
+            }),
+        ),
+        (
+            "a top digest at the bottom's address".into(),
+            Box::new(|hints: &mut Hints| {
+                let index = hints.entry_mut("lx_index", 0);
+                let top = index.len() / 2;
+                index[top] = index[0];
+            }),
+        ),
+    ];
+    // Each window of the path moved by one: the index bits it dispatches on change.
+    for window in 0..2 * (lean_xmss::internals::LAYER_HEIGHT / super::hints::LX_WINDOW) {
+        forgeries.push((
+            format!("path window {window} moved"),
+            Box::new(move |hints: &mut Hints| hints.entry_mut("lx_windows", 0)[window] *= count(1)),
+        ));
+    }
+    for (_, forgery) in forgeries {
+        assert_forgery_rejected(forgery, &[], signers.clone(), vec![], &[]);
+    }
+}
+
 /// The guest reads each child's root off its statement and publishes the one the
 /// node picks, which must be its own with blobs: a child's root other than the one
 /// its proof carries, a pick past the children, a child's root picked over the
