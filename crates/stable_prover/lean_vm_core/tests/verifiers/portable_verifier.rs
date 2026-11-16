@@ -78,9 +78,9 @@ fn tampers_fail_their_check() {
     let tail = round * mu;
     let final_coefficients = (1 << mu) + k;
     let final_level = 5 * k + final_coefficients + 1 + tail;
-    // After the announced sizes (the memory, six tables and the rate), the root and the OOD sample's nonce: its value,
+    // After the announced sizes (the memory, every table and the rate), the root and the OOD sample's nonce: its value,
     // which the transcript binds, so the first grind after it, the bus's, already fails.
-    let ood_value = 1 + 6 + 1 + 2 + 1;
+    let ood_value = 1 + verifier::layout::N_TABLES + 1 + 2 + 1;
     // The bytecode sumcheck ends on the stacked bytecode at the summary's point, the scalar the stream holds; its
     // degree-two rounds over the four slot bits follow the share.
     let bytecode_value = fixture
