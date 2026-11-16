@@ -7,7 +7,7 @@
 //! claims on the output lanes are the reduction's claim on the permutation's output ([`keccak_gkr::OutputClaim`]).
 //! The reduction proves the rounds between, and its two claims on `q_keccak` join the one opening.
 
-use keccak_gkr::{Openings, OutputClaim, Shape, Witness};
+use keccak_gkr::{Openings, OutputClaim, Shape, TableInputs, Witness, ZERO_PAD};
 use primitives::field::{F64, F128};
 use primitives::hash::STATE_LANES;
 use primitives::transcript::ProverState;
@@ -85,8 +85,8 @@ pub(crate) struct Reduction {
 impl Reduction {
     /// Rebuild the witness from `q_keccak`, the whole committed column, and run the reduction.
     pub(crate) fn prove(self, ps: &mut ProverState, q_keccak: &[F64], output: &OutputClaim) -> Openings {
-        let witness =
-            tracing::info_span!("Witness").in_scope(|| Witness::from_committed(self.shape, self.steps, q_keccak));
+        let witness = tracing::info_span!("Witness")
+            .in_scope(|| Witness::from_committed(self.shape, &[self.steps], &[ZERO_PAD], q_keccak));
         witness.prove(ps, q_keccak, output)
     }
 }
@@ -95,7 +95,8 @@ impl Reduction {
 /// slots, `states`: the spare slots past them are their columns' to fill.
 pub(crate) fn place(inputs: &[[u64; STATE_LANES]], states: &mut [F64]) -> Reduction {
     let shape = shape(inputs.len());
-    keccak_gkr::witness::commit_states(shape, inputs, states);
+    let table = TableInputs { inputs, pad: ZERO_PAD };
+    keccak_gkr::witness::commit_states(shape, &[table], states);
     Reduction {
         shape,
         steps: inputs.len(),

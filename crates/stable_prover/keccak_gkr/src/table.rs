@@ -113,20 +113,20 @@ pub(crate) fn fill(
 ) -> (F128, F128) {
     let fold = PackFold::new(mu, challenges);
     let eq = eq_table(&claim.point[SKIP + 1..]);
-    let (n_blocks, written) = (layer.n_blocks(), layer.written());
+    let n_blocks = layer.n_blocks();
     let rows = |block: &[u64], out: &mut [F128]| {
         fold.rows(block, out);
         summand.pair(&out[..BITS], &out[BITS..])
     };
     let padding = |segment: usize| {
-        let mut out = vec![F128::ZERO; 2 * BITS];
-        let values = rows(layer.state(segment, written), &mut out);
-        (out, values)
+        let written = layer.written(segment);
+        (written < n_blocks).then(|| {
+            let mut out = vec![F128::ZERO; 2 * BITS];
+            let values = rows(layer.state(segment, written), &mut out);
+            (out, values)
+        })
     };
-    let padding: Vec<(Vec<F128>, (F128, F128))> = match written < n_blocks {
-        true => (0..layer.segments()).map(padding).collect(),
-        false => Vec::new(),
-    };
+    let padding: Vec<_> = (0..layer.segments()).map(padding).collect();
     let values = parallel::map_reduce_chunks_mut(
         [&mut tables.0[0][..]],
         [2 * BITS],
@@ -137,11 +137,12 @@ pub(crate) fn fill(
                 out.fill(F128::ZERO);
                 return;
             }
-            let (zero, infinity) = if g < written {
+            let (zero, infinity) = if g < layer.written(segment) {
                 rows(layer.state(segment, g), out)
             } else {
-                out.copy_from_slice(&padding[segment].0);
-                padding[segment].1
+                let (padding, values) = padding[segment].as_ref().expect("a padding block");
+                out.copy_from_slice(padding);
+                *values
             };
             acc.0 ^= zero.mul_unreduced(eq[p]);
             acc.1 ^= infinity.mul_unreduced(eq[p]);

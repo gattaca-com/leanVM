@@ -42,10 +42,12 @@ impl Openings {
 }
 
 /// The weight a claim puts on each `(slot, z)`: its position weights, on the slots of the states
-/// it speaks of, scaled by the segment. `first` is the state segment 0 claims, and only the first
-/// `count` segments' states are committed.
+/// it speaks of, scaled by the run. `first` is the state run 0 claims, and only the first `count`
+/// runs' states are committed. The claim's table coordinates are not weights: they are coordinates
+/// of the point the committed block is evaluated at.
 fn slot_weights(shape: Shape, claim: &Claim, first: usize, count: usize) -> Vec<F128> {
-    let segments = eq_table(&claim.point[shape.pack_vars()..]);
+    let pack_vars = shape.pack_vars();
+    let segments = eq_table(&claim.point[pack_vars..pack_vars + shape.round_seg_log()]);
     let mut out = vec![F128::ZERO; 64 << shape.slot_log()];
     for segment in 0..count {
         let base = 64 * STATE_LANES * (first + segment);
@@ -62,10 +64,13 @@ fn slot_weights(shape: Shape, claim: &Claim, first: usize, count: usize) -> Vec<
 /// claim puts no weight on are evaluated too: the spare ones past [`Shape::slots`] carry other
 /// columns (`lean_vm_core::cpu::keccak_value`), and the fold that follows must see them.
 ///
+/// A slot holds the tables' instances one after the other, so the tables' packs are one more run of packs: the
+/// point's last variables, the table coordinates, index the table.
+///
 /// The words of 64 packs, bit-transposed, give per `z` a row of 64 bits, one per pack, whose weighted sum is a
 /// [`BitFold`] of those packs' weights.
 fn slices(shape: Shape, committed: &[F64], point: &[F128]) -> Vec<F128> {
-    let n = shape.n();
+    let n = shape.n() * shape.tables();
     let eq = eq_table(point);
     let chunks = eq.len().div_ceil(64);
     let folds: Vec<BitFold> = parallel::map_collect(chunks, |chunk| {
@@ -91,20 +96,21 @@ fn slices(shape: Shape, committed: &[F64], point: &[F128]) -> Vec<F128> {
 }
 
 /// The weight a word-level claim puts on each slot of the committed segment outputs, every
-/// segment's but the last: what [`slot_weights`] gives its bit 0.
+/// run's but the last: what [`slot_weights`] gives its bit 0.
 fn word_weights(shape: Shape, claim: &Claim) -> Vec<F128> {
-    slot_weights(shape, claim, 1, shape.segments() - 1)
+    slot_weights(shape, claim, 1, shape.round_segments() - 1)
         .into_iter()
         .step_by(64)
         .collect()
 }
 
-/// Every slot of the committed block as a word, at an instance point, and the part of the
-/// word-level `claim` on the committed segment outputs among them. An opening is of the whole
-/// block, so the slots the claim puts no weight on are evaluated too: the spare ones past
-/// [`Shape::slots`] carry other columns (`lean_vm_core::cpu::keccak_value`), and the fold that follows must see them.
+/// Every slot of the committed block as a word, at an instance point (the table coordinates
+/// included), and the part of the word-level `claim` on the committed segment outputs among them. An
+/// opening is of the whole block, so the slots the claim puts no weight on are evaluated too: the spare
+/// ones past [`Shape::slots`] carry other columns (`lean_vm_core::cpu::keccak_value`), and the fold that
+/// follows must see them.
 pub fn output_words(shape: Shape, committed: &[F64], instance: &[F128], claim: &Claim) -> (Vec<F128>, F128) {
-    let n = shape.n();
+    let n = shape.n() * shape.tables();
     let words = parallel::map_collect(1 << shape.slot_log(), |slot| {
         mle_eval(&committed[slot * n..][..n], instance)
     });
@@ -126,11 +132,13 @@ pub fn open_outputs(
     [instance, &slot].concat()
 }
 
-/// Open the claim on the inputs: the instances of a pack first, then the slot. Returns the opening's point.
+/// Open the claim on the inputs: the instances of a pack first, then the table, then the slot. The tables' states
+/// fold at the claim's table coordinates, which become coordinates of the opening's point. Returns that point.
 pub fn open_inputs(ps: &mut ProverState, shape: Shape, committed: &[F64], claim: &Claim) -> Vec<F128> {
     let pack = &claim.point[..shape.pack_vars()];
-    let folded = slices(shape, committed, pack);
-    let weights = slot_weights(shape, claim, 0, shape.segments());
+    let table_point = &claim.point[shape.pack_vars() + shape.round_seg_log()..];
+    let folded = slices(shape, committed, &[pack, table_point].concat());
+    let weights = slot_weights(shape, claim, 0, shape.round_segments());
     // Per instance of a pack, the weighted sum over slots and positions.
     let per_instance: Vec<F128> = (0..16)
         .map(|i| {
@@ -152,5 +160,5 @@ pub fn open_inputs(ps: &mut ProverState, shape: Shape, committed: &[F64], claim:
     }
     let (slices, _, slot) = product_sumcheck(ps, at_instance, weights, 64, mu[0]);
     ps.add_scalars(&slices);
-    [&low, pack, &slot].concat()
+    [&low, pack, table_point, &slot].concat()
 }

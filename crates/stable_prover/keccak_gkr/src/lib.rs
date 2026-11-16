@@ -47,15 +47,20 @@ pub mod witness;
 mod tests;
 
 pub use open::Openings;
-pub use witness::{Shape, Witness};
+pub use witness::{Shape, TableInputs, Witness, ZERO_PAD};
 
-/// A claim on the permutation's output, from outside the reduction: `lanes[l]` is lane `l` of the output state, as
-/// words over the instances, evaluated at `instance` (an instance index's low four variables first). Both must be
-/// bound to the transcript before [`Witness::prove`] runs, the point being a challenge drawn after the commitment.
+/// A claim on the permutation's output, from outside the reduction: `lanes[t][l]` is lane `l` of the output state of
+/// table `t`, as words over the table's instances, evaluated at `instance` (an instance index's low four variables
+/// first). All must be bound to the transcript before [`Witness::prove`] runs, the point being a challenge drawn
+/// after the commitment.
+///
+/// With several tables the reduction draws one more challenge per table bit, in the message that draws the segment
+/// and lane challenges, and folds the tables' lanes at them: the claim it proves is on the instances of every table
+/// at `instance` and those challenges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputClaim {
     pub instance: Vec<F128>,
-    pub lanes: [F128; STATE_LANES],
+    pub lanes: Vec<[F128; STATE_LANES]>,
 }
 
 impl Witness {
@@ -66,20 +71,24 @@ impl Witness {
     pub fn prove(&self, ps: &mut ProverState, committed: &[F64], output: &OutputClaim) -> Openings {
         let shape = self.shape;
         assert_eq!(output.instance.len(), shape.n_log);
+        assert_eq!(output.lanes.len(), shape.tables());
         assert_eq!(
             committed.len(),
             1 << shape.stack_log(),
             "the openings are claims on the whole committed block"
         );
-        // One message, the segment then the lane: the first claim is multilinear in them.
+        // One message, the segment (run, then table) then the lane: the first claim is multilinear in them.
         ps.grind(fiat_shamir::grinding_bits((shape.seg_log() + LANE_BITS) as u128));
         let segment = ps.sample_vec(shape.seg_log());
         let r_lane = ps.sample_vec(LANE_BITS);
         let first = first_claim(&output.instance, &segment, &r_lane);
-        // The last segment's output is the caller's, and the prover sends the committed ones' part.
+        // The point of the committed block the committed outputs are claimed at: the output claim's instance, then
+        // the table challenges.
+        let instance = [&output.instance[..], &segment[shape.round_seg_log()..]].concat();
+        // The last run's output is the caller's, and the prover sends the committed ones' part.
         let (words, committed_value) =
-            tracing::info_span!("Outputs").in_scope(|| open::output_words(shape, committed, &output.instance, &first));
-        if shape.segments() > 1 {
+            tracing::info_span!("Outputs").in_scope(|| open::output_words(shape, committed, &instance, &first));
+        if shape.round_segments() > 1 {
             ps.add_scalar(committed_value);
         }
 
@@ -92,7 +101,7 @@ impl Witness {
         drop(tables);
 
         let _span = tracing::info_span!("Openings").entered();
-        let outputs = (shape.segments() > 1).then(|| open::open_outputs(ps, shape, &output.instance, &first, words));
+        let outputs = (shape.round_segments() > 1).then(|| open::open_outputs(ps, shape, &instance, &first, words));
         let inputs = open::open_inputs(ps, shape, committed, &claim);
         Openings { outputs, inputs }
     }

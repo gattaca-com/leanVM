@@ -8,13 +8,25 @@ use verifier::VerifierError;
 use verifier::keccak::{LANE_BITS, LOCAL_BITS, PRODUCT_BITS};
 
 use crate::batch_bench::{batch_transcript, open_commitment, output_claim};
-use crate::witness::{BLOCK, Shape, Witness, run_block};
+use crate::witness::{BLOCK, Shape, TableInputs, TableWitness, Witness, ZERO_PAD, run_block};
 
 const LABEL: &[u8] = b"keccak-gkr-test";
 
+/// The batch `inputs` as the one table, padded with all-zero inputs.
+fn one(inputs: &[[u64; STATE_LANES]]) -> [TableInputs<'_>; 1] {
+    [TableInputs { inputs, pad: ZERO_PAD }]
+}
+
 fn verify(shape: Shape, proof: &Proof) -> Result<(), VerifierError> {
     let iv = primitives::hash::hash(LABEL);
-    verifier::verify_keccak_batch(&iv, shape.n_log(), shape.depth(), MIN_LOG_INV_RATE, proof)
+    verifier::verify_keccak_batch(
+        &iv,
+        shape.n_log(),
+        shape.depth(),
+        shape.table_bits(),
+        MIN_LOG_INV_RATE,
+        proof,
+    )
 }
 
 /// A proof of the batch `inputs`, its output claim offset by `lane_error` in one lane.
@@ -23,9 +35,9 @@ fn prove(shape: Shape, inputs: &[[u64; STATE_LANES]], committed: &[F64], lane_er
     let witness = Witness::generate(shape, inputs, &mut honest);
     let mut ps = batch_transcript(LABEL, shape, MIN_LOG_INV_RATE);
     let commitment = pcs::commit(&mut ps, committed, shape.stack_log(), MIN_LOG_INV_RATE);
-    let mut output = output_claim(&mut ps, shape, inputs);
-    output.lanes[7] += lane_error;
-    ps.add_scalars(&output.lanes);
+    let mut output = output_claim(&mut ps, shape, &one(inputs));
+    output.lanes[0][7] += lane_error;
+    ps.add_scalars(&output.lanes[0]);
     let openings = witness.prove(&mut ps, committed, &output);
     open_commitment(&mut ps, commitment, committed.to_vec(), openings);
     ps.into_proof()
@@ -38,7 +50,7 @@ fn prove(shape: Shape, inputs: &[[u64; STATE_LANES]], committed: &[F64], lane_er
 /// its scalars and its nonce, and a grind of zero bits sends none.
 fn keccak_check(shape: Shape, at: usize) -> Option<VerifierError> {
     let nonce = |numerator: usize| usize::from(fiat_shamir::grinding_bits(numerator as u128) > 0);
-    let committed = usize::from(shape.segments() > 1);
+    let committed = usize::from(shape.round_segments() > 1);
     // A sumcheck round of degree 2 or 3 sends two scalars; the bit position's, of degree 3 with no eq factor, three.
     let (round2, round3) = (2 + nonce(2), 2 + nonce(3));
     let layer = PRODUCT_BITS
@@ -115,8 +127,8 @@ fn spare_slots_must_be_the_committed_ones() {
 
     let mut ps = batch_transcript(LABEL, shape, MIN_LOG_INV_RATE);
     let commitment = pcs::commit(&mut ps, &committed, shape.stack_log(), MIN_LOG_INV_RATE);
-    let output = output_claim(&mut ps, shape, &inputs);
-    ps.add_scalars(&output.lanes);
+    let output = output_claim(&mut ps, shape, &one(&inputs));
+    ps.add_scalars(&output.lanes[0]);
     let openings = witness.prove(&mut ps, &folded, &output);
     open_commitment(&mut ps, commitment, committed, openings);
     verify(shape, &ps.into_proof()).expect_err("a spare slot that was not committed is rejected");
@@ -131,18 +143,73 @@ fn proof_verifies_against_the_commitment() {
     end_to_end(8192, 6);
 }
 
+/// A proof of the tables, whose committed column is `committed`, the second table's output claim offset by
+/// `lane_error` in one lane.
+fn prove_tables(shape: Shape, tables: &[TableInputs], committed: &[F64], lane_error: F128) -> Proof {
+    let instances: Vec<usize> = tables.iter().map(|table| table.inputs.len()).collect();
+    let pads: Vec<[u64; STATE_LANES]> = tables.iter().map(|table| table.pad).collect();
+    let witness = Witness::from_committed(shape, &instances, &pads, committed);
+    let mut ps = batch_transcript(LABEL, shape, MIN_LOG_INV_RATE);
+    let commitment = pcs::commit(&mut ps, committed, shape.stack_log(), MIN_LOG_INV_RATE);
+    let mut output = output_claim(&mut ps, shape, tables);
+    output.lanes[1][7] += lane_error;
+    for lanes in &output.lanes {
+        ps.add_scalars(lanes);
+    }
+    let openings = witness.prove(&mut ps, committed, &output);
+    open_commitment(&mut ps, commitment, committed.to_vec(), openings);
+    ps.into_proof()
+}
+
+/// Two tables of different heights and paddings are one proof, and a wrong lane of either is rejected.
+#[test]
+fn two_tables_prove_and_verify() {
+    let mut rng = Rng::new(83);
+    for (rows, depth) in [([700, 2600], 12), ([0, 1100], 12), ([3000, 512], 12), ([1100, 1100], 6)] {
+        let inputs: Vec<Vec<[u64; STATE_LANES]>> = rows
+            .iter()
+            .map(|&n| (0..n).map(|_| std::array::from_fn(|_| rng.next_u64())).collect())
+            .collect();
+        let pads = [ZERO_PAD, std::array::from_fn(|l| 0x0303 * (l as u64 + 1))];
+        let tables: Vec<TableInputs> = inputs
+            .iter()
+            .zip(pads)
+            .map(|(inputs, pad)| TableInputs { inputs, pad })
+            .collect();
+        let shape = Shape::with_tables(*rows.iter().max().unwrap(), depth, 1);
+        let mut committed = vec![F64(0); 1 << shape.stack_log()];
+        Witness::generate_tables(shape, &tables, &mut committed);
+        // The slots the states leave free carry other columns, which both openings fold.
+        let states = shape.slots() * shape.tables() * shape.n();
+        for word in &mut committed[states..] {
+            *word = F64(rng.next_u64());
+        }
+        let proof = prove_tables(shape, &tables, &committed, F128::ZERO);
+        verify(shape, &proof).unwrap_or_else(|e| panic!("{rows:?}: {e}"));
+        let bad = prove_tables(shape, &tables, &committed, F128::ONE);
+        verify(shape, &bad).expect_err("a wrong lane of the second table");
+        // A state of the second table changed.
+        let mut broken = committed.clone();
+        broken[(3 * shape.tables() + 1) * shape.n() + 5].0 ^= 1;
+        verify(shape, &prove_tables(shape, &tables, &broken, F128::ZERO)).expect_err("a changed state");
+    }
+}
+
 /// The witness of every block run, the padding ones included.
 fn dense(shape: Shape, inputs: &[[u64; STATE_LANES]]) -> Witness {
     let blocks = (0..shape.n_blocks())
         .map(|g| {
             let inputs = &inputs[(g * BLOCK).min(inputs.len())..((g + 1) * BLOCK).min(inputs.len())];
-            run_block(shape.depth(), inputs, true).1
+            run_block(shape.depth(), &ZERO_PAD, inputs, true).1
         })
         .collect();
-    Witness {
-        shape,
+    let table = TableWitness {
         blocks,
         written: shape.n_blocks(),
+    };
+    Witness {
+        shape,
+        tables: vec![table],
     }
 }
 
@@ -158,8 +225,8 @@ fn padding_proves_as_the_blocks_it_stands_for() {
         let padded = Witness::generate(shape, &inputs, &mut committed);
         let stream = |witness: &Witness| {
             let mut ps = ProverState::from_label(LABEL);
-            let output = output_claim(&mut ps, shape, &inputs);
-            ps.add_scalars(&output.lanes);
+            let output = output_claim(&mut ps, shape, &one(&inputs));
+            ps.add_scalars(&output.lanes[0]);
             let openings = witness.prove(&mut ps, &committed, &output);
             (openings, ps.into_proof())
         };

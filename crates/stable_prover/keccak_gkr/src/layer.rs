@@ -68,19 +68,30 @@ pub(crate) fn prove_layer(
     }
 }
 
-/// The states a layer's passes walk: a task per segment and block held by the witness, the blocks after the
-/// written ones all standing for the padding block, which is walked once.
+/// The states a layer's passes walk: a task per segment and block its table holds, the blocks after the written
+/// ones all standing for the padding block, which is walked once. Tables are written to different heights, so
+/// the segments differ in length.
 pub(crate) struct Layer<'a> {
     witness: &'a Witness,
     /// Per segment, the round whose `chi` its claim is on.
     rounds: Vec<usize>,
+    /// The tasks of segment `m` are `starts[m]..starts[m + 1]`: its table's held blocks.
+    starts: Vec<usize>,
 }
 
 impl<'a> Layer<'a> {
     fn new(witness: &'a Witness, step: usize) -> Self {
         let shape = witness.shape;
         let rounds = (0..shape.segments()).map(|m| shape.round(m, step)).collect();
-        Self { witness, rounds }
+        let mut starts = vec![0];
+        for m in 0..shape.segments() {
+            starts.push(starts[m] + witness.held(shape.table_of(m)));
+        }
+        Self {
+            witness,
+            rounds,
+            starts,
+        }
     }
 
     pub fn segments(&self) -> usize {
@@ -91,33 +102,35 @@ impl<'a> Layer<'a> {
         self.witness.shape.n_blocks()
     }
 
-    /// The blocks holding inputs: every later one is the padding block.
-    pub fn written(&self) -> usize {
-        self.witness.written
+    /// The blocks of segment `segment`'s table holding inputs: every later one is its padding block.
+    pub fn written(&self, segment: usize) -> usize {
+        self.witness.written(self.witness.shape.table_of(segment))
     }
 
     pub fn n_tasks(&self) -> usize {
-        self.segments() * self.witness.held()
+        self.starts[self.segments()]
     }
 
     /// Block `g` of segment `segment`'s state, sliced: the padding block for every `g` past the written ones.
     pub fn state(&self, segment: usize, g: usize) -> &'a [u64] {
-        self.witness.layer(self.rounds[segment], g)
+        let table = self.witness.shape.table_of(segment);
+        self.witness.layer(table, self.rounds[segment], g)
     }
 
-    /// Task `held * segment + g`'s block.
+    /// Task `task`'s block.
     pub fn task(&self, task: usize) -> &'a [u64] {
-        let held = self.witness.held();
-        self.state(task / held, task % held)
+        let segment = self.starts.partition_point(|&start| start <= task) - 1;
+        self.state(segment, task - self.starts[segment])
     }
 
     /// Each task's weight in `eq`, a table over the blocks then the segment: the padding block's is the sum over
     /// the blocks it stands for.
     pub fn task_weights(&self, eq: &[F128]) -> Vec<F128> {
-        let (n_blocks, written) = (self.n_blocks(), self.written());
+        let n_blocks = self.n_blocks();
         let eq = |segment: usize| &eq[n_blocks * segment..][..n_blocks];
         (0..self.segments())
             .flat_map(|m| {
+                let written = self.written(m);
                 let padding = (written < n_blocks).then(|| eq(m)[written..].iter().sum());
                 eq(m)[..written].iter().copied().chain(padding)
             })
