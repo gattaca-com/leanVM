@@ -280,6 +280,11 @@ pub(crate) trait Table: Sync {
     fn padding(&self) -> Vec<F64> {
         vec![F64::ZERO; self.n_committed_columns()]
     }
+    /// The columns that hold one constant on every row, executed or padding, as `(local index, value)`. The table
+    /// sumcheck sends no evaluation of them: the verifier takes the constant. None by default.
+    fn public_columns(&self) -> Vec<(usize, F64)> {
+        Vec::new()
+    }
     /// How many identities [`constraint`](Table::constraint) folds, the length of this table's range of `xi`-powers
     /// (§sec:air). None but for `JUMP`: a value that rides the bus as a coordinate needs no identity (§sec:m3).
     fn n_constraints(&self) -> usize {
@@ -916,8 +921,9 @@ impl Table for KeccakTable {
 /// of the state is `in_2 = (A.lo + k_a) / s_a` and lane 6 is `in_6 = Y.lo + k_y`, so the memory flush of `A` carries
 /// `(s_a · in_2 + k_a, in_3)` and that of `Y` carries `(in_6 + k_y, in_7)`. `s_a`, `k_a` and `k_y` are bytecode
 /// operands, K-valued. Lanes 8 to 24 of the state are the constants such a message leaves there under the padding
-/// (`verifier::layout::keccak64_pad`), which seventeen degree-one identities pin. It writes output cell 0, lanes 0 and
-/// 1, at `fp·o_out`, and with `out_two` cell 1, lanes 2 and 3, at `g·fp·o_out`.
+/// (`verifier::layout::keccak64_pad`). Lanes 8 to 23 are public: the table sends no evaluation of them and `q_keccak`
+/// commits no slot for them. A degree-one identity pins lane 24. It writes output cell 0, lanes 0 and 1, at
+/// `fp·o_out`, and with `out_two` cell 1, lanes 2 and 3, at `g·fp·o_out`.
 ///
 /// Like `KECCAK`'s, the input lanes are slots of `q_keccak` (its second half), and the output lanes 0 to 3 are virtual:
 /// their claims are the reduction's claim on the output. The other committed columns but `r_bc` and the three
@@ -945,8 +951,8 @@ pub(crate) mod keccak64 {
     pub const K_A: usize = S_A + 1;
     pub const K_Y: usize = K_A + 1;
     pub const N: usize = K_Y + 1;
-    /// Lanes of the message, which the four cells hold.
-    pub const MESSAGE_LANES: usize = 8;
+    /// The last lane of the state, the one capacity lane a committed column still pins to zero.
+    pub const CAPACITY_LANE: usize = STATE_LANES - 1;
 }
 
 /// What each cell a `KECCAK64` row touches is addressed by, in flush order: the offset operand it follows, in the
@@ -1047,19 +1053,24 @@ impl Table for Keccak64Table {
         row
     }
     fn n_constraints(&self) -> usize {
-        primitives::hash::STATE_LANES - keccak64::MESSAGE_LANES
+        1
     }
-    /// `in_l = PAD_l` for lanes 8 to 24, identity `l - 8` weighted `pows[l - 8]`.
+    /// `in_24 = PAD_24`, weighted `pows[0]`. Lanes 8 to 23 are public constants ([`Table::public_columns`]) and need
+    /// no identity.
     fn constraint(&self, pows: &[F128]) -> Form {
         use keccak64::*;
         let pad = verifier::layout::keccak64_pad();
         let mut form = Form::new(N);
-        for lane in MESSAGE_LANES..primitives::hash::STATE_LANES {
-            let w = pows[lane - MESSAGE_LANES];
-            form.coeffs[V_IN + lane] = w;
-            form.constant += w * F128::from(F64(pad[lane]));
-        }
+        form.coeffs[V_IN + CAPACITY_LANE] = pows[0];
+        form.constant += pows[0] * F128::from(F64(pad[CAPACITY_LANE]));
         form
+    }
+    /// Lanes 8 to 23 of the input state: the padding, the same on every row.
+    fn public_columns(&self) -> Vec<(usize, F64)> {
+        let pad = verifier::layout::keccak64_pad();
+        crate::keccak::KECCAK64_PUBLIC_SLOTS
+            .map(|lane| (keccak64::V_IN + lane, F64(pad[lane])))
+            .collect()
     }
     fn flushes(&self, f: &mut FlushBuilder) {
         use keccak64::*;

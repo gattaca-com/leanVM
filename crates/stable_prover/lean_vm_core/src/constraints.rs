@@ -97,6 +97,9 @@ pub(crate) struct Air<'a> {
     pub cols: &'a [&'a [F64]],
     /// Its summand.
     pub form: Form,
+    /// The columns of one constant on every row, by local index, ascending: their evaluations are the constant, which the
+    /// verifier knows, so they are not sent.
+    pub public: Vec<usize>,
 }
 
 /// Where each table's range of `ξ`-powers starts, given each one's identity count.
@@ -160,11 +163,19 @@ pub(crate) fn prove(airs: &[Air<'_>], zeta: &[F128], ps: &mut ProverState) -> Ve
     crate::stage!("Constraint evals", || {
         tables
             .iter()
-            .map(|t| {
+            .zip(airs)
+            .map(|(t, air)| {
                 let chi = &chi[..t.tau];
                 let columns: Vec<_> = t.cols.iter().map(|&c| (c, None)).collect();
                 let evals = crate::eq::eq_sums(chi, &columns);
-                ps.add_scalars(&evals);
+                // A public column's evaluation is known to the verifier: only the others are sent.
+                let sent: Vec<F128> = evals
+                    .iter()
+                    .enumerate()
+                    .filter(|(c, _)| !air.public.contains(c))
+                    .map(|(_, &e)| e)
+                    .collect();
+                ps.add_scalars(&sent);
                 Claims {
                     chi: chi.to_vec(),
                     evals,

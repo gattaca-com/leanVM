@@ -30,20 +30,20 @@ pub use truncate::{piece_digits, qt_pad};
 /// verifier rebuilds the layout ([`layout::table_logs`]). The statement, the program and the public input, is not
 /// announced: it seeds the transcript.
 ///
-/// A truncated proof (`truncate` holds its memory count and whether q_keccak is a region) packs
-/// `(mem_count << 2) | flag` in the rate word's high limb. Flag 1 is a truncated proof, flag 2 one with the region.
+/// A truncated proof (`truncate` holds its memory count) packs `(mem_count << 2) | 1` in the rate word's high limb.
+/// A full proof leaves it zero. q_keccak is pieces in both.
 fn announce_public(
     ps: &mut ProverState,
     log_mem: usize,
     rows: [usize; tables::N_TABLES],
     log_inv_rate: usize,
-    truncate: Option<(usize, bool)>,
+    truncate: Option<usize>,
 ) {
     ps.add_scalar(F128::new(log_mem as u64, 0));
     for n in rows {
         ps.add_scalar(F128::new(n as u64, 0));
     }
-    let memory = truncate.map_or(0, |(mem_count, qt)| ((mem_count as u64) << 2) | (1 + qt as u64));
+    let memory = truncate.map_or(0, |mem_count| ((mem_count as u64) << 2) | 1);
     ps.add_scalar(F128::new(log_inv_rate as u64, memory));
 }
 
@@ -112,6 +112,7 @@ fn airs<'a>(
                 tau,
                 cols: &cols[GLOBAL_COLUMN_BASES[t]..][..TABLE_WIDTHS[t]],
                 form: constraints::Form::sum(bus_forms.chain([identities])),
+                public: table.public_columns().into_iter().map(|(column, _)| column).collect(),
             }
         })
         .collect()
@@ -225,22 +226,23 @@ pub fn prove(
         log_mem,
         exec.trace.row_counts(),
     );
-    let compact = if program.truncate {
+    // q_keccak is pieces in every proof. A truncated program also cuts the memory and the table columns, unless that
+    // leaves the stack below what a recursion guest opens: then it keeps them whole, as a full proof does.
+    let truncated = if program.truncate {
         let floor = verifier::min_execution_stacked_log(crate::log2_strict_usize(program.prog.len()));
         truncate::Compact::reaching(&layout, exec.mem_used, floor)?
     } else {
         None
     };
-    let shape = compact.as_ref().map_or(layout.shape, |c| c.shape);
-    if !(pcs::MIN_STACKED_LOG..=pcs::MAX_STACKED_LOG).contains(&shape.mu) {
-        return Err(ProveError::WitnessOutOfRange {
-            log_committed: shape.mu,
-        });
-    }
+    let compact = match truncated {
+        Some(compact) => compact,
+        None => truncate::Compact::new(&layout, 1 << layout.placements[MEMORY_FINAL_COUNTERS].n_vars, false)?,
+    };
+    let shape = compact.shape;
     let stats = Stats {
         cycles: exec.cycles,
         rows: layout.rows,
-        committed: compact.as_ref().map_or_else(|| layout.committed_size(), |c| c.placed),
+        committed: compact.placed,
         log_mem,
         mem_used: exec.mem_used,
     };
@@ -253,19 +255,10 @@ pub fn prove(
         verifier::Digest(program.bytecode().fiat_shamir_iv()).words(),
         verifier::Digest(public_input_bytes(&public_input)).words(),
     );
-    announce_public(
-        &mut ps,
-        log_mem,
-        w.layout.rows,
-        log_inv_rate,
-        compact.as_ref().map(truncate::Compact::announced),
-    );
-    let compact_q = compact
-        .as_ref()
-        .map(|c| crate::stage!("Compact copy", || c.copy(&w.q, &w.layout)));
+    announce_public(&mut ps, log_mem, w.layout.rows, log_inv_rate, compact.announced());
+    let compact_q = crate::stage!("Compact copy", || compact.copy(&w.q, &w.layout));
     let committed = crate::stage!("Commit", || {
-        let q = compact_q.as_deref().unwrap_or(&w.q);
-        pcs::commit(&mut ps, &q[..shape.committed_len()], shape.mu, log_inv_rate)
+        pcs::commit(&mut ps, &compact_q[..shape.committed_len()], shape.mu, log_inv_rate)
     });
 
     let (bus, table_claims) = {
@@ -308,16 +301,10 @@ pub fn prove(
     });
     let (ring, outputs) = openings.into_pcs_claims(offset);
     slots.extend(outputs);
-    // The reduction was the last reader of the full stack: a truncated proof opens the compact one.
-    let (q, slots, ring) = match (compact.as_ref(), compact_q) {
-        (Some(c), Some(compact_q)) => {
-            drop(w.q);
-            let (slots, ring) = c.map_claims(&w.layout, slots, ring);
-            (compact_q, slots, ring)
-        }
-        _ => (w.q, slots, ring),
-    };
-    crate::stage!("PCS open", || pcs::open(&mut ps, committed, q, &slots, &ring));
+    // The reduction was the last reader of the full stack: the proof opens the compact one.
+    drop(w.q);
+    let (slots, ring) = compact.map_claims(&w.layout, slots, ring);
+    crate::stage!("PCS open", || pcs::open(&mut ps, committed, compact_q, &slots, &ring));
     Ok((ps.into_proof(), stats))
 }
 
@@ -335,9 +322,12 @@ fn finish_claims(
 ) -> Vec<pcs::StackClaim> {
     let bus = bus_claims.into_iter().map(|c| (c.col, c.point));
     let tables = (0..tables::N_TABLES).flat_map(|t| {
+        let public = tables::tables()[t].public_columns();
         (GLOBAL_COLUMN_BASES[t]..GLOBAL_COLUMN_BASES[t] + TABLE_WIDTHS[t])
             // the Keccak reduction's claim on the output (`keccak_output_claim`)
             .filter(|&col| !matches!(keccak_value(col), Some((_, KeccakLane::Output(_)))))
+            // a constant on every row: no claim, the verifier knows its value
+            .filter(move |&col| !public.iter().any(|&(p, _)| GLOBAL_COLUMN_BASES[t] + p == col))
             .map(move |col| (col, table_claims[t].chi.clone()))
     });
     let pi = pi_point(r_pi, l);
@@ -777,6 +767,10 @@ mod tests {
             (20, 600, false, false),
             (70_000, 40, true, true),
             (40, 70_000, true, true),
+            (70_000, 70_000, false, true),
+            // Four row pieces of `KECCAK64` (12 pieces by slot block) and two of `KECCAK`: fourteen ring blocks, more than
+            // the eight an opening used to carry.
+            (122_000, 98_000, true, true),
         ] {
             let (program, _, _) = keccak64_mix_program(message, keccak64, keccak, out_two, truncate);
             let (proof, stats) = prove(&program, &[], pi, crate::pcs::TEST_LOG_INV_RATE).unwrap();
@@ -789,12 +783,11 @@ mod tests {
             );
             let summary = verify(&program, &pi, &proof)
                 .unwrap_or_else(|e| panic!("{keccak64} KECCAK64 and {keccak} KECCAK rows: {e}"));
-            if truncate {
-                assert!(
-                    summary.truncation.is_some_and(|t| t.qt),
-                    "{keccak64} KECCAK64 and {keccak} KECCAK rows: q_keccak is pieces"
-                );
-            }
+            assert_eq!(
+                summary.truncation.is_some(),
+                truncate,
+                "{keccak64} KECCAK64 and {keccak} KECCAK rows: the rate word announces the truncation"
+            );
         }
     }
 

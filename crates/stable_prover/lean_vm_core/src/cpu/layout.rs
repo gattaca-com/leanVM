@@ -98,16 +98,6 @@ pub struct Layout {
     pub rows: [usize; tables::N_TABLES],
 }
 
-impl Layout {
-    /// Words of the committed columns, before the stack's pad to a power of two.
-    pub(crate) fn committed_size(&self) -> usize {
-        (self.placements.iter())
-            .filter(|p| !p.is_virtual())
-            .map(|p| 1usize << p.n_vars)
-            .sum()
-    }
-}
-
 /// The prover's witness: the stacked multilinear `q`, which holds every committed
 /// column at its placed offset, plus the public [`Layout`] (and the sizes needed to
 /// announce it).
