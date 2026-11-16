@@ -2,7 +2,7 @@
 //! n→1 recursion step over leaves of that size (`recursion`). Aggregation accepts
 //! signature counts and a blob count; recursion accepts these counts per leaf.
 
-use aggregation::{AggregateClaims, AggregateProof, OutputClaims, aggregate, signers_cache};
+use aggregation::{AggregateClaims, AggregateProof, ClaimTree, OutputClaims, aggregate, signers_cache};
 use bench::{Plan, Timing};
 use isa::{Prover, Stats, pretty_f64, pretty_integer};
 use lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
@@ -267,14 +267,16 @@ fn write_leaves<P: Prover>(
 /// A leaf's claims in the leaves' file: each list as its length and its `(key, message)` pairs, then
 /// a 0/1 byte for whether there is a DA root and 32 root bytes, zero without one. The proof carries
 /// no claims; the parent trusts its subprocess for them, standing in for a receiver that knows them.
+/// A leaf's claim tree is one node with no children, so the lists are all there is.
 fn write_claims(out: &mut Vec<u8>, claims: &AggregateClaims) {
-    out.extend((claims.lean_xmss.len() as u64).to_le_bytes());
-    for (pk, message) in &claims.lean_xmss {
+    assert!(claims.tree.children.is_empty(), "a leaf has no children");
+    out.extend((claims.tree.lean_xmss.len() as u64).to_le_bytes());
+    for (pk, message) in &claims.tree.lean_xmss {
         out.extend(pk.to_bytes());
         out.extend(message);
     }
-    out.extend((claims.lean_sphincs.len() as u64).to_le_bytes());
-    for (pk, message) in &claims.lean_sphincs {
+    out.extend((claims.tree.lean_sphincs.len() as u64).to_le_bytes());
+    for (pk, message) in &claims.tree.lean_sphincs {
         out.extend(pk.to_bytes());
         out.extend(message);
     }
@@ -318,8 +320,11 @@ impl<'a> LeavesFile<'a> {
         let [has_root] = self.array();
         let root = self.array();
         AggregateClaims {
-            lean_xmss,
-            lean_sphincs,
+            tree: ClaimTree {
+                children: vec![],
+                lean_xmss,
+                lean_sphincs,
+            },
             da_commitment: (has_root == 1).then_some(root),
         }
     }

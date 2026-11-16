@@ -5,7 +5,7 @@ use super::guest::{GUEST_SOURCE, compile_guest, unified_guest};
 use super::hints::{FORGE, Forgery, Hints};
 use super::placeholders::placeholder_map;
 use super::proof::{AggregateClaims, AggregateProof, decode, encode};
-use super::statement::{CLAIM_GROUP, claim_list_digest, list_split};
+use super::statement::CLAIM_GROUP;
 use super::*;
 use fiat_shamir_prover::merkle::hash_to_scalars;
 use isa::Program;
@@ -169,10 +169,17 @@ fn aggregate_mixed_leaf() {
         sphincs.push((public_key, signed, lean_sphincs::sign(&secret_key, &signed)));
     }
     let leaf = prove(&[], &get_signers::<StableProver>(3), &sphincs);
-    assert_eq!((leaf.0.lean_xmss.len(), leaf.0.lean_sphincs.len()), (3, 5));
-    assert_eq!(leaf.0.lean_xmss[0].1, message());
+    assert!(leaf.0.tree.children.is_empty(), "a leaf has no children");
+    assert_eq!((leaf.0.tree.lean_xmss.len(), leaf.0.tree.lean_sphincs.len()), (3, 5));
+    assert_eq!(leaf.0.tree.lean_xmss[0].1, message());
     assert_eq!(leaf.0.da_commitment, None);
-    let twice: Vec<_> = leaf.0.lean_sphincs.iter().filter(|(pk, _)| *pk == public_key).collect();
+    let twice: Vec<_> = leaf
+        .0
+        .tree
+        .lean_sphincs
+        .iter()
+        .filter(|(pk, _)| *pk == public_key)
+        .collect();
     assert!(
         twice.len() == 2 && twice[0].1 < twice[1].1,
         "the same pubkey twice, ordered by the message"
@@ -315,31 +322,25 @@ fn guest_column_selectors_match_native_eq() {
 }
 
 /// The right leaf holds more claims than one loop frame of its list hashes
-/// ([`CLAIM_GROUP`]), so both that leaf and the parent rebuilding it run the
-/// list's group loop and then a partial last group, while the left leaf's list is
-/// a partial group alone. The leaves share three signers, so the parent rebuilds the
-/// right list on the walk that allows repeated slots (`child_claim_list_any`).
+/// ([`CLAIM_GROUP`]), so that leaf runs the list's group loop and then a
+/// partial last group, while the left leaf's list is a partial group alone.
+/// The leaves share three signers, which the flattened set holds once.
 #[test]
 fn aggregate_two_to_one() {
     let big = 2 * CLAIM_GROUP + 3;
     let signers = get_signers::<StableProver>(SMALL_LEAF_SIZE + big);
     let left = prove(&[], &signers[..SMALL_LEAF_SIZE], &[]);
     let right = prove(&[], &signers[SMALL_LEAF_SIZE - 3..], &[]);
-    let cover = super::coverage::plan_coverage(&[], &[], &[left.clone(), right.clone()], None).unwrap();
-    assert!(
-        !cover.lean_xmss.children[1].is_sorted_by(|a, b| a < b),
-        "the right list takes the repeated-slot walk"
-    );
     // A child whose claims are out of order, or whose proof the replay cannot walk, is refused before proving.
     let node_of = |left: Node| aggregate(&[left, right.clone()], vec![], vec![], None, OutputClaims::All).err();
     let mut unsorted = left.clone();
-    unsorted.0.lean_xmss.reverse();
+    unsorted.0.tree.lean_xmss.reverse();
     assert_eq!(node_of(unsorted), Some(AggregateError::InvalidChild));
     let mut cut = left.clone();
     cut.1.proof.stream.truncate(cut.1.proof.stream.len() / 2);
     assert_eq!(node_of(cut), Some(AggregateError::InvalidChild));
     let node = prove(&[left, right], &[], &[]);
-    assert_eq!(node.0.lean_xmss.len(), SMALL_LEAF_SIZE + big);
+    assert_eq!(node.0.flatten().0.len(), SMALL_LEAF_SIZE + big);
 }
 
 /// A LeanDA payload of the most blobs a node takes, proven without signatures and published in the statement. The
@@ -368,7 +369,10 @@ fn aggregate_with_a_da_payload() {
         [0; lean_xmss::MESSAGE_LEN],
     );
     let unsorted = AggregateClaims {
-        lean_xmss: vec![claim, claim],
+        tree: ClaimTree {
+            lean_xmss: vec![claim, claim],
+            ..ClaimTree::default()
+        },
         ..expected.clone()
     };
     assert!(!received.verify(&unsorted));
@@ -413,10 +417,10 @@ fn a_node_passes_on_one_childs_da_root() {
     );
     assert_ne!(first, second);
     let pass_on = |selected: Option<Option<[u8; 32]>>, blobs: &[lean_da::Blob]| {
+        // A node publishes its children's claims whole; `Only` names its own raw ones.
         let declare = selected.map(|da_commitment| AggregateClaims {
-            lean_xmss: children[0].0.lean_xmss.clone(),
-            lean_sphincs: vec![],
             da_commitment,
+            ..AggregateClaims::default()
         });
         let node = aggregate(
             &children,
@@ -590,30 +594,28 @@ fn da_root(rows: &[Codeword]) -> Hash {
     hash_pair(&root(blob_roots), &count)
 }
 
-/// Claims left undeclared take duplicate slots. The first narrowing drops every
-/// claim on one message, the second all but one claim.
+/// Raw claims left undeclared take duplicate slots. The first narrowing drops every
+/// claim on one message, the second all but one claim. A child's claims cannot be
+/// narrowed: the node's commitment hashes the child's whole.
 #[test]
 fn a_node_may_publish_less_than_it_covers() {
     let at_a = get_signers::<StableProver>(3);
     let at_b = get_signers_for::<StableProver>(2, MESSAGE_B);
-    let wide = prove(&[], &[at_a.clone(), at_b].concat(), &[]);
-    assert_eq!(wide.0.lean_xmss.len(), 5);
+    let raw = [at_a.clone(), at_b].concat();
+    let wide = prove(&[], &raw, &[]);
+    assert_eq!(wide.0.tree.lean_xmss.len(), 5);
 
-    let narrowed = |declare: &AggregateClaims| {
-        aggregate(
-            std::slice::from_ref(&wide),
-            vec![],
-            vec![],
-            None,
-            OutputClaims::Only(declare),
-        )
-    };
+    let narrowed = |declare: &AggregateClaims| aggregate(&[], raw.clone(), vec![], None, OutputClaims::Only(declare));
     let only = |lean_xmss: Vec<LeanXmssClaim>| AggregateClaims {
-        lean_xmss,
+        tree: ClaimTree {
+            lean_xmss,
+            ..ClaimTree::default()
+        },
         ..AggregateClaims::default()
     };
     let on_b: Vec<LeanXmssClaim> = wide
         .0
+        .tree
         .lean_xmss
         .iter()
         .filter(|(_, message)| *message == message_for(MESSAGE_B))
@@ -623,12 +625,12 @@ fn a_node_may_publish_less_than_it_covers() {
 
     let narrow = narrowed(&only(on_b.clone())).expect("narrows to one message");
     assert!(narrow.1.verify(&narrow.0), "the one-message narrowing verifies");
-    assert_eq!(narrow.0.lean_xmss, on_b);
+    assert_eq!(narrow.0.tree.lean_xmss, on_b);
 
     let one = vec![(at_a[0].0, message())];
     let part = narrowed(&only(one.clone())).expect("narrows to one claim");
     assert!(part.1.verify(&part.0), "the one-claim narrowing verifies");
-    assert_eq!(part.0.lean_xmss, one);
+    assert_eq!(part.0.tree.lean_xmss, one);
 
     assert_eq!(
         narrowed(&AggregateClaims::default()).err(),
@@ -648,6 +650,32 @@ fn a_node_may_publish_less_than_it_covers() {
         narrowed(&only(vec![(at_a[0].0, message_for(MESSAGE_B + 1))])).err(),
         uncovered
     );
+    // A child's claim, declared at the parent: the parent covers no raw claim.
+    assert_eq!(
+        aggregate(
+            std::slice::from_ref(&wide),
+            vec![],
+            vec![],
+            None,
+            OutputClaims::Only(&only(on_b))
+        )
+        .err(),
+        uncovered
+    );
+    // A declaration naming children is not a selection of raw claims.
+    let with_children = AggregateClaims {
+        tree: ClaimTree {
+            children: vec![ClaimTree::default()],
+            ..ClaimTree::default()
+        },
+        ..AggregateClaims::default()
+    };
+    assert_eq!(
+        narrowed(&with_children).err(),
+        Some(AggregateError::InvalidInput(
+            "a node publishes its children's claims whole"
+        ))
+    );
 }
 
 /// A raw signature whose claim goes undeclared covers a duplicate slot.
@@ -656,19 +684,21 @@ fn raw_signatures_may_go_undeclared() {
     let b = get_signers_for::<StableProver>(1, MESSAGE_B);
     let claim_b = vec![(b[0].0, message_for(MESSAGE_B))];
     let declare = AggregateClaims {
-        lean_xmss: claim_b.clone(),
+        tree: ClaimTree {
+            lean_xmss: claim_b.clone(),
+            ..ClaimTree::default()
+        },
         ..AggregateClaims::default()
     };
     let raw = [get_signers::<StableProver>(1), b].concat();
     let node = aggregate(&[], raw, vec![], None, OutputClaims::Only(&declare)).expect("the narrowing leaf aggregates");
     assert!(node.1.verify(&node.0), "it verifies");
-    assert_eq!(node.0.lean_xmss, claim_b);
+    assert_eq!(node.0.tree.lean_xmss, claim_b);
 }
 
 /// Two messages in one tree. Signer `i` holds the same pubkey under both, at
 /// different leaf indices, so its claims on B are distinct from those on A; the
-/// left leaf holds one message, the right both, and the node needs a duplicate
-/// slot for the claim both leaves cover.
+/// left leaf holds one message, the right both, and both leaves cover one claim.
 #[test]
 fn aggregate_two_messages() {
     let at_a = get_signers::<StableProver>(4);
@@ -679,15 +709,14 @@ fn aggregate_two_messages() {
     let right = prove(&[], &[&at_a[2..], &at_b[..]].concat(), &[]);
     // A pubkey of `left` signing a second message is a second claim of that pubkey.
     let crossed = prove(std::slice::from_ref(&left), &at_b[..1], &[]);
-    let of_first: Vec<lean_xmss::Message> = crossed
-        .0
-        .lean_xmss
+    let crossed_claims = crossed.0.flatten().0;
+    let of_first: Vec<lean_xmss::Message> = crossed_claims
         .iter()
         .filter(|(pubkey, _)| *pubkey == at_a[0].0)
         .map(|(_, message)| *message)
         .collect();
     assert_eq!(of_first, vec![message(), message_for(MESSAGE_B)]);
-    assert_eq!(crossed.0.lean_xmss.len(), 4);
+    assert_eq!(crossed_claims.len(), 4);
     let node = prove(&[left, right], &[], &[]);
     let mut expected: Vec<LeanXmssClaim> = [at_a, at_b]
         .concat()
@@ -695,54 +724,12 @@ fn aggregate_two_messages() {
         .map(|(pubkey, message, _)| (pubkey, message))
         .collect();
     expected.sort();
-    assert_eq!(node.0.lean_xmss, expected);
+    assert_eq!(node.0.flatten().0, expected);
 }
 
-/// A child list walked by gaps (`child_claim_list_mono`) moves strictly forward. A
-/// child may declare a claim twice, and a gap of `g^-1` would walk the copy back onto
-/// the slot it just covered, with the same coverage mark, so write-once memory alone
-/// would not see it: only the gap's `assert_gpow` does.
-#[test]
-fn a_child_walk_cannot_step_back() {
-    let guest = guest_snippet(
-        r#"    n_c = hint_witness("n")
-    table = HeapBuf(GEN ** 8)
-    hint_witness(table[0:8], "claims")
-    cover = HeapBuf(GEN ** 2)
-    d0, d1 = child_claim_list_digest(table, cover, GEN ** 3, GEN ** 2, n_c)
-    public = GEN ** 0
-    assert public[1] == d0
-    assert public[GEN] == d1
-    return
-"#,
-        20,
-    );
-    let claim = |i: u64| [1, 2, 3, 4].map(|k| F128::new(i * 7919 + k, k));
-    let table: Vec<F128> = [claim(0), claim(1)].concat();
-    let walk = |child: &[[F128; 4]], gaps: &[F128]| {
-        let mut hints = Hints::default();
-        hints.push("n", vec![count(child.len())]);
-        hints.push("claims", table.clone());
-        hints.push("signers_split", list_split(child.len()));
-        hints.push("child_mono", vec![count(1)]);
-        for &gap in gaps {
-            hints.push("child_claim_gap", vec![gap]);
-        }
-        execute(&guest, &hints.0, claim_list_digest(child.iter().copied()))
-    };
-    assert!(walk(&[claim(0), claim(1)], &[count(0), count(0)]).is_ok());
-    let back = count(1).inv();
-    assert!(
-        walk(&[claim(0), claim(0)], &[count(0), back]).is_err(),
-        "a walk revisited a slot"
-    );
-}
-
-/// Three levels, both schemes. Each node has a child of one scheme only, so it rebuilds a list empty on one side,
-/// which is the only way the guest's claim-absorbing loops run over an empty range and reach their bound `log(x) <
-/// log(g^0)` (unsatisfiable, so nothing may be written there). Leaves overlap in claims of each scheme, within a node
-/// and across the two nodes, so the left node needs a duplicate slot and the root one in each region, each child's two
-/// lists landing in their own; the root adds a raw signature of each scheme, leanXMSS on a second message, alongside its
+/// Three levels, both schemes. Each node has a child of one scheme only, so a leaf hashes an empty raw list.
+/// Leaves overlap in claims of each scheme, within a node and across the two nodes, which the flattened set
+/// holds once; the root adds a raw signature of each scheme, leanXMSS on a second message, alongside its
 /// children. The root's proof goes over the wire.
 #[test]
 fn aggregate_three_levels() {
@@ -763,8 +750,9 @@ fn aggregate_three_levels() {
         &get_signers_for::<StableProver>(2, MESSAGE_B),
         &sphincs[4..],
     );
-    assert_eq!(root.0.lean_xmss.len(), 17 + 2);
-    assert_eq!(root.0.lean_sphincs.len(), 5, "the repeats merged");
+    let (flat_xmss, flat_sphincs) = root.0.flatten();
+    assert_eq!(flat_xmss.len(), 17 + 2);
+    assert_eq!(flat_sphincs.len(), 5, "the repeats merged");
     let received = AggregateProof::from_bytes(&root.1.to_bytes()).expect("round trip");
     assert_eq!(received.to_bytes(), root.1.to_bytes());
     assert!(received.verify(&root.0), "the receiver's claims verify");

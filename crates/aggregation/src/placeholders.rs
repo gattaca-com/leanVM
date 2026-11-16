@@ -312,6 +312,7 @@ fn constants(ph: &mut Placeholders) {
         ("CLAIM_GROUP", &CLAIM_GROUP),
         ("BIG_GROUPS", &BIG_GROUPS),
         ("MAX_RECURSIONS", &MAX_RECURSIONS),
+        ("CHILD_COUNTS", &(MAX_RECURSIONS + 1)),
         ("SP_V", &sp::V),
         ("SP_TARGET_SUM", &sp::TARGET_SUM),
         ("SP_FORS_TREES", &sp::FORS_TREES),

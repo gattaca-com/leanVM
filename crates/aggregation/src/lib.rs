@@ -4,20 +4,24 @@
 //! One bytecode (`guests/lean_ethereum.py`) serves every node of an aggregation tree.
 //!
 //! A node verifies `n_raw_lean_xmss` leanXMSS signatures, `n_raw_lean_sphincs` leanSPHINCS
-//! signatures and `n_children` sub-proofs **of this same bytecode**, and
-//! by default publishes the sorted deduplicated union of their signer sets. A claim
-//! of either scheme is a `(pubkey, message)` pair; a leanXMSS signature carries its own
-//! leaf index, which the statement does not record. Coverage is what carries the
-//! security claim: a write-once slot per declared claim, written once by each raw
-//! signature and each child claim, plus a final count, so every declared claim is
-//! backed by a real signature or a verified child.
+//! signatures and `n_children` sub-proofs **of this same bytecode**, and commits to
+//! the claims in the shape of that recursion ([`ClaimTree`]): its signer commitment
+//! hashes each child's commitment, then its own raw claim lists. A claim of either
+//! scheme is a `(pubkey, message)` pair; a leanXMSS signature carries its own leaf
+//! index, which the statement does not record. A child's claims never enter the
+//! parent's tables: the parent hashes the child's commitment, which the child's
+//! statement pins, and verifies the child's proof against that statement. The native
+//! verifier rebuilds the commitment from the tree and exposes the flattened, sorted,
+//! deduplicated set ([`AggregateClaims::flatten`]).
+//! Coverage carries the security claim for the raw claims a node checks itself: a
+//! write-once slot per declared claim, written once by each raw signature, plus a
+//! final count, so every declared raw claim is backed by a real signature.
 //!
 //! Those slots are one contiguous region per scheme, so the one range check a write
 //! already needs also keeps a signature off the other scheme's declared claims: that
-//! is what makes the published split mean which scheme verified which claim, at
-//! every level of the tree.
+//! is what makes the published split mean which scheme verified which claim.
 //!
-//! A duplicate slot sits outside the prefix the digest hashes, so a claim in one is
+//! A duplicate slot sits outside the prefix the digest hashes, so a raw claim in one is
 //! covered and not published. `aggregate`'s `OutputClaims::Only` rests on that. A slot holds
 //! four cells, the pubkey and its message, so the guest reads each signature's message
 //! out of the slot it verifies.
@@ -59,7 +63,7 @@ pub use guest::unified_guest;
 use lean_sphincs::LeanSphincsPublicKey;
 use lean_xmss::LeanXmssPublicKey;
 pub use node::aggregate;
-pub use proof::{AggregateClaims, AggregateProof, OutputClaims};
+pub use proof::{AggregateClaims, AggregateProof, ClaimTree, OutputClaims};
 
 /// One leanXMSS claim: a pubkey, and the message it signed at whatever leaf index its
 /// signature carries.
@@ -70,5 +74,15 @@ pub type LeanSphincsClaim = (LeanSphincsPublicKey, lean_sphincs::Message);
 
 /// The maximum number of child proofs one [`aggregate`] call can take.
 pub const MAX_RECURSIONS: usize = 16;
+
+/// The most levels a [`ClaimTree`] may have, the root being level 1.
+///
+/// An aggregation tree is a few levels deep: leaves, a node over them, a root. 32 leaves room
+/// for any realistic pipeline, and keeps every recursion over a checked tree far from a stack limit.
+pub const MAX_TREE_DEPTH: usize = 32;
+
+/// The most nodes a [`ClaimTree`] may have in all. A tree of 4096 leaves under one root is 4352
+/// nodes, so this is generous, and it bounds the hashing and flattening a hostile tree can force.
+pub const MAX_TREE_NODES: usize = 1 << 16;
 
 pub use verifier::{MAX_LOG_INV_RATE, MIN_LOG_INV_RATE};

@@ -77,43 +77,64 @@ fn public_api_end_to_end() {
     assert_eq!(claims.num_signature_claims(), 11);
     assert_eq!(claims.da_commitment, Some(commitment));
 
-    // 4. Onto the wire, which carries only the proof: the receiver rebuilds the claims it expects, and
+    // 4. Onto the wire, which carries only the proof: the receiver rebuilds the claim tree it expects, and
     //    verifying says exactly these pubkeys signed exactly these messages.
     let received = AggregateProof::from_bytes(&proof.to_bytes()).unwrap();
     assert!(received.verify(&claims));
-    let on = |message| claims.lean_xmss.iter().filter(|(_, m)| *m == message).count();
+    let (flat_xmss, _) = claims.flatten();
+    let on = |message| flat_xmss.iter().filter(|(_, m)| *m == message).count();
     assert_eq!((on(MSG_0), on(MSG_1), on(MSG_2)), (3, 4, 1));
-    // Claims the proof does not prove fail, here one signature claim short.
+    // A tree the proof does not prove fails, here one signature claim short.
     let mut fewer = claims.clone();
-    fewer.lean_xmss.pop();
+    fewer.tree.lean_xmss.pop();
     assert!(!received.verify(&fewer));
-
-    // 5. Removing some signatures from the aggregate: `OutputClaims::Only` is what we keep. Here every claim on MSG_1 goes,
-    //    and one leanSPHINCS claim.
-    let retained = AggregateClaims {
-        lean_xmss: claims.lean_xmss.iter().filter(|(_, m)| *m != MSG_1).cloned().collect(),
-        lean_sphincs: claims.lean_sphincs[1..].to_vec(),
+    // So does one a level deeper than the bound.
+    let mut deep = ClaimTree::default();
+    for _ in 0..MAX_TREE_DEPTH {
+        deep = ClaimTree {
+            children: vec![deep],
+            ..Default::default()
+        };
+    }
+    assert!(!received.verify(&AggregateClaims {
+        tree: deep,
         da_commitment: Some(commitment),
+    }));
+
+    // 5. Selecting what to publish: a node publishes its children's claims whole, since its commitment hashes
+    //    each child's. `OutputClaims::Only` selects the node's own raw signatures and the DA root. Here every
+    //    claim and the DA root stay.
+    let child = (claims, received);
+    let keep_root = AggregateClaims {
+        da_commitment: Some(commitment),
+        ..Default::default()
     };
     let narrowed = aggregate(
-        &[(claims, received)],
+        std::slice::from_ref(&child),
         vec![],
         vec![],
         None,
-        OutputClaims::Only(&retained),
+        OutputClaims::Only(&keep_root),
         2,
     )
     .unwrap();
     assert!(narrowed.1.verify(&narrowed.0));
-    assert_eq!(narrowed.0, retained);
-    assert_eq!(narrowed.0.num_signature_claims(), 11 - 4 - 1);
-
-    // And the blob claim.
-    let without_blobs = AggregateClaims {
-        da_commitment: None,
-        ..retained
+    assert_eq!(narrowed.0.flatten(), child.0.flatten());
+    // Naming a child's claim as the node's own is refused: nothing at this node covers it.
+    let subset = AggregateClaims {
+        tree: ClaimTree {
+            lean_xmss: flat_xmss.iter().filter(|(_, m)| *m != MSG_1).cloned().collect(),
+            ..Default::default()
+        },
+        da_commitment: Some(commitment),
     };
-    let dropped = aggregate(&[narrowed], vec![], vec![], None, OutputClaims::Only(&without_blobs), 2).unwrap();
-    assert!(dropped.1.verify(&dropped.0));
-    assert_eq!(dropped.0, without_blobs);
+    let refused = aggregate(
+        std::slice::from_ref(&child),
+        vec![],
+        vec![],
+        None,
+        OutputClaims::Only(&subset),
+        2,
+    );
+    assert!(matches!(refused, Err(AggregateError::InvalidInput(_))));
 }

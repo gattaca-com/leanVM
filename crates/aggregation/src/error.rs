@@ -3,15 +3,15 @@
 /// Why [`aggregate`](super::aggregate) made no proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregateError {
-    /// The request is inconsistent: too many children, a rate out of range, nothing to publish, or
-    /// [`OutputClaims::Only`](super::OutputClaims::Only) asking for a claim or DA root the inputs do not
-    /// cover. The message says which.
+    /// The request is inconsistent: too many children, a claim tree over its bounds, a rate out of range, nothing to
+    /// publish, or [`OutputClaims::Only`](super::OutputClaims::Only) asking for a raw claim or DA root the inputs do
+    /// not cover, or naming children. The message says which.
     InvalidInput(&'static str),
     /// A raw signature is invalid. Only some are caught here; the others make proving fail
     /// ([`Self::ProvingFailed`]).
     InvalidSignature,
-    /// A child is invalid. Only some are caught here; the others make proving fail
-    /// ([`Self::ProvingFailed`]).
+    /// A child is invalid, or its claim tree is out of bounds or unsorted. Only some invalid children are caught
+    /// here; the others make proving fail ([`Self::ProvingFailed`]).
     InvalidChild,
     /// No proof was made: an input that passed the checks above is invalid (a forged signature or
     /// child), or the node is too large for one proof.
