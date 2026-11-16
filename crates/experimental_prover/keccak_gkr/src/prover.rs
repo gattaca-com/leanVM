@@ -19,7 +19,7 @@ use crate::basis::{PolyEval, add_mul};
 use crate::kernels::{GROUP, MIXED, PACKS, SKIP, SkipBlock, TERNARY, embed, mixed_points, products, slot};
 use crate::power::{Element, PowerField, get, set};
 use crate::protocol::{Claim, chi_weights, mu_at};
-use crate::witness::{Shape, Witness, transpose64, words};
+use crate::witness::{Shape, TableWitness, Witness, transpose64, words};
 use verifier::keccak::PRODUCT_BITS;
 
 /// The pattern index of a binary assignment.
@@ -189,44 +189,86 @@ struct Layer<'a> {
     witness: &'a Witness,
     /// The round whose `chi` each segment's claim is on.
     rounds: Vec<usize>,
+    /// The tasks of segment `s` are `held[s]..held[s + 1]`: the blocks of its table written, then the
+    /// padding block once, standing for every block after them. Tables are written to different
+    /// heights, so the segments differ in length.
+    held: Vec<usize>,
+    /// The tasks of segment `s` that walk written blocks only: `written[s]..written[s + 1]`.
+    written: Vec<usize>,
 }
 
 /// A row of a table in the power basis: two words per position, laid out by word.
 const ROW: usize = 2 * BITS;
 
-impl Layer<'_> {
-    /// The blocks a segment's tasks walk: those written, then the padding block once, standing
-    /// for every block after them.
-    fn held(&self) -> usize {
-        let written = self.witness.written();
-        written + usize::from(written < self.witness.shape.n_blocks())
+/// The most segments a layer walks: four tables of the runs of a permutation, at depth 6.
+const MAX_SEGMENTS: usize = 16;
+
+impl<'a> Layer<'a> {
+    fn new(witness: &'a Witness, rounds: Vec<usize>) -> Self {
+        let shape = witness.shape;
+        let tables: Vec<_> = (0..rounds.len()).map(|s| witness.table(shape.table_of(s))).collect();
+        let prefix = |len: &dyn Fn(&TableWitness) -> usize| {
+            let mut sums = vec![0];
+            for table in &tables {
+                sums.push(sums.last().unwrap() + len(table));
+            }
+            sums
+        };
+        Self {
+            witness,
+            rounds,
+            held: prefix(&|t| t.held()),
+            written: prefix(&|t| t.written()),
+        }
     }
 
-    /// Task `held * segment + g`, as `(segment, g, block)`.
+    /// The witness of the table a segment belongs to.
+    fn table_of(&self, segment: usize) -> &TableWitness {
+        self.witness.table(self.witness.shape.table_of(segment))
+    }
+
+    /// The blocks written of segment `segment`'s table.
+    fn written_of(&self, segment: usize) -> usize {
+        self.written[segment + 1] - self.written[segment]
+    }
+
+    /// The blocks segment `segment` walks.
+    fn held_of(&self, segment: usize) -> usize {
+        self.held[segment + 1] - self.held[segment]
+    }
+
+    /// Task `held[segment] + g`, as `(segment, g, block)`.
     fn block(&self, task: usize) -> (usize, usize, &[u64]) {
-        let (segment, g) = (task / self.held(), task % self.held());
-        (segment, g, self.witness.layer(self.rounds[segment], g))
+        let segment = self.held.partition_point(|&start| start <= task) - 1;
+        let g = task - self.held[segment];
+        (segment, g, self.table_of(segment).layer(self.rounds[segment], g))
     }
 
     fn n_tasks(&self) -> usize {
-        self.rounds.len() * self.held()
+        *self.held.last().unwrap()
+    }
+
+    /// The tasks that walk written blocks only, `(segment, g)` of task `task`.
+    fn written_task(&self, task: usize) -> (usize, usize) {
+        let segment = self.written.partition_point(|&start| start <= task) - 1;
+        (segment, task - self.written[segment])
+    }
+
+    fn n_written_tasks(&self) -> usize {
+        *self.written.last().unwrap()
     }
 
     /// Each task's weight in `eq`, a table over the blocks then the segment: the padding block's
     /// is the sum over the blocks it stands for.
     fn task_weights(&self, eq: &[F128]) -> Vec<F128> {
         let nb = self.witness.shape.n_blocks();
-        (0..self.n_tasks())
-            .map(|task| {
-                let (segment, g) = (task / self.held(), task % self.held());
-                let eq = &eq[nb * segment..][..nb];
-                if g < self.witness.written() {
-                    eq[g]
-                } else {
-                    eq[g..].iter().sum()
-                }
-            })
-            .collect()
+        let mut weights = Vec::with_capacity(self.n_tasks());
+        for segment in 0..self.rounds.len() {
+            let eq = &eq[nb * segment..][..nb];
+            let written = self.written_of(segment);
+            weights.extend((0..self.held_of(segment)).map(|g| if g < written { eq[g] } else { eq[g..].iter().sum() }));
+        }
+        weights
     }
 
     /// Per pack `q` of a block, the coefficients of
@@ -360,14 +402,14 @@ impl Layer<'_> {
             .iter()
             .map(|&e| field.to_poly(e))
             .collect();
-        let (nb, written) = (self.witness.shape.n_blocks(), self.witness.written());
+        let nb = self.witness.shape.n_blocks();
         let mixed = parallel::map_reduce_with_state(
-            self.rounds.len() * written,
+            self.n_written_tasks(),
             || SkipBlock::new(weights),
             || vec![[0u64; 5]; MIXED],
             |skip, total, task| {
-                let (segment, g) = (task / written, task % written);
-                let (row, block) = (g + nb * segment, self.witness.layer(self.rounds[segment], g));
+                let (segment, g) = self.written_task(task);
+                let (row, block) = (g + nb * segment, self.table_of(segment).layer(self.rounds[segment], g));
                 skip.run(block);
                 for half in 0..2 {
                     for (i, total) in total.iter_mut().enumerate() {
@@ -419,8 +461,7 @@ impl Layer<'_> {
             target_feature = "gfni"
         ))]
         let row_maps = crate::table_gfni::RowMaps::new(field, &fold);
-        // Rows of segments that do not exist are zero, and so is their product.
-        table[self.rounds.len() * layout.live * ROW..layout.len() * ROW].fill(0);
+        // Segments that do not exist have no live row, and their padding row is zero, and so is their product.
         pads[self.rounds.len() * ROW..].fill(0);
         let (ptr, pads) = (
             parallel::SendPtr(table.as_mut_ptr()),
@@ -443,8 +484,8 @@ impl Layer<'_> {
                 let (segment, g, block) = self.block(task);
                 // SAFETY: each task owns its rows: a written block's two, or its segment's padding row.
                 let out = unsafe {
-                    if 2 * g < layout.live {
-                        ptr.slice((layout.live * segment + 2 * g) * ROW, 2 * ROW)
+                    if 2 * g < layout.live[segment] {
+                        ptr.slice((layout.start(segment) + 2 * g) * ROW, 2 * ROW)
                     } else {
                         pads.slice(segment * ROW, ROW)
                     }
@@ -581,14 +622,21 @@ impl<'a> Round<'a> {
             return self.finish(&sums);
         }
         // A task per pair of rows written, the second of a ragged one being the padding row.
-        let (pairs, half) = (to.live.div_ceil(2), to.m / 2);
+        // Task `pair_starts[segment] + t` owns rows `2t` and `2t + 1` of its segment. A segment with no
+        // block written has no live row and no task.
+        let half = to.m / 2;
+        let mut pair_starts = vec![0];
+        for segment in 0..to.segments {
+            pair_starts.push(pair_starts[segment] + to.live[segment].div_ceil(2));
+        }
         let mut sums = parallel::map_reduce_with_state(
-            to.segments * pairs,
+            pair_starts[to.segments],
             || vec![0u64; 2 * ROW],
             RoundSums::default,
             |rows, sums, task| {
-                let (segment, t) = (task / pairs, task % pairs);
-                let n = (to.live - 2 * t).min(2);
+                let segment = pair_starts.partition_point(|&start| start <= task) - 1;
+                let t = task - pair_starts[segment];
+                let n = (to.live[segment] - 2 * t).min(2);
                 let rows = &mut rows[..n * ROW];
                 for (i, row) in rows.as_chunks_mut::<ROW>().0.iter_mut().enumerate() {
                     fold(row, segment, 2 * t + i);
@@ -600,7 +648,7 @@ impl<'a> Round<'a> {
                 };
                 self.add_pair(sums, &rows[..ROW], high, eq[half * segment + t]);
                 // SAFETY: each task owns its rows of `dst`.
-                let out = unsafe { ptr.slice((to.live * segment + 2 * t) * ROW, n * ROW) };
+                let out = unsafe { ptr.slice((to.start(segment) + 2 * t) * ROW, n * ROW) };
                 // Built in cache for the round values, then published: the next round reads them.
                 primitives::stream::Stream::new().copy(out, rows);
             },
@@ -613,28 +661,35 @@ impl<'a> Round<'a> {
     /// Add the pairs of two padding rows of a table laid out as `layout`, weighted by `eq`: each
     /// segment's padding row, once, at the sum of their weights.
     fn add_padding(&self, sums: &mut RoundSums, layout: Rows, pads: &[u64], eq: &[F128]) {
-        let (first, half) = (layout.live.div_ceil(2), layout.m / 2);
-        if first == half {
-            return;
-        }
-        for (pad, eq) in pads.as_chunks::<ROW>().0.iter().zip(eq.chunks_exact(half)) {
-            self.add_pair(sums, pad, pad, eq[first..].iter().sum());
+        let half = layout.m / 2;
+        for (segment, (pad, eq)) in pads.as_chunks::<ROW>().0.iter().zip(eq.chunks_exact(half)).enumerate() {
+            let first = layout.live[segment].div_ceil(2);
+            if first != half {
+                self.add_pair(sums, pad, pad, eq[first..].iter().sum());
+            }
         }
     }
 }
 
-/// The rows of the table the tail folds: per segment, the first `live` of `m`, then, if there are
-/// fewer, the padding row every later one equals, kept apart. Once `m` is one, a row per segment.
+/// The rows of the table the tail folds: per segment, the first `live[segment]` of `m`, then, if there
+/// are fewer, the padding row every later one equals, kept apart. A segment's rows follow the previous
+/// segment's, whatever their number: the tables are written to different heights. Once `m` is one, a
+/// row per segment.
 #[derive(Clone, Copy)]
 struct Rows {
     m: usize,
-    live: usize,
+    live: [usize; MAX_SEGMENTS],
     segments: usize,
 }
 
 impl Rows {
     fn len(&self) -> usize {
-        self.segments * self.live
+        self.live[..self.segments].iter().sum()
+    }
+
+    /// The first row of `segment`.
+    fn start(&self, segment: usize) -> usize {
+        self.live[..segment].iter().sum()
     }
 
     /// The layout once the next variable is bound: the group, the block's, then the segment's.
@@ -645,18 +700,22 @@ impl Rows {
                 ..*self
             },
             // The fold writes every segment's row, a padding one included.
-            2 => Self { m: 1, live: 1, ..*self },
+            2 => Self {
+                m: 1,
+                live: [1; MAX_SEGMENTS],
+                ..*self
+            },
             m => Self {
                 m: m / 2,
-                live: self.live.div_ceil(2),
+                live: self.live.map(|live| live.div_ceil(2)),
                 ..*self
             },
         }
     }
 
     fn row<'t>(&self, table: &'t [u64], pads: &'t [u64], segment: usize, r: usize) -> &'t [u64] {
-        if r < self.live {
-            &table[(self.live * segment + r) * ROW..][..ROW]
+        if r < self.live[segment] {
+            &table[(self.start(segment) + r) * ROW..][..ROW]
         } else {
             &pads[segment * ROW..][..ROW]
         }
@@ -712,12 +771,12 @@ pub fn prove_layer(
     claim: &Claim,
 ) -> Claim {
     let shape = witness.shape;
-    let layer = Layer {
+    let layer = Layer::new(
         witness,
-        rounds: (0..shape.segments())
+        (0..shape.segments())
             .map(|segment| shape.round(segment, step))
             .collect(),
-    };
+    );
 
     let per_pack = tracing::info_span!("Product").in_scope(|| layer.pack_products(claim));
     let pack_weights = eq_table(&claim.point[..SKIP + 1]);
@@ -766,9 +825,16 @@ pub fn prove_layer(
     let round = Round::new(&field, claim, &polys, s, kappa);
     let mut layout = Rows {
         m: 2 * shape.n_blocks(),
-        live: 2 * witness.written(),
+        live: std::array::from_fn(|segment| {
+            if segment < shape.segments() {
+                2 * layer.written_of(segment)
+            } else {
+                0
+            }
+        }),
         segments: 1 << shape.seg_log(),
     };
+    assert!(layout.segments <= MAX_SEGMENTS);
     let (mut src, mut dst) = scratch.table.split_at_mut(layout.m * layout.segments * ROW);
     let pads = &mut scratch.pads;
     let mut values = tracing::info_span!("Tables").in_scope(|| {
@@ -860,12 +926,9 @@ mod gfni_tests {
             let shape = Shape::new(n, depth);
             let mut committed = vec![primitives::field::F64(0); 1 << shape.stack_log()];
             let witness = Witness::generate(shape, &inputs, &mut committed);
-            assert!(witness.written() < shape.n_blocks(), "a padding block");
+            assert!(witness.table(0).written() < shape.n_blocks(), "a padding block");
             for (step, mode) in [(0, "dense"), (depth - 1, "sparse"), (depth / 2, "lanes"), (1, "zero")] {
-                let layer = Layer {
-                    witness: &witness,
-                    rounds: (0..shape.segments()).map(|m| shape.round(m, step)).collect(),
-                };
+                let layer = Layer::new(&witness, (0..shape.segments()).map(|m| shape.round(m, step)).collect());
                 let mut claim = first_claim(shape, &rng.ext_vec(4), rng.ext_vec(shape.y_vars()), &rng.ext_vec(5));
                 claim.weights = (0..BITS)
                     .map(|j| {

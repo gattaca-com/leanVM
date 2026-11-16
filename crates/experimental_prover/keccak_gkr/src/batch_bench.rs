@@ -55,7 +55,7 @@ pub fn run(n: usize, depth: usize, log_inv_rate: usize, plan: Plan) -> Report {
         let t = Instant::now();
         let instance = batch_instance(&mut ps, shape);
         let output = tracing::info_span!("Output claim").in_scope(|| OutputClaim::of_inputs(shape, &inputs, instance));
-        ps.add_scalars(&output.lanes);
+        ps.add_scalars(&output.lanes[0]);
         let output_s = t.elapsed().as_secs_f64();
 
         let t = Instant::now();
@@ -94,8 +94,15 @@ pub fn run(n: usize, depth: usize, log_inv_rate: usize, plan: Plan) -> Report {
 
     let iv = primitives::hash::hash(LABEL);
     let (_, verify) = Plan::new(plan.repeat, 0).measure_quiet(|_| {
-        verifier::verify_keccak_batch(&iv, shape.n_log(), shape.depth(), log_inv_rate, &proof)
-            .expect("the batch proof verifies");
+        verifier::verify_keccak_batch(
+            &iv,
+            shape.n_log(),
+            shape.depth(),
+            shape.table_bits(),
+            log_inv_rate,
+            &proof,
+        )
+        .expect("the batch proof verifies");
     });
 
     let merkle_bytes = proof.to_bytes().len() - 16 * proof.stream.len();
@@ -166,7 +173,7 @@ impl Report {
 /// from `label` and, as its public input, the shape and the PCS rate.
 pub(crate) fn batch_transcript(label: &[u8], shape: Shape, log_inv_rate: usize) -> ProverState {
     let iv = verifier::Digest(primitives::hash::hash(label)).words();
-    let statement = [shape.n_log(), shape.depth(), log_inv_rate, 0].map(|w| w as u64);
+    let statement = [shape.n_log(), shape.depth(), log_inv_rate, shape.table_bits()].map(|w| w as u64);
     ProverState::new(iv, statement)
 }
 

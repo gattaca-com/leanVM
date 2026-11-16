@@ -189,7 +189,7 @@ fn keccak_output_claim(table_claims: &[constraints::Claims]) -> keccak_gkr::Outp
     let claims = &table_claims[verifier::layout::OP_KECCAK];
     keccak_gkr::OutputClaim {
         instance: claims.chi.clone(),
-        lanes: std::array::from_fn(|l| claims.evals[tables::keccakt::V_OUT + l]),
+        lanes: vec![std::array::from_fn(|l| claims.evals[tables::keccakt::V_OUT + l])],
     }
 }
 

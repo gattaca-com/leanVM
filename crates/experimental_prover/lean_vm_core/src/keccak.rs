@@ -17,7 +17,7 @@
 //! the lanes the VM reads, and the output is the permutation's, written as it is.
 
 use crate::transcript::ProverState;
-use keccak_gkr::witness::{BLOCK, block_lanes};
+use keccak_gkr::witness::{BLOCK, ZERO_PAD, block_lanes};
 use keccak_gkr::{Openings, OutputClaim, Shape, Witness};
 use primitives::field::{F64, F128};
 use primitives::hash::STATE_LANES;
@@ -104,8 +104,8 @@ pub(crate) struct Reduction {
 impl Reduction {
     /// Rebuild the witness from `q_keccak`, the whole committed block, and run the reduction.
     pub(crate) fn prove(self, ps: &mut ProverState, q_keccak: &[F64], output: &OutputClaim) -> Openings {
-        let witness =
-            tracing::info_span!("Witness").in_scope(|| Witness::from_committed(self.shape, self.steps, q_keccak));
+        let witness = tracing::info_span!("Witness")
+            .in_scope(|| Witness::from_committed(self.shape, &[self.steps], &[ZERO_PAD], q_keccak));
         witness.prove(ps, q_keccak, output)
     }
 }
@@ -150,7 +150,7 @@ impl Sink<'_> {
         let block = std::mem::replace(&mut self.pending, Vec::with_capacity(BLOCK));
         match self.jobs {
             Some(jobs) => jobs.send((self.blocks, block)).expect("the workers outlive the run"),
-            None => self.inline.push((self.blocks, block_lanes(DEPTH, &block))),
+            None => self.inline.push((self.blocks, block_lanes(DEPTH, &ZERO_PAD, &block))),
         }
         self.blocks += 1;
     }
@@ -178,7 +178,7 @@ impl Steps for Sink<'_> {
         let whole = rest.len() / BLOCK;
         let done = parallel::map_collect(whole, |b| {
             let block: Vec<_> = rest[b * BLOCK..(b + 1) * BLOCK].iter().map(|&&lanes| lanes).collect();
-            block_lanes(DEPTH, &block)
+            block_lanes(DEPTH, &ZERO_PAD, &block)
         });
         for lanes in done {
             self.inline.push((self.blocks, lanes));
@@ -205,7 +205,7 @@ pub(crate) fn while_executing<R>(run: impl FnOnce(&mut dyn Steps) -> R) -> (R, B
                     loop {
                         let job = queue.lock().expect("a worker panicked").recv();
                         let Ok((g, steps)) = job else { break };
-                        done.push((g, block_lanes(DEPTH, &steps)));
+                        done.push((g, block_lanes(DEPTH, &ZERO_PAD, &steps)));
                     }
                     done
                 })
@@ -249,7 +249,7 @@ impl Blocks {
             shape.slots() * shape.n(),
             "the committed states are the wrong size"
         );
-        Witness::write_committed(shape, &self.lanes, q_keccak);
+        Witness::write_committed(shape, &[ZERO_PAD], &[&self.lanes], q_keccak);
         Reduction { shape, steps }
     }
 }

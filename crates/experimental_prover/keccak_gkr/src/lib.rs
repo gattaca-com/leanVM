@@ -123,60 +123,90 @@ pub mod witness;
 mod tests;
 
 pub use open::{Opening, Openings, WordOpening};
-pub use witness::{Shape, Witness};
+pub use witness::{Shape, TableInputs, Witness, ZERO_PAD};
 
-/// A claim on the permutation's output, from outside the reduction: `lanes[l]` is lane `l` of
-/// the output state, as words over the instances, evaluated at `instance` (an instance index's
-/// low four variables first). Both must be bound to the transcript before [`Witness::prove`]
-/// runs, the point being a challenge drawn after the commitment.
+/// A claim on the permutation's output, from outside the reduction: `lanes[t][l]` is lane `l` of
+/// the output state of table `t`, as words over the table's instances, evaluated at `instance` (an
+/// instance index's low four variables first). All must be bound to the transcript before
+/// [`Witness::prove`] runs, the point being a challenge drawn after the commitment.
+///
+/// With several tables the reduction draws one more challenge per table bit, in the message that
+/// draws the segment and lane challenges, and folds the tables' lanes at them: the claim it proves
+/// is on the instances of every table at `instance` and those challenges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputClaim {
     pub instance: Vec<F128>,
-    pub lanes: [F128; STATE_LANES],
+    pub lanes: Vec<[F128; STATE_LANES]>,
 }
 
 impl OutputClaim {
-    /// The true claim at `instance` on the batch of `inputs`, padded with all-zero inputs, by
-    /// running the permutation: what a caller without a claim of its own (a test, a benchmark)
+    /// The true claim at `instance` on the one-table batch of `inputs`, padded with all-zero inputs,
+    /// by running the permutation: what a caller without a claim of its own (a test, a benchmark)
     /// binds and passes.
     pub fn of_inputs(shape: Shape, inputs: &[[u64; STATE_LANES]], instance: Vec<F128>) -> Self {
+        assert_eq!(shape.tables(), 1);
+        Self::of_tables(
+            shape,
+            &[witness::TableInputs {
+                inputs,
+                pad: witness::ZERO_PAD,
+            }],
+            instance,
+        )
+    }
+
+    /// The true claim at `instance` on the tables' batches, each padded with its pad input.
+    pub fn of_tables(shape: Shape, tables: &[witness::TableInputs], instance: Vec<F128>) -> Self {
         let permute = |mut state: [u64; STATE_LANES]| {
             primitives::hash::keccak_f(&mut state);
             state
         };
-        let padding = permute([0; STATE_LANES]);
         let eq = eq_table(&instance);
-        let lanes = parallel::fold_reduce(
-            shape.n(),
-            || [F128Unreduced::ZERO; STATE_LANES],
-            |acc, i| {
-                let output = inputs.get(i).map_or(padding, |&x| permute(x));
-                for (acc, word) in acc.iter_mut().zip(output) {
-                    *acc ^= eq[i].mul_base_unreduced(F64(word));
-                }
-            },
-            |mut a, b| {
-                for (a, b) in a.iter_mut().zip(b) {
-                    *a ^= b;
-                }
-                a
-            },
-        );
-        Self {
-            instance,
-            lanes: lanes.map(F128Unreduced::reduce),
-        }
+        let lanes = tables
+            .iter()
+            .map(|table| {
+                let padding = permute(table.pad);
+                let lanes = parallel::fold_reduce(
+                    shape.n(),
+                    || [F128Unreduced::ZERO; STATE_LANES],
+                    |acc, i| {
+                        let output = table.inputs.get(i).map_or(padding, |&x| permute(x));
+                        for (acc, word) in acc.iter_mut().zip(output) {
+                            *acc ^= eq[i].mul_base_unreduced(F64(word));
+                        }
+                    },
+                    |mut a, b| {
+                        for (a, b) in a.iter_mut().zip(b) {
+                            *a ^= b;
+                        }
+                        a
+                    },
+                );
+                lanes.map(F128Unreduced::reduce)
+            })
+            .collect();
+        Self { instance, lanes }
     }
 }
 
-/// The first claim, valued at the last segment's part only: the caller's lanes, at the claim's
-/// segment and lane weights.
+/// The first claim, valued at the last run's part only: the caller's lanes, at the claim's segment
+/// and lane weights. The segment point is the run's coordinates, then the table's: the tables' lanes
+/// fold at the latter.
 fn first(shape: Shape, output: &OutputClaim, segment: Vec<F128>, r_lane: &[F128]) -> Claim {
     assert_eq!(output.instance.len(), shape.n_log);
+    assert_eq!(output.lanes.len(), shape.tables());
     let point = [&output.instance[4..], &segment[..]].concat();
     let mut claim = first_claim(shape, &output.instance[..4], point, r_lane);
-    let last = eq_table(&segment)[shape.segments() - 1];
-    claim.value = last * dot(&eq_table(r_lane)[..STATE_LANES], &output.lanes);
+    let (run_log, theta) = (shape.round_seg_log(), &segment[shape.round_seg_log()..]);
+    let last = eq_table(&segment[..run_log])[shape.round_segments() - 1];
+    let (lane_weights, table_weights) = (eq_table(r_lane), eq_table(theta));
+    claim.value = last
+        * output
+            .lanes
+            .iter()
+            .zip(&table_weights)
+            .map(|(lanes, &w)| w * dot(&lane_weights[..STATE_LANES], lanes))
+            .sum::<F128>();
     claim
 }
 
@@ -192,14 +222,17 @@ impl Witness {
             1 << shape.stack_log(),
             "the openings are claims on the whole committed block"
         );
-        // One message: the first claim is multilinear in the segment and lane coordinates.
+        // One message: the first claim is multilinear in the segment, table and lane coordinates.
         ps.grind(fiat_shamir::grinding_bits((shape.seg_log() + LANE_BITS) as u128));
         let (segment, r_lane) = (ps.sample_vec(shape.seg_log()), ps.sample_vec(LANE_BITS));
+        // The point of the committed block the first claim's committed part is on: the output
+        // claim's instance, then the table challenges.
+        let instance = [&output.instance[..], &segment[shape.round_seg_log()..]].concat();
         let mut first = first(shape, output, segment, &r_lane);
-        let instance = &output.instance;
+        let instance = &instance;
         let (folded, committed_value) =
             tracing::info_span!("Outputs").in_scope(|| open::output_claim(shape, committed, instance, &first));
-        if shape.segments() > 1 {
+        if shape.round_segments() > 1 {
             ps.add_scalar(committed_value);
         }
         first.value += committed_value;
@@ -211,8 +244,8 @@ impl Witness {
                 .in_scope(|| prover::prove_layer(ps, self, &mut scratch, step, &claim));
         }
         let _span = tracing::info_span!("Openings").entered();
-        let outputs =
-            (shape.segments() > 1).then(|| open::open_outputs(ps, shape, instance, &first, committed_value, folded));
+        let outputs = (shape.round_segments() > 1)
+            .then(|| open::open_outputs(ps, shape, instance, &first, committed_value, folded));
         let inputs = open::open_inputs(ps, self, committed, &claim);
         Openings { outputs, inputs }
     }
