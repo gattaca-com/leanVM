@@ -45,6 +45,13 @@ impl Stream {
         unsafe { copy_raw(dst.cast(), src.as_ptr().cast(), size_of_val(src)) }
     }
 
+    /// [`copy_lines`](Self::copy_lines) into a borrowed destination, which is valid, aligned and disjoint from `src`.
+    #[inline(always)]
+    pub fn copy_lines_into<T: Plain>(&self, dst: &mut T, src: &T) {
+        // SAFETY: `dst` is a unique reference, so it is valid, aligned for `T` and disjoint from `src`.
+        unsafe { self.copy_lines(dst, src) }
+    }
+
     /// Copy one value to `dst`, which must not be fetched first: streamed when it is whole, aligned cache
     /// lines, a compile-time fact that leaves no head or tail to store normally, and stored normally otherwise.
     ///

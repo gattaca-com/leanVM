@@ -1,6 +1,5 @@
 //! Four lanes of products in YMM registers, for a machine with VPCLMULQDQ but no AVX-512: the
-//! 256-bit counterpart of the AVX-512 `x8`'s `F64x8`, `F128x8` and `Mixed8` for the leaf builder,
-//! and the halves of the eight-lane `f128x8` types.
+//! halves of the eight-lane `f128x8` types.
 
 use core::arch::x86_64::*;
 use core::ops::{Add, BitXorAssign, Mul};
@@ -12,7 +11,7 @@ use super::gf2_64x2::{F128, F128Unreduced};
 /// Four `K` elements in one register.
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
-pub struct F64x4(__m256i);
+pub struct F64x4(pub(super) __m256i);
 
 /// Four `E` elements; register `k` is coefficient `k` of lanes `0..4`.
 #[derive(Clone, Copy, Debug)]
@@ -48,7 +47,29 @@ fn karatsuba<const I: i32>(a: [__m256i; 2], b: [__m256i; 2]) -> [__m256i; 2] {
     fold(m0, m1, m01, xor, |p| unsafe { times_x256(p) })
 }
 
+/// A vector from its four qwords, in a const context.
+const fn words(w: [u64; 4]) -> __m256i {
+    // SAFETY: both are 32 bytes, and every bit pattern is a valid vector.
+    unsafe { std::mem::transmute::<[u64; 4], __m256i>(w) }
+}
+
 impl F64x4 {
+    pub const ZERO: Self = Self(words([0; 4]));
+    pub const ONE: Self = Self(words([1; 4]));
+
+    /// Every qword times `x`: a shift, and the carried-out bit folds back as `x^64 = 0x1B`.
+    #[inline(always)]
+    pub fn mul_x_words(w: __m256i) -> __m256i {
+        // SAFETY: the module's cfg enables avx2.
+        unsafe {
+            let carry = _mm256_cmpgt_epi64(_mm256_setzero_si256(), w);
+            xor(
+                _mm256_slli_epi64::<1>(w),
+                _mm256_and_si256(carry, _mm256_set1_epi64x(0x1B)),
+            )
+        }
+    }
+
     #[inline(always)]
     pub fn new(k: [F64; 4]) -> Self {
         Self::load(&k)
@@ -95,6 +116,9 @@ impl Mul for F64x4 {
 }
 
 impl F128x4 {
+    pub const ZERO: Self = Self([words([0; 4]); 2]);
+    pub const ONE: Self = Self([words([1; 4]), words([0; 4])]);
+
     #[inline(always)]
     pub fn splat(e: F128) -> Self {
         // SAFETY: the module's cfg enables avx2.
