@@ -22,7 +22,7 @@
 //! Soundness note: [`WhirSecurityConfig`] analyzes the challenge field
 //! `E`; the committed alphabet remains `K = GF(2^64)`.
 
-use crate::merkle;
+use crate::merkle::{self, Expansion};
 use crate::ntt::{AdditiveNttF64, Codeword, Keep};
 use crate::stack_open::Terms;
 use fiat_shamir::merkle::{Hash, MerklePath};
@@ -92,7 +92,20 @@ pub struct ProverData {
     row_words: usize,
     /// The committed lanes. The opened stack may hold more, all zero.
     n_lanes: usize,
+    /// How the encoded rows widen to `row_words`, if the encode left all-zero lanes out.
+    expansion: Option<Expansion>,
     pub(crate) merkle_tree: merkle::CutTree,
+}
+
+impl ProverData {
+    /// The full rows at the sorted `positions`, back to back. `stack` is the committed message.
+    fn rows(&self, stack: &[F64], positions: &[usize]) -> Vec<F64> {
+        let rows = self.ntt.rows(&self.codeword, stack, positions);
+        match &self.expansion {
+            Some(e) => e.widen(&rows),
+            None => rows,
+        }
+    }
 }
 
 /// The largest L0 codeword the commit keeps where [`primitives::REBUILD_OVER_STORE`], in bytes.
@@ -102,6 +115,17 @@ pub struct ProverData {
 /// - Above it, the codeword dominates the peak: when one gathered pass covers the layers before the deep pass,
 ///   the commit keeps none and encodes half of the cosets at a time; otherwise it keeps them as below.
 const KEEP_CODEWORD_MAX_BYTES: usize = 1 << 30;
+
+/// Pool size from which an encode leaves rows out of its codeword where [`primitives::REBUILD_OVER_STORE`].
+///
+/// - Leaving rows out saves a DRAM write of the codeword, against a transform per opened sub-block.
+/// - One worker alone keeps the codeword to avoid rebuilding it; larger pools share the memory bandwidth.
+const DEFER_MIN_THREADS: usize = 2;
+
+/// Whether an encode leaves rows out of its codeword, see [`DEFER_MIN_THREADS`].
+fn defers() -> bool {
+    primitives::REBUILD_OVER_STORE && parallel::num_threads() >= DEFER_MIN_THREADS
+}
 
 /// Commit to the `F64` message of a `2^log_n`-word witness: the message is its
 /// leading `n_lanes` lane blocks of `2^(log_n - log_batch_size)` words each, one
@@ -121,6 +145,9 @@ const KEEP_CODEWORD_MAX_BYTES: usize = 1 << 30;
 /// The encoded row is padded to a whole AVX-512 vector of lanes with zero lanes
 /// in front, so the NTT has no masked tail. The padding is the image's zeros and
 /// never rides the proof.
+///
+/// A lane block that is all zero is left out of the encode too.
+/// Its codeword lane is zero, so the leaf images, the root and the opened rows are the same.
 pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate: usize) -> (Commitment, ProverData) {
     assert!(log_inv_rate >= 1, "log_inv_rate must be >= 1 for a non-trivial RS code");
     assert!(log_n > log_batch_size, "witness must be wider than the interleaving");
@@ -134,21 +161,36 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
     let k_code = log_rows + log_inv_rate;
     let n_positions = 1usize << k_code;
     let row_words = n_lanes.next_multiple_of(8).min(1usize << log_batch_size);
+    let mut blocks = data_blocks(message, log_rows);
+    let mut enc_words = blocks.len().next_multiple_of(8);
+    if blocks.is_empty() || enc_words >= row_words {
+        // No lane is worth leaving out: encode them all, highest block first.
+        (blocks, enc_words) = ((0..n_lanes).rev().collect(), row_words);
+    }
+    let expansion = (enc_words < row_words).then(|| Expansion::new(&blocks, enc_words, row_words));
 
-    // Leaves are hashed as the encode finishes each block of rows.
-    let tree = merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size);
+    // Leaves are hashed as the encode finishes each block of rows, widened as the hasher stages them.
+    let tree = match &expansion {
+        None => merkle::MerkleBuilder::new(n_positions, row_words, 1usize << log_batch_size),
+        Some(e) => merkle::MerkleBuilder::widening(n_positions, 1usize << log_batch_size, e),
+    };
     let ntt = AdditiveNttF64::standard(k_code);
     let codeword =
-        tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = row_words).in_scope(|| {
+        tracing::info_span!("NTT", kind = "base encode", log_domain = k_code, lanes = enc_words).in_scope(|| {
             let on_rows = |row, rows: &[F64]| tree.absorb(row, rows);
+            // Sized by the full rows: a codeword kept only because lanes were left out would still cool
+            // the pages the later levels reuse.
             let keep = if !primitives::REBUILD_OVER_STORE {
                 Keep::Whole
             } else if n_positions * row_words * size_of::<F64>() > KEEP_CODEWORD_MAX_BYTES {
                 Keep::Nothing
-            } else {
+            } else if defers() {
                 Keep::BeforeDeep
+            } else {
+                Keep::Whole
             };
-            ntt.encode_lane_major(message, n_lanes, row_words, log_inv_rate, keep, &on_rows)
+            let (lanes, rate) = (enc_words, log_inv_rate);
+            ntt.encode_lane_major(message, &blocks, log_rows, lanes, rate, keep, &on_rows)
         });
     let merkle_tree = tracing::info_span!("Merkle").in_scope(|| tree.finish());
     let root = merkle_tree.root();
@@ -160,15 +202,30 @@ pub fn commit(message: &[F64], log_n: usize, log_batch_size: usize, log_inv_rate
             codeword,
             row_words,
             n_lanes,
+            expansion,
             merkle_tree,
         },
     )
+}
+
+/// The message's lane blocks to encode, highest first: all but those that are all zero.
+///
+/// The scan of a lane block stops at its first non-zero word, and the lane blocks go in parallel.
+fn data_blocks(message: &[F64], log_rows: usize) -> Vec<usize> {
+    let n_lanes = message.len() >> log_rows;
+    let zero = parallel::map_collect(n_lanes, |b| {
+        message[b << log_rows..][..1 << log_rows]
+            .iter()
+            .all(|w| *w == F64::ZERO)
+    });
+    (0..n_lanes).rev().filter(|&b| !zero[b]).collect()
 }
 
 /// Codeword + Merkle tree for one deeper WHIR commitment level: a row is one position across the
 /// `num_interleaved` lanes, one Merkle leaf of `num_interleaved * 16` bytes.
 ///
 /// A codeword kept before its deep layers has them finished on the rows a query opens.
+/// A coset-major one keeps only the message, and rebuilds the cosets a query opens.
 pub(crate) struct LigeroWitness {
     ntt: AdditiveNttF64,
     codeword: Codeword,
@@ -233,8 +290,11 @@ pub(crate) fn ligero_commit_ext(
     )
     .in_scope(|| {
         let on_rows = |row, rows: &[F64]| builder.absorb(row, rows);
-        let defer_deep = primitives::REBUILD_OVER_STORE;
-        ntt.encode_interleaved_with(words(poly), row_words, log_inv_rate, defer_deep, &on_rows)
+        if defers() && AdditiveNttF64::encodes_by_coset(2 * poly.len()) {
+            ntt.encode_cosets(words(poly).to_vec(), row_words, log_inv_rate, &on_rows)
+        } else {
+            ntt.encode_interleaved_with(words(poly), row_words, log_inv_rate, defers(), &on_rows)
+        }
     });
     let tree = tracing::info_span!("Merkle").in_scope(|| builder.finish());
 
@@ -767,7 +827,11 @@ pub(crate) fn recursive_prover_with_prepared_basis(
         n_lanes >= 1 && n_lanes <= num_interleaved_0,
         "at most 2^initial_k lanes"
     );
-    assert_eq!(prover_data.codeword.plan().words(), block_len_0 * prover_data.row_words);
+    let enc_words = prover_data
+        .expansion
+        .as_ref()
+        .map_or(prover_data.row_words, |e| e.enc_words());
+    assert_eq!(prover_data.codeword.words(), block_len_0 * enc_words);
     let committed_lanes = prover_data.n_lanes;
     assert!((committed_lanes..=num_interleaved_0).contains(&prover_data.row_words));
     assert!(n_lanes >= committed_lanes);
@@ -784,7 +848,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
 
     // Level 0: its rounds run on the weight's terms.
     // A rebuilding L0 open recomputes its rows from the stack, so that lives until then.
-    let keep_stack = matches!(prover_data.codeword, Codeword::Nothing(..));
+    let keep_stack = matches!(prover_data.codeword, Codeword::Nothing { .. });
     let mut lanes = whir_lanes::LaneRounds::new(witness, b_initial, lane_block, keep_stack);
     let mut rounds = Vec::with_capacity(initial_k);
     for j in 0..initial_k {
@@ -886,7 +950,7 @@ pub(crate) fn recursive_prover_with_prepared_basis(
                 // A rebuild reads the committed lanes only; the rest of the stack is zero. The stack is
                 // empty unless the codeword is rebuilt.
                 let committed = &stack[..stack.len().min(committed_lanes * lane_block)];
-                let group_rows = prover_data.ntt.rows(&prover_data.codeword, committed, &group);
+                let group_rows = prover_data.rows(committed, &group);
                 let image = |q| &fetched_row(&group, &group_rows, row_words, q)[row_words - committed_lanes..];
                 // Lane `t` of the codeword is stack block `n_lanes-1-t`: reversing the image puts block `b` at index
                 // `b`, and the absent lanes' zeros at the end.

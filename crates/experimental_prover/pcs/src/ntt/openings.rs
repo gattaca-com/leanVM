@@ -3,6 +3,7 @@
 use primitives::field::F64;
 
 use super::encode::Codeword;
+use super::layers::no_hook;
 use super::plan::Plan;
 use super::scratch::with_scratch;
 use super::source::Lanes;
@@ -73,14 +74,24 @@ impl AdditiveNttF64 {
                     &words[(sub * sub_len) % words.len()..][..sub_len]
                 })
             }
-            Codeword::Nothing(plan, n_lanes) => {
+            Codeword::Nothing { plan, ref blocks } => {
                 let log_sub = plan.log_sub();
                 let mut subs: Vec<usize> = positions.iter().map(|q| q >> log_sub).collect();
                 subs.dedup();
-                let built = Rebuild::new(&plan, Lanes { words: msg, n_lanes }, &subs).run(self);
+                let lanes = Lanes {
+                    words: msg,
+                    blocks,
+                    rows: 1 << (plan.log_d - plan.start),
+                };
+                let built = Rebuild::new(&plan, lanes, &subs).run(self);
                 let sub_len = plan.sub_len();
                 self.finished_rows(&plan, positions, |i, _| &built[i * sub_len..][..sub_len])
             }
+            Codeword::Cosets {
+                ref msg,
+                num_ntts,
+                log_inv_rate,
+            } => self.coset_rows(msg, num_ntts, log_inv_rate, positions),
         }
     }
 
@@ -102,7 +113,17 @@ impl AdditiveNttF64 {
         } = *plan;
         built_rows(num_ntts, plan.log_sub(), positions, |i, sub_idx, live, sub| {
             let src = Some(src(i, sub_idx));
-            self.run_layers(sub, src, log_d, num_ntts, deep_start, deep_start, sub_idx, Some(live));
+            self.run_layers(
+                sub,
+                src,
+                log_d,
+                num_ntts,
+                deep_start,
+                deep_start,
+                sub_idx,
+                Some(live),
+                no_hook,
+            );
         })
     }
 }
@@ -140,7 +161,7 @@ impl<'a> Rebuild<'a> {
         let (rows, log_step) = (1usize << g, plan.log_sub());
         let msg_rows = 1usize << (log_d - start);
         assert!(plan.rebuilds_from_lanes(), "one gathered pass reads the lanes");
-        assert_eq!(lanes.words.len(), lanes.n_lanes * msg_rows);
+        assert_eq!(lanes.rows, msg_rows);
         let mut next = 0;
         let cosets = subs
             .chunk_by(|a, b| a >> g == b >> g)
@@ -153,7 +174,7 @@ impl<'a> Rebuild<'a> {
                 )
             })
             .collect();
-        let stage = Stage::new(lanes, log_step, msg_rows, num_ntts);
+        let stage = Stage::new(lanes, log_step, msg_rows, num_ntts, 1);
         Self {
             plan: *plan,
             stage,
@@ -197,6 +218,7 @@ impl<'a> Rebuild<'a> {
                                 start,
                                 *coset,
                                 live_rows,
+                                no_hook,
                             );
                             for (pos, &i) in run.clone().zip(live) {
                                 for (s, line) in scratch[i * BATCH * 8..][..BATCH * 8]

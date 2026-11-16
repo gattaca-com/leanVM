@@ -1,9 +1,11 @@
 //! The deep pass: the near layers, which hand their finished rows to the hasher while they are in L2.
 
 use primitives::field::F64;
-use primitives::stream::Stream;
+use primitives::stream::{HINT_T1, prefetch_lines};
 
+use super::drain::{Drain, LateDrain};
 use super::encode::RowSink;
+use super::layers::hook_calls;
 use super::plan::Plan;
 use super::scratch::with_scratch;
 use super::source::Source;
@@ -23,6 +25,8 @@ pub(super) struct DeepPass<'s> {
     log_task: usize,
     task_len: usize,
     outer: usize,
+    /// Hook calls of one task's layers.
+    hooks: usize,
     defer: bool,
     sink: Option<&'s RowSink<'s>>,
 }
@@ -36,6 +40,7 @@ impl<'s> DeepPass<'s> {
             log_task,
             task_len: plan.num_ntts << log_task,
             outer,
+            hooks: hook_calls(plan.log_d, plan.deep_start, outer),
             defer,
             sink,
         }
@@ -50,7 +55,8 @@ impl<'s> DeepPass<'s> {
 
     /// A separate message: build each task in scratch, hash it, then write it out once into `out`, if given.
     ///
-    /// Streamed out whole, the codeword is written without ever being read.
+    /// - Streamed out whole, the codeword is written without ever being read.
+    /// - With whole cache lines in every row, a task drains late, as a gathered group does.
     pub(super) fn with_message(&self, ntt: &AdditiveNttF64, out: Option<&mut Window>, msg: &[F64]) {
         let Plan {
             log_d,
@@ -59,12 +65,14 @@ impl<'s> DeepPass<'s> {
             ..
         } = self.plan;
         let (task_len, outer, log_task, sink) = (self.task_len, self.outer, self.log_task, self.sink);
-        let out = out.map(|win| (win.base(), win.stream()));
+        let out = out.map(|win| (win.base(), win.stream(), win.streams_lines()));
+        let (stream, late) = out.map_or((false, false), |(_, stream, late)| (stream, late));
+        let per_hook = (task_len / 8).div_ceil(self.hooks);
         let block_len = msg.len();
         parallel::for_each_chunk(1 << outer, |lo, hi| {
-            with_scratch(task_len, |scratch| {
+            with_scratch(task_len << usize::from(late), |both| {
                 // One fence at the end of the task covers all its streaming stores.
-                let stream = out.is_some_and(|(_, stream)| stream).then(Stream::new);
+                let mut ld = LateDrain::new(both, task_len, stream, late, per_hook);
                 for task in lo..hi {
                     // A task sits at the same offset in every replica, or covers whole replicas.
                     //
@@ -74,25 +82,42 @@ impl<'s> DeepPass<'s> {
                     let from = (task_len <= block_len).then(|| &msg[off..][..task_len]);
                     if from.is_none() {
                         let copy = |part: &mut [F64]| part.copy_from_slice(&msg[..part.len()]);
-                        scratch.chunks_mut(block_len).for_each(copy);
+                        ld.scratch().chunks_mut(block_len).for_each(copy);
                     }
-                    ntt.run_layers(scratch, from, log_d, num_ntts, deep_start, outer, task, None);
+                    // The previous task drains while this one transforms, if it drains late.
+                    ld.transform(|scratch, mut hook| {
+                        ntt.run_layers(
+                            scratch,
+                            from,
+                            log_d,
+                            num_ntts,
+                            deep_start,
+                            outer,
+                            task,
+                            None,
+                            move || hook.step(),
+                        )
+                    });
                     if let Some(f) = sink {
-                        f(task << log_task, scratch);
+                        f(task << log_task, ld.scratch());
                     }
-                    let Some((base, _)) = out else { continue };
-                    // SAFETY: the task's rows lie inside the codeword, and this task alone owns them.
-                    let dst = unsafe { std::slice::from_raw_parts_mut(base.add(task * task_len), task_len) };
-                    match &stream {
-                        Some(s) => s.copy(dst, scratch),
-                        None => dst.copy_from_slice(scratch),
-                    }
+                    let Some((base, ..)) = out else { continue };
+                    ld.send(Drain {
+                        // SAFETY: the task's rows lie inside the codeword, and this task alone owns them.
+                        dst: unsafe { base.add(task * task_len) },
+                        row_len: task_len,
+                        rows: 1,
+                        ..Drain::default()
+                    });
                 }
+                ld.finish();
             });
         });
     }
 
     /// The buffer holds the replicas: run the layers where they are, or in scratch when deferred.
+    ///
+    /// While a task transforms, the next one is prefetched into L2, spread over its row groups.
     fn in_place(&self, ntt: &AdditiveNttF64, win: &mut Window) {
         let Plan {
             log_d,
@@ -102,23 +127,53 @@ impl<'s> DeepPass<'s> {
         } = self.plan;
         let (task_len, outer, log_task, sink) = (self.task_len, self.outer, self.log_task, self.sink);
         let first_task = win.first_row() >> log_task;
+        let (base, total) = (win.base(), win.len());
         parallel::chunks_mut(win.words_mut(), task_len, |local, words| {
             let task = first_task + local;
+            let next = (local + 1) * task_len;
+            let hook = prefetch_spread(base, next, if next < total { task_len } else { 0 }, self.hooks);
             if self.defer {
                 // The rows are hashed from scratch and the buffer keeps its pre-deep state.
                 with_scratch(task_len, |scratch| {
-                    ntt.run_layers(scratch, Some(&*words), log_d, num_ntts, deep_start, outer, task, None);
+                    ntt.run_layers(
+                        scratch,
+                        Some(&*words),
+                        log_d,
+                        num_ntts,
+                        deep_start,
+                        outer,
+                        task,
+                        None,
+                        hook,
+                    );
                     if let Some(f) = sink {
                         f(task << log_task, scratch);
                     }
                 });
             } else {
                 // The replicas are already in place: run the layers where they are.
-                ntt.run_layers(words, None, log_d, num_ntts, deep_start, outer, task, None);
+                ntt.run_layers(words, None, log_d, num_ntts, deep_start, outer, task, None, hook);
                 if let Some(f) = sink {
                     f(task << log_task, words);
                 }
             }
         });
+    }
+}
+
+/// A hook that prefetches `words` words at `base + start` into L2, evenly over `calls` calls.
+///
+/// - A task that fills the L2 cannot be prefetched whole before its predecessor is done.
+/// - Spread over the predecessor's sweeps, the lines arrive while it is still working.
+fn prefetch_spread(base: parallel::SendPtr<F64>, start: usize, words: usize, calls: usize) -> impl FnMut() {
+    let lines = words / 8;
+    let per_call = lines.div_ceil(calls.max(1));
+    // Only an address is formed, never a reference.
+    let first = base.0.wrapping_add(start);
+    let mut done = 0;
+    move || {
+        let end = (done + per_call).min(lines);
+        prefetch_lines::<HINT_T1>(first.wrapping_add(8 * done).cast(), 64 * (end - done));
+        done = end;
     }
 }

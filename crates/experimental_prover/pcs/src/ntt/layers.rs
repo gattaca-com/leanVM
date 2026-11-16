@@ -2,9 +2,7 @@
 
 use primitives::field::F64;
 
-use super::kernels::{
-    butterfly_interleaved_block, butterfly_interleaved_fused_2layer, butterfly_interleaved_fused_3layer,
-};
+use super::kernels::{butterfly_interleaved_block, butterfly_interleaved_fused};
 use super::twiddles::AdditiveNttF64;
 
 impl AdditiveNttF64 {
@@ -13,6 +11,7 @@ impl AdditiveNttF64 {
     /// - The domain has `2^log_d` rows and splits into `2^outer_log` equal sub-blocks.
     /// - The buffer is one of them; its index fixes the global block index, and so the twiddle, of each block.
     /// - Layers fuse into radix-8 sweeps, with radix-4 sweeps where a lone radix-2 would be left over.
+    /// - `hook` runs once after each row group of each sweep, [`hook_calls`] times in all.
     ///
     /// With `live` (sorted), blocks that hold none of those buffer rows are left alone.
     ///
@@ -32,6 +31,7 @@ impl AdditiveNttF64 {
         outer_log: usize,
         sub_idx: usize,
         live: Option<&[usize]>,
+        mut hook: impl FnMut(),
     ) {
         if let Some(src) = src.filter(|_| first_layer >= log_d) {
             buf.copy_from_slice(src);
@@ -48,22 +48,20 @@ impl AdditiveNttF64 {
             let radix = radix_layers(log_d - layer);
             if radix == 3 {
                 // One radix-8 sweep.
-                let eighth = block_size >> 3;
                 for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
                     let t = self.radix8(layer, global(block_in_buf));
                     let start = block_in_buf * block_elems;
-                    butterfly_interleaved_fused_3layer(
+                    butterfly_interleaved_fused::<8, 7>(
                         &mut buf[start..start + block_elems],
                         src.map(|s| &s[start..start + block_elems]),
                         &t,
-                        eighth,
                         num_ntts,
+                        &mut hook,
                     );
                 });
                 layer += 3;
             } else if radix == 2 {
                 // One radix-4 sweep.
-                let quarter = block_size >> 2;
                 for_each_block(num_blocks_in_buf, log_d - layer, live, |block_in_buf| {
                     let global_block = global(block_in_buf);
                     let t = [
@@ -72,12 +70,12 @@ impl AdditiveNttF64 {
                         self.twiddle(layer + 1, 2 * global_block + 1),
                     ];
                     let start = block_in_buf * block_elems;
-                    butterfly_interleaved_fused_2layer(
+                    butterfly_interleaved_fused::<4, 3>(
                         &mut buf[start..start + block_elems],
                         src.map(|s| &s[start..start + block_elems]),
                         &t,
-                        quarter,
                         num_ntts,
+                        &mut hook,
                     );
                 });
                 layer += 2;
@@ -96,6 +94,7 @@ impl AdditiveNttF64 {
                         twiddle,
                         block_size_half,
                         num_ntts,
+                        &mut hook,
                     );
                 });
                 layer += 1;
@@ -104,6 +103,21 @@ impl AdditiveNttF64 {
         }
     }
 }
+
+/// How many times [`AdditiveNttF64::run_layers`] calls its hook over layers `first_layer..log_d` of a sub-block.
+pub(super) fn hook_calls(log_d: usize, first_layer: usize, outer_log: usize) -> usize {
+    let (mut layer, mut calls) = (first_layer, 0);
+    while layer < log_d {
+        let radix = radix_layers(log_d - layer);
+        // Every block of the sweep calls once per row group, and a group takes `2^radix` rows.
+        calls += (1usize << (layer - outer_log)) << (log_d - layer - radix);
+        layer += radix;
+    }
+    calls
+}
+
+/// The hook of a sweep nobody listens to: one named function, so all such callers share one instance.
+pub(super) fn no_hook() {}
 
 /// Call `f` with each block of `1 << log_rows` rows that holds a row of `live` (sorted).
 /// With no `live`, call it with every block of `num_blocks`.
