@@ -1,4 +1,4 @@
-//! `disassemble` must render every one of the six opcodes without panicking,
+//! `disassemble` must render every one of the seven opcodes without panicking,
 //! so it stays usable for the `DBG_DISASM` workflow (a failed guest `assert`
 //! surfaces as a write-once conflict, and the pc is all you get).
 
@@ -24,10 +24,12 @@ def main():
     h[0] = 5
     h[1] = 7
     d = StackBuf(2)
-    keccak(h, h, d)
+    keccak(h, h, d, a_add=1)
+    long = StackBuf(2)
+    keccak([1, 2], [3, 4], long, tail=[5, 6, 7, 8], len=128)
     packed = pack64x2(5, 7)
     p = 1
-    p[1] = buff[GEN ** 4] + packed
+    p[1] = buff[GEN ** 4] + packed + long[0]
     p[GEN] = d[0]
     return
 ";
@@ -42,7 +44,7 @@ def main():
     let text = disassemble(&program.prog);
     print!("{text}");
 
-    for mnemonic in ["SET", "XOR", "MUL", "DEREF", "JUMP", "KECCAK"] {
+    for mnemonic in ["SET", "XOR", "MUL", "DEREF", "JUMP", "KECCAK", "KECCAK64"] {
         assert!(text.contains(mnemonic), "disassembly is missing {mnemonic}");
     }
 }

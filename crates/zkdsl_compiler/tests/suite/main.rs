@@ -10,6 +10,7 @@ mod field_div;
 mod frame_cells;
 mod hint_log2_ceil;
 mod inline_expr;
+mod keccak64;
 mod loop_frames;
 mod miscompiles;
 mod pack64x2;

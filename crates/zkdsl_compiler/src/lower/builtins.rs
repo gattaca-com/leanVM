@@ -33,8 +33,31 @@ impl FnLower<'_> {
     /// capacity, are `cap`'s, the five cells a previous output ends with (`cap` that 13-cell
     /// output or those five cells). Lane 16 is in Keccak-256's 17-lane rate, but the
     /// transcript keeps it.
+    ///
+    /// `a_shift=n`, `a_add=c` and `y_add=d` are for the 64-byte message of four cells and no state, written to one
+    /// or two cells: the `KECCAK64` instruction. The message is then `a0 ‖ a·g^n + c ‖ b0 ‖ b1 + d`, `a0`, `a` the
+    /// cells of the first list, `b0`, `b1` those of the second: the instruction takes the product and the sums
+    /// of the low limbs, without writing the temporaries. `n`, `c` and `d` are compile-time integers and `c`, `d`
+    /// fit one 64-bit limb. The product leaves the high limb of `a` as it is, so `a` is K-valued, or `n` is 0.
+    /// Any other `keccak`, with a tail, a `cap`, a length but 64 or a 13-cell destination, refuses them.
     fn lower_keccak(&mut self, args: &[Expr]) {
-        let kwargs = self.keccak_kwargs(args, "keccak", &["a", "b", "out"], &["tail", "len", "cap", "pad_tail"]);
+        let kwargs = self.keccak_kwargs(
+            args,
+            "keccak",
+            &["a", "b", "out"],
+            &["tail", "len", "cap", "pad_tail", "a_shift", "a_add", "y_add"],
+        );
+        let affine = ["a_shift", "a_add", "y_add"].iter().any(|k| kwargs.contains_key(k));
+        if affine {
+            if let Some(other) = ["tail", "cap", "pad_tail"].iter().find(|k| kwargs.contains_key(**k)) {
+                self.fail(format!(
+                    "keccak a_shift=, a_add= and y_add= are for the 64-byte message of four cells and no state: no {other}="
+                ))
+            }
+            if self.keccak_len(&kwargs, 4) != 64 {
+                self.fail("keccak a_shift=, a_add= and y_add= are for the 64-byte message of four cells: len= is 64")
+            }
+        }
         let mut cells = self.keccak_operand(&args[0], 2);
         cells.extend(self.keccak_operand(&args[1], 2));
         if let Some(tail) = kwargs.get("tail") {
@@ -71,8 +94,51 @@ impl FnLower<'_> {
             self.pad_tail_in_place(&kwargs, &cells, len);
         }
         let out = self.keccak_out(&args[2]);
-        self.emit_keccak_message(cells, Some(len), None, &out, padded);
+        if affine {
+            if !matches!(out.cells, OutCells::One | OutCells::Two) {
+                self.fail("keccak a_shift=, a_add= and y_add= write one or two cells: the destination is a 1-cell or 2-cell run")
+            }
+            let immediates = self.keccak64_immediates(&kwargs, &cells);
+            self.emit_keccak64(&cells, &out, immediates);
+        } else {
+            self.emit_keccak_message(cells, Some(len), None, &out, padded);
+        }
         self.keccak_finish(out);
+    }
+
+    /// `(s_a, k_a, k_y)` of the `KECCAK64` that hashes `a·g^n + c` and `y + d`: `s_a = g^(-n)`, `k_a = c·g^(-n)`, `k_y = d`.
+    fn keccak64_immediates(&self, kwargs: &HashMap<&str, &Expr>, cells: &[SpongeCell]) -> (F64, F64, F64) {
+        let int = |key: &str| -> u128 {
+            let Some(e) = kwargs.get(key) else { return 0 };
+            self.try_const_int(e)
+                .unwrap_or_else(|| self.fail(format!("keccak `{key}` must be a compile-time integer, got `{e:?}`")))
+        };
+        let limb = |key: &str| -> F64 {
+            let v = int(key);
+            F64(u64::try_from(v)
+                .unwrap_or_else(|_| self.fail(format!("keccak `{key}` = {v} does not fit one 64-bit limb"))))
+        };
+        let shift = int("a_shift");
+        if shift != 0 && matches!(cells[1], SpongeCell::Const(v) if v.c1 != 0) {
+            self.fail("keccak a_shift= on a constant with a high limb: the shift leaves that limb as it is")
+        }
+        // The shift is a power of the generator, whose order is 2^64 - 1: `g^(-n)` is the inverse of `g^n`.
+        let s_a = F64::G.pow(shift % u128::from(u64::MAX)).inv();
+        (s_a, limb("a_add") * s_a, limb("y_add"))
+    }
+
+    /// The `KECCAK64` of the four cells of a 64-byte message, written to `out`'s one or two cells: `A'.lo = (A.lo + k_a) / s_a`
+    /// and `Y'.lo = Y.lo + k_y`.
+    fn emit_keccak64(&mut self, cells: &[SpongeCell], out: &KeccakOut, (s_a, k_a, k_y): (F64, F64, F64)) {
+        let m = [0, 1, 2, 3].map(|i| self.sponge_cell(cells[i]));
+        self.emit(LOp::Keccak64 {
+            m,
+            c: out.state,
+            out_two: out.cells == OutCells::Two,
+            s_a,
+            k_a,
+            k_y,
+        });
     }
 
     /// `pad_tail=1`: set the cells of the `tail` slice from `len` on to the padding (its first

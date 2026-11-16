@@ -222,11 +222,17 @@ def keccak(
     tail=None,
     len: Optional[int] = None,
     cap=None,
+    a_shift: Optional[int] = None,
+    a_add: Optional[int] = None,
+    y_add: Optional[int] = None,
 ) -> None:
     """The leanVM hash (Keccak-256) of at most 128 bytes, one `KECCAK`
     instruction. The message cells are `a` (2 cells), `b` (2 cells) and `tail`
     (4 cells, none when omitted), and the message is their first `len` bytes
-    (all of them by default). A cell wholly past `len` must be a literal 0 (a
+    (all of them by default). `a_shift`, `a_add` and `y_add` are for the 64-byte
+    message of four cells alone (the `KECCAK64` instruction): the second cell of `a`
+    is taken as `a[1] * GEN ** a_shift + a_add` and the second cell of `b` as
+    `b[1] + y_add`, without instructions of their own. A cell wholly past `len` must be a literal 0 (a
     compile error otherwise); the bytes past `len` in the cell where the message
     ends must be zero, which the circuit does not enforce. `out` receives the
     13-cell sponge state, whose first two cells are the digest, just the digest

@@ -280,6 +280,25 @@ pub fn disassemble(prog: &[Op]) -> String {
                     layout(*in_odd)
                 )
             }
+            Op::Keccak64 {
+                o,
+                out,
+                out_two,
+                s_a,
+                k_a,
+                k_y,
+                ..
+            } => format!(
+                "KECCAK64    fp[{out}..+{}] = keccak_f(fp[{}], (fp[{}] + {:#x}) / {:#x}, fp[{}], fp[{}] + {:#x})",
+                1 + usize::from(*out_two),
+                o[0],
+                o[1],
+                k_a.0,
+                s_a.0,
+                o[2],
+                o[3],
+                k_y.0
+            ),
         };
         writeln!(out, "{:>6}  {line}", pretty_integer(pc)).unwrap();
     }
@@ -347,5 +366,14 @@ fn resolve(op: &LOp, entry: &HashMap<String, u32>, sentinel: u32, pc0: u32, fram
             out_odd: *out_odd,
             out_cells: *out_cells,
         },
+        LOp::Keccak64 {
+            m,
+            c,
+            out_two,
+            s_a,
+            k_a,
+            k_y,
+        } => Op::keccak64(*m, *c, *out_two, *s_a, *k_a, *k_y)
+            .unwrap_or_else(|e| panic!("the compiler lowered a KECCAK64 it cannot assemble: {e}")),
     }
 }

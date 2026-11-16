@@ -92,6 +92,17 @@ pub(crate) enum LOp {
         out_odd: bool,
         out_cells: OutCells,
     },
+    /// `KECCAK64`: one permutation of a 64-byte message, the four cells `m`, to the cell `c` and, with `out_two`, the
+    /// cell after it. The second cell's low limb is `(A.lo + k_a) / s_a` and the fourth's is `Y.lo + k_y`. With
+    /// `s_a = 1` and `k_a = k_y = 0` it equals the `KECCAK` of the same cells with the padding in the others.
+    Keccak64 {
+        m: [Off; 4],
+        c: Off,
+        out_two: bool,
+        s_a: F64,
+        k_a: F64,
+        k_y: F64,
+    },
 }
 
 /// A prover hint attached to an instruction. Most are already the runtime's own
