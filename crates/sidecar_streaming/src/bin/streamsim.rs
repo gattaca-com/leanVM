@@ -125,7 +125,8 @@ fn cmd_bound(a: &Args) -> Result<(), String> {
         None => vec![set.meta.deadline_us],
     };
     let slots = parse_range(a.get("slots").unwrap_or("100000"), set.meta.slots)?;
-    let grid = a.num("grid", 10usize)?;
+    // Only grid 1 is an upper bound; a larger grid is faster and gives a lower bound on the optimum.
+    let grid = a.num("grid", 1usize)?;
     let cheap = a.num("cheap", 1u8)?;
     let mut out = String::from("slot,deadline_us,arrived,clairvoyant,universal,clairvoyant_coverage,universal_coverage\n");
     for &d in &deadlines {

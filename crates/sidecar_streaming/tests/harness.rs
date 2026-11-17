@@ -459,21 +459,26 @@ fn dp_matches_brute_force() {
 
 #[test]
 fn bound_above_strategies() {
-    let set = make_set(&leaf_params(), 50, 21);
+    let set = make_set(&leaf_params(), 25, 21);
+    let train = make_set(&leaf_params(), 30, 22);
     for text in [STEPPED, SMOOTH] {
         let mut backend = sim(text);
         let m = model(text);
         for d in [1_200_000u64, 1_500_000, 2_000_000] {
-            for slot in 0..50 {
+            for slot in 0..25 {
                 let arr: Vec<u64> = set.slots[slot as usize].arrivals.iter().map(|a| a.t_us).collect();
-                let grid = 5;
-                let clair = clairvoyant_leaf(&arr, m.as_ref(), d, 2, 1, grid);
+                // Grid 1 is the only grid for which this is a bound.
+                let clair = clairvoyant_leaf(&arr, m.as_ref(), d, 2, 1, 1);
                 let univ = universal_leaf(&arr, m.as_ref(), d, 2, 1);
                 assert!(clair <= univ, "clairvoyant {clair} above universal {univ} (slot {slot}, D {d})");
-                for s in ["one_shot_late", "greedy_fit", "min_batch_fit:m=300", "fixed_fit:b=600", "step_cut_fit", "cheap_chain", "two_stage"] {
-                    let (_, met) = run(&mut backend, &set, slot, d, s, None);
-                    // The clairvoyant grid is `grid` claims wide.
-                    assert!(met.got <= clair + grid as u32, "{s}: got {} above clairvoyant {clair} (slot {slot}, D {d}, {text:.20})", met.got);
+                let strategies = ["one_shot_late", "greedy_fit", "min_batch_fit:m=300", "fixed_fit:b=600", "step_cut_fit", "cheap_chain", "two_stage", "plan_cover"];
+                for s in strategies {
+                    // The planner replans often: a few slots.
+                    if s == "plan_cover" && slot >= 4 {
+                        continue;
+                    }
+                    let (_, met) = run(&mut backend, &set, slot, d, s, Some(&train));
+                    assert!(met.got <= clair, "{s}: got {} above clairvoyant {clair} (slot {slot}, D {d}, {text:.20})", met.got);
                     assert!(met.got <= univ, "{s}: got {} above universal {univ}", met.got);
                 }
             }

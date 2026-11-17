@@ -12,6 +12,7 @@ fn cost(m: &dyn CostModel, shape: &JobShape) -> f64 {
 /// Clairvoyant chain: knowing the whole schedule, the most votes any one-lane chain can have in a
 /// final-rate proof by `d`. `arr` is the sorted arrival times of one run. Prefixes in arrival order lose
 /// nothing, since cost depends on counts only. Only every `grid`-th prefix is a node, plus the last one that arrived.
+/// **Only `grid` 1 is an upper bound.** A larger grid restricts the chain, so its value is a lower bound on the optimum.
 ///
 /// `f(j, r)` is the earliest time a rate-`r` proof of the first `j` arrivals exists:
 /// `min(a_j + agg(j, r), min_i,rk max(f(i, rk), a_j) + ext(i, j - i, rk, r), f(j, rk) + conv(j, rk, r))`.
