@@ -41,6 +41,8 @@ pub struct LeafStrategy<I: Inner> {
     waiting: VecDeque<SigId>,
     seen: u32,
     known_total: Option<u32>,
+    /// The kept proof and the signatures of the job in flight, to restore if it fails.
+    in_flight: Option<(Option<ProofId>, Vec<SigId>)>,
     kept: Option<ProofId>,
     busy: bool,
     last_started: bool,
@@ -49,7 +51,7 @@ pub struct LeafStrategy<I: Inner> {
 
 impl<I: Inner> LeafStrategy<I> {
     pub fn new(inner: I) -> Self {
-        Self { inner, waiting: VecDeque::new(), seen: 0, known_total: None, kept: None, busy: false, last_started: false, published: false }
+        Self { inner, waiting: VecDeque::new(), seen: 0, known_total: None, in_flight: None, kept: None, busy: false, last_started: false, published: false }
     }
 
     /// The strategy is told how many inputs will come in all, and may stop waiting when they have. A strategy does not
@@ -68,8 +70,9 @@ impl<I: Inner> LeafStrategy<I> {
 
     fn launch(&mut self, ctx: &mut dyn Ctx, n: usize, rate: Rate, last: bool) {
         let signatures: Vec<SigId> = self.waiting.drain(..n).collect();
-        let children: Vec<ProofId> = self.kept.take().into_iter().collect();
-        ctx.prove(0, Job { children, signatures, rate });
+        let kept = self.kept.take();
+        self.in_flight = Some((kept, signatures.clone()));
+        ctx.prove(0, Job { children: kept.into_iter().collect(), signatures, rate });
         self.busy = true;
         self.last_started = last;
     }
@@ -153,11 +156,22 @@ impl<I: Inner> Strategy for LeafStrategy<I> {
             Event::Aggregate(_) | Event::Verified { .. } => {}
             Event::Proved { result, .. } => {
                 self.busy = false;
-                if let Ok(id) = result {
-                    self.kept = Some(id);
-                    if self.last_started {
-                        self.publish(ctx, id);
-                        return;
+                let launched = self.in_flight.take();
+                match result {
+                    Ok(id) => {
+                        self.kept = Some(id);
+                        if self.last_started {
+                            self.publish(ctx, id);
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        // A failed job changes nothing: the kept proof and the signatures it took are back.
+                        if let Some((kept, signatures)) = launched {
+                            self.kept = kept;
+                            signatures.into_iter().rev().for_each(|s| self.waiting.push_front(s));
+                        }
+                        self.last_started = false;
                     }
                 }
                 self.evaluate(ctx);

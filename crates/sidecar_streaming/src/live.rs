@@ -54,6 +54,8 @@ pub struct LiveBackend {
     pool: HashMap<u32, (Vec<u8>, Vec<u8>)>,
     pool_key: Option<u64>,
     inflight: Option<Inflight>,
+    /// A request that could not be sent (no room in the channel), reported by the next `wait`.
+    rejected: Option<String>,
     /// How late each wake-up came, in microseconds.
     pub lateness_us: Vec<u64>,
 }
@@ -86,6 +88,7 @@ impl LiveBackend {
             pool: HashMap::new(),
             pool_key: None,
             inflight: None,
+            rejected: None,
             lateness_us: Vec::new(),
         })
     }
@@ -100,6 +103,10 @@ impl LiveBackend {
         let started = Instant::now();
         loop {
             if let Some(r) = self.client.try_recv() {
+                if r.id < id {
+                    // A response left over from before a restart.
+                    continue;
+                }
                 if r.id != id {
                     return Err(format!("response {} for request {id}", r.id));
                 }
@@ -113,9 +120,10 @@ impl LiveBackend {
     }
 
     fn pool_dir(&self, key: u64) -> PathBuf {
-        // On the perf backend a proof's claim tree lives in the server's memory: tie the cache to the server run.
-        let epoch = if self.label.contains("perf") { format!("-epoch{}", self.client.epoch()) } else { String::new() };
-        self.cache_root.join(&self.label).join(format!("{key:016x}{epoch}"))
+        // A pool proof is an AGGREGATE output: a one-node claim tree. The perf backend decodes any child it did not
+        // remember (it keeps the trees of the last 32 proofs it made) as one leaf node, so a pool of any size works,
+        // and a cached proof stays valid across sidecar restarts.
+        self.cache_root.join(&self.label).join(format!("{key:016x}"))
     }
 
     /// Build every aggregate of the pool once, through this sidecar, and cache it on disk.
@@ -128,9 +136,6 @@ impl LiveBackend {
         }
         if self.pool_key == Some(h) {
             return Ok(());
-        }
-        if self.label.contains("perf") && set.pool.len() > 32 {
-            return Err(format!("the perf backend remembers the claim trees of 32 proofs; this set has {}", set.pool.len()));
         }
         let dir = self.pool_dir(h);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -244,16 +249,20 @@ impl Backend for LiveBackend {
             new_sigs: job.signatures.len() as u32,
             rate: job.rate,
         };
-        let id = self.client.send(op, flags, job.rate as u32, &payload, RESP_CAP).expect("no room in the channel");
-        self.inflight = Some(Inflight { id, what: What::Prove { made, rate: job.rate }, children: job.children.clone(), epoch: self.client.epoch(), sent: Instant::now() });
+        match self.client.send(op, flags, job.rate as u32, &payload, RESP_CAP) {
+            Ok(id) => self.inflight = Some(Inflight { id, what: What::Prove { made, rate: job.rate }, children: job.children.clone(), epoch: self.client.epoch(), sent: Instant::now() }),
+            Err(e) => self.rejected = Some(e.to_string()),
+        }
         Started { predicted: self.model.prove_us(&shape, THREADS), verify_us: 0 }
     }
 
     fn start_verify(&mut self, lane: usize, proof: ProofId, store: &ProofStore) -> Started {
         assert!(lane == 0 && self.inflight.is_none(), "one request at a time");
         let payload = verify_payload(&self.child(proof));
-        let id = self.client.send(OP_VERIFY, 0, 0, &payload, RESP_CAP).expect("no room in the channel");
-        self.inflight = Some(Inflight { id, what: What::Verify, children: Vec::new(), epoch: self.client.epoch(), sent: Instant::now() });
+        match self.client.send(OP_VERIFY, 0, 0, &payload, RESP_CAP) {
+            Ok(id) => self.inflight = Some(Inflight { id, what: What::Verify, children: Vec::new(), epoch: self.client.epoch(), sent: Instant::now() }),
+            Err(e) => self.rejected = Some(e.to_string()),
+        }
         let us = self.model.verify_us(&crate::sim::child_shape(&store.get(proof).info, true));
         Started { predicted: us, verify_us: us }
     }
@@ -263,10 +272,22 @@ impl Backend for LiveBackend {
     }
 
     fn wait(&mut self, until: Micros) -> Option<Done> {
+        if let Some(why) = self.rejected.take() {
+            let at = self.elapsed();
+            return Some(Done { lane: 0, at, outcome: Outcome::Failed(Failure::Rejected(why)) });
+        }
         loop {
             if let Some(inf) = self.inflight.take() {
                 if let Some(r) = self.client.try_recv() {
-                    assert_eq!(r.id, inf.id, "responses come in request order");
+                    if r.id < inf.id {
+                        // A response to a request sent before a restart: the server still served it. Drop it.
+                        self.inflight = Some(inf);
+                        continue;
+                    }
+                    if r.id > inf.id {
+                        let at = self.elapsed();
+                        return Some(Done { lane: 0, at, outcome: Outcome::Failed(Failure::Rejected(format!("response {} for request {}", r.id, inf.id))) });
+                    }
                     return Some(self.finish(inf, r));
                 }
                 if self.client.epoch() != inf.epoch {
