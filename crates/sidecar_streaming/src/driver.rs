@@ -326,7 +326,8 @@ fn finish(mut ctx: DriverCtx, inputs: Vec<InputRec>, spec: &RunSpec) -> SlotReco
         (t, ctx.store.get(id).info.coverage.clone())
     });
     for (j, t) in ctx.jobs.iter_mut().zip(&ctx.target) {
-        j.useful = matches!(t, Target::Prove(p) if useful.contains(p));
+        // A job is useful if it made an ancestor of the published proof, or verified one.
+        j.useful = matches!(t, Target::Prove(p) | Target::Verify(p) if useful.contains(p));
     }
     SlotRecord { shape: ctx.info.shape, deadline: spec.deadline, inputs, published, jobs: ctx.jobs, sent_override: None }
 }

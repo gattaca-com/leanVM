@@ -24,7 +24,7 @@ pub struct JobRec {
     pub predicted: Micros,
     /// Lane time spent verifying: all of a `VERIFY` job, the child verification inside a prove job.
     pub verify_us: Micros,
-    /// An ancestor of the published proof.
+    /// An ancestor of the published proof, or a verification of one.
     pub useful: bool,
     pub result: String,
     /// Claims in the proof a prove job made; 0 for any other outcome.
@@ -79,8 +79,27 @@ pub fn slot_metrics(rec: &SlotRecord) -> Metrics {
         }
     }
     let (arrived, sent) = (by_d.len(), rec.sent_override.unwrap_or_else(|| all.len()));
+    // The earliest moment at which the valid inputs that had arrived hold every claim of the proof. A later input
+    // that is a subset of the proof does not move it.
     let cut = on_time.and_then(|(_, p)| {
-        rec.inputs.iter().filter(|i| i.valid && i.claims.iter().all(|&c| p.contains(c))).map(|i| i.t).max()
+        let mut order: Vec<&InputRec> = rec.inputs.iter().filter(|i| i.valid).collect();
+        order.sort_by_key(|i| i.t);
+        let (mut seen, mut left) = (Coverage::empty(), p.len());
+        if left == 0 {
+            return None;
+        }
+        for i in order {
+            for &c in &i.claims {
+                if p.contains(c) && !seen.contains(c) {
+                    seen.insert(c);
+                    left -= 1;
+                }
+            }
+            if left == 0 {
+                return Some(i.t);
+            }
+        }
+        None
     });
     Metrics {
         got,
