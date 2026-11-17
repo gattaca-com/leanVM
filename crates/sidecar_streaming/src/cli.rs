@@ -98,6 +98,15 @@ pub fn load(path: &Path) -> Result<(Box<dyn CostModel>, String), String> {
     Ok((load_model(path)?, backend))
 }
 
+/// `load`, then apply `--cross-rate-ms X` (the extra cost of a kept proof of another rate), to test the worst case.
+pub fn load_args(a: &Args, path: &Path) -> Result<(Box<dyn CostModel>, String), String> {
+    let (mut model, name) = load(path)?;
+    if let Some(ms) = a.get("cross-rate-ms") {
+        model.set_cross_rate_us(ms.parse::<f64>().map_err(|_| format!("--cross-rate-ms: bad value `{ms}`"))? * 1000.0);
+    }
+    Ok((model, name))
+}
+
 pub fn load_forecast(args: &Args) -> Result<Option<Rc<Forecast>>, String> {
     args.get("train").map(|d| Forecast::from_set(Path::new(d)).map(Rc::new)).transpose()
 }

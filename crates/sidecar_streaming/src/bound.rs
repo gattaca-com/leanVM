@@ -68,7 +68,7 @@ pub fn universal_leaf(arr: &[Micros], model: &dyn CostModel, d: Micros, final_ra
         .fold(f64::INFINITY, f64::min);
     let mut best = arr.partition_point(|&t| (t as f64) <= d as f64 - c_min);
     // Work per signature: no job proves signatures cheaper than the best ratio, so `x` of lane time proves at most `x / e` of them.
-    let e = (1..=1500u32)
+    let e = (1..=2048u32)
         .flat_map(|m| rates.iter().map(move |&r| (m, r)))
         .map(|(m, r)| cost(model, &JobShape::aggregate(m, r)) / m as f64)
         .fold(f64::INFINITY, f64::min);

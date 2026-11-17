@@ -9,7 +9,7 @@ fn table(n: u32) -> SigTable {
         data.extend([0xAA, i as u8]);
         data.extend([1, 2, 3]);
     }
-    SigTable::new(data, 4, 2, 3).unwrap()
+    SigTable::new(data, 4, 2, 3, n).unwrap()
 }
 
 #[test]

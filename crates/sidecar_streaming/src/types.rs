@@ -4,9 +4,9 @@ pub type Micros = u64;
 /// `log_inv_rate`, 1 to 4.
 pub type Rate = u8;
 
-/// Claims of one subnet are numbered `1500 * subnet + signer`.
-pub const SUBNET_SIZE: u32 = 1500;
-pub const MAX_CLAIMS: usize = 24000;
+/// Claims of one subnet are numbered `2048 * subnet + signer`: room for subnets of up to 2048 signers, the most measured.
+pub const SUBNET_SIZE: u32 = 2048;
+pub const MAX_CLAIMS: usize = 16 * SUBNET_SIZE as usize;
 const WORDS: usize = MAX_CLAIMS / 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -90,7 +90,7 @@ pub struct Caps {
 
 impl Default for Caps {
     fn default() -> Self {
-        Caps { lanes: 1, abort: false, verify_lane: false, max_children: 16, max_new_sigs: 1500 }
+        Caps { lanes: 1, abort: false, verify_lane: false, max_children: 16, max_new_sigs: 2048 }
     }
 }
 
@@ -99,7 +99,7 @@ pub struct SlotInfo {
     pub shape: Shape,
     pub deadline: Micros,
     pub final_rate: Rate,
-    /// 1500 signatures, or 16 subnets.
+    /// The signatures of a subnet (1500 or 1700 in the sets so far), or 16 subnets.
     pub expected_inputs: u32,
     pub caps: Caps,
 }

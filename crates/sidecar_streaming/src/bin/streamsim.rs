@@ -39,13 +39,21 @@ fn main() {
 }
 
 fn cmd_fit(a: &Args) -> Result<(), String> {
-    let csv = std::fs::read_to_string(a.need("csv")?).map_err(|e| e.to_string())?;
+    let texts: Vec<String> = a.need("csv")?.split(',').map(|p| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))).collect::<Result<_, _>>()?;
+    let csv = fit::union_csv(&texts.iter().map(String::as_str).collect::<Vec<_>>());
     let r = fit::fit(&csv, a.get("backend").unwrap_or("unknown"), a.num("threads", 8)?, a.get("isa").unwrap_or("avx2"), a.get("form"))?;
     std::fs::write(a.need("out")?, &r.model_text).map_err(|e| e.to_string())?;
     let mut text = format!("form {}\nmedian |residual| {:.2} %, max {:.2} %\n", r.form, r.median_res * 100.0, r.max_res * 100.0);
     for l in &r.lines {
         text += l;
         text.push('\n');
+    }
+    if let Some(j) = a.get("holdout-from") {
+        let jumps = std::fs::read_to_string(j).map_err(|e| format!("{j}: {e}"))?;
+        let v = fit::validate_holdout(&csv, &jumps, a.num("holdout-every", 4usize)?, a.get("backend").unwrap_or("unknown"))?;
+        text += &format!("held-out validation: {} points of {j}, median error {:.2} %, max {:.2} %, worst under-estimate {:.2} %, worst first:\n", v.n, v.median * 100.0, v.max * 100.0, v.under * 100.0);
+        v.lines.iter().for_each(|l| text += &format!("  {l}\n"));
+        println!("held-out: {} points, median error {:.2} %, max {:.2} %, worst under-estimate {:.2} %", v.n, v.median * 100.0, v.max * 100.0, v.under * 100.0);
     }
     for l in fit::verify_cross_check(&csv)? {
         text += &format!("cross-check {l}\n");
@@ -65,7 +73,7 @@ fn caps_of(a: &Args) -> Result<Caps, String> {
 fn cmd_sim(a: &Args) -> Result<(), String> {
     let set_dir = a.need("set")?;
     let set = ScheduleSet::read(Path::new(set_dir))?;
-    let (model, backend_name) = load(Path::new(a.need("model")?))?;
+    let (model, backend_name) = load_args(a, Path::new(a.need("model")?))?;
     let shape = if set.meta.shape == "merge" { Shape::Merge } else { Shape::Leaf };
     let deadlines = match a.get("deadline-ms") {
         Some(t) => parse_deadlines(t)?,
@@ -119,7 +127,7 @@ fn cmd_sim(a: &Args) -> Result<(), String> {
 
 fn cmd_bound(a: &Args) -> Result<(), String> {
     let set = ScheduleSet::read(Path::new(a.need("set")?))?;
-    let (model, _) = load(Path::new(a.need("model")?))?;
+    let (model, _) = load_args(a, Path::new(a.need("model")?))?;
     let deadlines = match a.get("deadline-ms") {
         Some(t) => parse_deadlines(t)?,
         None => vec![set.meta.deadline_us],

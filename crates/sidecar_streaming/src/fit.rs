@@ -222,7 +222,7 @@ fn fit_recurse(pts: &[Point], rates: &[u8], child_rate: usize) -> ParamSet {
 }
 
 fn common(pts: &[Point], backend: &str, threads: u32, isa: &str) -> Common {
-    let mut c = Common { backend: backend.into(), threads, isa: isa.into(), sigma: 0.0, v: [0.0; 5], bytes: [0.0; 5], abort_us: 5000.0 };
+    let mut c = Common { backend: backend.into(), threads, isa: isa.into(), sigma: 0.0, v: [0.0; 5], bytes: [0.0; 5], abort_us: 5000.0, cross_rate_us: 0.0 };
     for r in 1..=4u8 {
         let mut v: Vec<f64> = pts.iter().filter(|p| p.op == "VERIFY" && p.rate == r && p.children == 0).map(|p| p.us).collect();
         if !v.is_empty() {
@@ -232,6 +232,16 @@ fn common(pts: &[Point], backend: &str, threads: u32, isa: &str) -> Common {
         if !b.is_empty() {
             c.bytes[r as usize] = median(&mut b);
         }
+    }
+    // N1: a kept proof made at rate 1 and extended at rate 2 (`EXTEND_X`) against the same cell with a rate-2 kept proof (`EXTEND_S`).
+    let mut penalties: Vec<f64> = Vec::new();
+    for x in pts.iter().filter(|p| p.op == "EXTEND_X") {
+        if let Some(s) = pts.iter().find(|s| s.op == "EXTEND_S" && s.kept == x.kept && s.new_sigs == x.new_sigs) {
+            penalties.push(x.us - s.us);
+        }
+    }
+    if !penalties.is_empty() {
+        c.cross_rate_us = (penalties.iter().sum::<f64>() / penalties.len() as f64).max(0.0).round();
     }
     let mut s: Vec<f64> = pts.iter().map(|p| p.std_ln).collect();
     c.sigma = (median(&mut s) * 1e4).round() / 1e4;
@@ -289,23 +299,10 @@ fn residuals(model: &dyn CostModel, pts: &[Point]) -> (Vec<String>, f64, f64) {
     (lines, median(&mut res), max)
 }
 
-fn curve(points: &[(f64, f64)]) -> Curve {
-    let mut pts = points.to_vec();
-    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
-    pts.dedup_by(|a, b| a.0 == b.0);
-    let slopes: Vec<f64> = pts.windows(2).map(|w| (w[1].1 - w[0].1) / (w[1].0 - w[0].0)).collect();
-    let slope = median(&mut slopes.clone());
-    let mut jumps = Vec::new();
-    for (i, w) in pts.windows(2).enumerate() {
-        let expected = w[0].1 + slope * (w[1].0 - w[0].0);
-        if w[1].1 > 1.25 * expected {
-            jumps.push((i, (w[0].0 + w[1].0) / 2.0));
-        }
-    }
-    Curve { pts, jumps, slope }
-}
+/// A rise of this many microseconds above what the series' median slope predicts is a jump.
+const JUMP_US: f64 = 60_000.0;
 
-/// Medians over the other columns, at each `x`.
+/// Medians over repeated x, sorted by x.
 fn median_by_x(points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     let mut by: BTreeMap<u64, Vec<f64>> = BTreeMap::new();
     for (x, y) in points {
@@ -314,35 +311,140 @@ fn median_by_x(points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     by.into_iter().map(|(x, mut v)| (x as f64, median(&mut v))).collect()
 }
 
-fn fit_table(pts: &[Point], common: Common, rates: &[u8]) -> TableModel {
+/// Intervals `(a, b, rise)` between adjacent measured points where the cost rises by more than `JUMP_US` over what the
+/// median slope predicts, and the slope is over three times the median. `(a, b]` means the jump is somewhere in it:
+/// where points are one apart, it is at `b`.
+pub fn find_jumps(pts: &[(f64, f64)]) -> (Vec<(f64, f64, f64)>, f64) {
+    let segs: Vec<(f64, f64, f64, f64)> = pts.windows(2).map(|w| ((w[1].1 - w[0].1) / (w[1].0 - w[0].0), w[0].0, w[1].0, w[1].1 - w[0].1)).collect();
+    let mut slopes: Vec<f64> = segs.iter().map(|s| s.0).collect();
+    let med = median(&mut slopes).max(10.0);
+    let jumps = segs.iter().filter(|s| s.0 > 3.0 * med && s.3 - med * (s.2 - s.1) > JUMP_US).map(|s| (s.1, s.2, s.3 - med * (s.2 - s.1))).collect();
+    (jumps, med)
+}
+
+/// A curve from points. `extend`: past the last point, grow by the median slope; else stay flat.
+fn curve(points: Vec<(f64, f64)>, extend: bool) -> Curve {
+    let pts = median_by_x(points);
+    let (jumps, slope) = if pts.len() > 1 { find_jumps(&pts) } else { (Vec::new(), 0.0) };
+    Curve { pts, jumps, slope: if extend { slope } else { 0.0 } }
+}
+
+/// The table form from every measured point. The cost at a size is that of the next measured point at or above it.
+pub fn fit_table(pts: &[Point], common: Common, rates: &[u8]) -> TableModel {
     let mut m = TableModel {
         common,
         agg: Default::default(),
         ext: Default::default(),
         rec_small: Default::default(),
         rec: Default::default(),
+        kept_excess: Curve::default(),
         small_claims: 100.0,
         big_claims: 1500.0,
     };
     for &r in rates {
         let r_ix = r as usize;
         let agg: Vec<(f64, f64)> = rate_points(pts, "AGGREGATE", r).iter().map(|p| (p.n_sigs as f64, p.us)).collect();
-        m.agg[r_ix] = curve(&agg);
+        m.agg[r_ix] = curve(agg, false);
         let mut kepts: Vec<u32> = rate_points(pts, "EXTEND", r).iter().map(|p| p.kept).collect();
         kepts.sort_unstable();
         kepts.dedup();
         for k in kepts {
             let ext: Vec<(f64, f64)> = rate_points(pts, "EXTEND", r).iter().filter(|p| p.kept == k).map(|p| (p.new_sigs as f64, p.us)).collect();
-            m.ext[r_ix].push((k as f64, curve(&median_by_x(ext))));
+            m.ext[r_ix].push((k as f64, curve(ext, true)));
         }
-        let rec = |claims: u32| -> Vec<(f64, f64)> {
-            rate_points(pts, "RECURSE", r).iter().filter(|p| p.child_sigs == claims).map(|p| (p.children as f64, p.us)).collect()
+        // Children of 1700 claims cost what 1500 do.
+        let rec = |claims: &[u32]| -> Vec<(f64, f64)> {
+            rate_points(pts, "RECURSE", r).iter().filter(|p| claims.contains(&p.child_sigs)).map(|p| (p.children as f64, p.us)).collect()
         };
-        m.rec[r_ix] = curve(&rec(1500));
-        m.rec_small[r_ix] = curve(&rec(100));
+        m.rec[r_ix] = curve(rec(&[1500, 1700]), false);
+        m.rec_small[r_ix] = curve(rec(&[100]), false);
     }
+    // A kept root adds, over the same number of fresh children, what its rows show (rate 1).
+    let kept: Vec<(f64, f64)> = rate_points(pts, "RECURSE_KEPT", 1)
+        .iter()
+        .map(|p| (p.children as f64, (p.us - m.rec[1].at(p.children as f64 + 1.0)).max(0.0)))
+        .collect();
+    m.kept_excess = curve(kept, false);
     m
 }
+
+pub struct Validation {
+    pub lines: Vec<String>,
+    pub median: f64,
+    pub max: f64,
+    /// The worst under-estimate (most negative relative error), 0 if none.
+    pub under: f64,
+    pub n: usize,
+}
+
+/// Hold out every `every`-th point of each series of `jumps_csv` (not its ends), refit from what is left of `union_csv`,
+/// and predict them. A point just under a jump, with its neighbour held out too, is read from the other side of the jump:
+/// the errors say how far the step function is from the truth where the data is sparse.
+pub fn validate_holdout(union_csv: &str, jumps_csv: &str, every: usize, backend: &str) -> Result<Validation, String> {
+    let all = read_csv(union_csv)?;
+    let jump_pts = read_csv(jumps_csv)?;
+    type Series = (String, u8, u32, u32);
+    let series_of = |p: &Point| -> Series { (p.op.clone(), p.rate, if p.op == "EXTEND" { p.kept } else { 0 }, if p.op == "RECURSE" { p.child_sigs } else { 0 }) };
+    let x_of = |p: &Point| -> u32 {
+        match p.op.as_str() {
+            "AGGREGATE" => p.n_sigs,
+            "EXTEND" => p.new_sigs,
+            _ => p.children,
+        }
+    };
+    let mut by: BTreeMap<Series, Vec<&Point>> = BTreeMap::new();
+    for p in jump_pts.iter().filter(|p| ["AGGREGATE", "EXTEND", "RECURSE"].contains(&p.op.as_str()) && !p.verify_children) {
+        by.entry(series_of(p)).or_default().push(p);
+    }
+    let mut held: Vec<Point> = Vec::new();
+    for v in by.values_mut() {
+        v.sort_by_key(|p| x_of(p));
+        let n = v.len();
+        for (i, p) in v.iter().enumerate() {
+            if i > 0 && i + 1 < n && i % every.max(2) == every.max(2) / 2 {
+                held.push((*p).clone());
+            }
+        }
+    }
+    let same = |a: &Point, b: &Point| series_of(a) == series_of(b) && x_of(a) == x_of(b);
+    let train: Vec<Point> = all.iter().filter(|p| !held.iter().any(|h| same(h, p))).cloned().collect();
+    let rates: Vec<u8> = [1u8, 2].into_iter().filter(|&r| train.iter().any(|p| p.op == "AGGREGATE" && p.rate == r)).collect();
+    let model = fit_table(&train, common(&train, backend, 8, "avx2"), &rates);
+    let mut errs = Vec::new();
+    let mut under = 0.0f64;
+    let mut lines = Vec::new();
+    for h in &held {
+        let Some(shape) = shape_of(h) else { continue };
+        let pred = model.prove_us(&shape, 8) as f64;
+        let rel = (pred - h.us) / h.us;
+        under = under.min(rel);
+        errs.push((rel.abs(), format!("{:9} rate {} kept {:4} new {:4} n {:4} children {:2}x{:4}: measured {:8.1} ms, predicted {:8.1} ms, error {:+6.1} %", h.op, h.rate, h.kept, h.new_sigs, h.n_sigs, h.children, h.child_sigs, h.us / 1000.0, pred / 1000.0, rel * 100.0)));
+    }
+    if errs.is_empty() {
+        return Err("no held-out points".into());
+    }
+    let mut mags: Vec<f64> = errs.iter().map(|e| e.0).collect();
+    let (median, max) = (median(&mut mags), errs.iter().map(|e| e.0).fold(0.0, f64::max));
+    errs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    lines.extend(errs.iter().take(10).map(|e| e.1.clone()));
+    Ok(Validation { lines, median, max, under: under.min(0.0), n: errs.len() })
+}
+
+/// The CSVs as one: the first file's header, then every row. A point measured in two files has all its runs.
+pub fn union_csv(texts: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, t) in texts.iter().enumerate() {
+        for (j, line) in t.lines().enumerate() {
+            if j == 0 && i > 0 {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 
 /// Fit a model file from a cost CSV. `form` forces `rows` or `table`; `None` tries rows, then table.
 pub fn fit(csv: &str, backend: &str, threads: u32, isa: &str, form: Option<&str>) -> Result<Report, String> {
@@ -352,6 +454,11 @@ pub fn fit(csv: &str, backend: &str, threads: u32, isa: &str, form: Option<&str>
         return Err("no AGGREGATE rows".into());
     }
     let common = common(&pts, backend, threads, isa);
+    if form == Some("table") {
+        let table = fit_table(&pts, common, &rates);
+        let (lines, med, max) = residuals(&table, &pts);
+        return Ok(Report { model_text: table.to_text(), form: "table", median_res: med, max_res: max, lines });
+    }
     let mut ext = fit_aggregate(&pts, &rates)?;
     fit_extend(&pts, &rates, &mut ext);
     let merge = fit_recurse(&pts, &rates, 2);

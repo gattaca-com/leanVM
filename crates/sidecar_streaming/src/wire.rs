@@ -7,26 +7,57 @@
 use crate::types::*;
 use std::collections::HashMap;
 
-/// The signature file: records of `pubkey | message | signature`. Record `i` signs claim `i`.
+/// The signature file: records of `pubkey | message | signature`. A subnet of `subnet_size` signers owns `subnet_size`
+/// consecutive records; claim `SUBNET_SIZE * s + j` (the stride of the harness) is record `subnet_size * s + j`.
+/// With the file of 24000 records, `subnet_size` can be at most 1500 for 16 subnets.
 pub struct SigTable {
     data: Vec<u8>,
     record: usize,
     claim_len: usize,
+    subnet_size: u32,
     index: HashMap<Vec<u8>, u32>,
 }
 
 impl SigTable {
-    pub fn new(data: Vec<u8>, pub_key: usize, message: usize, sig: usize) -> Result<SigTable, String> {
+    pub fn new(data: Vec<u8>, pub_key: usize, message: usize, sig: usize, subnet_size: u32) -> Result<SigTable, String> {
         let (claim_len, record) = (pub_key + message, pub_key + message + sig);
         if record == 0 || !data.len().is_multiple_of(record) {
             return Err("signature file is not a whole number of records".into());
         }
-        let n = data.len() / record;
-        if n > MAX_CLAIMS {
-            return Err(format!("signature file has {n} records, at most {MAX_CLAIMS} are used"));
+        let mut t = SigTable { data, record, claim_len, subnet_size, index: HashMap::new() };
+        t.rebuild()?;
+        Ok(t)
+    }
+
+    fn rebuild(&mut self) -> Result<(), String> {
+        if self.subnet_size == 0 || self.subnet_size > SUBNET_SIZE {
+            return Err(format!("subnet size {} is outside 1..={SUBNET_SIZE}", self.subnet_size));
         }
-        let index = (0..n).map(|i| (data[i * record..i * record + claim_len].to_vec(), i as u32)).collect();
-        Ok(SigTable { data, record, claim_len, index })
+        self.index = (0..self.len())
+            .map(|rec| (self.data[rec * self.record..rec * self.record + self.claim_len].to_vec(), self.claim_of(rec as u32)))
+            .collect();
+        Ok(())
+    }
+
+    /// Use `size` records per subnet. A set whose subnets need more records than the file has is refused.
+    pub fn set_subnet_size(&mut self, size: u32, subnets: u32) -> Result<(), String> {
+        let needed = size as usize * subnets as usize;
+        if needed > self.len() {
+            return Err(format!("{subnets} subnets of {size} signers need {needed} signature records; the file has {}", self.len()));
+        }
+        if self.subnet_size == size {
+            return Ok(());
+        }
+        self.subnet_size = size;
+        self.rebuild()
+    }
+
+    fn rec_of(&self, claim: u32) -> usize {
+        ((claim / SUBNET_SIZE) * self.subnet_size + claim % SUBNET_SIZE) as usize
+    }
+
+    fn claim_of(&self, rec: u32) -> u32 {
+        (rec / self.subnet_size) * SUBNET_SIZE + rec % self.subnet_size
     }
 
     pub fn len(&self) -> usize {
@@ -38,12 +69,12 @@ impl SigTable {
     }
 
     pub fn claim(&self, i: u32) -> &[u8] {
-        let at = i as usize * self.record;
+        let at = self.rec_of(i) * self.record;
         &self.data[at..at + self.claim_len]
     }
 
     pub fn record(&self, i: u32) -> &[u8] {
-        let at = i as usize * self.record;
+        let at = self.rec_of(i) * self.record;
         &self.data[at..at + self.record]
     }
 

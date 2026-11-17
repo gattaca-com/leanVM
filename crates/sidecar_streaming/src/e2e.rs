@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
-fn backend(path: &Path, caps: Caps, seed: u64, noise: bool) -> Result<(SimBackend, String), String> {
-    let (model, name) = load(path)?;
+fn backend(a: &Args, path: &Path, caps: Caps, seed: u64, noise: bool) -> Result<(SimBackend, String), String> {
+    let (model, name) = load_args(a, path)?;
     Ok((SimBackend::new(model, caps, seed, noise), name))
 }
 
@@ -96,7 +96,7 @@ pub fn run(a: &Args) -> Result<(), String> {
     let mut summary = String::from("| D_leaf ms | leaf runs | published | leaf coverage p50 | end_to_end p50 | end_to_end p10 | end_to_end mean | merge coverage p50 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
     let mut best: Option<(f64, u64)> = None;
     for &dl in &d_leaf {
-        let (mut lb, backend_name) = backend(model_path, Caps::default(), seed, noise)?;
+        let (mut lb, backend_name) = backend(a, model_path, Caps::default(), seed, noise)?;
         let mut st = Stats { end_to_end: Vec::new(), merge_coverage: Vec::new(), leaf_coverage: Vec::new(), published: 0, runs: 0 };
         let mut compose = String::from("slot,subnet,view,published_us,rate,signers_hex\n");
         for slot in slots.clone() {
@@ -108,12 +108,12 @@ pub fn run(a: &Args) -> Result<(), String> {
                 st.leaf_coverage.push(slot_metrics(&rec).coverage);
                 if let Some((t, cov)) = rec.published.as_ref().filter(|(t, _)| *t <= dl) {
                     st.published += 1;
-                    let mut signers = vec![0u64; (SUBNET_SIZE as usize).div_ceil(64)];
+                    let mut signers = vec![0u64; (leaf.meta.subnet_size as usize).div_ceil(64)];
                     for c in cov.iter() {
                         let id = (c - SUBNET_SIZE * subnet as u32) as usize;
                         signers[id / 64] |= 1 << (id % 64);
                     }
-                    let digits = (SUBNET_SIZE as usize).div_ceil(4);
+                    let digits = (leaf.meta.subnet_size as usize).div_ceil(4);
                     compose.push_str(&format!("{slot},{subnet},{view},{t},{},{}\n", leaf.meta.final_rate, signers_to_hex(&signers, digits)));
                 }
             }
@@ -140,7 +140,7 @@ pub fn run(a: &Args) -> Result<(), String> {
             return Err("arrivalgen failed".into());
         }
         let merge_set = ScheduleSet::read(&dir.join("set"))?;
-        let (mut mb, _) = backend(merge_model_path, Caps::default(), seed, noise)?;
+        let (mut mb, _) = backend(a, merge_model_path, Caps::default(), seed, noise)?;
         for slot in slots.clone() {
             let mut s = merge_spec.make(merge_fc.as_ref())?;
             let spec = RunSpec { set: &merge_set, slot, subnet: 0, view: 0, deadline: d_merge, caps: mb.caps() };

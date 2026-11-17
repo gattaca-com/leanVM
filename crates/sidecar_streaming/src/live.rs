@@ -75,7 +75,7 @@ impl LiveBackend {
     pub fn open(channel: &Path, signatures: &Path, model: Box<dyn CostModel>, label: &str, cache_root: &Path) -> Result<LiveBackend, String> {
         let client = Client::open(channel).map_err(|e| format!("{}: {e}", channel.display()))?;
         let data = std::fs::read(signatures).map_err(|e| format!("{}: {e}", signatures.display()))?;
-        let table = SigTable::new(data, client.pub_key_size(), client.message_len(), client.sig_size())?;
+        let table = SigTable::new(data, client.pub_key_size(), client.message_len(), client.sig_size(), 1500)?;
         Ok(LiveBackend {
             client,
             model,
@@ -202,7 +202,7 @@ impl LiveBackend {
 
 impl Backend for LiveBackend {
     fn caps(&self) -> Caps {
-        Caps { lanes: 1, abort: false, verify_lane: false, max_children: 16, max_new_sigs: 1500 }
+        Caps { lanes: 1, abort: false, verify_lane: false, max_children: 16, max_new_sigs: 2048 }
     }
 
     fn model(&self) -> &dyn CostModel {
@@ -214,6 +214,8 @@ impl Backend for LiveBackend {
     }
 
     fn begin_slot(&mut self, set: &ScheduleSet, _run: u32) {
+        // The signature file lays subnets out by the set's subnet size; a set the file cannot cover is refused.
+        self.table.set_subnet_size(set.meta.subnet_size, set.meta.subnets).unwrap_or_else(|e| panic!("live backend: {e}"));
         if set.meta.shape == "merge" {
             self.ensure_pool(set).unwrap_or_else(|e| panic!("live backend: {e}"));
         }
@@ -334,7 +336,7 @@ pub fn run(a: &Args) -> Result<(), String> {
 fn run_locked(a: &Args) -> Result<(), String> {
     let set_dir = a.need("set")?;
     let set = ScheduleSet::read(Path::new(set_dir))?;
-    let (model, model_backend) = load(Path::new(a.need("model")?))?;
+    let (model, model_backend) = load_args(a, Path::new(a.need("model")?))?;
     let label = a.get("backend").map_or(model_backend, str::to_string);
     let signatures = a.get("signatures").unwrap_or("bins/leanvm-sidecar/testdata/signatures-24000.bin");
     let cache = a.get("cache").unwrap_or("target/streaming-cache");
