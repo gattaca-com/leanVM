@@ -35,6 +35,17 @@ fn arrivalgen_path(a: &Args) -> Result<PathBuf, String> {
     }
 }
 
+/// Refuse an `arrivalgen` that was not built from the same arrival crate as this binary.
+pub fn check_arrivalgen(path: &Path) -> Result<(), String> {
+    let out = Command::new(path).arg("--version").output().map_err(|e| format!("{}: {e} (build arrivalgen, or pass --arrivalgen)", path.display()))?;
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let want = arrival_model::schedule::version_line();
+    if got != want {
+        return Err(format!("{} is a different build: it says `{got}`, this binary expects `{want}`", path.display()));
+    }
+    Ok(())
+}
+
 struct Stats {
     end_to_end: Vec<f64>,
     merge_coverage: Vec<f64>,
@@ -70,6 +81,7 @@ pub fn run(a: &Args) -> Result<(), String> {
     let work = PathBuf::from(a.get("work").map_or(format!("{out}.work"), str::to_string));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let gen_bin = arrivalgen_path(a)?;
+    check_arrivalgen(&gen_bin)?;
     let delay = a.get("delay").unwrap_or("const(0)");
     let set_name = Path::new(leaf_dir).file_name().map_or(leaf_dir.to_string(), |s| s.to_string_lossy().into());
 

@@ -3,6 +3,14 @@
 
 use std::fmt::Write as _;
 use std::fs;
+
+/// The schedule file format. Bump it when a file written by one build cannot be read by another.
+pub const FORMAT: u32 = 1;
+
+/// The line `arrivalgen --version` prints, and `streamsim` expects from the binary it runs.
+pub fn version_line() -> String {
+    format!("arrival_model {} schedule-format {FORMAT}", env!("CARGO_PKG_VERSION"))
+}
 use std::io;
 use std::path::Path;
 

@@ -92,6 +92,10 @@ fn main() {
             "--seed" => seed = value().parse().unwrap_or_else(|_| usage()),
             "--out" => out = Some(PathBuf::from(value())),
             "--explain" => explain = true,
+            "--version" => {
+                println!("{}", arrival_model::schedule::version_line());
+                return;
+            }
             "--import" => imp = Some(PathBuf::from(value())),
             "--deadline-ms" => deadline = value().parse().unwrap_or_else(|_| usage()),
             "--pool" => pool = Some(PathBuf::from(value())),
