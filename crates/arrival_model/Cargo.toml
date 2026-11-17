@@ -1,0 +1,12 @@
+[package]
+name = "arrival_model"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "arrivalgen"
+path = "src/bin/arrivalgen.rs"
