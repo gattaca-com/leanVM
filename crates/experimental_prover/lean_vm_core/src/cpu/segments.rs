@@ -5,7 +5,9 @@
 //! iteration's first instruction. The run goes serially to the start of iteration 2, predicts every later iteration's
 //! start (frame, `next_free`, stream cursors, and the arguments the previous iteration wrote into its frame) as linear in
 //! its index, runs iterations `2..n-1` as one segment per pool thread, merges them in serial order, and goes on serially
-//! from iteration `n-1`. Only a loop whose frames were all reserved before it started is tried.
+//! from iteration `n-1`. A segment holds at least [`MIN_ITERATIONS`] iterations, or one if iteration 1 ran at least
+//! [`HEAVY_ITERATION`] steps: a loop of a few heavy iterations, like the aggregation guest's child loop, still runs in
+//! parallel. Only a loop whose frames were all reserved before it started is tried.
 //!
 //! A segment owns its iterations' frames and heap at or above [`LOW`] and writes them in place. It reaches every other
 //! cell through its overlay, which starts from memory as the dispatch found it, from the predicted arguments, or unwritten
@@ -34,11 +36,14 @@ use primitives::field::{F64, F128};
 const LOW: u32 = 1 << 16;
 /// Fewest iterations per segment: fewer cost more to merge than they save.
 const MIN_ITERATIONS: usize = 8;
+/// Fewest steps of an iteration that may stand alone in a segment: a loop of a few such iterations, like the
+/// aggregation guest's child loop, still runs in parallel. The run reads it off iteration 1.
+const HEAVY_ITERATION: usize = 20_000;
 
 /// Whether a stream of `entries` may be a loop's that runs as segments: the two iterations that predict the rest, the
-/// last, and two segments.
+/// last, and two segments of one iteration, which only a heavy loop fills ([`HEAVY_ITERATION`]).
 pub(super) fn may_be_loop(entries: usize) -> bool {
-    entries >= 3 + 2 * MIN_ITERATIONS
+    entries >= 3 + 2
 }
 
 /// An iteration's start, at the loop's pc.
@@ -194,7 +199,7 @@ pub(super) fn run(
             break;
         }
         let at1 = start_of(run);
-        let heap0 = at1.next_free - nf0;
+        let (heap0, steps1) = (at1.next_free - nf0, run.steps);
         // Iteration 1's frame as it starts: reserved frames lie a stride apart, and a frame is far smaller than `LOW`.
         if at1.fp.saturating_sub(fp0) > LOW {
             continue;
@@ -208,7 +213,12 @@ pub(super) fn run(
         let Some(pred) = predict(m, pc, s, at1, &frame1, start_of(run)) else {
             continue;
         };
-        let segments = ((n - 3) / MIN_ITERATIONS).min(parallel::num_threads());
+        let per_segment = if run.steps - steps1 >= HEAVY_ITERATION {
+            1
+        } else {
+            MIN_ITERATIONS
+        };
+        let segments = ((n - 3) / per_segment).min(parallel::num_threads());
         // Only a loop whose frames were all reserved before it started: an inner loop's stream, popped across many runs
         // of the loop, predicts frames past them. The segments write their own cells in place and read the shared
         // g-power table, so both have to reach the last iteration's heap before they start: only a heap that grew alike

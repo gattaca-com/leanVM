@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use super::super::execute::{Execution, Lanes, execute_as};
 use super::super::{DerefMode, ExecError, Op, OutCells, Program, to_scalar};
-use super::{LOOPS, LOW};
+use super::{HEAVY_ITERATION as HEAVY, LOOPS, LOW};
 use isa::RHint;
 use primitives::field::{F128, g_pow};
 use verifier::K;
@@ -93,8 +93,14 @@ fn hash_ops() -> [Op; HASH_OPS] {
 /// each iteration allocates two buffers of `HEAP / 2` cells, at its first instruction and after its `DEREF`s. With
 /// `hashes`, it also runs a `KECCAK64` and a `KECCAK` ([`hash_ops`]).
 fn program(frame0: usize, iterations: &[Iteration], heap: bool, hashes: bool, prefix: [Op; 2]) -> Run {
-    let len = if hashes { 128 } else { 64 };
-    let tail = 17 + if hashes { HASH_OPS } else { 0 };
+    padded(frame0, iterations, heap, hashes, 0, prefix)
+}
+
+/// [`program`], with `pad` more instructions before each iteration's jump back, which rewrite a frame cell with its own
+/// value: a loop of iterations that run past [`HEAVY`] steps.
+fn padded(frame0: usize, iterations: &[Iteration], heap: bool, hashes: bool, pad: usize, prefix: [Op; 2]) -> Run {
+    let tail = 17 + pad + if hashes { HASH_OPS } else { 0 };
+    let len = (tail + 5).next_power_of_two().max(64);
     let mut code = vec![set(7, F128::ZERO); len];
     code[0] = set(frame0, word(7));
     code[1] = set(2, F128::ONE);
@@ -116,8 +122,10 @@ fn program(frame0: usize, iterations: &[Iteration], heap: bool, hashes: bool, pr
         code[12 + k as usize] = deref(8 + k, 24 + k);
     }
     code[16] = set(6, address(MARKER as usize));
+    // Cell 50 holds 7 in every iteration: the iterations' pointers and writes never reach it.
+    code[17..tail].fill(set(50, word(7)));
     if hashes {
-        code[17..tail].copy_from_slice(&hash_ops());
+        code[17..17 + HASH_OPS].copy_from_slice(&hash_ops());
     }
     code[tail] = Op::Jump { oc: 3, od: 6, of: 2 };
     // The exit path, in the last iteration's frame, ending at the last slot.
@@ -257,6 +265,43 @@ fn keccak_rows_of_both_tables_merge_as_serial() {
         "a step per row, by table"
     );
     assert_eq!(divergence(&run), (None, (merges(), merges())));
+}
+
+/// Invariant: a loop of light iterations runs as segments of at least eight iterations, so a short one runs serially,
+/// with the serial result.
+#[test]
+fn short_loop_of_light_iterations_is_serial() {
+    for n in [5, 12, 18] {
+        let iterations: Vec<_> = (0..n).map(benign).collect();
+        assert_eq!(
+            divergence(&plain(FRAME0, &iterations, true, false)),
+            (None, (0, 0)),
+            "{n} iterations"
+        );
+    }
+}
+
+/// Invariant: a loop of a few heavy iterations, like the aggregation guest's child loop, runs as segments of one
+/// iteration each, with the serial result, whatever its frames; with fewer than five iterations it runs serially.
+#[test]
+fn few_heavy_iterations_run_as_segments() {
+    let prefix = || [set(311, word(9)), set(312, word(7))];
+    for n in [3, 4, 5, 6, 9] {
+        let iterations: Vec<_> = (0..n).map(benign).collect();
+        for frame0 in [FRAME0, LOWER[0], LOWER[1]] {
+            let run = padded(frame0, &iterations, true, true, 2 * HEAVY, prefix());
+            let loops = if n >= 5 { merges() } else { 0 };
+            assert_eq!(
+                divergence(&run),
+                (None, (loops, loops)),
+                "{n} heavy iterations, frame0 {frame0}"
+            );
+        }
+    }
+    let iterations: Vec<_> = (0..5).map(benign).collect();
+    let run = padded(FRAME0, &iterations, true, false, 2 * HEAVY, prefix());
+    let (serial, _) = execute(&run, false).expect("the serial run succeeds");
+    assert!(serial.cycles > 5 * HEAVY, "the iterations run past the heavy mark");
 }
 
 /// A segment sees its own cells as memory holds them when the loop starts, so a run whose prefix writes or links a
