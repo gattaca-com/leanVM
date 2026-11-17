@@ -1,0 +1,16 @@
+[package]
+name = "sidecar_streaming"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+leanvm_sidecar_client = { path = "../leanvm_sidecar_client" }
+arrival_model = { path = "../arrival_model" }
+
+[[bin]]
+name = "streamsim"
+path = "src/bin/streamsim.rs"

@@ -1,0 +1,317 @@
+//! The event loop shared by both backends (SPEC 7.2). Ties are delivered arrivals first, then
+//! completions, then timers. The driver, not the strategy, writes the slot record.
+
+use crate::backend::*;
+use crate::metric::{InputRec, JobRec, SlotRecord};
+use crate::strategy::{Ctx, Strategy};
+use crate::types::*;
+use arrival_model::schedule::{Kind, ScheduleSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
+
+/// One run: a slot of a schedule set, for one aggregator view of one subnet (`Leaf`) or for the proposer (`Merge`).
+pub struct RunSpec<'a> {
+    pub set: &'a ScheduleSet,
+    pub slot: u32,
+    /// `Leaf` only.
+    pub subnet: u8,
+    pub view: u8,
+    pub deadline: Micros,
+    pub caps: Caps,
+}
+
+struct Arrival {
+    t: Micros,
+    kind: Kind,
+    id: u32,
+    valid: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Target {
+    Prove(ProofId),
+    Verify(ProofId),
+}
+
+pub struct DriverCtx<'a> {
+    backend: &'a mut dyn Backend,
+    info: SlotInfo,
+    store: ProofStore,
+    timers: BinaryHeap<Reverse<(Micros, u64, u64)>>,
+    timer_seq: u64,
+    lane_job: Vec<Option<JobId>>,
+    jobs: Vec<JobRec>,
+    target: Vec<Target>,
+    published: Option<(Micros, ProofId)>,
+}
+
+impl Ctx for DriverCtx<'_> {
+    fn now(&self) -> Micros {
+        self.backend.now()
+    }
+
+    fn slot(&self) -> &SlotInfo {
+        &self.info
+    }
+
+    fn proof(&self, id: ProofId) -> &ProofInfo {
+        &self.store.get(id).info
+    }
+
+    fn lane_idle(&self, lane: usize) -> bool {
+        self.lane_job[lane].is_none()
+    }
+
+    fn prove(&mut self, lane: usize, job: Job) -> JobId {
+        assert!(self.lane_idle(lane), "prove on busy lane {lane}");
+        assert!(!job.children.is_empty() || !job.signatures.is_empty(), "empty job");
+        assert!(job.children.len() <= self.info.caps.max_children, "too many children: {}", job.children.len());
+        assert!(job.signatures.len() as u32 <= self.info.caps.max_new_sigs, "too many signatures: {}", job.signatures.len());
+        let mut coverage = Coverage::empty();
+        let mut leaves = u32::from(!job.signatures.is_empty());
+        let mut child_claims = 0;
+        for &c in &job.children {
+            let e = self.store.entries.get(c.0 as usize).unwrap_or_else(|| panic!("unknown proof {c:?}"));
+            assert!(e.ready, "proof {c:?} is not finished");
+            coverage.union_with(&e.info.coverage);
+            leaves += e.info.leaves;
+            child_claims += e.info.coverage.len();
+        }
+        for s in &job.signatures {
+            coverage.insert(s.0);
+        }
+        let made = ProofId(self.store.entries.len() as u32);
+        self.store.entries.push(Entry {
+            info: ProofInfo { coverage, rate: job.rate, verified: true, subnet: None, received_at: None, leaves },
+            valid: true,
+            parents: job.children.clone(),
+            ready: false,
+        });
+        let started = self.backend.start_prove(lane, &job, &self.store, made);
+        let id = JobId(self.jobs.len() as u32);
+        let op = match (job.children.is_empty(), job.signatures.is_empty()) {
+            (true, _) => "AGGREGATE",
+            (false, true) => "RECURSE",
+            _ => "EXTEND",
+        };
+        self.jobs.push(JobRec {
+            job: id.0,
+            lane,
+            op,
+            children: job.children.len() as u32,
+            child_claims,
+            new_sigs: job.signatures.len() as u32,
+            rate: job.rate,
+            start: self.backend.now(),
+            end: 0,
+            predicted: started.predicted,
+            verify_us: started.verify_us,
+            useful: false,
+            result: String::new(),
+        });
+        self.target.push(Target::Prove(made));
+        self.lane_job[lane] = Some(id);
+        id
+    }
+
+    fn verify(&mut self, lane: usize, proof: ProofId) -> JobId {
+        assert!(self.lane_idle(lane), "verify on busy lane {lane}");
+        let started = self.backend.start_verify(lane, proof, &self.store);
+        let id = JobId(self.jobs.len() as u32);
+        let e = self.store.get(proof);
+        self.jobs.push(JobRec {
+            job: id.0,
+            lane,
+            op: "VERIFY",
+            children: 1,
+            child_claims: e.info.coverage.len(),
+            new_sigs: 0,
+            rate: e.info.rate,
+            start: self.backend.now(),
+            end: 0,
+            predicted: started.predicted,
+            verify_us: started.verify_us,
+            useful: false,
+            result: String::new(),
+        });
+        self.target.push(Target::Verify(proof));
+        self.lane_job[lane] = Some(id);
+        id
+    }
+
+    fn abort(&mut self, job: JobId) -> bool {
+        match self.jobs.get(job.0 as usize) {
+            Some(j) if self.lane_job[j.lane] == Some(job) => self.backend.abort(j.lane),
+            _ => false,
+        }
+    }
+
+    fn publish(&mut self, proof: ProofId) {
+        assert!(self.published.is_none(), "second publish");
+        assert!(self.store.get(proof).info.rate >= self.info.final_rate, "publish below the final rate");
+        self.published = Some((self.backend.now(), proof));
+    }
+
+    fn set_timer(&mut self, at: Micros, token: u64) {
+        let at = at.max(self.backend.now());
+        self.timer_seq += 1;
+        self.timers.push(Reverse((at, self.timer_seq, token)));
+    }
+
+    fn cost(&self, shape: &JobShape) -> Micros {
+        self.backend.model().prove_us(shape, THREADS)
+    }
+}
+
+impl DriverCtx<'_> {
+    /// Write a completion into the record and the store, and turn it into an event.
+    fn complete(&mut self, d: Done) -> Event {
+        let job = self.lane_job[d.lane].take().expect("completion on an idle lane");
+        let rec = &mut self.jobs[job.0 as usize];
+        rec.end = d.at;
+        match (self.target[job.0 as usize], d.outcome) {
+            (Target::Prove(id), Outcome::Proved { coverage, rate, .. }) => {
+                let e = &mut self.store.entries[id.0 as usize];
+                e.info.coverage = *coverage;
+                e.info.rate = rate;
+                e.ready = true;
+                rec.result = "ok".into();
+                Event::Proved { job, lane: d.lane, result: Ok(id) }
+            }
+            (Target::Verify(proof), Outcome::Verified(ok)) => {
+                rec.result = if ok { "ok" } else { "invalid" }.into();
+                if ok {
+                    self.store.entries[proof.0 as usize].info.verified = true;
+                }
+                Event::Verified { job, lane: d.lane, proof, ok }
+            }
+            (_, Outcome::Failed(f)) => {
+                rec.result = format!("{f:?}");
+                Event::Proved { job, lane: d.lane, result: Err(f) }
+            }
+            _ => panic!("backend answered a job with the wrong outcome"),
+        }
+    }
+}
+
+pub fn run_slot(backend: &mut dyn Backend, strategy: &mut dyn Strategy, spec: &RunSpec) -> SlotRecord {
+    let meta = &spec.set.meta;
+    let shape = if meta.shape == "merge" { Shape::Merge } else { Shape::Leaf };
+    let info = SlotInfo { shape, deadline: spec.deadline, final_rate: meta.final_rate, expected_inputs: meta.expected_inputs, caps: spec.caps };
+    backend.begin_slot(spec.set, spec.slot);
+    let sched = &spec.set.slots[spec.slot as usize];
+    let arrivals: Vec<Arrival> = sched
+        .arrivals
+        .iter()
+        .filter(|a| match shape {
+            Shape::Leaf => a.kind == Kind::Vote && a.subnet == spec.subnet && a.view == spec.view,
+            Shape::Merge => a.kind == Kind::Aggregate,
+        })
+        .map(|a| Arrival { t: a.t_us, kind: a.kind, id: a.id, valid: a.valid })
+        .collect();
+    let claim_of = |id: u32| SUBNET_SIZE * spec.subnet as u32 + id;
+    let inputs: Vec<InputRec> = arrivals
+        .iter()
+        .map(|a| match a.kind {
+            Kind::Vote => InputRec { t: a.t, claims: vec![claim_of(a.id)], valid: true },
+            Kind::Aggregate => {
+                let e = &spec.set.pool[a.id as usize];
+                InputRec { t: a.t, claims: e.signer_ids().map(|s| SUBNET_SIZE * e.subnet as u32 + s).collect(), valid: a.valid }
+            }
+        })
+        .collect();
+
+    let mut ctx = DriverCtx {
+        backend,
+        info,
+        store: ProofStore::default(),
+        timers: BinaryHeap::new(),
+        timer_seq: 0,
+        lane_job: vec![None; info.caps.lanes],
+        jobs: Vec::new(),
+        target: Vec::new(),
+        published: None,
+    };
+    strategy.on_event(Event::SlotStart, &mut ctx);
+    let (mut ai, mut pending): (usize, Option<Done>) = (0, None);
+    let deadline = spec.deadline;
+    loop {
+        let t_arr = arrivals.get(ai).map_or(Micros::MAX, |a| a.t);
+        let t_tim = ctx.timers.peek().map_or(Micros::MAX, |r| r.0.0);
+        let busy = ctx.lane_job.iter().any(Option::is_some);
+        if t_arr == Micros::MAX && t_tim == Micros::MAX && !busy && pending.is_none() {
+            break;
+        }
+        let tn = t_arr.min(t_tim).min(deadline).max(ctx.backend.now());
+        let done = pending.take().or_else(|| ctx.backend.wait(tn));
+        if let Some(d) = done {
+            if t_arr <= d.at {
+                // Arrivals first: they are delivered below, then this completion.
+                pending = Some(d);
+            } else {
+                let event = ctx.complete(d);
+                strategy.on_event(event, &mut ctx);
+                continue;
+            }
+        }
+        let now = ctx.backend.now();
+        while arrivals.get(ai).is_some_and(|a| a.t <= now) {
+            let a = &arrivals[ai];
+            ai += 1;
+            let event = match a.kind {
+                Kind::Vote => Event::Signature(SigId(claim_of(a.id))),
+                Kind::Aggregate => {
+                    let e = &spec.set.pool[a.id as usize];
+                    let mut coverage = Coverage::empty();
+                    for s in e.signer_ids() {
+                        coverage.insert(SUBNET_SIZE * e.subnet as u32 + s);
+                    }
+                    let id = ProofId(ctx.store.entries.len() as u32);
+                    ctx.store.entries.push(Entry {
+                        info: ProofInfo { coverage, rate: e.rate, verified: false, subnet: Some(e.subnet), received_at: Some(a.t), leaves: 1 },
+                        valid: a.valid,
+                        parents: Vec::new(),
+                        ready: true,
+                    });
+                    ctx.backend.receive(id, e, a.valid);
+                    Event::Aggregate(id)
+                }
+            };
+            strategy.on_event(event, &mut ctx);
+        }
+        if let Some(d) = pending.take() {
+            let event = ctx.complete(d);
+            strategy.on_event(event, &mut ctx);
+        }
+        while ctx.timers.peek().is_some_and(|r| r.0.0 <= now) {
+            let Reverse((_, _, token)) = ctx.timers.pop().unwrap();
+            strategy.on_event(Event::Timer(token), &mut ctx);
+        }
+        if now >= deadline {
+            break;
+        }
+    }
+    // A job still running at the deadline is written down, not delivered.
+    while ctx.lane_job.iter().any(Option::is_some) {
+        let d = ctx.backend.wait(Micros::MAX).expect("a lane is busy");
+        let _ = ctx.complete(d);
+    }
+    finish(ctx, inputs, spec)
+}
+
+fn finish(mut ctx: DriverCtx, inputs: Vec<InputRec>, spec: &RunSpec) -> SlotRecord {
+    let mut useful = HashSet::new();
+    let published = ctx.published.map(|(t, id)| {
+        let mut stack = vec![id];
+        while let Some(p) = stack.pop() {
+            if useful.insert(p) {
+                stack.extend(ctx.store.get(p).parents.iter().copied());
+            }
+        }
+        (t, ctx.store.get(id).info.coverage.clone())
+    });
+    for (j, t) in ctx.jobs.iter_mut().zip(&ctx.target) {
+        j.useful = matches!(t, Target::Prove(p) if useful.contains(p));
+    }
+    SlotRecord { shape: ctx.info.shape, deadline: spec.deadline, inputs, published, jobs: ctx.jobs, sent_override: None }
+}
