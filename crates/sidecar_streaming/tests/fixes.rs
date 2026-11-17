@@ -54,3 +54,35 @@ fn empty_slots_are_not_full_coverage() {
     // The CSV keeps the N/A.
     assert!(Row::from_csv(&early[0].to_csv()).unwrap().m.coverage.is_nan());
 }
+
+/// Finding 6: the merge bound is the union of the valid candidates in time, and no strategy exceeds it.
+#[test]
+fn merge_bound_is_the_arrived_union() {
+    use arrival_model::schedule::Kind;
+    use sidecar_streaming::bound::merge_upper_bound;
+    use sidecar_streaming::types::*;
+    let set = make_set(&merge_invalid_params(), 20, 4);
+    let mut backend = sim(SMOOTH);
+    for slot in 0..20 {
+        let covs: Vec<(u64, Coverage, bool)> = set.slots[slot as usize]
+            .arrivals
+            .iter()
+            .filter(|a| a.kind == Kind::Aggregate)
+            .map(|a| {
+                let e = &set.pool[a.id as usize];
+                let mut c = Coverage::empty();
+                e.signer_ids().for_each(|s| c.insert(SUBNET_SIZE * e.subnet as u32 + s));
+                (a.t_us, c, a.valid)
+            })
+            .collect();
+        let refs: Vec<(u64, &Coverage, bool)> = covs.iter().map(|c| (c.0, &c.1, c.2)).collect();
+        let d = 4_000_000;
+        let bound = merge_upper_bound(&refs, d);
+        for s in ["best_per_subnet_late", "fill_16", "two_round", "union_chain"] {
+            let (_, m) = run(&mut backend, &set, slot, d, s, None);
+            assert!(m.got <= bound, "{s}: got {} above the union {bound}", m.got);
+        }
+        // It is the metric's `arrived`.
+        assert_eq!(run(&mut backend, &set, slot, d, "fill_16", None).1.arrived, bound);
+    }
+}

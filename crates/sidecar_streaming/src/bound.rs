@@ -80,12 +80,19 @@ pub fn universal_leaf(arr: &[Micros], model: &dyn CostModel, d: Micros, final_ra
     best.min(m) as u32
 }
 
-/// Universal and one-round clairvoyant bounds for `Merge`. A candidate that arrives after
-/// `d - (verify + RECURSE of its children)` cannot be in the root. With `n` children the root job
-/// costs `cost(n)`, so the best round chooses `n` to trade candidates for time.
-/// `cands` are `(arrival, subnet, claims, valid)`; the clairvoyant value is the best over `n`
-/// of the exact selection of 3.2 on the candidates that arrived by `d - cost(n)`.
-pub fn merge_bounds(cands: &[(Micros, u8, &Coverage, bool)], model: &dyn CostModel, d: Micros, final_rate: Rate, max_children: usize) -> (u32, u32) {
+/// Upper bound for `Merge`: the claims in the union of all valid candidates that arrived by `d`.
+/// No root can hold a claim that no valid candidate carried in time. `cands` are `(arrival, claims, valid)`.
+pub fn merge_upper_bound(cands: &[(Micros, &Coverage, bool)], d: Micros) -> u32 {
+    let mut u = Coverage::empty();
+    cands.iter().filter(|c| c.2 && c.0 <= d).for_each(|c| u.union_with(c.1));
+    u.len()
+}
+
+/// A reference value for `Merge`, **not a bound**: the best single round of up to `max_children` children,
+/// by the exact selection of 3.2, on the candidates that arrived by `d - cost(n)` for the best `n`.
+/// Strategies with several rounds or a kept root can exceed it.
+/// `cands` are `(arrival, subnet, claims, valid)`.
+pub fn merge_one_round_reference(cands: &[(Micros, u8, &Coverage, bool)], model: &dyn CostModel, d: Micros, final_rate: Rate, max_children: usize) -> u32 {
     let job = |n: usize, claims: u32| {
         cost(model, &JobShape { children: vec![ChildShape { claims, rate: 2, verify: true, leaves: 1 }; n], new_sigs: 0, rate: final_rate })
     };
@@ -96,7 +103,5 @@ pub fn merge_bounds(cands: &[(Micros, u8, &Coverage, bool)], model: &dyn CostMod
             valid.iter().enumerate().filter(|(_, c)| c.0 as f64 <= cut).map(|(i, c)| (ProofId(i as u32), c.1, c.2)).collect();
         select_exact(&items, &empty, budget).1
     };
-    let universal = pick(d as f64 - job(2, 1500), max_children);
-    let clairvoyant = (1..=max_children).map(|n| pick(d as f64 - job(n, 1500), n)).max().unwrap_or(0);
-    (clairvoyant.min(universal), universal)
+    (1..=max_children).map(|n| pick(d as f64 - job(n, 1500), n)).max().unwrap_or(0)
 }

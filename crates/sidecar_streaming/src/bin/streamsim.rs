@@ -1,7 +1,7 @@
 //! streamsim fit | sim | e2e | live | bound | report. See `design/SPEC.md` section 8.
 
 use arrival_model::schedule::{Kind, ScheduleSet};
-use sidecar_streaming::bound::{clairvoyant_leaf, merge_bounds, universal_leaf};
+use sidecar_streaming::bound::{clairvoyant_leaf, merge_one_round_reference, merge_upper_bound, universal_leaf};
 use sidecar_streaming::cli::*;
 use sidecar_streaming::metric::{ROW_HEADER, Row};
 use sidecar_streaming::report::{compare, compare_jobs, report};
@@ -128,11 +128,13 @@ fn cmd_bound(a: &Args) -> Result<(), String> {
     // Only grid 1 is an upper bound; a larger grid is faster and gives a lower bound on the optimum.
     let grid = a.num("grid", 1usize)?;
     let cheap = a.num("cheap", 1u8)?;
-    let mut out = String::from("slot,deadline_us,arrived,clairvoyant,universal,clairvoyant_coverage,universal_coverage\n");
+    // For a merge set both bounds are the union of the valid candidates that arrived; `one_round_reference` is not a bound.
+    let mut out = String::from("slot,deadline_us,arrived,clairvoyant,universal,clairvoyant_coverage,universal_coverage,one_round_reference\n");
     for &d in &deadlines {
         for slot in slots.clone() {
             for (id, subnet, view) in sidecar_streaming::runner::runs_of(&set, slot) {
                 let sched = &set.slots[slot as usize];
+                let mut reference = String::new();
                 let (clair, univ, arrived) = if set.meta.shape == "merge" {
                     let covs: Vec<(u64, u8, Coverage, bool)> = sched
                         .arrivals
@@ -148,15 +150,16 @@ fn cmd_bound(a: &Args) -> Result<(), String> {
                     let cands: Vec<(u64, u8, &Coverage, bool)> = covs.iter().map(|c| (c.0, c.1, &c.2, c.3)).collect();
                     let mut by_d = Coverage::empty();
                     covs.iter().filter(|c| c.3 && c.0 <= d).for_each(|c| by_d.union_with(&c.2));
-                    let (c, u) = merge_bounds(&cands, model.as_ref(), d, set.meta.final_rate, 16);
-                    (c, u, by_d.len())
+                    let upper = merge_upper_bound(&cands.iter().map(|c| (c.0, c.2, c.3)).collect::<Vec<_>>(), d);
+                    reference = merge_one_round_reference(&cands, model.as_ref(), d, set.meta.final_rate, 16).to_string();
+                    (upper, upper, by_d.len())
                 } else {
                     let arr: Vec<u64> = sched.arrivals.iter().filter(|x| x.kind == Kind::Vote && x.subnet == subnet && x.view == view).map(|x| x.t_us).collect();
                     let arrived = arr.partition_point(|&t| t <= d) as u32;
                     (clairvoyant_leaf(&arr, model.as_ref(), d, set.meta.final_rate, cheap, grid), universal_leaf(&arr, model.as_ref(), d, set.meta.final_rate, cheap), arrived)
                 };
                 let cov = |x: u32| if arrived == 0 { f64::NAN } else { x as f64 / arrived as f64 };
-                out += &format!("{id},{d},{arrived},{clair},{univ},{:.6},{:.6}\n", cov(clair), cov(univ));
+                out += &format!("{id},{d},{arrived},{clair},{univ},{:.6},{:.6},{reference}\n", cov(clair), cov(univ));
             }
         }
     }
