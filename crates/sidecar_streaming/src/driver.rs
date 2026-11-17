@@ -188,6 +188,17 @@ impl DriverCtx<'_> {
                 }
                 Event::Verified { job, lane: d.lane, proof, ok }
             }
+            (Target::Prove(made), Outcome::Failed(f)) => {
+                rec.result = format!("{f:?}");
+                if let Failure::InvalidChild(c) = &f {
+                    // The backend verifies children in order: those before the bad one passed.
+                    let parents = self.store.entries[made.0 as usize].parents.clone();
+                    for p in parents.iter().take_while(|p| *p != c) {
+                        self.store.entries[p.0 as usize].info.verified = true;
+                    }
+                }
+                Event::Proved { job, lane: d.lane, result: Err(f) }
+            }
             (_, Outcome::Failed(f)) => {
                 rec.result = format!("{f:?}");
                 Event::Proved { job, lane: d.lane, result: Err(f) }

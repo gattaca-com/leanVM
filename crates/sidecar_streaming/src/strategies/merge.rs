@@ -19,7 +19,7 @@ const MARGIN: Micros = 2_000;
 pub enum Policy {
     /// Verify every candidate on arrival, while the lane is idle.
     AllIdle,
-    /// Verify only the children a job will take, just before it.
+    /// Verify only the children a job will take, one by one, while the lane waits for the job's launch time.
     Selected,
     /// Verify inside the job (`VERIFY_CHILDREN`); a bad child fails the job.
     Inline,
@@ -90,11 +90,18 @@ pub struct MergeStrategy<P: Plan> {
     last_started: bool,
     published: bool,
     seen: u32,
+    /// A job has failed on a bad child: the children before it are verified, so verify the rest before proving.
+    failed: bool,
 }
 
 impl<P: Plan> MergeStrategy<P> {
+    /// After one failed job, inline verification gives way to verifying the chosen children one by one.
+    fn effective_policy(&self) -> Policy {
+        if self.policy == Policy::Inline && self.failed { Policy::Selected } else { self.policy }
+    }
+
     pub fn new(plan: P, policy: Policy) -> Self {
-        Self { plan, policy, cands: Vec::new(), kept: None, busy: false, last_started: false, published: false, seen: 0 }
+        Self { plan, policy, cands: Vec::new(), kept: None, busy: false, last_started: false, published: false, seen: 0, failed: false }
     }
 
     fn set_state(&mut self, id: ProofId, st: St) {
@@ -116,7 +123,7 @@ impl<P: Plan> MergeStrategy<P> {
 
     fn launch(&mut self, ctx: &mut dyn Ctx, children: Vec<ProofId>, last: bool) {
         // Under `Selected`, verify the unverified children first, one per step.
-        if self.policy == Policy::Selected
+        if self.effective_policy() == Policy::Selected
             && let Some(&c) = children.iter().find(|&&c| !ctx.proof(c).verified)
         {
             self.set_state(c, St::Verifying);
@@ -144,7 +151,7 @@ impl<P: Plan> MergeStrategy<P> {
         let avail: Vec<&Cand> = self
             .cands
             .iter()
-            .filter(|c| match self.policy {
+            .filter(|c| match self.effective_policy() {
                 Policy::AllIdle => c.st == St::Good,
                 _ => c.st != St::Bad && c.st != St::Verifying,
             })
@@ -162,7 +169,16 @@ impl<P: Plan> MergeStrategy<P> {
                 .unwrap();
             chosen.remove(worst);
         }
-        let latest = d.saturating_sub(est(self, &chosen) + MARGIN);
+        // Under inline verification a bad child fails the job after the verification up to it. Start early enough that a
+        // retry without that child still fits: keep the verification time of the chosen children in reserve.
+        let reserve = if self.effective_policy() == Policy::Inline {
+            let mut verified = self.shape(ctx, &chosen);
+            verified.children.iter_mut().for_each(|c| c.verify = false);
+            ctx.cost(&self.shape(ctx, &chosen)).saturating_sub(ctx.cost(&verified))
+        } else {
+            0
+        };
+        let latest = d.saturating_sub(est(self, &chosen) + MARGIN + reserve);
         let go = self.plan.go_time(&st, ctx, latest).unwrap_or(latest).min(latest);
         let nothing_new = chosen.is_empty();
         if now >= go {
@@ -196,7 +212,16 @@ impl<P: Plan> MergeStrategy<P> {
                 return;
             }
         }
-        if self.policy == Policy::AllIdle
+        // While the lane waits for the launch time, verify the children the last job would take.
+        if self.effective_policy() == Policy::Selected
+            && let Some(&c) = chosen.iter().find(|&&c| !ctx.proof(c).verified)
+        {
+            self.set_state(c, St::Verifying);
+            ctx.verify(0, c);
+            self.busy = true;
+            return;
+        }
+        if self.effective_policy() == Policy::AllIdle
             && let Some(c) = self.cands.iter().find(|c| c.st == St::Unverified).map(|c| c.id)
         {
             self.set_state(c, St::Verifying);
@@ -238,6 +263,7 @@ impl<P: Plan> Strategy for MergeStrategy<P> {
                     }
                     Err(Failure::InvalidChild(c)) => {
                         self.set_state(c, St::Bad);
+                        self.failed = true;
                     }
                     Err(_) => {}
                 }
