@@ -40,6 +40,7 @@ pub struct LeafStrategy<I: Inner> {
     inner: I,
     waiting: VecDeque<SigId>,
     seen: u32,
+    known_total: Option<u32>,
     kept: Option<ProofId>,
     busy: bool,
     last_started: bool,
@@ -48,7 +49,14 @@ pub struct LeafStrategy<I: Inner> {
 
 impl<I: Inner> LeafStrategy<I> {
     pub fn new(inner: I) -> Self {
-        Self { inner, waiting: VecDeque::new(), seen: 0, kept: None, busy: false, last_started: false, published: false }
+        Self { inner, waiting: VecDeque::new(), seen: 0, known_total: None, kept: None, busy: false, last_started: false, published: false }
+    }
+
+    /// The strategy is told how many inputs will come in all, and may stop waiting when they have. A strategy does not
+    /// know this by default: even with no vote missing, the aggregator cannot tell that the window has closed.
+    pub fn with_known_total(mut self, total: u32) -> Self {
+        self.known_total = Some(total);
+        self
     }
 
     fn kept_info(&self, ctx: &dyn Ctx) -> (u32, Rate) {
@@ -82,7 +90,7 @@ impl<I: Inner> LeafStrategy<I> {
         let w = self.waiting.len();
         let (kc, kr) = self.kept_info(ctx);
         let kept_final = self.kept.is_some() && kr >= f;
-        let all_present = self.seen >= ctx.slot().expected_inputs;
+        let all_present = self.known_total.is_some_and(|n| self.seen >= n);
         if w == 0 && (self.kept.is_none() || kept_final) {
             if let Some(k) = self.kept.filter(|_| kept_final && (all_present || s + TICK >= d)) {
                 self.publish(ctx, k);
@@ -113,7 +121,10 @@ impl<I: Inner> LeafStrategy<I> {
             if n == 0 && self.kept.is_none() {
                 return;
             }
-            let after = s + with_margin(ctx.cost(&JobShape::extend(kc, kr, n as u32, rate))) + with_margin(ctx.cost(&JobShape::extend(kc + n as u32, rate, 1, f)));
+            // A last job must still fit after this one: with one more signature, or, if this job is cheaper than the
+            // final rate, a plain conversion. Take the dearer.
+            let last = ctx.cost(&JobShape::extend(kc + n as u32, rate, 1, f)).max(ctx.cost(&JobShape::extend(kc + n as u32, rate, 0, f)));
+            let after = s + with_margin(ctx.cost(&JobShape::extend(kc, kr, n as u32, rate))) + with_margin(last);
             if after <= d {
                 self.launch(ctx, n, rate, false);
             }
@@ -135,7 +146,7 @@ impl<I: Inner> Strategy for LeafStrategy<I> {
             Event::Signature(s) => {
                 self.waiting.push_back(s);
                 self.seen += 1;
-                if self.seen >= ctx.slot().expected_inputs {
+                if self.known_total.is_some_and(|n| self.seen >= n) {
                     self.evaluate(ctx);
                 }
             }
