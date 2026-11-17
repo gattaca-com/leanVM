@@ -60,8 +60,9 @@ pub struct Metrics {
     pub verify_us: Micros,
 }
 
+/// N/A (NaN) when there is nothing to divide by: a slot with nothing arrived has no coverage to measure.
 fn ratio(a: u32, b: u32) -> f64 {
-    if b == 0 { 1.0 } else { a as f64 / b as f64 }
+    if b == 0 { f64::NAN } else { a as f64 / b as f64 }
 }
 
 pub fn slot_metrics(rec: &SlotRecord) -> Metrics {
@@ -175,21 +176,29 @@ impl Row {
     }
 }
 
-/// Nearest-rank quantile: `x[ceil(k N / 100) - 1]` of the sorted list.
+/// Nearest-rank quantile of the valid (not NaN) values: `x[ceil(k N / 100) - 1]`. NaN if there are none.
 pub fn quantile(xs: &[f64], k: u32) -> f64 {
-    let mut v = xs.to_vec();
+    let mut v: Vec<f64> = xs.iter().copied().filter(|x| !x.is_nan()).collect();
+    if v.is_empty() {
+        return f64::NAN;
+    }
     v.sort_by(f64::total_cmp);
     let rank = (k as usize * v.len()).div_ceil(100).max(1);
     v[rank - 1]
 }
 
+/// Mean of the valid (not NaN) values. NaN if there are none.
 pub fn mean(xs: &[f64]) -> f64 {
-    xs.iter().sum::<f64>() / xs.len().max(1) as f64
+    let v: Vec<f64> = xs.iter().copied().filter(|x| !x.is_nan()).collect();
+    v.iter().sum::<f64>() / v.len() as f64
 }
 
 #[derive(Clone, Debug)]
 pub struct Summary {
+    /// Slots with a coverage.
     pub n: usize,
+    /// Slots with nothing arrived by `D`: no coverage, left out of every aggregate of coverage.
+    pub empty: usize,
     pub p50: f64,
     pub p10: f64,
     pub mean: f64,
@@ -211,7 +220,8 @@ pub fn summarize(rows: &[&Row]) -> Summary {
         if v.is_empty() { f64::NAN } else { mean(&v) }
     };
     Summary {
-        n: rows.len(),
+        n: rows.iter().filter(|r| !r.m.coverage.is_nan()).count(),
+        empty: rows.iter().filter(|r| r.m.coverage.is_nan()).count(),
         p50: quantile(&c, 50),
         p10: quantile(&c, 10),
         mean: mean(&c),
@@ -228,7 +238,7 @@ pub fn summarize(rows: &[&Row]) -> Summary {
 
 /// Mean of `a - b` in coverage over paired slots, and its standard error.
 pub fn paired_diff(a: &[f64], b: &[f64]) -> (f64, f64) {
-    let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+    let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| x - y).filter(|x| !x.is_nan()).collect();
     let m = mean(&d);
     if d.len() < 2 {
         return (m, 0.0);
@@ -237,7 +247,8 @@ pub fn paired_diff(a: &[f64], b: &[f64]) -> (f64, f64) {
     (m, (var / d.len() as f64).sqrt())
 }
 
-/// `D_99`: the smallest swept deadline at which p10 coverage is at least 0.99.
+/// `D_99`: the smallest swept deadline at which p10 coverage is at least 0.99. A deadline whose slots are all empty has
+/// no p10 (NaN) and never counts.
 pub fn d99(points: &[(Micros, f64)]) -> Option<Micros> {
     points.iter().filter(|(_, p10)| *p10 >= 0.99).map(|(d, _)| *d).min()
 }

@@ -28,3 +28,29 @@ fn failed_merge_job_keeps_the_root() {
     }
     assert!(checked > 3, "only {checked} slots had a successful job");
 }
+
+/// Finding 4: a slot with nothing arrived by `D` has no coverage, is left out of the aggregates and counted apart.
+#[test]
+fn empty_slots_are_not_full_coverage() {
+    use sidecar_streaming::metric::*;
+    let set = make_set(&leaf_params(), 10, 3);
+    let mut backend = sim(SMOOTH);
+    // The votes start at 567 ms: at D = 300 ms nothing has arrived.
+    let (_, m) = run(&mut backend, &set, 0, 300_000, "one_shot_late", None);
+    assert_eq!((m.arrived, m.got), (0, 0));
+    assert!(m.coverage.is_nan());
+    let row = |slot: u32, d: u64| {
+        let (_, m) = run(&mut sim(SMOOTH), &set, slot, d, "one_shot_late", None);
+        Row { set: "s".into(), backend: "b".into(), strategy: "x".into(), deadline_us: d, slot, m }
+    };
+    let early: Vec<Row> = (0..10).map(|s| row(s, 300_000)).collect();
+    let sm = summarize(&early.iter().collect::<Vec<_>>());
+    assert_eq!((sm.n, sm.empty), (0, 10));
+    assert!(sm.p10.is_nan() && sm.p50.is_nan());
+    // D_99 skips a deadline with no valid slot.
+    let late: Vec<Row> = (0..10).map(|s| row(s, 3_000_000)).collect();
+    let p10 = summarize(&late.iter().collect::<Vec<_>>()).p10;
+    assert_eq!(d99(&[(300_000, sm.p10), (3_000_000, p10)]), Some(3_000_000));
+    // The CSV keeps the N/A.
+    assert!(Row::from_csv(&early[0].to_csv()).unwrap().m.coverage.is_nan());
+}

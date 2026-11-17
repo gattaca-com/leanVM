@@ -43,16 +43,17 @@ pub fn report(rows: &[Row], baseline: Option<&str>, by_arrival: bool) -> String 
         let mut d99s: BTreeMap<&String, Vec<(u64, f64)>> = BTreeMap::new();
         for (d, by_s) in by_d {
             let _ = writeln!(out, "### D = {} ms\n", d / 1000);
-            let _ = write!(out, "| strategy | n | p50 | p10 | mean | sent p50 | sent p10 | stale ms | slack ms | jobs | busy ms | wasted ms | verify ms |");
+            let _ = write!(out, "| strategy | n | empty | p50 | p10 | mean | sent p50 | sent p10 | stale ms | slack ms | jobs | busy ms | wasted ms | verify ms |");
             let _ = writeln!(out, "{}", if baseline.is_some() { " d mean vs baseline |" } else { "" });
-            let _ = writeln!(out, "|{}", "---|".repeat(13 + usize::from(baseline.is_some())));
+            let _ = writeln!(out, "|{}", "---|".repeat(14 + usize::from(baseline.is_some())));
             for (s, v) in by_s {
                 let sm = summarize(v);
                 d99s.entry(s).or_default().push((*d, sm.p10));
                 let _ = write!(
                     out,
-                    "| {s} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {} |",
+                    "| {s} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {} |",
                     sm.n,
+                    sm.empty,
                     pct(sm.p50),
                     pct(sm.p10),
                     pct(sm.mean),
@@ -106,7 +107,9 @@ pub fn compare(sim: &[Row], live: &[Row]) -> String {
     let (mut dcov, mut dt) = (Vec::new(), Vec::new());
     for l in live {
         if let Some(s) = index.get(&((l.set.clone(), l.strategy.clone(), l.deadline_us), l.slot)) {
-            dcov.push((l.m.coverage - s.m.coverage).abs());
+            if !(l.m.coverage.is_nan() || s.m.coverage.is_nan()) {
+                dcov.push((l.m.coverage - s.m.coverage).abs());
+            }
             if let (Some(a), Some(b)) = (l.m.published_us, s.m.published_us) {
                 dt.push((a as f64 - b as f64).abs() / b.max(1) as f64);
             }

@@ -154,7 +154,7 @@ fn cmd_bound(a: &Args) -> Result<(), String> {
                     let arrived = arr.partition_point(|&t| t <= d) as u32;
                     (clairvoyant_leaf(&arr, model.as_ref(), d, set.meta.final_rate, cheap, grid), universal_leaf(&arr, model.as_ref(), d, set.meta.final_rate, cheap), arrived)
                 };
-                let cov = |x: u32| if arrived == 0 { 1.0 } else { x as f64 / arrived as f64 };
+                let cov = |x: u32| if arrived == 0 { f64::NAN } else { x as f64 / arrived as f64 };
                 out += &format!("{id},{d},{arrived},{clair},{univ},{:.6},{:.6}\n", cov(clair), cov(univ));
             }
         }
