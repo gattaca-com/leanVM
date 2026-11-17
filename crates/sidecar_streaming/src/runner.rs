@@ -24,7 +24,7 @@ pub fn runs_of(set: &ScheduleSet, slot: u32) -> Vec<(u32, u8, u8)> {
     (0..s).flat_map(|sn| (0..v).map(move |vw| ((slot * s + sn) * v + vw, sn as u8, vw as u8))).collect()
 }
 
-pub struct Job {
+pub struct Study {
     pub spec: Spec,
     pub forecast: Option<Rc<Forecast>>,
 }
@@ -35,7 +35,7 @@ pub fn run_set(
     set: &ScheduleSet,
     set_name: &str,
     backend_name: &str,
-    job: &Job,
+    job: &Study,
     deadlines: &[Micros],
     slots: std::ops::Range<u32>,
     mut progress: impl FnMut(&RunResult),

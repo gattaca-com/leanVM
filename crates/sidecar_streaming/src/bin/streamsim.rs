@@ -5,7 +5,7 @@ use sidecar_streaming::bound::{clairvoyant_leaf, merge_bounds, universal_leaf};
 use sidecar_streaming::cli::*;
 use sidecar_streaming::metric::{ROW_HEADER, Row};
 use sidecar_streaming::report::{compare, compare_jobs, report};
-use sidecar_streaming::runner::{JOBS_HEADER, Job, job_line, run_set};
+use sidecar_streaming::runner::{JOBS_HEADER, Study, job_line, run_set};
 use sidecar_streaming::sim::SimBackend;
 use sidecar_streaming::strategies::{Spec, registry};
 use sidecar_streaming::types::*;
@@ -95,7 +95,7 @@ fn cmd_sim(a: &Args) -> Result<(), String> {
             eprintln!("skipping {}: no --train set", spec.name);
             continue;
         }
-        let job = Job { spec, forecast: forecast.clone() };
+        let job = Study { spec, forecast: forecast.clone() };
         let results = run_set(&mut backend, &set, &set_name, &backend_name, &job, &deadlines, slots.clone(), |_| {})?;
         for r in results {
             if want_jobs {
