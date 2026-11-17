@@ -108,6 +108,7 @@ impl Ctx for DriverCtx<'_> {
             verify_us: started.verify_us,
             useful: false,
             result: String::new(),
+            result_claims: 0,
         });
         self.target.push(Target::Prove(made));
         self.lane_job[lane] = Some(id);
@@ -133,6 +134,7 @@ impl Ctx for DriverCtx<'_> {
             verify_us: started.verify_us,
             useful: false,
             result: String::new(),
+            result_claims: 0,
         });
         self.target.push(Target::Verify(proof));
         self.lane_job[lane] = Some(id);
@@ -176,6 +178,7 @@ impl DriverCtx<'_> {
                 e.info.rate = rate;
                 e.ready = true;
                 rec.result = "ok".into();
+                rec.result_claims = e.info.coverage.len();
                 Event::Proved { job, lane: d.lane, result: Ok(id) }
             }
             (Target::Verify(proof), Outcome::Verified(ok)) => {

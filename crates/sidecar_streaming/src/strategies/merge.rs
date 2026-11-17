@@ -124,7 +124,8 @@ impl<P: Plan> MergeStrategy<P> {
             self.busy = true;
             return;
         }
-        let all: Vec<ProofId> = self.kept.take().into_iter().chain(children).collect();
+        // The kept root stays until a job succeeds: a failed job must not lose the fallback.
+        let all: Vec<ProofId> = self.kept.into_iter().chain(children).collect();
         ctx.prove(0, Job { children: all, signatures: Vec::new(), rate: ctx.slot().final_rate });
         self.busy = true;
         self.last_started = last;

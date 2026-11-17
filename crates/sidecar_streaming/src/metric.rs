@@ -27,6 +27,8 @@ pub struct JobRec {
     /// An ancestor of the published proof.
     pub useful: bool,
     pub result: String,
+    /// Claims in the proof a prove job made; 0 for any other outcome.
+    pub result_claims: u32,
 }
 
 /// What the driver writes down about one slot.
