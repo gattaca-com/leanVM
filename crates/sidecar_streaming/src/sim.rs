@@ -53,11 +53,11 @@ impl Backend for SimBackend {
         self.now
     }
 
-    fn begin_slot(&mut self, set: &ScheduleSet, slot: u32) {
+    fn begin_slot(&mut self, set: &ScheduleSet, run: u32) {
         let _ = set;
         self.now = 0;
         self.lanes.iter_mut().for_each(|l| *l = None);
-        self.rng = SplitMix64::derive(self.seed, slot as u64);
+        self.rng = SplitMix64::derive(self.seed, run as u64);
     }
 
     fn receive(&mut self, _id: ProofId, _pool_entry: &PoolEntry, _valid: bool) {}

@@ -212,7 +212,8 @@ pub fn run_slot(backend: &mut dyn Backend, strategy: &mut dyn Strategy, spec: &R
     let meta = &spec.set.meta;
     let shape = if meta.shape == "merge" { Shape::Merge } else { Shape::Leaf };
     let info = SlotInfo { shape, deadline: spec.deadline, final_rate: meta.final_rate, expected_inputs: meta.expected_inputs, caps: spec.caps };
-    backend.begin_slot(spec.set, spec.slot);
+    let run = if shape == Shape::Merge { spec.slot } else { (spec.slot * meta.subnets + spec.subnet as u32) * meta.views + spec.view as u32 };
+    backend.begin_slot(spec.set, run);
     let sched = &spec.set.slots[spec.slot as usize];
     let arrivals: Vec<Arrival> = sched
         .arrivals

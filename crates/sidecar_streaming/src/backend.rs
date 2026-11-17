@@ -55,7 +55,9 @@ pub trait Backend {
     /// What `Ctx::cost` answers from.
     fn model(&self) -> &dyn CostModel;
     fn now(&self) -> Micros;
-    fn begin_slot(&mut self, set: &ScheduleSet, slot: u32);
+    /// `run` identifies the run within the set: `(slot * subnets + subnet) * views + view` for a leaf set, `slot` for a merge set.
+    /// The simulator draws independent noise per run.
+    fn begin_slot(&mut self, set: &ScheduleSet, run: u32);
     /// A received aggregate enters the proof store.
     fn receive(&mut self, id: ProofId, pool_entry: &PoolEntry, valid: bool);
     fn start_prove(&mut self, lane: usize, job: &Job, store: &ProofStore, made: ProofId) -> Started;

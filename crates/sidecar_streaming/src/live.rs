@@ -208,7 +208,7 @@ impl Backend for LiveBackend {
         self.elapsed()
     }
 
-    fn begin_slot(&mut self, set: &ScheduleSet, _slot: u32) {
+    fn begin_slot(&mut self, set: &ScheduleSet, _run: u32) {
         if set.meta.shape == "merge" {
             self.ensure_pool(set).unwrap_or_else(|e| panic!("live backend: {e}"));
         }
