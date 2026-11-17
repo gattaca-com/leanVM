@@ -256,3 +256,45 @@ impl ScheduleSet {
 pub fn sort_arrivals(a: &mut [Arrival]) {
     a.sort_by_key(|x| (x.t_us, x.subnet, x.id, x.view, x.kind == Kind::Aggregate));
 }
+
+/// A leaf set with `n` votes per subnet in place of the votes it has: each (slot, subnet, view) keeps its arrival
+/// distribution. The `n` offsets are the `(i + 0.5) / n` quantiles of the sorted times, interpolated linearly between
+/// order statistics, so the shape of the spread is unchanged; the signer ids are a seeded shuffle of `0..n`.
+/// Aggregates are not resampled: a set with candidates is refused.
+pub fn resample_votes(set: &ScheduleSet, n: u32, seed: u64) -> Result<ScheduleSet, String> {
+    use crate::rng::SplitMix64;
+    if set.meta.shape != "leaf" || !set.pool.is_empty() {
+        return Err("only a leaf set of votes can be resampled".into());
+    }
+    let mut out = ScheduleSet { meta: set.meta.clone(), params_txt: set.params_txt.clone(), pool: Vec::new(), slots: Vec::new() };
+    out.meta.subnet_size = n;
+    out.meta.expected_inputs = n;
+    for (slot, sched) in set.slots.iter().enumerate() {
+        let mut arrivals = Vec::new();
+        for subnet in 0..set.meta.subnets as u8 {
+            for view in 0..set.meta.views as u8 {
+                let mut times: Vec<u64> = sched.arrivals.iter().filter(|a| a.kind == Kind::Vote && a.subnet == subnet && a.view == view).map(|a| a.t_us).collect();
+                if times.is_empty() {
+                    continue;
+                }
+                times.sort_unstable();
+                let m = times.len();
+                let mut rng = SplitMix64::derive(seed, slot as u64, subnet as u64 * 256 + view as u64);
+                let mut ids: Vec<u32> = (0..n).collect();
+                for i in (1..ids.len()).rev() {
+                    ids.swap(i, rng.below(i as u64 + 1) as usize);
+                }
+                for (i, &id) in ids.iter().enumerate() {
+                    let pos = ((i as f64 + 0.5) / n as f64 * m as f64 - 0.5).clamp(0.0, (m - 1) as f64);
+                    let (lo, frac) = (pos.floor() as usize, pos - pos.floor());
+                    let hi = (lo + 1).min(m - 1);
+                    let t = times[lo] as f64 * (1.0 - frac) + times[hi] as f64 * frac;
+                    arrivals.push(Arrival { t_us: t.round() as u64, kind: Kind::Vote, subnet, view, id, valid: true });
+                }
+            }
+        }
+        sort_arrivals(&mut arrivals);
+        out.slots.push(SlotSchedule { arrivals });
+    }
+    Ok(out)
+}

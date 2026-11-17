@@ -1,5 +1,6 @@
 //! arrivalgen --params FILE --slots N --seed S --out DIR [--set key=value]... [--explain]
 //! arrivalgen --import FILE.csv --deadline-ms D --out DIR [--pool FILE]
+//! arrivalgen --resample N --from DIR --out DIR [--seed S]   (a recorded leaf set with N votes per subnet)
 
 use arrival_model::model::{Params, build, generate};
 use arrival_model::schedule::{Kind, Meta, PoolEntry, ScheduleSet, SlotSchedule, signers_from_hex};
@@ -78,6 +79,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut params, mut slots, mut seed, mut out, mut explain) = (None, 100u32, 1u64, None, false);
     let (mut imp, mut deadline, mut pool) = (None, 0u64, None);
+    let (mut resample, mut from): (Option<u32>, Option<PathBuf>) = (None, None);
     let mut sets: Vec<(String, String)> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -99,6 +101,8 @@ fn main() {
             "--import" => imp = Some(PathBuf::from(value())),
             "--deadline-ms" => deadline = value().parse().unwrap_or_else(|_| usage()),
             "--pool" => pool = Some(PathBuf::from(value())),
+            "--resample" => resample = Some(value().parse().unwrap_or_else(|_| usage())),
+            "--from" => from = Some(PathBuf::from(value())),
             "--set" => {
                 let v = value();
                 let (k, x) = v.split_once('=').unwrap_or_else(|| usage());
@@ -112,6 +116,13 @@ fn main() {
         eprintln!("arrivalgen: {e}");
         std::process::exit(1);
     };
+    if let Some(n) = resample {
+        let out = out.unwrap_or_else(|| usage());
+        let src = ScheduleSet::read(&from.unwrap_or_else(|| usage())).unwrap_or_else(|e| fail(e));
+        let set = arrival_model::schedule::resample_votes(&src, n, seed).unwrap_or_else(|e| fail(e));
+        set.write(&out).unwrap_or_else(|e| fail(e.to_string()));
+        return;
+    }
     if let Some(csv) = imp {
         let out = out.unwrap_or_else(|| usage());
         let set = import(&csv, deadline, pool.as_deref()).unwrap_or_else(|e| fail(e));

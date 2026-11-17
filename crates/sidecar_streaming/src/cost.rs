@@ -247,7 +247,8 @@ pub struct Curve {
 impl Curve {
     pub fn at(&self, x: f64) -> f64 {
         let Some(last) = self.pts.last() else { return 0.0 };
-        match self.pts.iter().find(|p| p.0 >= x) {
+        // The points are sorted by x: the first one at or above `x`.
+        match self.pts.get(self.pts.partition_point(|p| p.0 < x)) {
             Some(p) => p.1,
             None => last.1 + self.slope * (x - last.0),
         }
