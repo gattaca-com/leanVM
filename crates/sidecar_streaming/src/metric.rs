@@ -19,6 +19,7 @@ pub struct JobRec {
     pub child_claims: u32,
     pub new_sigs: u32,
     pub rate: Rate,
+    /// Taken before the request is built and sent, so a job lasts from payload build to completion.
     pub start: Micros,
     pub end: Micros,
     pub predicted: Micros,

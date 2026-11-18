@@ -93,6 +93,7 @@ impl Ctx for DriverCtx<'_, '_> {
             parents: job.children.clone(),
             ready: false,
         });
+        let sent_at = self.backend.now();
         let started = self.backend.start_prove(lane, &job, &self.store, made);
         let id = JobId(self.jobs.len() as u32);
         let op = match (job.children.is_empty(), job.signatures.is_empty()) {
@@ -108,7 +109,7 @@ impl Ctx for DriverCtx<'_, '_> {
             child_claims,
             new_sigs: job.signatures.len() as u32,
             rate: job.rate,
-            start: self.backend.now(),
+            start: sent_at,
             end: 0,
             predicted: started.predicted,
             verify_us: started.verify_us,
@@ -123,6 +124,7 @@ impl Ctx for DriverCtx<'_, '_> {
 
     fn verify(&mut self, lane: usize, proof: ProofId) -> JobId {
         assert!(self.lane_idle(lane), "verify on busy lane {lane}");
+        let sent_at = self.backend.now();
         let started = self.backend.start_verify(lane, proof, &self.store);
         let id = JobId(self.jobs.len() as u32);
         let e = self.store.get(proof);
@@ -134,7 +136,7 @@ impl Ctx for DriverCtx<'_, '_> {
             child_claims: e.info.coverage.len(),
             new_sigs: 0,
             rate: e.info.rate,
-            start: self.backend.now(),
+            start: sent_at,
             end: 0,
             predicted: started.predicted,
             verify_us: started.verify_us,
