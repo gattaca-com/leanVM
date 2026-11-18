@@ -109,12 +109,7 @@ impl<I: Inner> LeafStrategy<I> {
         let last_cost = |ctx: &dyn Ctx, n: usize| with_margin(ctx.cost(&JobShape::extend(kc, kr, n as u32, f)));
         if all_present || s + last_cost(ctx, w.min(cap)) + TICK > d {
             // The last job. If it cannot take everything, take the most that fits.
-            let (mut lo, mut hi) = (0usize, w.min(cap));
-            while lo < hi {
-                let mid = (lo + hi).div_ceil(2);
-                if s + last_cost(ctx, mid) <= d { lo = mid } else { hi = mid - 1 }
-            }
-            let n = lo;
+            let n = most_that_fits(w.min(cap), |n| s + last_cost(ctx, n) <= d);
             let convert = n == 0 && self.kept.is_some() && kr < f && s + last_cost(ctx, 0) <= d;
             if n > 0 || convert {
                 self.launch(ctx, n, f, true);
@@ -153,15 +148,33 @@ impl<I: Inner> LeafStrategy<I> {
         }
         let f = ctx.slot().final_rate;
         let (kc, kr) = self.kept_info(ctx);
-        let (mut lo, mut hi) = (0usize, self.waiting.len().min(ctx.slot().caps.max_new_sigs as usize));
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if self.fits_before_last(ctx, (kc, kr), mid, f) { lo = mid } else { hi = mid - 1 }
-        }
-        if lo > 0 {
-            self.launch(ctx, lo, f, false);
+        let n = most_that_fits(self.waiting.len().min(ctx.slot().caps.max_new_sigs as usize), |n| self.fits_before_last(ctx, (kc, kr), n, f));
+        if n > 0 {
+            self.launch(ctx, n, f, false);
         }
     }
+}
+
+/// The largest `n` in `1..=max` for which `fits(n)` holds, or 0. A scan from the top: right for any cost, including a
+/// table that is not monotone (a bisection stops at a hump). `max` is at most a few thousand.
+pub fn most_that_fits(max: usize, fits: impl Fn(usize) -> bool) -> usize {
+    (1..=max).rev().find(|&n| fits(n)).unwrap_or(0)
+}
+
+/// Sizes `n` in `lo..=hi` at which `cost` steps up by more than 12 % over `n - 1`.
+/// The step is read on the cheapest cost still to come, `floor(n) = min cost(k) for k in n..=hi`. That floor never
+/// falls, and a hump (one size dearer than both neighbours) is not a step.
+pub fn steps(cost: impl Fn(u32) -> f64, lo: u32, hi: u32) -> Vec<u32> {
+    let lo = lo.max(1);
+    if hi < lo {
+        return Vec::new();
+    }
+    let mut floor: Vec<f64> = (lo - 1..=hi).map(|n| if n == 0 { 0.0 } else { cost(n) }).collect();
+    for i in (0..floor.len() - 1).rev() {
+        floor[i] = floor[i].min(floor[i + 1]);
+    }
+    // Size 0 costs nothing, which would be a step at `lo = 1`: start from the first real size.
+    (lo..=hi).filter(|&n| n > 1 && floor[(n - lo + 1) as usize] > 1.12 * floor[(n - lo) as usize]).collect()
 }
 
 impl<I: Inner> Strategy for LeafStrategy<I> {
@@ -359,8 +372,8 @@ impl Inner for StepCutFit {
             return Act::Wait;
         }
         let cost = |n: usize| ctx.cost(&JobShape::extend(v.kept_claims, v.kept_rate, n as u32, f)) as f64;
-        // The largest n <= w at which the cost jumps by more than 12 % over n - 1.
-        let jump = (self.m.max(2)..=v.waiting).rev().find(|&n| cost(n) > 1.12 * cost(n - 1));
+        // The largest n <= w at which the cost steps up by more than 12 % over n - 1, humps left out.
+        let jump = steps(|n| cost(n as usize), self.m.max(2) as u32, v.waiting as u32).last().map(|&n| n as usize);
         match jump {
             Some(j) if j > self.m.max(1) => Act::Go { n: j - 1, rate: f },
             _ => Act::Go { n: v.waiting, rate: f },
@@ -412,14 +425,9 @@ impl Inner for PlanCover {
     fn start(&mut self, ctx: &dyn Ctx) {
         let f = ctx.slot().final_rate;
         let cap = ctx.slot().caps.max_new_sigs;
-        let mut prev = ctx.cost(&JobShape::aggregate(1, f)) as f64;
-        for n in 2..=cap {
-            let c = ctx.cost(&JobShape::aggregate(n, f)) as f64;
-            if c > 1.12 * prev {
-                self.jumps.push(n - 1);
-                self.jumps.push(n);
-            }
-            prev = c;
+        for n in steps(|n| ctx.cost(&JobShape::aggregate(n, f)) as f64, 2, cap) {
+            self.jumps.push(n - 1);
+            self.jumps.push(n);
         }
     }
 
