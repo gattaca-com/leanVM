@@ -229,3 +229,23 @@ fn strategies_run_a_subnet_of_1700() {
         }
     }
 }
+
+/// EXTEND cost follows the new signatures, so a sparse curve must not price 301 new as 750 new.
+#[test]
+fn extend_price_follows_new_signatures_not_kept_size() {
+    for backend in ["perf", "main"] {
+        let Some(text) = real(&format!("model-{backend}-avx2-8c.txt")) else { return };
+        let m = parse_model(&text).unwrap();
+        let cost = |k: u32, n: u32| m.prove_us(&JobShape::extend(k, 2, n, 2), 8) as f64;
+        let (a, b) = (cost(900, 301), cost(300, 301));
+        assert!((a / b - 1.0).abs() < 0.15, "{backend}: kept 900 costs {a}, kept 300 costs {b}");
+        assert!(a < cost(900, 750) * 0.8, "{backend}: n = 301 is priced as n = 750");
+        // The price stays monotone in n for a fixed kept size.
+        let mut prev = 0.0;
+        for n in [1, 50, 150, 300, 301, 400, 548, 750] {
+            let c = cost(900, n);
+            assert!(c + 30_000.0 >= prev, "{backend}: price falls at n = {n}");
+            prev = c;
+        }
+    }
+}

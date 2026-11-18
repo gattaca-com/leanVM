@@ -350,12 +350,28 @@ impl TableModel {
         }
     }
 
-    /// EXTEND time: the curve of the smallest measured kept size at or above `kept` (the largest, if none is).
+    /// EXTEND time, priced from the curve that measured `new` most closely.
+    ///
+    /// The measurements show that EXTEND cost follows the new signatures, not the kept size. Some curves are sparse
+    /// (for example 1, 50, 150, 300, 750 new), and `Curve::at` rounds up to the next measured point. A curve for the
+    /// kept size would price 301 new as 750 new. So among all curves, take the one whose first point at or above `new`
+    /// lies nearest to `new`. Ties go to the curve of the smallest measured kept size at or above `kept` (the
+    /// largest, if none is). A curve with no point at or above `new` is used only if no curve has one.
     fn ext_at(&self, r: usize, kept: f64, new: f64) -> f64 {
         let v = &self.ext[r];
         let Some(last) = v.last() else { return self.agg[r].at(new) };
-        let (_, curve) = v.iter().find(|(k, _)| *k >= kept).unwrap_or(last);
-        curve.at(new)
+        let (_, preferred) = v.iter().find(|(k, _)| *k >= kept).unwrap_or(last);
+        let gap = |c: &Curve| c.pts.get(c.pts.partition_point(|p| p.0 < new)).map(|p| p.0 - new);
+        let mut best = (preferred, gap(preferred));
+        for (_, c) in v {
+            let g = gap(c);
+            if let Some(g) = g
+                && best.1.is_none_or(|b| g < b)
+            {
+                best = (c, Some(g));
+            }
+        }
+        best.0.at(new)
     }
 
     fn rec_at(&self, r: usize, n: f64, avg_claims: f64) -> f64 {
