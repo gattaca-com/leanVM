@@ -14,6 +14,8 @@ use std::rc::Rc;
 pub struct RunResult {
     pub row: Row,
     pub record: SlotRecord,
+    /// Jobs the estimator had learned from when this run started; 0 with no estimator.
+    pub est_jobs: usize,
 }
 
 /// The runs of a slot: one per (subnet, view) for `Leaf`, one for `Merge`. A run's id is `(slot * subnets + subnet) * views + view`.
@@ -82,11 +84,12 @@ pub fn run_set(
         warm_up(backend, set, &job.spec, job.forecast.as_ref(), job.grace, d, slots.clone(), job.warmup, &mut est)?;
         for slot in slots.clone() {
             for (id, subnet, view) in runs_of(set, slot) {
+                let est_jobs = est.as_ref().map_or(0, |e| e.jobs_seen());
                 let mut strategy = job.spec.make(job.forecast.as_ref())?;
                 let spec = RunSpec { set, slot, subnet, view, deadline: d, caps: backend.caps(), grace: job.grace };
                 let record = run_slot_with(backend, strategy.as_mut(), &spec, calib::lend(&mut est));
                 let row = Row { set: set_name.into(), backend: backend_name.into(), strategy: strategy.name(), deadline_us: d, slot: id, m: slot_metrics(&record) };
-                let r = RunResult { row, record };
+                let r = RunResult { row, record, est_jobs };
                 progress(&r);
                 out.push(r);
             }

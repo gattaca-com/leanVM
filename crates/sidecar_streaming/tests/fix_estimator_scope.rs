@@ -50,3 +50,26 @@ fn warmup_slots_parses() {
     assert_eq!(warmup_slots(&args(&["--warmup-slots", "5"])).unwrap(), 5);
     assert!(warmup_slots(&args(&["--warmup-slots", "-1"])).is_err());
 }
+
+fn jobs_at_start(deadlines: &[Micros], warmup: u32) -> Vec<(Micros, u32, usize)> {
+    let set = make_set(&leaf_params(), 4, 12);
+    let mut b = sim(STEPPED);
+    let job = Study { cost: CostKind::Calibrated, grace: 0, spec: Spec::parse("one_shot_late").unwrap(), forecast: None, warmup };
+    run_set(&mut b, &set, "set", "test", &job, deadlines, 0..4, |_| {}).unwrap().into_iter().map(|r| (r.row.deadline_us, r.row.slot, r.est_jobs)).collect()
+}
+
+/// The state `streamsim live` prints per slot: what the estimator has learned when the run starts. `run_set` serves
+/// the sim and live paths, so this is the live state too.
+#[test]
+fn the_estimator_is_warm_at_the_start_of_every_scored_slot() {
+    let cold = jobs_at_start(&[1_800_000, 2_500_000], 0);
+    // Cold: slot 0 starts with nothing, slot 1 with the job of slot 0. A new deadline starts over.
+    assert_eq!((cold[0].2, cold[1].2), (0, 1));
+    assert_eq!(cold[4].2, 0);
+    let warm = jobs_at_start(&[1_800_000, 2_500_000], 2);
+    assert!(warm.iter().all(|r| r.2 >= 2), "{warm:?}");
+    // The estimator persists across the slots of a deadline.
+    assert_eq!(warm[0].2, 2);
+    assert_eq!(warm[3].2, 5);
+    assert_eq!(warm[4].2, 2);
+}

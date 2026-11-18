@@ -59,6 +59,10 @@ pub trait CostEstimator {
     fn estimate(&self, shape: &JobShape) -> Micros;
     /// A prove job finished. Called for every completion, also one that ended after the deadline.
     fn observe(&mut self, obs: &Observation);
+    /// Jobs learned from so far, for traces.
+    fn jobs_seen(&self) -> usize {
+        0
+    }
 }
 
 /// The numbers a fresh estimator starts from, in one place.
@@ -199,6 +203,10 @@ impl Calibrated {
 }
 
 impl CostEstimator for Calibrated {
+    fn jobs_seen(&self) -> usize {
+        self.jobs_kept()
+    }
+
     fn estimate(&self, shape: &JobShape) -> Micros {
         let c = class(shape.children.len(), shape.new_sigs);
         let n = shape.new_sigs as f64;
