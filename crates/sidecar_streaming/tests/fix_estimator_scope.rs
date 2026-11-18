@@ -11,7 +11,7 @@ use sidecar_streaming::types::*;
 fn rows(deadlines: &[Micros], spec: &str, warmup: u32) -> Vec<Row> {
     let set = make_set(&leaf_params(), 6, 12);
     let mut b = sim(STEPPED);
-    let job = Study { cost: CostKind::Calibrated, grace: 0, spec: Spec::parse(spec).unwrap(), forecast: None, warmup };
+    let job = Study { cost: CostKind::Calibrated, grace: 0, spec: Spec::parse(spec).unwrap(), forecast: None, warmup, state: None };
     run_set(&mut b, &set, "set", "test", &job, deadlines, 0..6, |_| {}).unwrap().into_iter().map(|r| r.row).collect()
 }
 
@@ -54,7 +54,7 @@ fn warmup_slots_parses() {
 fn jobs_at_start(deadlines: &[Micros], warmup: u32) -> Vec<(Micros, u32, usize)> {
     let set = make_set(&leaf_params(), 4, 12);
     let mut b = sim(STEPPED);
-    let job = Study { cost: CostKind::Calibrated, grace: 0, spec: Spec::parse("one_shot_late").unwrap(), forecast: None, warmup };
+    let job = Study { cost: CostKind::Calibrated, grace: 0, spec: Spec::parse("one_shot_late").unwrap(), forecast: None, warmup, state: None };
     run_set(&mut b, &set, "set", "test", &job, deadlines, 0..4, |_| {}).unwrap().into_iter().map(|r| (r.row.deadline_us, r.row.slot, r.est_jobs)).collect()
 }
 

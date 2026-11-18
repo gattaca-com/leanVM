@@ -40,6 +40,16 @@ impl CostKind {
     }
 }
 
+impl CostKind {
+    /// The estimator of `estimator` with the state of a `dump`. `None` for the table.
+    pub fn restore(self, shape: Shape, lines: &[String]) -> Result<Option<Box<dyn CostEstimator>>, String> {
+        match (self, shape) {
+            (CostKind::Calibrated, Shape::Leaf) => Ok(Some(Box::new(Calibrated::restore(lines)?))),
+            _ => Ok(None),
+        }
+    }
+}
+
 /// The estimator of `CostKind::estimator`, lent to one slot.
 pub fn lend(est: &mut Option<Box<dyn CostEstimator>>) -> Option<&mut dyn CostEstimator> {
     est.as_mut().map(|b| -> &mut dyn CostEstimator { b.as_mut() })
@@ -62,6 +72,10 @@ pub trait CostEstimator {
     /// Jobs learned from so far, for traces.
     fn jobs_seen(&self) -> usize {
         0
+    }
+    /// The learned state as text lines, for `--estimator-state`. `Calibrated::restore` reads it back.
+    fn dump(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -224,9 +238,68 @@ impl CostEstimator for Calibrated {
         if v.len() > KEEP {
             v.pop_front();
         }
+        self.refit(c, o.rate);
+    }
+
+    fn dump(&self) -> Vec<String> {
+        let mut keys: Vec<(Class, Rate)> = self.obs.keys().copied().collect();
+        keys.sort_by_key(|(c, r)| (c.letter(), *r));
+        keys.iter().flat_map(|k| self.obs[k].iter().map(move |(n, us)| format!("{} {} {} {}", k.0.letter(), k.1, n, us))).collect()
+    }
+}
+
+impl Class {
+    fn letter(self) -> char {
+        match self {
+            Class::Aggregate => 'A',
+            Class::Extend => 'E',
+            Class::Convert => 'C',
+        }
+    }
+
+    fn from_letter(s: &str) -> Option<Class> {
+        match s {
+            "A" => Some(Class::Aggregate),
+            "E" => Some(Class::Extend),
+            "C" => Some(Class::Convert),
+            _ => None,
+        }
+    }
+}
+
+impl Calibrated {
+    /// Fit the line and margin of one (class, rate) from its kept jobs.
+    fn refit(&mut self, c: Class, rate: Rate) {
+        let v = &self.obs[&(c, rate)];
         let (fixed, slope) = line(c, v);
         let worst = v.iter().map(|ob| ob.1 / (fixed + slope * ob.0).max(1.0)).fold(1.0, f64::max);
-        self.fit.insert((c, o.rate), Fit { fixed, slope, worst, jobs: v.len() });
+        self.fit.insert((c, rate), Fit { fixed, slope, worst, jobs: v.len() });
+    }
+
+    /// The estimator a `dump` came from. Every line is checked: a bad line is an error, not a skipped job.
+    pub fn restore(lines: &[String]) -> Result<Calibrated, String> {
+        let mut c = Calibrated::new();
+        for l in lines {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let bad = || format!("estimator state: bad line `{l}`");
+            if f.len() != 4 {
+                return Err(bad());
+            }
+            let class = Class::from_letter(f[0]).ok_or_else(bad)?;
+            let rate: Rate = f[1].parse().map_err(|_| bad())?;
+            let (n, us): (f64, f64) = (f[2].parse().map_err(|_| bad())?, f[3].parse().map_err(|_| bad())?);
+            if !(n.is_finite() && us.is_finite() && n >= 0.0 && us > 0.0) {
+                return Err(bad());
+            }
+            let v = c.obs.entry((class, rate)).or_default();
+            v.push_back((n, us));
+            if v.len() > KEEP {
+                return Err(format!("estimator state: more than {KEEP} jobs of one class and rate"));
+            }
+        }
+        let keys: Vec<(Class, Rate)> = c.obs.keys().copied().collect();
+        keys.into_iter().for_each(|(k, r)| c.refit(k, r));
+        Ok(c)
     }
 }
 

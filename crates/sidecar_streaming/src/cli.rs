@@ -4,7 +4,9 @@ use crate::cost::{CostModel, Kv, load_model};
 use crate::forecast::Forecast;
 use crate::types::Micros;
 use std::collections::HashMap;
-use std::path::Path;
+use crate::runner::StateSpec;
+use arrival_model::schedule::ScheduleSet;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// `--key value` pairs and bare flags.
@@ -135,6 +137,19 @@ pub const DEFAULT_WARMUP: u32 = 2;
 /// discarded. Default 2. 0 scores from a cold estimator. It has no effect with `--strategy-cost table`.
 pub fn warmup_slots(a: &Args) -> Result<u32, String> {
     a.num("warmup-slots", DEFAULT_WARMUP)
+}
+
+/// `--estimator-state FILE`: load each deadline's estimator from FILE when it has an entry, and save them there at the
+/// end. `--warmup-set SET` (needs the file): a deadline with no entry warms on the first `--warmup-slots` slots of SET.
+pub fn state_spec(a: &Args) -> Result<Option<StateSpec>, String> {
+    let Some(path) = a.get("estimator-state") else {
+        if a.get("warmup-set").is_some() {
+            return Err("--warmup-set needs --estimator-state".into());
+        }
+        return Ok(None);
+    };
+    let warmup_set = a.get("warmup-set").map(|d| ScheduleSet::read(Path::new(d))).transpose()?;
+    Ok(Some(StateSpec { path: PathBuf::from(path), warmup_set }))
 }
 
 /// `--strategy-cost calibrated|table`, default calibrated.

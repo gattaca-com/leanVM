@@ -8,6 +8,8 @@ use crate::metric::{JobRec, Row, SlotRecord, slot_metrics};
 use crate::strategies::Spec;
 use crate::types::*;
 use arrival_model::schedule::ScheduleSet;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// One executed run: the metric row and the record it came from.
@@ -36,6 +38,44 @@ pub struct Study {
     pub forecast: Option<Rc<Forecast>>,
     /// Slots run and discarded before each deadline's scored slots; see `warm_up`.
     pub warmup: u32,
+    /// `--estimator-state`: carry each deadline's estimator from one call to the next.
+    pub state: Option<StateSpec>,
+}
+
+/// A file with the estimator of each deadline, and the set to warm on while the file has no entry for a deadline.
+pub struct StateSpec {
+    pub path: PathBuf,
+    /// `--warmup-set`: warm on its first slots instead of the run's own set. `None` warms on the run's own set.
+    pub warmup_set: Option<ScheduleSet>,
+}
+
+/// The state file: per deadline, a line `D <microseconds>` and then the lines of `CostEstimator::dump`.
+pub fn read_state(path: &Path) -> Result<BTreeMap<Micros, Vec<String>>, String> {
+    let mut out: BTreeMap<Micros, Vec<String>> = BTreeMap::new();
+    if !path.exists() {
+        return Ok(out);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut cur: Option<Micros> = None;
+    for l in text.lines().filter(|l| !l.trim().is_empty()) {
+        if let Some(d) = l.strip_prefix("D ") {
+            let d: Micros = d.trim().parse().map_err(|_| format!("{}: bad line `{l}`", path.display()))?;
+            out.entry(d).or_default();
+            cur = Some(d);
+        } else {
+            out.get_mut(&cur.ok_or_else(|| format!("{}: a job line before any `D` line", path.display()))?).unwrap().push(l.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn write_state(path: &Path, state: &BTreeMap<Micros, Vec<String>>) -> Result<(), String> {
+    let mut text = String::new();
+    for (d, lines) in state {
+        text += &format!("D {d}\n");
+        lines.iter().for_each(|l| text += &format!("{l}\n"));
+    }
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Run the first `n` slots of `slots` at deadline `d` for `est` to learn from, and discard the results. Does nothing
@@ -78,10 +118,26 @@ pub fn run_set(
     mut progress: impl FnMut(&RunResult),
 ) -> Result<Vec<RunResult>, String> {
     let mut out = Vec::new();
+    let shape = if set.meta.shape == "merge" { Shape::Merge } else { Shape::Leaf };
+    let mut saved = match &job.state {
+        Some(s) => read_state(&s.path)?,
+        None => BTreeMap::new(),
+    };
     for &d in deadlines {
         // One estimator per deadline, warmed on discarded slots: a row does not depend on the other deadlines.
-        let mut est = job.cost.estimator(if set.meta.shape == "merge" { Shape::Merge } else { Shape::Leaf });
-        warm_up(backend, set, &job.spec, job.forecast.as_ref(), job.grace, d, slots.clone(), job.warmup, &mut est)?;
+        // With a state file that has this deadline, the estimator is the one the last call left.
+        let mut est = match saved.get(&d) {
+            Some(lines) => job.cost.restore(shape, lines)?,
+            None => {
+                let mut est = job.cost.estimator(shape);
+                let (wset, wslots) = match job.state.as_ref().and_then(|s| s.warmup_set.as_ref()) {
+                    Some(w) => (w, 0..w.meta.slots),
+                    None => (set, slots.clone()),
+                };
+                warm_up(backend, wset, &job.spec, job.forecast.as_ref(), job.grace, d, wslots, job.warmup, &mut est)?;
+                est
+            }
+        };
         for slot in slots.clone() {
             for (id, subnet, view) in runs_of(set, slot) {
                 let est_jobs = est.as_ref().map_or(0, |e| e.jobs_seen());
@@ -94,6 +150,12 @@ pub fn run_set(
                 out.push(r);
             }
         }
+        if let Some(e) = &est {
+            saved.insert(d, e.dump());
+        }
+    }
+    if let Some(s) = &job.state {
+        write_state(&s.path, &saved)?;
     }
     Ok(out)
 }
