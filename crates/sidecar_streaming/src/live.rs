@@ -58,6 +58,9 @@ pub struct LiveBackend {
     rejected: Option<String>,
     /// How late each wake-up came, in microseconds.
     pub lateness_us: Vec<u64>,
+    /// Jump the clock over the idle start of a slot: the first wait of a slot, with no request out, ends 100 ms before its target.
+    pub skip_idle: bool,
+    first_wait: bool,
 }
 
 fn status_text(r: &Response) -> String {
@@ -90,6 +93,8 @@ impl LiveBackend {
             inflight: None,
             rejected: None,
             lateness_us: Vec::new(),
+            skip_idle: false,
+            first_wait: false,
         })
     }
 
@@ -223,6 +228,7 @@ impl Backend for LiveBackend {
         self.proofs.clear();
         self.made.clear();
         self.t0 = Instant::now();
+        self.first_wait = true;
     }
 
     fn receive(&mut self, id: ProofId, pool_entry: &PoolEntry, valid: bool) {
@@ -274,6 +280,13 @@ impl Backend for LiveBackend {
     }
 
     fn wait(&mut self, until: Micros) -> Option<Done> {
+        let first = std::mem::replace(&mut self.first_wait, false);
+        if first && self.skip_idle && self.inflight.is_none() && self.rejected.is_none() && until != Micros::MAX {
+            let now = self.elapsed();
+            if until > now + 100_000 {
+                self.t0 -= Duration::from_micros(until - 100_000 - now);
+            }
+        }
         if let Some(why) = self.rejected.take() {
             let at = self.elapsed();
             return Some(Done { lane: 0, at, outcome: Outcome::Failed(Failure::Rejected(why)) });
@@ -354,6 +367,7 @@ fn run_locked(a: &Args) -> Result<(), String> {
         spec.default_param("verify", a.get("verify-policy").unwrap_or("all_idle"));
     }
     let mut backend = LiveBackend::open(Path::new(a.need("channel")?), Path::new(signatures), model, &label, Path::new(cache))?;
+    backend.skip_idle = !a.flag("no-skip-idle");
     let set_name = Path::new(set_dir).file_name().map_or(set_dir.to_string(), |s| s.to_string_lossy().into());
     let job = Study { spec, forecast: load_forecast(a)? };
     let results = run_set(&mut backend, &set, &set_name, &label, &job, &deadlines, slots, |r| eprintln!("slot {} D {} ms: coverage {:.3}", r.row.slot, r.row.deadline_us / 1000, r.row.m.coverage))?;

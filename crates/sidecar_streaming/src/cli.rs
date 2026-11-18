@@ -12,7 +12,7 @@ pub struct Args {
     map: HashMap<String, String>,
 }
 
-const FLAGS: &[&str] = &["abort", "verify-lane", "no-noise", "by-arrival", "force", "ignored"];
+const FLAGS: &[&str] = &["abort", "verify-lane", "no-noise", "by-arrival", "force", "ignored", "no-skip-idle"];
 
 impl Args {
     pub fn parse(args: &[String]) -> Result<Args, String> {
