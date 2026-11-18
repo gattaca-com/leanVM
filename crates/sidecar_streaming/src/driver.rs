@@ -19,6 +19,8 @@ pub struct RunSpec<'a> {
     pub view: u8,
     pub deadline: Micros,
     pub caps: Caps,
+    /// A proof finished by `deadline + grace` counts. A strategy still plans against `deadline`.
+    pub grace: Micros,
 }
 
 struct Arrival {
@@ -290,14 +292,17 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
     strategy.on_event(Event::SlotStart, &mut ctx);
     let (mut ai, mut pending): (usize, Option<Done>) = (0, None);
     let deadline = spec.deadline;
+    // Inputs stop at `deadline`; completions and timers go on until the end of the grace window.
+    let end = deadline + spec.grace;
     loop {
-        let t_arr = arrivals.get(ai).map_or(Micros::MAX, |a| a.t);
+        let t_arr = arrivals.get(ai).filter(|a| a.t <= deadline).map_or(Micros::MAX, |a| a.t);
         let t_tim = ctx.timers.peek().map_or(Micros::MAX, |r| r.0.0);
         let busy = ctx.lane_job.iter().any(Option::is_some);
         if t_arr == Micros::MAX && t_tim == Micros::MAX && !busy && pending.is_none() {
             break;
         }
-        let tn = t_arr.min(t_tim).min(deadline).max(ctx.backend.now());
+        let wake = if ctx.backend.now() < deadline { deadline } else { end };
+        let tn = t_arr.min(t_tim).min(wake).max(ctx.backend.now());
         let done = pending.take().or_else(|| ctx.backend.wait(tn));
         if let Some(d) = done {
             if t_arr <= d.at {
@@ -310,7 +315,7 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
             }
         }
         let now = ctx.backend.now();
-        while arrivals.get(ai).is_some_and(|a| a.t <= now) {
+        while arrivals.get(ai).is_some_and(|a| a.t <= now.min(deadline)) {
             let a = &arrivals[ai];
             ai += 1;
             let event = match a.kind {
@@ -342,13 +347,17 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
             let Reverse((_, _, token)) = ctx.timers.pop().unwrap();
             strategy.on_event(Event::Timer(token), &mut ctx);
         }
-        if now >= deadline {
+        if now >= end {
+            break;
+        }
+        // Past the deadline the slot is settled once a proof is out, or once no job can still bring a better one.
+        if now >= deadline && (ctx.published.is_some() || !ctx.lane_job.iter().any(Option::is_some)) {
             break;
         }
     }
-    // The driver's own timer, not the strategy's: at the deadline, or when nothing more can happen, a slot that
-    // published nothing publishes the best proof finished by then. A job still running is not that proof.
-    let at = ctx.backend.now().min(deadline);
+    // The driver's own timer, not the strategy's: at the end of the grace window, or when nothing more can happen,
+    // a slot that published nothing publishes the best proof finished by then. A job still running is not that proof.
+    let at = ctx.backend.now().min(end);
     ctx.fallback(at);
     // A job still running at the deadline is written down, not delivered.
     while ctx.lane_job.iter().any(Option::is_some) {
@@ -373,5 +382,5 @@ fn finish(mut ctx: DriverCtx, inputs: Vec<InputRec>, spec: &RunSpec) -> SlotReco
         // A job is useful if it made an ancestor of the published proof, or verified one.
         j.useful = matches!(t, Target::Prove(p) | Target::Verify(p) if useful.contains(p));
     }
-    SlotRecord { shape: ctx.info.shape, deadline: spec.deadline, inputs, published, jobs: ctx.jobs, sent_override: None }
+    SlotRecord { shape: ctx.info.shape, deadline: spec.deadline, inputs, published, jobs: ctx.jobs, sent_override: None, grace: spec.grace }
 }

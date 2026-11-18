@@ -28,6 +28,8 @@ pub fn runs_of(set: &ScheduleSet, slot: u32) -> Vec<(u32, u8, u8)> {
 pub struct Study {
     /// Where the strategy gets its job costs. State carries over all slots and deadlines of one `run_set`.
     pub cost: CostKind,
+    /// A proof finished by `D + grace` counts.
+    pub grace: Micros,
     pub spec: Spec,
     pub forecast: Option<Rc<Forecast>>,
 }
@@ -49,7 +51,7 @@ pub fn run_set(
         for slot in slots.clone() {
             for (id, subnet, view) in runs_of(set, slot) {
                 let mut strategy = job.spec.make(job.forecast.as_ref())?;
-                let spec = RunSpec { set, slot, subnet, view, deadline: d, caps: backend.caps() };
+                let spec = RunSpec { set, slot, subnet, view, deadline: d, caps: backend.caps(), grace: job.grace };
                 let record = run_slot_with(backend, strategy.as_mut(), &spec, calib::lend(&mut est));
                 let row = Row { set: set_name.into(), backend: backend_name.into(), strategy: strategy.name(), deadline_us: d, slot: id, m: slot_metrics(&record) };
                 let r = RunResult { row, record };

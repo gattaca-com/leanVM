@@ -84,6 +84,7 @@ fn leaf_record(inputs: &[(u64, u32)], published: Option<(u64, &[u32])>, d: u64) 
         published: published.map(|(t, c)| (t, cov(c))),
         jobs: Vec::new(),
         sent_override: None,
+        grace: 0,
     }
 }
 
@@ -120,6 +121,7 @@ fn metric_hand_cases() {
         published: Some((900, cov(&(0..15).collect::<Vec<_>>()))),
         jobs: Vec::new(),
         sent_override: None,
+        grace: 0,
     };
     let m = slot_metrics(&rec);
     assert_eq!((m.got, m.arrived, m.sent), (15, 15, 115));
@@ -195,7 +197,7 @@ fn vote(t_us: u64, id: u32) -> Arrival {
 
 fn run_script(backend: &mut dyn Backend, set: &ScheduleSet, s: &mut Script, d: u64) -> SlotRecord {
     let caps = backend.caps();
-    run_slot(backend, s, &RunSpec { set, slot: 0, subnet: 0, view: 0, deadline: d, caps })
+    run_slot(backend, s, &RunSpec { set, slot: 0, subnet: 0, view: 0, deadline: d, caps, grace: 0 })
 }
 
 #[test]
@@ -256,7 +258,7 @@ fn second_publish_panics() {
         }
     }
     let mut t = Twice(Script { log: Vec::new(), on_start: std::mem::replace(&mut s.on_start, Box::new(|_| {})) });
-    run_slot(&mut backend, &mut t, &RunSpec { set: &set, slot: 0, subnet: 0, view: 0, deadline: 3_000_000, caps: Caps::default() });
+    run_slot(&mut backend, &mut t, &RunSpec { set: &set, slot: 0, subnet: 0, view: 0, deadline: 3_000_000, caps: Caps::default(), grace: 0 });
 }
 
 #[test]
@@ -320,7 +322,7 @@ fn sim_invalid_child() {
         }
     }
     let mut t = Try(Vec::new(), Vec::new());
-    run_slot(&mut backend, &mut t, &RunSpec { set: &set, slot: 0, subnet: 0, view: 0, deadline: 3_000_000, caps: Caps::default() });
+    run_slot(&mut backend, &mut t, &RunSpec { set: &set, slot: 0, subnet: 0, view: 0, deadline: 3_000_000, caps: Caps::default(), grace: 0 });
     // The second child is bad: the job fails after verifying the first two, and names the second.
     assert_eq!(t.1.len(), 1);
     assert_eq!(t.1[0].0, 3000 + 2 * v);

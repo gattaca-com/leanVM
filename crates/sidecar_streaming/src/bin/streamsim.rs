@@ -103,7 +103,7 @@ fn cmd_sim(a: &Args) -> Result<(), String> {
             eprintln!("skipping {}: no --train set", spec.name);
             continue;
         }
-        let job = Study { spec, forecast: forecast.clone(), cost: cost_kind(a)? };
+        let job = Study { spec, forecast: forecast.clone(), cost: cost_kind(a)?, grace: grace_us(a)? };
         let results = run_set(&mut backend, &set, &set_name, &backend_name, &job, &deadlines, slots.clone(), |_| {})?;
         for r in results {
             if want_jobs {
@@ -198,6 +198,11 @@ fn cmd_report(a: &Args) -> Result<(), String> {
     let mut rows = Vec::new();
     for f in files.split_whitespace() {
         rows.extend(read_rows(f)?);
+    }
+    // With --grace-ms a proof published after D + grace counts for nothing; without it the rows stand as written.
+    if a.get("grace-ms").is_some() {
+        let g = grace_us(a)?;
+        rows.iter_mut().for_each(|r| r.rescore_grace(g));
     }
     let text = report(&rows, a.get("baseline"), a.flag("by-arrival"));
     match a.get("out") {

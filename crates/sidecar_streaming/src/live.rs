@@ -369,7 +369,7 @@ fn run_locked(a: &Args) -> Result<(), String> {
     let mut backend = LiveBackend::open(Path::new(a.need("channel")?), Path::new(signatures), model, &label, Path::new(cache))?;
     backend.skip_idle = !a.flag("no-skip-idle");
     let set_name = Path::new(set_dir).file_name().map_or(set_dir.to_string(), |s| s.to_string_lossy().into());
-    let job = Study { spec, forecast: load_forecast(a)?, cost: cost_kind(a)? };
+    let job = Study { spec, forecast: load_forecast(a)?, cost: cost_kind(a)?, grace: grace_us(a)? };
     let results = run_set(&mut backend, &set, &set_name, &label, &job, &deadlines, slots, |r| eprintln!("slot {} D {} ms: coverage {:.3}", r.row.slot, r.row.deadline_us / 1000, r.row.m.coverage))?;
     let mut text = format!("{ROW_HEADER}\n");
     let mut jobs = vec![JOBS_HEADER.to_string()];

@@ -16,7 +16,7 @@ merge.step 400\nmerge.w0 0\nmerge.t0.1 60000\nmerge.lin.1 600\nmerge.pad.1 0\nme
 /// One slot with the strategy pricing jobs by `est` (`None`: the backend's table).
 pub fn run_est(backend: &mut dyn Backend, set: &arrival_model::schedule::ScheduleSet, slot: u32, d: Micros, spec: &str, est: Option<&mut dyn CostEstimator>) -> (SlotRecord, Metrics) {
     let mut s = Spec::parse(spec).unwrap().make(None).unwrap();
-    let rs = RunSpec { set, slot, subnet: 0, view: 0, deadline: d, caps: backend.caps() };
+    let rs = RunSpec { set, slot, subnet: 0, view: 0, deadline: d, caps: backend.caps(), grace: 0 };
     let rec = run_slot_with(backend, s.as_mut(), &rs, est);
     let m = slot_metrics(&rec);
     (rec, m)

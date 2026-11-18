@@ -54,7 +54,7 @@ pub fn run(backend: &mut dyn Backend, set: &ScheduleSet, slot: u32, d: Micros, s
     }
     let fc = train.map(|t| std::rc::Rc::new(sidecar_streaming::forecast::Forecast::from_schedule_set(t)));
     let mut s = spec.make(fc.as_ref()).unwrap();
-    let rs = RunSpec { set, slot, subnet: 0, view: 0, deadline: d, caps: backend.caps() };
+    let rs = RunSpec { set, slot, subnet: 0, view: 0, deadline: d, caps: backend.caps(), grace: 0 };
     let rec = run_slot(backend, s.as_mut(), &rs);
     let m = slot_metrics(&rec);
     (rec, m)

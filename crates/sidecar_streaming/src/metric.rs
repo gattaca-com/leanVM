@@ -41,6 +41,8 @@ pub struct SlotRecord {
     pub jobs: Vec<JobRec>,
     /// `end_to_end` charges `sent` to the votes of all 16 subnets.
     pub sent_override: Option<u32>,
+    /// A proof published by `deadline + grace` counts. `arrived` still counts the inputs by `deadline`.
+    pub grace: Micros,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,7 +68,7 @@ fn ratio(a: u32, b: u32) -> f64 {
 }
 
 pub fn slot_metrics(rec: &SlotRecord) -> Metrics {
-    let on_time = rec.published.as_ref().filter(|(t, _)| *t <= rec.deadline);
+    let on_time = rec.published.as_ref().filter(|(t, _)| *t <= rec.deadline + rec.grace);
     let got = on_time.map_or(0, |(_, c)| c.len());
     let mut by_d = Coverage::empty();
     let mut all = Coverage::empty();
@@ -110,7 +112,8 @@ pub fn slot_metrics(rec: &SlotRecord) -> Metrics {
         published_us: rec.published.as_ref().map(|(t, _)| *t),
         cut_us: cut,
         staleness_us: on_time.zip(cut).map(|((t, _), c)| t.saturating_sub(c)),
-        slack_us: on_time.map(|(t, _)| rec.deadline - t),
+        // Zero for a proof that came inside the grace window.
+        slack_us: on_time.map(|(t, _)| rec.deadline.saturating_sub(*t)),
         jobs: rec.jobs.len() as u32,
         busy_us: rec.jobs.iter().map(|j| j.end - j.start).sum(),
         wasted_us: rec.jobs.iter().filter(|j| !j.useful).map(|j| j.end - j.start).sum(),
@@ -159,6 +162,23 @@ impl Row {
             m.wasted_us,
             m.verify_us
         )
+    }
+
+    /// Score the row as if the grace window were `grace_us`: a proof published after `deadline + grace_us` counts for
+    /// nothing. A row cannot be given more grace than it was run with.
+    pub fn rescore_grace(&mut self, grace_us: Micros) {
+        let m = &mut self.m;
+        if m.published_us.is_some_and(|t| t > self.deadline_us + grace_us) {
+            m.got = 0;
+            m.coverage = if m.arrived == 0 { f64::NAN } else { 0.0 };
+            m.coverage_sent = if m.sent == 0 { f64::NAN } else { 0.0 };
+            m.published_us = None;
+            m.cut_us = None;
+            m.staleness_us = None;
+            m.slack_us = None;
+        } else if m.published_us.is_some_and(|t| t > self.deadline_us) {
+            m.slack_us = Some(0);
+        }
     }
 
     pub fn from_csv(line: &str) -> Result<Row, String> {

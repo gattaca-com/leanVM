@@ -107,6 +107,15 @@ pub fn load_args(a: &Args, path: &Path) -> Result<(Box<dyn CostModel>, String), 
     Ok((model, name))
 }
 
+/// `--grace-ms X`: a proof finished by `D + X` counts. Default 0. Milliseconds in, microseconds out.
+pub fn grace_us(a: &Args) -> Result<Micros, String> {
+    let ms: f64 = a.num("grace-ms", 0.0)?;
+    if !(ms >= 0.0 && ms.is_finite()) {
+        return Err(format!("--grace-ms: {ms} is not a time at or above zero"));
+    }
+    Ok((ms * 1000.0).round() as Micros)
+}
+
 /// `--strategy-cost calibrated|table`, default calibrated.
 pub fn cost_kind(a: &Args) -> Result<crate::calib::CostKind, String> {
     a.get("strategy-cost").map_or(Ok(crate::calib::CostKind::Calibrated), crate::calib::CostKind::parse)

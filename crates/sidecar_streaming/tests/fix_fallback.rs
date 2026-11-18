@@ -34,7 +34,7 @@ fn the_best_finished_proof_is_published_when_the_last_job_overruns() {
     for slot in 0..3 {
         let mut b = sim(SMOOTH);
         let mut s = Spec::parse("greedy_fit").unwrap().make(None).unwrap();
-        let rs = RunSpec { set: &set, slot, subnet: 0, view: 0, deadline: d, caps: b.caps() };
+        let rs = RunSpec { set: &set, slot, subnet: 0, view: 0, deadline: d, caps: b.caps(), grace: 0 };
         let rec = run_slot_with(&mut b, s.as_mut(), &rs, Some(&mut Optimist));
         let m = slot_metrics(&rec);
         let last = rec.jobs.last().unwrap();
@@ -89,7 +89,7 @@ fn a_finished_proof_is_published_without_a_tick_near_d() {
     let d = 2_505_000;
     for slot in 0..2 {
         let mut b = sim(SMOOTH);
-        let rs = RunSpec { set: &set, slot, subnet: 0, view: 0, deadline: d, caps: b.caps() };
+        let rs = RunSpec { set: &set, slot, subnet: 0, view: 0, deadline: d, caps: b.caps(), grace: 0 };
         let rec = run_slot(&mut b, &mut Drift { sigs: Vec::new(), kept: None, busy: false }, &rs);
         let m = slot_metrics(&rec);
         assert_eq!(m.got, m.arrived, "slot {slot}");

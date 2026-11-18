@@ -24,6 +24,7 @@ fn merge_cut_ignores_a_later_subset_candidate() {
         published: Some((900, cov(0..15))),
         jobs: Vec::new(),
         sent_override: None,
+        grace: 0,
     };
     let m = slot_metrics(&rec);
     assert_eq!((m.cut_us, m.staleness_us), (Some(200), Some(700)));

@@ -51,7 +51,7 @@ fn noise_is_independent_per_run() {
     let set = two_subnet_set();
     let duration = |subnet: u8| {
         let mut backend = sidecar_streaming::sim::SimBackend::new(model(&text), Caps::default(), 1, true);
-        let rec = run_slot(&mut backend, &mut OneJob, &RunSpec { set: &set, slot: 0, subnet, view: 0, deadline: 3_000_000, caps: Caps::default() });
+        let rec = run_slot(&mut backend, &mut OneJob, &RunSpec { set: &set, slot: 0, subnet, view: 0, deadline: 3_000_000, caps: Caps::default(), grace: 0 });
         rec.jobs[0].end - rec.jobs[0].start
     };
     assert_ne!(duration(0), duration(1));

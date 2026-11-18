@@ -68,6 +68,7 @@ pub fn run(a: &Args) -> Result<(), String> {
     let slots = parse_range(a.get("slots").unwrap_or("100000"), leaf.meta.slots)?;
     let seed = a.num("seed", 1u64)?;
     let noise = !a.flag("no-noise");
+    let grace = grace_us(a)?;
     let mut leaf_spec = Spec::parse(a.need("leaf-strategy")?)?;
     let mut merge_spec = Spec::parse(a.need("merge-strategy")?)?;
     if leaf_spec.shape() != Shape::Leaf || merge_spec.shape() != Shape::Merge {
@@ -104,11 +105,11 @@ pub fn run(a: &Args) -> Result<(), String> {
         for slot in slots.clone() {
             for (_, subnet, view) in runs_of(&leaf, slot) {
                 let mut s = leaf_spec.make(leaf_fc.as_ref())?;
-                let spec = RunSpec { set: &leaf, slot, subnet, view, deadline: dl, caps: lb.caps() };
+                let spec = RunSpec { set: &leaf, slot, subnet, view, deadline: dl, caps: lb.caps(), grace };
                 let rec = run_slot_with(&mut lb, s.as_mut(), &spec, calib::lend(&mut est));
                 st.runs += 1;
                 st.leaf_coverage.push(slot_metrics(&rec).coverage);
-                if let Some((t, cov)) = rec.published.as_ref().filter(|(t, _)| *t <= dl) {
+                if let Some((t, cov)) = rec.published.as_ref().filter(|(t, _)| *t <= dl + grace) {
                     st.published += 1;
                     let mut signers = vec![0u64; (leaf.meta.subnet_size as usize).div_ceil(64)];
                     for c in cov.iter() {
@@ -145,7 +146,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         let (mut mb, _) = backend(a, merge_model_path, Caps::default(), seed, noise)?;
         for slot in slots.clone() {
             let mut s = merge_spec.make(merge_fc.as_ref())?;
-            let spec = RunSpec { set: &merge_set, slot, subnet: 0, view: 0, deadline: d_merge, caps: mb.caps() };
+            let spec = RunSpec { set: &merge_set, slot, subnet: 0, view: 0, deadline: d_merge, caps: mb.caps(), grace: 0 };
             let mut rec = run_slot(&mut mb, s.as_mut(), &spec);
             rec.sent_override = Some(sent[slot as usize]);
             let m = slot_metrics(&rec);

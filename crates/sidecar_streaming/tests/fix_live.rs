@@ -68,7 +68,7 @@ fn rejected_leaf_job_loses_nothing() {
     for slot in 0..5 {
         let mut backend = RejectFirst { inner: sim(SMOOTH), rejected: false, pending: None };
         let mut s = Spec::parse("greedy_fit").unwrap().make(None).unwrap();
-        let rs = RunSpec { set: &set, slot, subnet: 0, view: 0, deadline: 2_500_000, caps: backend.caps() };
+        let rs = RunSpec { set: &set, slot, subnet: 0, view: 0, deadline: 2_500_000, caps: backend.caps(), grace: 0 };
         let rec = run_slot(&mut backend, s.as_mut(), &rs);
         let m = slot_metrics(&rec);
         assert!(rec.jobs.iter().any(|j| j.result.starts_with("Rejected")), "the rejection happened");
