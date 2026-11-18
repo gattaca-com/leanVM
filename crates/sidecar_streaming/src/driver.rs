@@ -365,8 +365,9 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
         }
     }
     // The driver's own timer, not the strategy's: at the end of the grace window, or when nothing more can happen,
-    // a slot that published nothing publishes the best proof finished by then. The stamp is the real time, so a
-    // wake-up that overshot the window shows as late. A job still running is not that proof.
+    // a slot that published nothing publishes the best proof finished by then. The stamp is the real time, but at most the
+    // end of the window, so a wake-up that overshot it by microseconds does not make a proof on time late. A proof whose
+    // job ended after the window never counts. A job still running is not that proof.
     let at = ctx.backend.now();
     // A job still running at the deadline is written down, not delivered.
     if let Some(d) = held.take() {
@@ -376,7 +377,7 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
         let d = ctx.backend.wait(Micros::MAX).expect("a lane is busy");
         let _ = ctx.complete(d);
     }
-    ctx.fallback(at);
+    ctx.fallback(at.min(end));
     finish(ctx, inputs, spec)
 }
 
