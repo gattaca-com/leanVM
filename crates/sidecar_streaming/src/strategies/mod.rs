@@ -2,6 +2,7 @@
 
 pub mod leaf;
 pub mod merge;
+pub mod simple;
 
 use crate::forecast::Forecast;
 use crate::strategy::Strategy;
@@ -31,7 +32,7 @@ pub struct Spec {
 }
 
 pub const LEAF: &[&str] =
-    &["one_shot_late", "two_stage", "min_batch_fit", "fixed_fit", "greedy_fit", "cheap_chain", "step_cut_fit", "plan_cover"];
+    &["one_shot_late", "two_stage", "min_batch_fit", "fixed_fit", "greedy_fit", "cheap_chain", "step_cut_fit", "plan_cover", "greedy_simple", "once_at"];
 pub const MERGE: &[&str] = &["best_per_subnet_late", "fill_16", "two_round", "union_chain", "plan_merge"];
 
 /// The strategies registered for a shape.
@@ -87,6 +88,8 @@ impl Spec {
             "cheap_chain" => Box::new(leaf::LeafStrategy::new(leaf::CheapChain::new(p))),
             "step_cut_fit" => Box::new(leaf::LeafStrategy::new(leaf::StepCutFit::new(p))),
             "plan_cover" => Box::new(leaf::LeafStrategy::new(leaf::PlanCover::new(p, need()?))),
+            "greedy_simple" => Box::new(simple::GreedySimple::new()),
+            "once_at" => Box::new(simple::OnceAt::new(p)),
             "best_per_subnet_late" => Box::new(merge::MergeStrategy::new(merge::BestPerSubnetLate, policy)),
             "fill_16" => Box::new(merge::MergeStrategy::new(merge::Fill16, policy)),
             "two_round" => Box::new(merge::MergeStrategy::new(merge::TwoRound::new(p), policy)),

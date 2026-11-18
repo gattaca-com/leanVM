@@ -498,6 +498,10 @@ fn strategies_publish_once() {
         let train = make_set(&params, 30, 77);
         let mut backend = sim(STEPPED);
         for name in names {
+            // The two baselines without a cost estimate guarantee nothing before `D`: see `fix_simple.rs`.
+            if matches!(*name, "greedy_simple" | "once_at") {
+                continue;
+            }
             // The planners replan often: fewer slots.
             let n = if name.starts_with("plan_") { 8 } else { slots };
             for d in ds {
