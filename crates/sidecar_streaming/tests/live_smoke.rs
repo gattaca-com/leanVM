@@ -17,7 +17,7 @@ fn live_smoke() {
     let set = make_set(&leaf_params(), 2, 5);
     let mut lines = Vec::new();
     for slot in 0..2 {
-        let (rec, m) = run(&mut backend, &set, slot, 2_000_000, "greedy_fit", None);
+        let (rec, m) = run(&mut backend, &set, slot, 3_000_000, "greedy_fit", None);
         assert!(m.got > 0, "slot {slot}: nothing published");
         // Every proof the jobs made verifies.
         assert!(backend.verify_made().unwrap() >= 1);
