@@ -34,6 +34,11 @@ pub trait Inner {
     fn name(&self) -> String;
     fn start(&mut self, _ctx: &dyn Ctx) {}
     fn act(&mut self, v: &View, ctx: &dyn Ctx) -> Act;
+    /// True if waiting with votes in hand is the strategy itself, as in the one-shot and two-stage baselines.
+    /// Every other strategy is kept from idling by `LeafStrategy::fill`.
+    fn waits_by_design(&self) -> bool {
+        false
+    }
 }
 
 pub struct LeafStrategy<I: Inner> {
@@ -121,16 +126,40 @@ impl<I: Inner> LeafStrategy<I> {
         let view = View { now: s, waiting: w, seen: self.seen, kept_claims: kc, kept_rate: kr };
         if let Act::Go { n, rate } = self.inner.act(&view, ctx) {
             let n = n.min(w).min(cap);
-            if n == 0 && self.kept.is_none() {
-                return;
+            if n > 0 || self.kept.is_some() {
+                if self.fits_before_last(ctx, (kc, kr), n, rate) {
+                    self.launch(ctx, n, rate, false);
+                    return;
+                }
             }
-            // A last job must still fit after this one: with one more signature, or, if this job is cheaper than the
-            // final rate, a plain conversion. Take the dearer.
-            let last = ctx.cost(&JobShape::extend(kc + n as u32, rate, 1, f)).max(ctx.cost(&JobShape::extend(kc + n as u32, rate, 0, f)));
-            let after = s + with_margin(ctx.cost(&JobShape::extend(kc, kr, n as u32, rate))) + with_margin(last);
-            if after <= d {
-                self.launch(ctx, n, rate, false);
-            }
+        }
+        self.fill(ctx);
+    }
+
+    /// True if an EXTEND of `n` waiting votes at `rate` and then a last job still end by `D`. The last job must fit
+    /// with one more signature or, if this job is cheaper than the final rate, with a plain conversion. Take the dearer.
+    fn fits_before_last(&self, ctx: &dyn Ctx, (kc, kr): (u32, Rate), n: usize, rate: Rate) -> bool {
+        let (s, d, f) = (ctx.now(), ctx.slot().deadline, ctx.slot().final_rate);
+        let last = ctx.cost(&JobShape::extend(kc + n as u32, rate, 1, f)).max(ctx.cost(&JobShape::extend(kc + n as u32, rate, 0, f)));
+        s + with_margin(ctx.cost(&JobShape::extend(kc, kr, n as u32, rate))) + with_margin(last) <= d
+    }
+
+    /// No lane idles while votes wait and an EXTEND of at least one of them, then the last job, still fits before `D`.
+    /// If the inner rule did not start a job, start the largest such EXTEND at the final rate. Strategies that wait by
+    /// design are left alone.
+    fn fill(&mut self, ctx: &mut dyn Ctx) {
+        if self.inner.waits_by_design() || self.waiting.is_empty() {
+            return;
+        }
+        let f = ctx.slot().final_rate;
+        let (kc, kr) = self.kept_info(ctx);
+        let (mut lo, mut hi) = (0usize, self.waiting.len().min(ctx.slot().caps.max_new_sigs as usize));
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if self.fits_before_last(ctx, (kc, kr), mid, f) { lo = mid } else { hi = mid - 1 }
+        }
+        if lo > 0 {
+            self.launch(ctx, lo, f, false);
         }
     }
 }
@@ -195,6 +224,9 @@ impl Inner for OneShotLate {
     fn name(&self) -> String {
         "one_shot_late".into()
     }
+    fn waits_by_design(&self) -> bool {
+        true
+    }
     fn act(&mut self, _: &View, _: &dyn Ctx) -> Act {
         Act::Wait
     }
@@ -216,6 +248,9 @@ impl TwoStage {
 impl Inner for TwoStage {
     fn name(&self) -> String {
         format!("two_stage:t1_frac={}", self.t1_frac)
+    }
+    fn waits_by_design(&self) -> bool {
+        true
     }
     fn start(&mut self, ctx: &dyn Ctx) {
         self.t1 = (ctx.slot().deadline as f64 * self.t1_frac) as Micros;
@@ -343,11 +378,13 @@ pub struct PlanCover {
     jumps: Vec<u32>,
     ticks: u32,
     plan: Option<Act>,
+    /// True while the last plan chose to wait for votes that have not arrived yet.
+    deliberate: std::cell::Cell<bool>,
 }
 
 impl PlanCover {
     pub fn new(p: &Params, forecast: Rc<Forecast>) -> Self {
-        Self { forecast, grid: p.f("grid", 30.0) as u32, cheap: p.f("cheap", 1.0) as Rate, jumps: Vec::new(), ticks: 0, plan: None }
+        Self { forecast, grid: p.f("grid", 30.0) as u32, cheap: p.f("cheap", 1.0) as Rate, jumps: Vec::new(), ticks: 0, plan: None, deliberate: Default::default() }
     }
 }
 
@@ -362,6 +399,12 @@ struct Node {
 impl Inner for PlanCover {
     fn name(&self) -> String {
         format!("plan_cover:grid={};cheap={}", self.grid, self.cheap)
+    }
+
+    /// The planner waits on purpose when its first job needs votes that have not come. It does not when no plan
+    /// reaches a prefix by `D`: then the wrapper keeps the lane busy.
+    fn waits_by_design(&self) -> bool {
+        self.deliberate.get()
     }
 
     /// Put the model's jump positions on the planner's grid.
@@ -381,6 +424,7 @@ impl Inner for PlanCover {
 
     fn act(&mut self, v: &View, ctx: &dyn Ctx) -> Act {
         self.ticks += 1;
+        self.deliberate.set(false);
         // Between replans, repeat the last plan's first step if it is still possible.
         if self.ticks.is_multiple_of(2)
             && let Some(Act::Go { n, rate }) = self.plan.take()
@@ -474,6 +518,7 @@ impl PlanCover {
             (j, r) = (pj, pr);
         }
         if pos[j] > present {
+            self.deliberate.set(true);
             return Act::Wait;
         }
         Act::Go { n: (pos[j] - kc) as usize, rate: rates[r] }

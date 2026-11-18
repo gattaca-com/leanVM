@@ -21,3 +21,21 @@ fn leaf_strategies_do_not_know_the_total() {
         }
     }
 }
+
+/// A strategy that would wait (here: a batch size no slot reaches) must still start an EXTEND while votes wait
+/// and the last job fits after it. The one-shot baseline waits by design and keeps a single job.
+#[test]
+fn no_strategy_idles_while_an_extend_fits() {
+    let set = make_set(&leaf_params(), 5, 3);
+    let mut backend = sim(SMOOTH);
+    let d = 2_500_000;
+    for slot in 0..5 {
+        let (rec, m) = run(&mut backend, &set, slot, d, "min_batch_fit:m=5000", None);
+        assert!(m.jobs >= 2, "slot {slot}: {} jobs, the lane idled while votes waited", m.jobs);
+        assert!(m.published_us.is_some_and(|t| t <= d), "slot {slot}: published late");
+        assert!(m.coverage > 0.99, "slot {slot}: coverage {}", m.coverage);
+        let (_, m1) = run(&mut backend, &set, slot, d, "one_shot_late", None);
+        assert_eq!(m1.jobs, 1, "one_shot_late waits by design");
+        drop(rec);
+    }
+}
