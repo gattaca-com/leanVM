@@ -52,7 +52,8 @@ impl ProofStore {
 
 pub trait Backend {
     fn caps(&self) -> Caps;
-    /// What `Ctx::cost` answers from.
+    /// The truth of this backend: what the simulator draws durations from. A strategy reaches it only when the run
+    /// asks for `--strategy-cost table`; see `calib`.
     fn model(&self) -> &dyn CostModel;
     fn now(&self) -> Micros;
     /// `run` identifies the run within the set: `(slot * subnets + subnet) * views + view` for a leaf set, `slot` for a merge set.

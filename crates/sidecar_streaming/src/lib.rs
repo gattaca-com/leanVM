@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod bound;
+pub mod calib;
 pub mod cli;
 pub mod cost;
 pub mod driver;

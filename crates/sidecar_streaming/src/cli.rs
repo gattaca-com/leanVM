@@ -107,6 +107,11 @@ pub fn load_args(a: &Args, path: &Path) -> Result<(Box<dyn CostModel>, String), 
     Ok((model, name))
 }
 
+/// `--strategy-cost calibrated|table`, default calibrated.
+pub fn cost_kind(a: &Args) -> Result<crate::calib::CostKind, String> {
+    a.get("strategy-cost").map_or(Ok(crate::calib::CostKind::Calibrated), crate::calib::CostKind::parse)
+}
+
 pub fn load_forecast(args: &Args) -> Result<Option<Rc<Forecast>>, String> {
     args.get("train").map(|d| Forecast::from_set(Path::new(d)).map(Rc::new)).transpose()
 }

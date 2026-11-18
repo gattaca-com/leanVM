@@ -2,6 +2,7 @@
 //! completions, then timers. The driver, not the strategy, writes the slot record.
 
 use crate::backend::*;
+use crate::calib::{CostEstimator, Observation};
 use crate::metric::{InputRec, JobRec, SlotRecord};
 use crate::strategy::{Ctx, Strategy};
 use crate::types::*;
@@ -33,8 +34,11 @@ enum Target {
     Verify(ProofId),
 }
 
-pub struct DriverCtx<'a> {
+pub struct DriverCtx<'a, 'e> {
     backend: &'a mut dyn Backend,
+    /// What the strategy prices jobs with. `None`: the backend's own table, as the old harness did.
+    /// The backend's model is the simulator's truth and is otherwise out of the strategy's reach.
+    est: Option<&'e mut dyn CostEstimator>,
     info: SlotInfo,
     store: ProofStore,
     timers: BinaryHeap<Reverse<(Micros, u64, u64)>>,
@@ -45,7 +49,7 @@ pub struct DriverCtx<'a> {
     published: Option<(Micros, ProofId)>,
 }
 
-impl Ctx for DriverCtx<'_> {
+impl Ctx for DriverCtx<'_, '_> {
     fn now(&self) -> Micros {
         self.backend.now()
     }
@@ -161,11 +165,14 @@ impl Ctx for DriverCtx<'_> {
     }
 
     fn cost(&self, shape: &JobShape) -> Micros {
-        self.backend.model().prove_us(shape, THREADS)
+        match &self.est {
+            Some(e) => e.estimate(shape),
+            None => self.backend.model().prove_us(shape, THREADS),
+        }
     }
 }
 
-impl DriverCtx<'_> {
+impl DriverCtx<'_, '_> {
     /// Write a completion into the record and the store, and turn it into an event.
     fn complete(&mut self, d: Done) -> Event {
         let job = self.lane_job[d.lane].take().expect("completion on an idle lane");
@@ -179,6 +186,9 @@ impl DriverCtx<'_> {
                 e.ready = true;
                 rec.result = "ok".into();
                 rec.result_claims = e.info.coverage.len();
+                if let Some(est) = self.est.as_deref_mut() {
+                    est.observe(&Observation { children: rec.children as usize, new_sigs: rec.new_sigs, rate: rec.rate, took_us: d.at.saturating_sub(rec.start) });
+                }
                 Event::Proved { job, lane: d.lane, result: Ok(id) }
             }
             (Target::Verify(proof), Outcome::Verified(ok)) => {
@@ -208,7 +218,13 @@ impl DriverCtx<'_> {
     }
 }
 
+/// `run_slot_with` and the backend's own table as the strategy's cost.
 pub fn run_slot(backend: &mut dyn Backend, strategy: &mut dyn Strategy, spec: &RunSpec) -> SlotRecord {
+    run_slot_with(backend, strategy, spec, None)
+}
+
+/// One slot. `est` prices jobs for the strategy and learns from every job that finishes; keep one across slots.
+pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy, spec: &RunSpec, est: Option<&'e mut dyn CostEstimator>) -> SlotRecord {
     let meta = &spec.set.meta;
     let shape = if meta.shape == "merge" { Shape::Merge } else { Shape::Leaf };
     let info = SlotInfo { shape, deadline: spec.deadline, final_rate: meta.final_rate, expected_inputs: meta.expected_inputs, caps: spec.caps };
@@ -238,6 +254,7 @@ pub fn run_slot(backend: &mut dyn Backend, strategy: &mut dyn Strategy, spec: &R
 
     let mut ctx = DriverCtx {
         backend,
+        est,
         info,
         store: ProofStore::default(),
         timers: BinaryHeap::new(),

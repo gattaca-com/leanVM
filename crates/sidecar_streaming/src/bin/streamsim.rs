@@ -103,7 +103,7 @@ fn cmd_sim(a: &Args) -> Result<(), String> {
             eprintln!("skipping {}: no --train set", spec.name);
             continue;
         }
-        let job = Study { spec, forecast: forecast.clone() };
+        let job = Study { spec, forecast: forecast.clone(), cost: cost_kind(a)? };
         let results = run_set(&mut backend, &set, &set_name, &backend_name, &job, &deadlines, slots.clone(), |_| {})?;
         for r in results {
             if want_jobs {

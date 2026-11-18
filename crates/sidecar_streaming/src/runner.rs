@@ -1,7 +1,8 @@
 //! Runs of one strategy over a schedule set at several deadlines, with any backend.
 
 use crate::backend::Backend;
-use crate::driver::{RunSpec, run_slot};
+use crate::calib::{self, CostKind};
+use crate::driver::{RunSpec, run_slot_with};
 use crate::forecast::Forecast;
 use crate::metric::{JobRec, Row, SlotRecord, slot_metrics};
 use crate::strategies::Spec;
@@ -25,6 +26,8 @@ pub fn runs_of(set: &ScheduleSet, slot: u32) -> Vec<(u32, u8, u8)> {
 }
 
 pub struct Study {
+    /// Where the strategy gets its job costs. State carries over all slots and deadlines of one `run_set`.
+    pub cost: CostKind,
     pub spec: Spec,
     pub forecast: Option<Rc<Forecast>>,
 }
@@ -41,12 +44,13 @@ pub fn run_set(
     mut progress: impl FnMut(&RunResult),
 ) -> Result<Vec<RunResult>, String> {
     let mut out = Vec::new();
+    let mut est = job.cost.estimator(if set.meta.shape == "merge" { Shape::Merge } else { Shape::Leaf });
     for &d in deadlines {
         for slot in slots.clone() {
             for (id, subnet, view) in runs_of(set, slot) {
                 let mut strategy = job.spec.make(job.forecast.as_ref())?;
                 let spec = RunSpec { set, slot, subnet, view, deadline: d, caps: backend.caps() };
-                let record = run_slot(backend, strategy.as_mut(), &spec);
+                let record = run_slot_with(backend, strategy.as_mut(), &spec, calib::lend(&mut est));
                 let row = Row { set: set_name.into(), backend: backend_name.into(), strategy: strategy.name(), deadline_us: d, slot: id, m: slot_metrics(&record) };
                 let r = RunResult { row, record };
                 progress(&r);

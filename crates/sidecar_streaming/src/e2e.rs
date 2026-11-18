@@ -6,8 +6,9 @@
 //! program): this module writes a compose file and a parameter file, runs it, and reads the set back.
 
 use crate::backend::Backend;
+use crate::calib;
 use crate::cli::*;
-use crate::driver::{RunSpec, run_slot};
+use crate::driver::{RunSpec, run_slot, run_slot_with};
 use crate::forecast::Forecast;
 use crate::metric::*;
 use crate::runner::runs_of;
@@ -97,13 +98,14 @@ pub fn run(a: &Args) -> Result<(), String> {
     let mut best: Option<(f64, u64)> = None;
     for &dl in &d_leaf {
         let (mut lb, backend_name) = backend(a, model_path, Caps::default(), seed, noise)?;
+        let mut est = cost_kind(a)?.estimator(Shape::Leaf);
         let mut st = Stats { end_to_end: Vec::new(), merge_coverage: Vec::new(), leaf_coverage: Vec::new(), published: 0, runs: 0 };
         let mut compose = String::from("slot,subnet,view,published_us,rate,signers_hex\n");
         for slot in slots.clone() {
             for (_, subnet, view) in runs_of(&leaf, slot) {
                 let mut s = leaf_spec.make(leaf_fc.as_ref())?;
                 let spec = RunSpec { set: &leaf, slot, subnet, view, deadline: dl, caps: lb.caps() };
-                let rec = run_slot(&mut lb, s.as_mut(), &spec);
+                let rec = run_slot_with(&mut lb, s.as_mut(), &spec, calib::lend(&mut est));
                 st.runs += 1;
                 st.leaf_coverage.push(slot_metrics(&rec).coverage);
                 if let Some((t, cov)) = rec.published.as_ref().filter(|(t, _)| *t <= dl) {
