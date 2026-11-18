@@ -72,9 +72,17 @@ pub struct Prior {
     pub conv_us: f64,
     /// The prior is this many times the perf-like line, so that it sits above every build measured.
     pub scale: f64,
+    /// Rate 1 costs this much of rate 2 for the same job. Measured 0.77 to 0.91 over the perf and main tables;
+    /// the top is taken so that a class never seen at rate 1 is not under-priced.
+    pub rate1_over_rate2: f64,
 }
 
-pub const PRIOR: Prior = Prior { agg_fixed_us: 40_000.0, agg_per_sig_us: 750.0, ext_fixed_us: 120_000.0, ext_per_sig_us: 750.0, conv_us: 125_000.0, scale: 2.5 };
+pub const PRIOR: Prior = Prior { agg_fixed_us: 40_000.0, agg_per_sig_us: 750.0, ext_fixed_us: 120_000.0, ext_per_sig_us: 750.0, conv_us: 125_000.0, scale: 2.5, rate1_over_rate2: 0.9 };
+
+/// What a job costs at `rate`, relative to rate 2, on the prior's scale.
+fn rate_weight(rate: Rate) -> f64 {
+    if rate == 1 { PRIOR.rate1_over_rate2 } else { 1.0 }
+}
 
 /// Jobs kept per (class, rate).
 pub const KEEP: usize = 64;
@@ -168,14 +176,34 @@ impl Calibrated {
     pub fn jobs_kept(&self) -> usize {
         self.obs.values().map(VecDeque::len).sum()
     }
+
+    /// The base time of a job of class `c` and `n` new signatures at `rate`, with the fit whose margin it carries.
+    /// A class seen at this rate uses its own line. Otherwise it is derived from a line that was seen:
+    ///
+    /// - a conversion is the EXTEND line at `n = 0`, its fixed term;
+    /// - another rate of the same class is scaled by the prior's rate ratio, taking the fit with most jobs.
+    ///
+    /// `None`: nothing related was seen, the prior applies.
+    fn derive(&self, c: Class, rate: Rate, n: f64) -> Option<(f64, Fit)> {
+        if let Some(f) = self.fit.get(&(c, rate)) {
+            return Some((f.fixed + f.slope * n, *f));
+        }
+        if c == Class::Convert
+            && let Some(d) = self.derive(Class::Extend, rate, 0.0)
+        {
+            return Some(d);
+        }
+        let (other, f) = self.fit.iter().filter(|((k, r), _)| *k == c && *r != rate).map(|((_, r), f)| (*r, f)).max_by_key(|(r, f)| (f.jobs, *r))?;
+        Some(((f.fixed + f.slope * n) * rate_weight(rate) / rate_weight(other), *f))
+    }
 }
 
 impl CostEstimator for Calibrated {
     fn estimate(&self, shape: &JobShape) -> Micros {
         let c = class(shape.children.len(), shape.new_sigs);
         let n = shape.new_sigs as f64;
-        let (base, worst, pad) = match self.fit.get(&(c, shape.rate)) {
-            Some(f) => (f.fixed + f.slope * n, f.worst, PAD + FEW / f.jobs as f64),
+        let (base, worst, pad) = match self.derive(c, shape.rate, n) {
+            Some((base, f)) => (base, f.worst, PAD + FEW / f.jobs as f64),
             None => (prior(c, n), 1.0, PAD),
         };
         (base * worst * (1.0 + pad) + ADD_US).round() as Micros
@@ -258,8 +286,30 @@ mod tests {
         assert!(a < 100_000, "{a}");
         // No EXTEND seen: still the prior, far above.
         assert!(c.estimate(&JobShape::extend(300, 2, 500, 2)) > 1_000_000);
-        // Another rate: still the prior.
-        assert!(c.estimate(&JobShape::aggregate(500, 1)) > 1_000_000);
+        // Another rate of a seen class: the seen line times the prior's rate ratio, not the prior.
+        let r1 = c.estimate(&JobShape::aggregate(500, 1));
+        assert!(r1 < a && r1 > a * 8 / 10, "{r1} against {a}");
+    }
+
+    #[test]
+    fn an_unseen_class_is_derived_from_a_seen_one() {
+        let mut c = Calibrated::new();
+        // EXTEND at rate 2: 100 ms fixed, 600 us per signature.
+        for n in [10u32, 50, 100, 300, 600, 900, 1200] {
+            c.observe(&obs(1, n, 100_000 + 600 * n as u64));
+        }
+        // A conversion costs the EXTEND's fixed term, not the 2.5 times prior.
+        let conv = c.estimate(&JobShape::extend(800, 2, 0, 2));
+        assert!((100_000..140_000).contains(&conv), "{conv}");
+        // The same at rate 1: the rate ratio of the prior applies.
+        let conv1 = c.estimate(&JobShape::extend(800, 1, 0, 1));
+        assert!(conv1 < conv && conv1 > conv * 8 / 10, "{conv1} against {conv}");
+        // EXTEND at rate 1 follows rate 2 the same way.
+        let e2 = c.estimate(&JobShape::extend(800, 2, 400, 2));
+        let e1 = c.estimate(&JobShape::extend(800, 1, 400, 1));
+        assert!(e1 < e2 && e1 > e2 * 8 / 10, "{e1} against {e2}");
+        // Nothing of the AGGREGATE class was seen, and an EXTEND does not stand for it.
+        assert!(c.estimate(&JobShape::aggregate(500, 2)) > 1_000_000);
     }
 
     #[test]

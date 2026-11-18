@@ -136,9 +136,11 @@ impl<I: Inner> LeafStrategy<I> {
 
     /// True if an EXTEND of `n` waiting votes at `rate` and then a last job still end by `D`. The last job must fit
     /// with one more signature or, if this job is cheaper than the final rate, with a plain conversion. Take the dearer.
+    /// At the final rate or above there is nothing to convert: only the job with one more signature counts.
     fn fits_before_last(&self, ctx: &dyn Ctx, (kc, kr): (u32, Rate), n: usize, rate: Rate) -> bool {
         let (s, d, f) = (ctx.now(), ctx.slot().deadline, ctx.slot().final_rate);
-        let last = ctx.cost(&JobShape::extend(kc + n as u32, rate, 1, f)).max(ctx.cost(&JobShape::extend(kc + n as u32, rate, 0, f)));
+        let one_more = ctx.cost(&JobShape::extend(kc + n as u32, rate, 1, f));
+        let last = if rate >= f { one_more } else { one_more.max(ctx.cost(&JobShape::extend(kc + n as u32, rate, 0, f))) };
         s + with_margin(ctx.cost(&JobShape::extend(kc, kr, n as u32, rate))) + with_margin(last) <= d
     }
 
