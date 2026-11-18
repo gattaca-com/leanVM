@@ -107,6 +107,16 @@ pub fn load_args(a: &Args, path: &Path) -> Result<(Box<dyn CostModel>, String), 
     Ok((model, name))
 }
 
+/// `--noise-replay FILE..`: live job files (`live-*-jobs.csv`) whose measured over predicted ratios the simulator
+/// replays as job noise, per op and size. Replaces the model's own noise, also under `--no-noise`. Default off.
+pub fn load_replay(a: &Args) -> Result<Option<crate::sim::Replay>, String> {
+    let Some(files) = a.get("noise-replay") else {
+        return Ok(None);
+    };
+    let texts: Vec<String> = files.split_whitespace().map(|p| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))).collect::<Result<_, _>>()?;
+    crate::sim::Replay::from_job_files(&texts).map(Some)
+}
+
 /// `--grace-ms X`: a proof finished by `D + X` counts. Default 0. Milliseconds in, microseconds out.
 pub fn grace_us(a: &Args) -> Result<Micros, String> {
     let ms: f64 = a.num("grace-ms", 0.0)?;

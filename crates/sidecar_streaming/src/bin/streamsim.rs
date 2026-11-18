@@ -87,6 +87,9 @@ fn cmd_sim(a: &Args) -> Result<(), String> {
         s => vec![s.to_string()],
     };
     let mut backend = SimBackend::new(model, caps_of(a)?, a.num("seed", 1)?, !a.flag("no-noise"));
+    if let Some(r) = load_replay(a)? {
+        backend = backend.with_replay(r);
+    }
     let set_name = Path::new(set_dir).file_name().map_or(set_dir.to_string(), |s| s.to_string_lossy().into());
     let mut rows: Vec<Row> = Vec::new();
     let mut jobs = vec![JOBS_HEADER.to_string()];

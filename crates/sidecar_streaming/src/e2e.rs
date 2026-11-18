@@ -23,7 +23,8 @@ use std::rc::Rc;
 
 fn backend(a: &Args, path: &Path, caps: Caps, seed: u64, noise: bool) -> Result<(SimBackend, String), String> {
     let (model, name) = load_args(a, path)?;
-    Ok((SimBackend::new(model, caps, seed, noise), name))
+    let b = SimBackend::new(model, caps, seed, noise);
+    Ok((if let Some(r) = load_replay(a)? { b.with_replay(r) } else { b }, name))
 }
 
 fn arrivalgen_path(a: &Args) -> Result<PathBuf, String> {
