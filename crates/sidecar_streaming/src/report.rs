@@ -10,6 +10,20 @@ fn pct(x: f64) -> String {
     format!("{x:.3}")
 }
 
+/// Slots from which a p10 is worth quoting as a tenth percentile.
+pub const P10_MIN_SLOTS: usize = 30;
+
+/// A p10 with its sample size when `n` is small. Nearest rank of 10 or fewer slots is the minimum.
+pub fn p10_text(p10: f64, n: usize) -> String {
+    if p10.is_nan() || n >= P10_MIN_SLOTS {
+        pct(p10)
+    } else if n <= 10 {
+        format!("{} (min of {n})", pct(p10))
+    } else {
+        format!("{} (n={n})", pct(p10))
+    }
+}
+
 fn ms(x: f64) -> String {
     if x.is_nan() { "-".into() } else { format!("{x:.0}") }
 }
@@ -30,10 +44,16 @@ pub fn report(rows: &[Row], baseline: Option<&str>, by_arrival: bool) -> String 
         let _ = writeln!(out, "| set | backend | D ms | best strategy | mean coverage | margin to second | p10 |\n| --- | --- | --- | --- | --- | --- | --- |");
         for ((set, backend), by_d) in &groups {
             for (d, by_s) in by_d {
-                let mut ranked: Vec<(f64, f64, &String)> = by_s.iter().map(|(s, v)| (summarize(v).mean, summarize(v).p10, s)).collect();
+                let mut ranked: Vec<(f64, f64, usize, &String)> = by_s
+                    .iter()
+                    .map(|(s, v)| {
+                        let sm = summarize(v);
+                        (sm.mean, sm.p10, sm.n, s)
+                    })
+                    .collect();
                 ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
                 let margin = if ranked.len() > 1 { ranked[0].0 - ranked[1].0 } else { 0.0 };
-                let _ = writeln!(out, "| {set} | {backend} | {} | {} | {} | {} | {} |", d / 1000, ranked[0].2, pct(ranked[0].0), pct(margin), pct(ranked[0].1));
+                let _ = writeln!(out, "| {set} | {backend} | {} | {} | {} | {} | {} |", d / 1000, ranked[0].3, pct(ranked[0].0), pct(margin), p10_text(ranked[0].1, ranked[0].2));
             }
         }
         return out;
@@ -43,22 +63,24 @@ pub fn report(rows: &[Row], baseline: Option<&str>, by_arrival: bool) -> String 
         let mut d99s: BTreeMap<&String, Vec<(u64, f64)>> = BTreeMap::new();
         for (d, by_s) in by_d {
             let _ = writeln!(out, "### D = {} ms\n", d / 1000);
-            let _ = write!(out, "| strategy | n | empty | p50 | p10 | mean | sent p50 | sent p10 | stale ms | slack ms | jobs | busy ms | wasted ms | verify ms |");
+            let _ = write!(out, "| strategy | n | no votes | empty | p50 | p10 | mean | mean non-empty | sent p50 | sent p10 | stale ms | slack ms | jobs | busy ms | wasted ms | verify ms |");
             let _ = writeln!(out, "{}", if baseline.is_some() { " d mean vs baseline |" } else { "" });
-            let _ = writeln!(out, "|{}", "---|".repeat(14 + usize::from(baseline.is_some())));
+            let _ = writeln!(out, "|{}", "---|".repeat(16 + usize::from(baseline.is_some())));
             for (s, v) in by_s {
                 let sm = summarize(v);
                 d99s.entry(s).or_default().push((*d, sm.p10));
                 let _ = write!(
                     out,
-                    "| {s} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {} |",
+                    "| {s} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {} |",
                     sm.n,
                     sm.empty,
+                    pct(sm.empty_share),
                     pct(sm.p50),
-                    pct(sm.p10),
+                    p10_text(sm.p10, sm.n),
                     pct(sm.mean),
+                    pct(sm.mean_published),
                     pct(sm.sent_p50),
-                    pct(sm.sent_p10),
+                    p10_text(sm.sent_p10, sm.n),
                     ms(sm.staleness_ms),
                     ms(sm.slack_ms),
                     sm.jobs,
@@ -105,10 +127,16 @@ fn median(mut v: Vec<f64>) -> f64 {
 pub fn compare(sim: &[Row], live: &[Row]) -> String {
     let index: BTreeMap<(Key, u32), &Row> = sim.iter().map(|r| (((r.set.clone(), r.strategy.clone(), r.deadline_us), r.slot), r)).collect();
     let (mut dcov, mut dt) = (Vec::new(), Vec::new());
+    // Slots with votes where one side published nothing: the median above does not see a few of them.
+    let (mut live_empty, mut sim_empty, mut mean_live, mut mean_sim) = (0, 0, Vec::new(), Vec::new());
     for l in live {
         if let Some(s) = index.get(&((l.set.clone(), l.strategy.clone(), l.deadline_us), l.slot)) {
             if !(l.m.coverage.is_nan() || s.m.coverage.is_nan()) {
                 dcov.push((l.m.coverage - s.m.coverage).abs());
+                mean_live.push(l.m.coverage);
+                mean_sim.push(s.m.coverage);
+                live_empty += usize::from(l.m.got == 0);
+                sim_empty += usize::from(s.m.got == 0);
             }
             if let (Some(a), Some(b)) = (l.m.published_us, s.m.published_us) {
                 dt.push((a as f64 - b as f64).abs() / b.max(1) as f64);
@@ -117,12 +145,14 @@ pub fn compare(sim: &[Row], live: &[Row]) -> String {
     }
     let (mc, mt) = (median(dcov.clone()), median(dt.clone()));
     format!(
-        "matched slots: {}\nmedian |coverage live - sim|: {:.4} (accept <= 0.01): {}\nmedian |t_P live - sim| / sim: {:.4} (accept <= 0.05): {}\n",
+        "matched slots: {}\nmedian |coverage live - sim|: {:.4} (accept <= 0.01): {}\nmedian |t_P live - sim| / sim: {:.4} (accept <= 0.05): {}\nmean coverage live {:.4}, sim {:.4}; empty slots live {live_empty}, sim {sim_empty} (a few empty slots leave the median unchanged)\n",
         dcov.len(),
         mc,
         if mc <= 0.01 { "ok" } else { "NOT ok" },
         mt,
-        if mt <= 0.05 { "ok" } else { "NOT ok" }
+        if mt <= 0.05 { "ok" } else { "NOT ok" },
+        mean(&mean_live),
+        mean(&mean_sim)
     )
 }
 

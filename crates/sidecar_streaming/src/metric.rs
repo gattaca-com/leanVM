@@ -236,11 +236,17 @@ pub fn mean(xs: &[f64]) -> f64 {
 pub struct Summary {
     /// Slots with a coverage.
     pub n: usize,
-    /// Slots with nothing arrived by `D`: no coverage, left out of every aggregate of coverage.
+    /// Slots with no vote arrived by `D` (the report calls them "no votes"): no coverage, left out of every aggregate.
+    /// A slot with votes and nothing published is not here: see `unpublished`.
     pub empty: usize,
     pub p50: f64,
     pub p10: f64,
     pub mean: f64,
+    /// Slots with votes where nothing was published in time (coverage 0), over `n`. They are in `mean` and `p50`.
+    pub empty_share: f64,
+    pub unpublished: usize,
+    /// Mean coverage over the slots that published something. Beside `mean`, not instead of it.
+    pub mean_published: f64,
     pub sent_p50: f64,
     pub sent_p10: f64,
     pub staleness_ms: f64,
@@ -258,12 +264,17 @@ pub fn summarize(rows: &[&Row]) -> Summary {
         let v: Vec<f64> = rows.iter().filter_map(|r| f(&r.m)).map(|x| x as f64 / 1000.0).collect();
         if v.is_empty() { f64::NAN } else { mean(&v) }
     };
+    let n = rows.iter().filter(|r| !r.m.coverage.is_nan()).count();
+    let unpublished = rows.iter().filter(|r| !r.m.coverage.is_nan() && r.m.got == 0).count();
     Summary {
-        n: rows.iter().filter(|r| !r.m.coverage.is_nan()).count(),
+        n,
         empty: rows.iter().filter(|r| r.m.coverage.is_nan()).count(),
         p50: quantile(&c, 50),
         p10: quantile(&c, 10),
         mean: mean(&c),
+        empty_share: if n == 0 { f64::NAN } else { unpublished as f64 / n as f64 },
+        unpublished,
+        mean_published: mean(&rows.iter().filter(|r| r.m.got > 0).map(|r| r.m.coverage).collect::<Vec<_>>()),
         sent_p50: quantile(&s, 50),
         sent_p10: quantile(&s, 10),
         staleness_ms: avg(&|m| m.staleness_us),
