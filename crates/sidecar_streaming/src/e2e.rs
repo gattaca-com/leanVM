@@ -11,7 +11,7 @@ use crate::cli::*;
 use crate::driver::{RunSpec, run_slot, run_slot_with};
 use crate::forecast::Forecast;
 use crate::metric::*;
-use crate::runner::runs_of;
+use crate::runner::{runs_of, warm_up};
 use crate::sim::SimBackend;
 use crate::strategies::{Spec, merge::Policy};
 use crate::types::*;
@@ -70,6 +70,7 @@ pub fn run(a: &Args) -> Result<(), String> {
     let seed = a.num("seed", 1u64)?;
     let noise = !a.flag("no-noise");
     let grace = grace_us(a)?;
+    let warmup = warmup_slots(a)?;
     let mut leaf_spec = Spec::parse(a.need("leaf-strategy")?)?;
     let mut merge_spec = Spec::parse(a.need("merge-strategy")?)?;
     if leaf_spec.shape() != Shape::Leaf || merge_spec.shape() != Shape::Merge {
@@ -100,7 +101,9 @@ pub fn run(a: &Args) -> Result<(), String> {
     let mut best: Option<(f64, u64)> = None;
     for &dl in &d_leaf {
         let (mut lb, backend_name) = backend(a, model_path, Caps::default(), seed, noise)?;
+        // One estimator per D_leaf, as in `run_set`, warmed on discarded slots.
         let mut est = cost_kind(a)?.estimator(Shape::Leaf);
+        warm_up(&mut lb, &leaf, &leaf_spec, leaf_fc.as_ref(), grace, dl, slots.clone(), warmup, &mut est)?;
         let mut st = Stats { end_to_end: Vec::new(), merge_coverage: Vec::new(), leaf_coverage: Vec::new(), published: 0, runs: 0 };
         let mut compose = String::from("slot,subnet,view,published_us,rate,signers_hex\n");
         for slot in slots.clone() {

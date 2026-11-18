@@ -126,6 +126,16 @@ pub fn grace_us(a: &Args) -> Result<Micros, String> {
     Ok((ms * 1000.0).round() as Micros)
 }
 
+/// Slots run and discarded before the scored slots of each deadline, so that a calibrated strategy starts the
+/// scored slots with an estimator that has seen jobs. Each deadline has its own estimator.
+pub const DEFAULT_WARMUP: u32 = 2;
+
+/// `--warmup-slots N`: the first N slots of the range are run first to train the estimator, and their rows are
+/// discarded. Default 2. 0 scores from a cold estimator. It has no effect with `--strategy-cost table`.
+pub fn warmup_slots(a: &Args) -> Result<u32, String> {
+    a.num("warmup-slots", DEFAULT_WARMUP)
+}
+
 /// `--strategy-cost calibrated|table`, default calibrated.
 pub fn cost_kind(a: &Args) -> Result<crate::calib::CostKind, String> {
     a.get("strategy-cost").map_or(Ok(crate::calib::CostKind::Calibrated), crate::calib::CostKind::parse)

@@ -32,6 +32,36 @@ pub struct Study {
     pub grace: Micros,
     pub spec: Spec,
     pub forecast: Option<Rc<Forecast>>,
+    /// Slots run and discarded before each deadline's scored slots; see `warm_up`.
+    pub warmup: u32,
+}
+
+/// Run the first `n` slots of `slots` at deadline `d` for `est` to learn from, and discard the results. Does nothing
+/// when there is no estimator. The backend sees the same runs again in the scored pass: a simulator draws its noise
+/// per run, so the scored slots do not change, and a live backend simply proves them twice.
+#[allow(clippy::too_many_arguments)]
+pub fn warm_up(
+    backend: &mut dyn Backend,
+    set: &ScheduleSet,
+    spec: &Spec,
+    forecast: Option<&Rc<Forecast>>,
+    grace: Micros,
+    d: Micros,
+    slots: std::ops::Range<u32>,
+    n: u32,
+    est: &mut Option<Box<dyn calib::CostEstimator>>,
+) -> Result<(), String> {
+    if est.is_none() {
+        return Ok(());
+    }
+    for slot in slots.take(n as usize) {
+        for (_, subnet, view) in runs_of(set, slot) {
+            let mut strategy = spec.make(forecast)?;
+            let rs = RunSpec { set, slot, subnet, view, deadline: d, caps: backend.caps(), grace };
+            run_slot_with(backend, strategy.as_mut(), &rs, calib::lend(est));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -46,8 +76,10 @@ pub fn run_set(
     mut progress: impl FnMut(&RunResult),
 ) -> Result<Vec<RunResult>, String> {
     let mut out = Vec::new();
-    let mut est = job.cost.estimator(if set.meta.shape == "merge" { Shape::Merge } else { Shape::Leaf });
     for &d in deadlines {
+        // One estimator per deadline, warmed on discarded slots: a row does not depend on the other deadlines.
+        let mut est = job.cost.estimator(if set.meta.shape == "merge" { Shape::Merge } else { Shape::Leaf });
+        warm_up(backend, set, &job.spec, job.forecast.as_ref(), job.grace, d, slots.clone(), job.warmup, &mut est)?;
         for slot in slots.clone() {
             for (id, subnet, view) in runs_of(set, slot) {
                 let mut strategy = job.spec.make(job.forecast.as_ref())?;
