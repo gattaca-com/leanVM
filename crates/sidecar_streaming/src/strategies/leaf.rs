@@ -208,7 +208,8 @@ impl<I: Inner> Strategy for LeafStrategy<I> {
             Event::Timer(_) => {
                 self.evaluate(ctx);
                 if !self.published && ctx.now() < ctx.slot().deadline {
-                    ctx.set_timer(ctx.now() + TICK, TICK_TOKEN);
+                    // The next point of the grid `k * TICK`, so that a late wake-up does not shift every later tick.
+                    ctx.set_timer((ctx.now() / TICK + 1) * TICK, TICK_TOKEN);
                 }
             }
         }

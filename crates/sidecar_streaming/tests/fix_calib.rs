@@ -88,8 +88,9 @@ fn a_model_calibrated_on_one_build_runs_on_another() {
             let mut b = sim(to);
             for slot in 0..6 {
                 let (_, m) = run_est(&mut b, &set, slot, d, strategy, Some(&mut est));
-                // The first slot may be priced by the other build's numbers; a late job is learned from.
-                if slot >= 1 {
+                // The first slot may be priced by the other build's numbers: a one-shot cannot recover from a late job
+                // but learns from it. A chain publishes what it finished.
+                if slot >= 1 || strategy == "greedy_fit" {
                     assert!(m.published_us.is_some_and(|t| t <= d), "{strategy}: slot {slot} of the new build published nothing");
                     // The reference: the same slot with the strategy reading the new build's table.
                     let (_, table) = run_est(&mut b, &set, slot, d, strategy, None);

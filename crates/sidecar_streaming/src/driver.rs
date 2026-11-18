@@ -173,6 +173,29 @@ impl Ctx for DriverCtx<'_, '_> {
 }
 
 impl DriverCtx<'_, '_> {
+    /// If the strategy published nothing, publish the largest finished proof of this prover at the final rate, stamped
+    /// `at`. A proof from a failed or running job is not finished. Nothing happens when no such proof exists.
+    fn fallback(&mut self, at: Micros) {
+        if self.published.is_some() {
+            return;
+        }
+        let best = self
+            .target
+            .iter()
+            .filter_map(|t| match t {
+                Target::Prove(id) => Some(*id),
+                Target::Verify(_) => None,
+            })
+            .filter(|id| {
+                let e = self.store.get(*id);
+                e.ready && e.info.rate >= self.info.final_rate
+            })
+            .max_by_key(|id| (self.store.get(*id).info.coverage.len(), id.0));
+        if let Some(id) = best {
+            self.published = Some((at, id));
+        }
+    }
+
     /// Write a completion into the record and the store, and turn it into an event.
     fn complete(&mut self, d: Done) -> Event {
         let job = self.lane_job[d.lane].take().expect("completion on an idle lane");
@@ -323,6 +346,10 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
             break;
         }
     }
+    // The driver's own timer, not the strategy's: at the deadline, or when nothing more can happen, a slot that
+    // published nothing publishes the best proof finished by then. A job still running is not that proof.
+    let at = ctx.backend.now().min(deadline);
+    ctx.fallback(at);
     // A job still running at the deadline is written down, not delivered.
     while ctx.lane_job.iter().any(Option::is_some) {
         let d = ctx.backend.wait(Micros::MAX).expect("a lane is busy");
