@@ -123,3 +123,32 @@ fn grace_ms_parses() {
     assert!(grace_us(&args(&["--grace-ms", "-1"])).is_err());
     assert!(grace_us(&args(&["--grace-ms", "x"])).is_err());
 }
+
+/// A row published after the window it was run with counts for nothing: `got` 0, no slack. Scoring it with a longer
+/// window must not give it a slack of 0, which would read as a proof that counted.
+#[test]
+fn a_late_row_stays_late_under_a_longer_window() {
+    use sidecar_streaming::metric::Metrics;
+    let m = Metrics {
+        got: 0,
+        arrived: 100,
+        sent: 100,
+        coverage: 0.0,
+        coverage_sent: 0.0,
+        published_us: Some(2_510_000),
+        cut_us: None,
+        staleness_us: None,
+        slack_us: None,
+        jobs: 1,
+        busy_us: 1,
+        wasted_us: 0,
+        verify_us: 0,
+    };
+    let row = Row { set: "s".into(), backend: "b".into(), strategy: "x".into(), deadline_us: 2_500_000, slot: 0, m };
+    for grace in [0, 5_000, 25_000] {
+        let mut r = row.clone();
+        r.rescore_grace(grace);
+        assert_eq!(r.m.got, 0, "grace {grace}");
+        assert_eq!(r.m.slack_us.is_some(), r.m.got > 0, "grace {grace}: slack {:?} with got {}", r.m.slack_us, r.m.got);
+    }
+}

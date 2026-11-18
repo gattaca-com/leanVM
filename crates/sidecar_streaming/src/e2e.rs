@@ -150,6 +150,8 @@ pub fn run(a: &Args) -> Result<(), String> {
         let (mut mb, _) = backend(a, merge_model_path, Caps::default(), seed, noise)?;
         for slot in slots.clone() {
             let mut s = merge_spec.make(merge_fc.as_ref())?;
+            // The merge run has no grace window: `--grace-ms` applies to the leaf runs only. The root must be out
+            // by `D_merge`, and the leaf proofs were composed from their publish times.
             let spec = RunSpec { set: &merge_set, slot, subnet: 0, view: 0, deadline: d_merge, caps: mb.caps(), grace: 0 };
             let mut rec = run_slot(&mut mb, s.as_mut(), &spec);
             rec.sent_override = Some(sent[slot as usize]);

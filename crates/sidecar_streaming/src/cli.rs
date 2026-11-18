@@ -118,6 +118,7 @@ pub fn load_replay(a: &Args) -> Result<Option<crate::sim::Replay>, String> {
 }
 
 /// `--grace-ms X`: a proof finished by `D + X` counts. Default 0. Milliseconds in, microseconds out.
+/// In `e2e` it applies to the leaf runs only; the merge run always has grace 0.
 pub fn grace_us(a: &Args) -> Result<Micros, String> {
     let ms: f64 = a.num("grace-ms", 0.0)?;
     if !(ms >= 0.0 && ms.is_finite()) {

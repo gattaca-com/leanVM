@@ -169,6 +169,11 @@ impl Row {
     /// nothing. A row cannot be given more grace than it was run with.
     pub fn rescore_grace(&mut self, grace_us: Micros) {
         let m = &mut self.m;
+        // A row with no slack was published after the window it ran with: it counted for nothing, and a longer
+        // window does not change that.
+        if m.slack_us.is_none() {
+            return;
+        }
         if m.published_us.is_some_and(|t| t > self.deadline_us + grace_us) {
             m.got = 0;
             m.coverage = if m.arrived == 0 { f64::NAN } else { 0.0 };
