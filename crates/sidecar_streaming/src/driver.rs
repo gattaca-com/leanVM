@@ -176,7 +176,8 @@ impl Ctx for DriverCtx<'_, '_> {
 
 impl DriverCtx<'_, '_> {
     /// If the strategy published nothing, publish the largest finished proof of this prover at the final rate, stamped
-    /// `at`. A proof from a failed or running job is not finished. Nothing happens when no such proof exists.
+    /// `at`. A proof from a failed or running job is not finished, and neither is one whose job ended after `at`.
+    /// Nothing happens when no such proof exists.
     fn fallback(&mut self, at: Micros) {
         if self.published.is_some() {
             return;
@@ -184,9 +185,10 @@ impl DriverCtx<'_, '_> {
         let best = self
             .target
             .iter()
-            .filter_map(|t| match t {
-                Target::Prove(id) => Some(*id),
-                Target::Verify(_) => None,
+            .zip(&self.jobs)
+            .filter_map(|(t, j)| match t {
+                Target::Prove(id) if j.end <= at => Some(*id),
+                _ => None,
             })
             .filter(|id| {
                 let e = self.store.get(*id);
@@ -291,6 +293,7 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
     };
     strategy.on_event(Event::SlotStart, &mut ctx);
     let (mut ai, mut pending): (usize, Option<Done>) = (0, None);
+    let mut held: Option<Done> = None;
     let deadline = spec.deadline;
     // Inputs stop at `deadline`; completions and timers go on until the end of the grace window.
     let end = deadline + spec.grace;
@@ -305,7 +308,11 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
         let tn = t_arr.min(t_tim).min(wake).max(ctx.backend.now());
         let done = pending.take().or_else(|| ctx.backend.wait(tn));
         if let Some(d) = done {
-            if t_arr <= d.at {
+            if d.at > end {
+                // A wake-up that overshot: this job ended after the window. The strategy never sees it, the
+                // drain below writes it down.
+                held = Some(d);
+            } else if t_arr <= d.at {
                 // Arrivals first: they are delivered below, then this completion.
                 pending = Some(d);
             } else {
@@ -356,14 +363,18 @@ pub fn run_slot_with<'e>(backend: &mut dyn Backend, strategy: &mut dyn Strategy,
         }
     }
     // The driver's own timer, not the strategy's: at the end of the grace window, or when nothing more can happen,
-    // a slot that published nothing publishes the best proof finished by then. A job still running is not that proof.
-    let at = ctx.backend.now().min(end);
-    ctx.fallback(at);
+    // a slot that published nothing publishes the best proof finished by then. The stamp is the real time, so a
+    // wake-up that overshot the window shows as late. A job still running is not that proof.
+    let at = ctx.backend.now();
     // A job still running at the deadline is written down, not delivered.
+    if let Some(d) = held.take() {
+        let _ = ctx.complete(d);
+    }
     while ctx.lane_job.iter().any(Option::is_some) {
         let d = ctx.backend.wait(Micros::MAX).expect("a lane is busy");
         let _ = ctx.complete(d);
     }
+    ctx.fallback(at);
     finish(ctx, inputs, spec)
 }
 

@@ -319,7 +319,8 @@ impl Backend for LiveBackend {
                 self.lateness_us.push(now - until);
                 return None;
             }
-            std::thread::sleep(POLL);
+            // Do not sleep past `until`: the poll is the wake-up error.
+            std::thread::sleep(POLL.min(Duration::from_micros(until - now)));
         }
     }
 }
