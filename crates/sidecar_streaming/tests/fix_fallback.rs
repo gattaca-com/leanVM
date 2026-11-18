@@ -44,56 +44,23 @@ fn the_best_finished_proof_is_published_when_the_last_job_overruns() {
     }
 }
 
-/// A strategy whose own clock never lands in the last 5 ms before `D`.
-struct Drift {
-    sigs: Vec<SigId>,
-    kept: Option<ProofId>,
-    busy: bool,
-}
-
-impl Strategy for Drift {
-    fn name(&self) -> String {
-        "drift".into()
-    }
-    fn on_event(&mut self, event: Event, ctx: &mut dyn Ctx) {
-        match event {
-            Event::SlotStart => ctx.set_timer(7_000, 1),
-            Event::Signature(s) => self.sigs.push(s),
-            Event::Proved { result: Ok(id), .. } => {
-                self.kept = Some(id);
-                self.busy = false;
-            }
-            Event::Timer(_) => {
-                let (now, d) = (ctx.now(), ctx.slot().deadline);
-                if !self.busy && !self.sigs.is_empty() {
-                    let job = Job { children: self.kept.into_iter().collect(), signatures: std::mem::take(&mut self.sigs), rate: ctx.slot().final_rate };
-                    ctx.prove(0, job);
-                    self.busy = true;
-                }
-                if let Some(k) = self.kept.filter(|_| now + 5_000 >= d && now < d) {
-                    ctx.publish(k);
-                } else if now < d {
-                    ctx.set_timer(now + 7_000, 1);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Finding 3: ticks 6 ms and 1 ms before `D` never come, so the strategy never publishes. The driver does, at `D`.
+/// The real leaf strategies tick on a 5 ms grid. Wherever `D` falls between two ticks, a slot whose votes are all in
+/// and proved publishes everything by `D`, with or without the driver's fallback.
 #[test]
-fn a_finished_proof_is_published_without_a_tick_near_d() {
+fn the_leaf_strategies_publish_by_d_wherever_d_falls_on_the_tick_grid() {
     let set = make_set(&leaf_params(), 2, 3);
-    // Ticks fall on multiples of 7 ms: the last one before D is 6 ms ahead of it.
-    let d = 2_505_000;
-    for slot in 0..2 {
-        let mut b = sim(SMOOTH);
-        let rs = RunSpec { set: &set, slot, subnet: 0, view: 0, deadline: d, caps: b.caps(), grace: 0 };
-        let rec = run_slot(&mut b, &mut Drift { sigs: Vec::new(), kept: None, busy: false }, &rs);
-        let m = slot_metrics(&rec);
-        assert_eq!(m.got, m.arrived, "slot {slot}");
-        assert!(m.published_us.is_some_and(|t| t <= d), "slot {slot}");
+    for offset in [0u64, 1, 1_000, 2_500, 4_000, 4_999] {
+        let d = 2_500_000 + offset;
+        for name in ["greedy_fit", "cheap_chain", "min_batch_fit:m=300", "one_shot_late"] {
+            for slot in 0..2 {
+                let mut b = sim(SMOOTH);
+                let (rec, m) = run(&mut b, &set, slot, d, name, None);
+                assert_eq!(m.got, m.arrived, "{name} slot {slot} D {d}");
+                assert!(m.published_us.is_some_and(|t| t <= d), "{name} slot {slot} D {d}");
+                // The strategy itself published, not the driver at the end of the window: its last job was its own.
+                assert!(rec.jobs.last().is_some_and(|j| j.useful), "{name} slot {slot} D {d}");
+            }
+        }
     }
 }
 
