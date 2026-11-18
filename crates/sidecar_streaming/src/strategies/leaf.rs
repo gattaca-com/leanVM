@@ -33,6 +33,8 @@ pub enum Act {
 pub trait Inner {
     fn name(&self) -> String;
     fn start(&mut self, _ctx: &dyn Ctx) {}
+    /// A job was launched, by this rule or by the wrapper. A plan made before it is out of date.
+    fn job_started(&mut self) {}
     fn act(&mut self, v: &View, ctx: &dyn Ctx) -> Act;
     /// True if waiting with votes in hand is the strategy itself, as in the one-shot and two-stage baselines.
     /// Every other strategy is kept from idling by `LeafStrategy::fill`.
@@ -80,6 +82,7 @@ impl<I: Inner> LeafStrategy<I> {
         ctx.prove(0, Job { children: kept.into_iter().collect(), signatures, rate });
         self.busy = true;
         self.last_started = last;
+        self.inner.job_started();
     }
 
     fn publish(&mut self, ctx: &mut dyn Ctx, id: ProofId) {
@@ -429,6 +432,11 @@ impl Inner for PlanCover {
             self.jumps.push(n - 1);
             self.jumps.push(n);
         }
+    }
+
+    /// The cached plan began with the job that just started. Repeating its first step would run the same size again.
+    fn job_started(&mut self) {
+        self.plan = None;
     }
 
     fn act(&mut self, v: &View, ctx: &dyn Ctx) -> Act {
