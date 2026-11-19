@@ -3,75 +3,96 @@
 This folder shows how to write a strategy that aggregates votes as they arrive during a slot.
 The strategy drives a leanVM sidecar and publishes one proof by a deadline `D`.
 
-The code lives in [`crates/sidecar_streaming`](../../crates/sidecar_streaming).
-Two files there are the examples to read and copy.
-The rest of the crate is experiment code: simulator, live driver, cost models and research strategies.
-It works, but it is not cleaned up.
+## Where the strategies are
 
-## The examples
+All code is in [`crates/sidecar_streaming`](../../crates/sidecar_streaming).
 
-[`strategies/simple.rs`](../../crates/sidecar_streaming/src/strategies/simple.rs) holds two strategies in about 120 lines.
-Neither one estimates cost, so both behave the same on any hardware.
+| File | Content |
+|---|---|
+| [`src/strategies/simple.rs`](../../crates/sidecar_streaming/src/strategies/simple.rs) | The two example strategies, about 120 lines. Read and copy these. |
+| [`src/strategy.rs`](../../crates/sidecar_streaming/src/strategy.rs) | The `Strategy` and `Ctx` traits a strategy implements and calls. |
+| [`src/types.rs`](../../crates/sidecar_streaming/src/types.rs#L140) | `Event`, `Job` and the other types a strategy sees. |
+| [`src/strategies/mod.rs`](../../crates/sidecar_streaming/src/strategies/mod.rs#L34) | The registry: strategy names and their constructors. |
+| [`tests/fix_simple.rs`](../../crates/sidecar_streaming/tests/fix_simple.rs) | Tests of the examples against a mock `Ctx`. |
+| [`src/strategies/leaf.rs`](../../crates/sidecar_streaming/src/strategies/leaf.rs), [`src/calib.rs`](../../crates/sidecar_streaming/src/calib.rs) | Research strategies that plan with a cost estimate. Experimental. |
+| [`src/strategies/merge.rs`](../../crates/sidecar_streaming/src/strategies/merge.rs) | Research strategies for the 16:1 merge at the proposer. Experimental. |
+
+The two examples estimate no cost, so they behave the same on any hardware:
 
 | Strategy | Rule |
 |---|---|
 | `greedy_simple` ([line 17](../../crates/sidecar_streaming/src/strategies/simple.rs#L17)) | BLS-style batching. Whenever the prover is idle, prove all queued votes, extending the previous proof. |
 | `once_at` ([line 81](../../crates/sidecar_streaming/src/strategies/simple.rs#L81)) | Wait until `D - lead_ms`, then prove all queued votes in one job. |
 
-Neither strategy publishes at `D` itself.
+Neither example publishes at `D` itself.
 The driver publishes the largest proof finished by `D` plus a grace window (`--grace-ms`).
 
-## The API
+The rest of the crate is experiment code: simulator, live driver, cost models and research strategies.
+It works, but it is not cleaned up.
 
-A strategy is a state machine ([`strategy.rs`](../../crates/sidecar_streaming/src/strategy.rs)).
-It receives events and answers with calls on `Ctx`.
-It never sees payload bytes or the wire protocol.
+## Reproduce the results
 
-Events ([`types.rs`](../../crates/sidecar_streaming/src/types.rs#L140)):
+The results table below comes from real sidecars, not from the simulator.
+You need two programs: the strategy client `streamsim` from this branch, and a `leanvm-sidecar` build.
 
-| Event | Meaning |
-|---|---|
-| `SlotStart` | The slot begins. `ctx.slot()` gives `D`, the final rate and job caps. |
-| `Signature(id)` | A vote arrived; the consensus layer has already validated it. |
-| `Proved { result, .. }` | A job ended, with a proof id or a failure. |
-| `Timer(token)` | A timer set with `ctx.set_timer` fired. |
-| `Aggregate`, `Verified` | Received proofs from other aggregators. Used by the 16:1 merge, not by leaves. |
+### 1. Build the sidecar
 
-Calls on `Ctx`:
+The table used two sidecar builds, each on its own branch of the fork:
 
-| Call | Effect |
-|---|---|
-| `prove(lane, Job)` | Start a job. `children` are earlier proofs; `signatures` are new votes; `rate` is the proof rate. |
-| `publish(proof)` | Publish the slot's one output. A second call panics. |
-| `set_timer(at, token)` | Get `Timer(token)` at time `at`. |
-| `now()`, `slot()`, `proof(id)`, `lane_idle(lane)` | Read state. |
-| `cost(shape)` | Predicted duration of a job. The examples do not use it. |
+| Build | Branch | Base |
+|---|---|---|
+| main | `alexey/sidecar-main` (`34a7285bf`) | upstream main `29077b733` plus a sidecar port |
+| perf | `alexey/sidecar-perf` (`b102bb988`) | perf/optimisations `8329de69f` plus the same port |
 
-One job with no children is an AGGREGATE.
-One job with one child plus new votes is an EXTEND of that proof.
-The live driver sends each child proof in the job payload.
+Build with Rust 1.99.1 and AVX2 flags, as for the table:
 
-## Write your own
+```sh
+git checkout alexey/sidecar-main   # or alexey/sidecar-perf
+RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq" \
+  cargo +1.99.1 build --release -p leanvm-sidecar
+```
 
-1. Add a type that implements `Strategy` in a new file under `src/strategies/`. Start from `GreedySimple`.
-2. Add its name to `LEAF` and a line to `Spec::make` in [`strategies/mod.rs`](../../crates/sidecar_streaming/src/strategies/mod.rs#L34).
-3. Run it in the simulator, then against a live sidecar (below).
+The binary is `target/release/leanvm-sidecar`. Copy it out before switching branches.
 
-Parameters come as `name:key=value;key=value`, for example `once_at:lead_ms=1300`.
-`Params::f(key, default)` reads one.
+### 2. Build the client and unpack the votes
 
-[`tests/fix_simple.rs`](../../crates/sidecar_streaming/tests/fix_simple.rs) tests a strategy against a mock `Ctx`.
-
-## Run
-
-Build with Rust 1.99.1 (a recent nightly fails on `vec_deque_pop_if`), then unpack the vote sets:
+On this branch (a recent nightly fails on `vec_deque_pop_if`, so use 1.99.1):
 
 ```sh
 cargo +1.99.1 build --release -p sidecar_streaming --bin streamsim
 gunzip -k experiments/sidecar-streaming/sets/*/slots.csv.gz
 ```
 
-Simulator: job times come from a measured cost table for one build (`models/`), with no prover running.
+### 3. Run
+
+[`scripts/reproduce.sh`](scripts/reproduce.sh) starts the sidecar, runs both examples on the three slots, and stops it.
+Run it from the repository root:
+
+```sh
+experiments/sidecar-streaming/scripts/reproduce.sh <path to leanvm-sidecar> <8|4> <once_at lead ms> [out dir]
+```
+
+| Build, cores | Lead (ms) |
+|---|---|
+| main, 8 | 2200 |
+| main, 4 | 3700 |
+| perf, 8 | 1300 |
+| perf, 4 | 2200 |
+
+The lead is about the time one AGGREGATE of all votes takes on that build.
+The sidecar runs on cores 0–7 or 0–3, and the client on cores 8–11.
+A full run takes about 2 minutes, warm-up included.
+Each `<out>/<slot>-<strategy>.md` holds a coverage table per `D`.
+Each `-jobs.csv` lists every proving job with its start and end time.
+Job times depend on the CPU and on other load, so coverage moves with them.
+
+To try your own strategy, pass its name to `streamsim live --strategy`, as the script does.
+
+### Simulator
+
+The simulator needs no sidecar.
+Job times come from a cost table measured for one build ([`models/`](models)).
+It is fast, but it is not a real prover.
 
 ```sh
 target/release/streamsim sim \
@@ -81,23 +102,22 @@ target/release/streamsim sim \
   --out sim.csv --jobs sim-jobs.csv
 ```
 
-Live: start a sidecar, then drive it with the same strategy.
-`--model` is still required, but the two examples do not use it.
+## Results
 
-```sh
-leanvm-sidecar --path /dev/shm/leanvm-live --threads 8 --warmup-signatures 1500 --warmup-rates 1,2 --arena-mib 256 &
-target/release/streamsim live \
-  --set experiments/sidecar-streaming/sets/rec3-typical \
-  --model experiments/sidecar-streaming/models/model-main-avx2-8c.txt \
-  --channel /dev/shm/leanvm-live --strategy greedy_simple --strategy-cost table \
-  --slots 2..3 --deadline-ms 4000,6000,8000 --grace-ms 25 --force \
-  --out live.csv --jobs live-jobs.csv
-```
+One slot per scenario, on an AMD EPYC 4585PX (Zen 5), with the AVX2 builds above.
+`k` is the slot index in the set.
+Each cell gives coverage for `greedy_simple` / `once_at`, in percent.
 
-Both commands print a coverage table per `D` on stdout.
-`--jobs` writes one row per proving job, with start and end times.
+| Slot, D | main, 8 cores | main, 4 cores | perf, 8 cores | perf, 4 cores |
+|---|---|---|---|---|
+| typical k=2, 4 s | 99 / 4 | 31.5 / 0 | 99 / 59 | 73 / 4 |
+| typical k=2, 8 s | 100 / 100 | 100 / 93 | 100 / 100 | 100 / 100 |
+| epoch k=23, 6 s | 96.5 / 35 | 64 / 0 | 97 / 65 | 94 / 35 |
+| epoch k=23, 8 s | 99.9 / 90 | 99.7 / 52 | 98.8 / 98 | 99.8 / 90 |
+| timer k=0, 5.5 s | 23 / 0 | 43 / 0 | 97 / 24 | 38 / 0 |
+| timer k=0, 8 s | 100 / 99 | 100 / 46 | ~100 / 99.9 | 100 / 99 |
 
-## Metric
+These are single slots, so read them as examples, not as distributions.
 
 Coverage is the number of votes in the published proof, divided by the votes that arrived by `D`.
 Time zero is the slot start.
@@ -120,33 +140,37 @@ Each set has `slots.csv` (`slot,t_us,kind,subnet,view,id,valid`), `meta.txt` and
 `sets/scenario_index.csv` lists the mainnet slot behind each sample.
 `scripts/make_timer_set.py` builds the timer set from `rec3-typical`.
 
-## Live results
+## Writing a strategy
 
-One slot per scenario, on an AMD EPYC 4585PX (Zen 5) with AVX2 builds.
-`k` is the slot index in the set.
-Each cell is coverage for `greedy_simple` / `once_at`, in percent.
+A strategy is a state machine.
+It receives events and answers with calls on `Ctx`.
+It never sees payload bytes or the wire protocol.
 
-| Slot, D | main, 8 cores | main, 4 cores | perf, 8 cores | perf, 4 cores |
-|---|---|---|---|---|
-| typical k=2, 4 s | 99 / 4 | 31.5 / 0 | 99 / 59 | 73 / 4 |
-| typical k=2, 8 s | 100 / 100 | 100 / 93 | 100 / 100 | 100 / 100 |
-| epoch k=23, 6 s | 96.5 / 35 | 64 / 0 | 97 / 65 | 94 / 35 |
-| epoch k=23, 8 s | 99.9 / 90 | 99.7 / 52 | 98.8 / 98 | 99.8 / 90 |
-| timer k=0, 5.5 s | 23 / 0 | 43 / 0 | 97 / 24 | 38 / 0 |
-| timer k=0, 8 s | 100 / 99 | 100 / 46 | ~100 / 99.9 | 100 / 99 |
+| Event | Meaning |
+|---|---|
+| `SlotStart` | The slot begins. `ctx.slot()` gives `D`, the final rate and job caps. |
+| `Signature(id)` | A vote arrived; the consensus layer has already validated it. |
+| `Proved { result, .. }` | A job ended, with a proof id or a failure. |
+| `Timer(token)` | A timer set with `ctx.set_timer` fired. |
+| `Aggregate`, `Verified` | Received proofs from other aggregators. Used by the 16:1 merge, not by leaves. |
 
-`once_at` leads were 2200 ms (main, 8 cores), 3700 ms (main, 4 cores), 1300 ms (perf, 8 cores) and 2200 ms (perf, 4 cores).
-"main" is upstream main `29077b733` with a sidecar port.
-"perf" is the perf/optimisations branch `8329de69f` with the same port.
-Neither sidecar build is on this branch.
-These are single slots, so read them as examples, not as distributions.
+| Call on `Ctx` | Effect |
+|---|---|
+| `prove(lane, Job)` | Start a job. `children` are earlier proofs; `signatures` are new votes; `rate` is the proof rate. |
+| `publish(proof)` | Publish the slot's one output. A second call panics. |
+| `set_timer(at, token)` | Get `Timer(token)` at time `at`. |
+| `now()`, `slot()`, `proof(id)`, `lane_idle(lane)` | Read state. |
+| `cost(shape)` | Predicted duration of a job. The examples do not use it. |
 
-## Research strategies
+A job with no children is an AGGREGATE.
+A job with one child plus new votes is an EXTEND of that proof.
+The live driver sends each child proof in the job payload.
 
-[`strategies/leaf.rs`](../../crates/sidecar_streaming/src/strategies/leaf.rs) holds strategies that plan with a cost estimate.
-Examples are `greedy_fit`, `plan_cover` and `one_shot_late`.
-They share a deadline guard in `LeafStrategy::evaluate` ([line 93](../../crates/sidecar_streaming/src/strategies/leaf.rs#L93)).
-Under that guard, the last job must end by `D`, and an earlier job must leave room for it.
-The estimate comes from [`calib.rs`](../../crates/sidecar_streaming/src/calib.rs), a cost line fitted online from finished jobs.
-[`strategies/merge.rs`](../../crates/sidecar_streaming/src/strategies/merge.rs) holds the 16:1 merge strategies.
-Both files are experimental.
+To add a strategy:
+
+1. Add a type that implements `Strategy` in a new file under `src/strategies/`. Start from `GreedySimple`.
+2. Add its name to `LEAF` and a line to `Spec::make` in `src/strategies/mod.rs`.
+3. Run it in the simulator, then against a live sidecar.
+
+Parameters come as `name:key=value;key=value`, for example `once_at:lead_ms=1300`.
+`Params::f(key, default)` reads one.
