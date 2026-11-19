@@ -1,0 +1,15 @@
+shape leaf
+slots 100
+slot_us 12000000
+att_due_us 4000000
+agg_due_us 8000000
+ptc_due_us 9000000
+deadline_us 8000000
+horizon_us 24000000
+final_rate 2
+expected_inputs 1587
+seed 0
+source recorded
+subnet_size 1600
+subnets 1
+views 1

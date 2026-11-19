@@ -1,0 +1,7 @@
+# Recorded set rec3: real mainnet votes, 2026-11-01, Xatu libp2p_gossipsub_beacon_attestation. No resampling.
+# One slot = the union of 4 committees of one mainnet slot, seen by 2 nodes of one client type.
+# t = 0 is the mainnet slot start. Recorded layout: 12 s slot, attestation due 4000 ms, aggregate due 8000 ms.
+# Every vote kept: head and non-head votes, timer voters included. The count per slot varies (expected_inputs = median).
+# Scenario rule: slot 0 of an epoch (slot % 32 = 0), block attested as head, 100 samples by hash.
+# Deadline: sweep D from the slot start. Other layouts map by aligning the attestation due (design/MEASURE.md).
+# Method and sample list: design/MEASURE.md, data/DATA.md (Recorded sets rec3), data/scenario_index.csv.
