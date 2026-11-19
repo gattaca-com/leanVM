@@ -2,7 +2,7 @@
 # Reproduce the live results table in ../README.md for one sidecar build and core count.
 #
 # Usage: reproduce.sh <leanvm-sidecar binary> <8|4> <once_at lead ms> [out dir]
-#   Leads used for the table: main 8 cores 2200, main 4 cores 3700, perf 8 cores 1300, perf 4 cores 2200.
+#   Leads used for the table: 2200 on 8 cores, 3700 on 4 cores.
 #
 # Run from the repository root, after building streamsim and unpacking the sets (see ../README.md).
 # The sidecar runs on cores 0-7 (8) or 0-3 (4); the client runs on cores 8-11.

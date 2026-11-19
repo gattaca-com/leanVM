@@ -37,22 +37,23 @@ You need two programs: the strategy client `streamsim` from this branch, and a `
 
 ### 1. Build the sidecar
 
-The table used two sidecar builds, each on its own branch of the fork:
+The table used upstream main `29077b733` (2026-11-17) with a sidecar port on top.
+The port is [`patches/sidecar-port-main.patch`](patches/sidecar-port-main.patch): 7 commits for `git am`.
+It is the shared-memory sidecar of the fork's `ve/sidecar`, ported to the `lean_vm` API of that commit.
+Upstream's own sidecar (#784, merged later) speaks a different protocol and does not work with this client.
 
-| Build | Branch | Base |
-|---|---|---|
-| main | `alexey/sidecar-main` (`34a7285bf`) | upstream main `29077b733` plus a sidecar port |
-| perf | `alexey/sidecar-perf` (`b102bb988`) | perf/optimisations `8329de69f` plus the same port |
-
-Build with Rust 1.99.1 and AVX2 flags, as for the table:
+Build it in a separate clone, with Rust 1.99.1 and the AVX2 flags used for the table:
 
 ```sh
-git checkout alexey/sidecar-main   # or alexey/sidecar-perf
+git clone https://github.com/leanEthereum/leanVM leanvm-sidecar-main
+cd leanvm-sidecar-main
+git checkout -b sidecar-port 29077b733
+git am <this repo>/experiments/sidecar-streaming/patches/sidecar-port-main.patch
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq" \
   cargo +1.99.1 build --release -p leanvm-sidecar
 ```
 
-The binary is `target/release/leanvm-sidecar`. Copy it out before switching branches.
+The binary is `target/release/leanvm-sidecar`.
 
 ### 2. Build the client and unpack the votes
 
@@ -72,14 +73,8 @@ Run it from the repository root:
 experiments/sidecar-streaming/scripts/reproduce.sh <path to leanvm-sidecar> <8|4> <once_at lead ms> [out dir]
 ```
 
-| Build, cores | Lead (ms) |
-|---|---|
-| main, 8 | 2200 |
-| main, 4 | 3700 |
-| perf, 8 | 1300 |
-| perf, 4 | 2200 |
-
-The lead is about the time one AGGREGATE of all votes takes on that build.
+The table used a lead of 2200 ms on 8 cores and 3700 ms on 4 cores.
+The lead is about the time one AGGREGATE of all votes takes there.
 The sidecar runs on cores 0–7 or 0–3, and the client on cores 8–11.
 A full run takes about 2 minutes, warm-up included.
 Each `<out>/<slot>-<strategy>.md` holds a coverage table per `D`.
@@ -104,18 +99,18 @@ target/release/streamsim sim \
 
 ## Results
 
-One slot per scenario, on an AMD EPYC 4585PX (Zen 5), with the AVX2 builds above.
+One slot per scenario, on an AMD EPYC 4585PX (Zen 5), with the AVX2 sidecar build above.
 `k` is the slot index in the set.
 Each cell gives coverage for `greedy_simple` / `once_at`, in percent.
 
-| Slot, D | main, 8 cores | main, 4 cores | perf, 8 cores | perf, 4 cores |
-|---|---|---|---|---|
-| typical k=2, 4 s | 99 / 4 | 31.5 / 0 | 99 / 59 | 73 / 4 |
-| typical k=2, 8 s | 100 / 100 | 100 / 93 | 100 / 100 | 100 / 100 |
-| epoch k=23, 6 s | 96.5 / 35 | 64 / 0 | 97 / 65 | 94 / 35 |
-| epoch k=23, 8 s | 99.9 / 90 | 99.7 / 52 | 98.8 / 98 | 99.8 / 90 |
-| timer k=0, 5.5 s | 23 / 0 | 43 / 0 | 97 / 24 | 38 / 0 |
-| timer k=0, 8 s | 100 / 99 | 100 / 46 | ~100 / 99.9 | 100 / 99 |
+| Slot, D | 8 cores | 4 cores |
+|---|---|---|
+| typical k=2, 4 s | 99 / 4 | 31.5 / 0 |
+| typical k=2, 8 s | 100 / 100 | 100 / 93 |
+| epoch k=23, 6 s | 96.5 / 35 | 64 / 0 |
+| epoch k=23, 8 s | 99.9 / 90 | 99.7 / 52 |
+| timer k=0, 5.5 s | 23 / 0 | 43 / 0 |
+| timer k=0, 8 s | 100 / 99 | 100 / 46 |
 
 These are single slots, so read them as examples, not as distributions.
 
