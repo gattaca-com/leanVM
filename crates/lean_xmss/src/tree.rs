@@ -38,12 +38,18 @@ fn subtree(pp: &PublicParam, seed: &SchemeSeed, layer: usize, j: u32) -> Vec<Vec
     levels(pp, layer, first, 0, CACHED_LEVEL, leaves)
 }
 
-/// Tree `index` of `layer`: its nodes at [`CACHED_LEVEL`].
+/// The levels under one node of [`CACHED_LEVEL`]: its index, and levels `0..CACHED_LEVEL`.
+#[cfg(feature = "std")]
+type Lower = (u32, std::sync::Arc<Vec<Vec<Digest>>>);
+
+/// Tree `index` of `layer`: its nodes at [`CACHED_LEVEL`], and the levels under the
+/// one the last path went through, which the next paths, at the next leaves, share.
 #[cfg(feature = "std")]
 pub(crate) struct LayerTree {
     layer: usize,
     pub(crate) index: u32,
     pub(crate) nodes: Vec<Digest>,
+    lower: std::sync::Mutex<Option<Lower>>,
 }
 
 #[cfg(feature = "std")]
@@ -53,12 +59,43 @@ impl LayerTree {
         let nodes = (first..first + CACHED_NODES as u32)
             .map(|j| subtree(pp, seed, layer, j)[CACHED_LEVEL][0])
             .collect();
-        Self { layer, index, nodes }
+        Self::new(layer, index, nodes)
     }
 
     pub(crate) fn from_bytes(layer: usize, index: u32, nodes: &[u8]) -> Self {
-        let nodes = nodes.as_chunks().0.to_vec();
-        Self { layer, index, nodes }
+        Self::new(layer, index, nodes.as_chunks().0.to_vec())
+    }
+
+    fn new(layer: usize, index: u32, nodes: Vec<Digest>) -> Self {
+        Self {
+            layer,
+            index,
+            nodes,
+            lower: Default::default(),
+        }
+    }
+
+    /// Levels `0..CACHED_LEVEL` under node `j` of [`CACHED_LEVEL`]: the kept ones, or
+    /// built and kept. Never waits for the lock: a path that finds it held builds its
+    /// own levels and leaves the kept ones, so no signature waits on another, and a
+    /// process forked while another thread held it still signs.
+    fn lower(&self, pp: &PublicParam, seed: &SchemeSeed, j: u32) -> std::sync::Arc<Vec<Vec<Digest>>> {
+        if let Ok(kept) = self.lower.try_lock()
+            && let Some((kept, levels)) = &*kept
+            && *kept == j
+        {
+            return levels.clone();
+        }
+        let mut levels = subtree(pp, seed, self.layer, j);
+        levels.truncate(CACHED_LEVEL);
+        let levels = std::sync::Arc::new(levels);
+        // The replaced levels are freed after the lock is released.
+        let _replaced = self
+            .lower
+            .try_lock()
+            .ok()
+            .and_then(|mut kept| kept.replace((j, levels.clone())));
+        levels
     }
 
     /// Levels `CACHED_LEVEL..=LAYER_HEIGHT`.
@@ -74,9 +111,10 @@ impl LayerTree {
     /// The path of `leaf`, a leaf of this tree.
     pub(crate) fn path(&self, pp: &PublicParam, seed: &SchemeSeed, leaf: u32) -> [Digest; LAYER_HEIGHT] {
         // A level starts at a multiple of its length, hence the modulo.
-        let mut levels = subtree(pp, seed, self.layer, leaf >> CACHED_LEVEL);
-        levels.truncate(CACHED_LEVEL);
-        levels.extend(self.upper(pp));
-        core::array::from_fn(|level| levels[level][((leaf as usize >> level) ^ 1) % levels[level].len()])
+        let (lower, upper) = (self.lower(pp, seed, leaf >> CACHED_LEVEL), self.upper(pp));
+        core::array::from_fn(|level| {
+            let nodes = lower.get(level).unwrap_or_else(|| &upper[level - CACHED_LEVEL]);
+            nodes[((leaf as usize >> level) ^ 1) % nodes.len()]
+        })
     }
 }

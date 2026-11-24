@@ -36,6 +36,45 @@ fn full_key_signs_and_verifies() {
     assert!(!verify(&pk, &other_message, &first));
 }
 
+/// Signatures in one bottom tree that leave a run of 256 leaves and come back to it
+/// verify: a path is right whether it reuses the levels the previous signature built,
+/// or builds them again for another run.
+#[test]
+fn signatures_across_leaf_runs_verify() {
+    let (sk, pk) = key_gen(&[2; SECRET_KEY_LEN]);
+    let message = test_message();
+    for leaf_index in [5, 6, (1 << 8) + 1, 7] {
+        assert!(
+            verify(&pk, &message, &sign(&sk, &message, leaf_index)),
+            "leaf {leaf_index}"
+        );
+    }
+}
+
+/// Threads signing with one key in different runs of 256 leaves of one bottom tree, at
+/// once, make signatures that verify and that a copy of the key, signing one leaf at a
+/// time, makes too.
+#[test]
+fn concurrent_signatures_across_leaf_runs_match_serial_ones() {
+    let seed = [6; SECRET_KEY_LEN];
+    let (sk, pk) = key_gen(&seed);
+    let message = test_message();
+    sk.prepare(0);
+    let copy = LeanXmssExpandedSecretKey::from_cache_bytes(&seed, &pk, &sk.cache_to_bytes()).unwrap();
+    let leaves: Vec<LeafIndex> = (0..4).flat_map(|run| [run << 8 | 1, run << 8 | 2]).collect();
+    let concurrent: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = leaves
+            .chunks(2)
+            .map(|pair| s.spawn(|| pair.iter().map(|&leaf| sign(&sk, &message, leaf)).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    for (&leaf, signature) in leaves.iter().zip(&concurrent) {
+        assert!(verify(&pk, &message, signature), "leaf {leaf}");
+        assert_eq!(*signature, sign(&copy, &message, leaf), "leaf {leaf}");
+    }
+}
+
 /// A key loaded from its cache signs as the original.
 #[test]
 fn cache_round_trip() {
