@@ -22,7 +22,7 @@ pub mod lean_da {
 /// The prover's thread pool, as a randomizer search.
 struct Pool;
 
-impl ::lean_xmss::FindFirst for Pool {
+impl ::lean_xmss::Parallel for Pool {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         P::find_first_if_idle(n, pred)
     }

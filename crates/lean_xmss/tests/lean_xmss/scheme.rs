@@ -79,7 +79,7 @@ fn concurrent_signatures_across_leaf_runs_match_serial_ones() {
 /// any order.
 struct LastFirst;
 
-impl FindFirst for LastFirst {
+impl Parallel for LastFirst {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         (0..n).rev().filter(|&i| pred(i)).last()
     }

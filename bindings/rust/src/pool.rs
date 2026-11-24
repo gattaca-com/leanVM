@@ -80,7 +80,7 @@ pub(crate) fn sign(
 struct Pool;
 
 #[cfg(not(feature = "aggregation"))]
-impl lean_xmss::FindFirst for Pool {
+impl lean_xmss::Parallel for Pool {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         parallel::find_first_if_idle(n, pred)
     }

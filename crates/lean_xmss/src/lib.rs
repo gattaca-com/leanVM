@@ -31,7 +31,7 @@ use wots::*;
 pub use scheme::{DEFAULT_BOTTOM_TREE_CACHE_SIZE, LeanXmssExpandedSecretKey, key_gen, sign, sign_with};
 pub use scheme::{LeanXmssPublicKey, LeanXmssSignature, verify};
 #[cfg(feature = "std")]
-pub use wots::{FindFirst, OnThisThread};
+pub use wots::{OnThisThread, Parallel};
 
 /// How many bytes in a [`SecretKey`].
 pub const SECRET_KEY_LEN: usize = 32;

@@ -87,12 +87,12 @@ fn is_codeword(d: u128) -> bool {
 /// Trials hashed at once.
 const GRIND_BATCH: usize = 64;
 
-/// Batches of trials one [`FindFirst::find_first`] call searches: enough to amortize a
+/// Batches of trials one [`Parallel::find_first`] call searches: enough to amortize a
 /// dispatch, few enough that every thread of a pool claims some.
 const WINDOW_BATCHES: u64 = 1 << 10;
 
 /// How `sign_with` spreads the randomizer search over threads.
-pub trait FindFirst {
+pub trait Parallel {
     /// The least `i < n` with `pred(i)`, or `None`. The least, whatever the order it
     /// tries them in: signing is deterministic.
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize>;
@@ -102,7 +102,7 @@ pub trait FindFirst {
 #[derive(Debug)]
 pub struct OnThisThread;
 
-impl FindFirst for OnThisThread {
+impl Parallel for OnThisThread {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         (0..n).find(|&i| pred(i))
     }
@@ -113,7 +113,7 @@ impl FindFirst for OnThisThread {
 /// codeword. Those bytes are zero in `input` and lie in its last block, so the blocks before
 /// are absorbed once and a trial costs one permutation. `S` searches a window of batches
 /// at a time.
-fn least_trial<S: FindFirst>(input: &[u8], base: u128) -> Option<u64> {
+fn least_trial<S: Parallel>(input: &[u8], base: u128) -> Option<u64> {
     let at = input.len() - RANDOMIZER_LEN;
     assert!(at.is_multiple_of(8) && at / RATE == input.len() / RATE);
     let template = keccak256::final_state(input);
@@ -144,7 +144,7 @@ fn least_trial<S: FindFirst>(input: &[u8], base: u128) -> Option<u64> {
 /// in its inputs, so signing one message again gives the same signature and a key
 /// never opens two codewords.
 #[cfg(feature = "std")]
-pub(crate) fn wots_sign<S: FindFirst>(
+pub(crate) fn wots_sign<S: Parallel>(
     pp: &PublicParam,
     seed: &SchemeSeed,
     layer: usize,

@@ -205,7 +205,7 @@ pub fn sign(sk: &LeanXmssExpandedSecretKey, message: &Message, leaf_index: LeafI
 /// [`sign`], its randomizer searches spread over threads by `S`. The signature is
 /// [`sign`]'s.
 #[cfg(feature = "std")]
-pub fn sign_with<S: FindFirst>(
+pub fn sign_with<S: Parallel>(
     sk: &LeanXmssExpandedSecretKey,
     message: &Message,
     leaf_index: LeafIndex,
@@ -308,7 +308,7 @@ impl LeanXmssExpandedSecretKey {
     /// The bottom tree `leaf_index` is in, with the top layer's signature of its root:
     /// the cached one, or built and cached. Built outside the lock, which is only ever
     /// held to read or update the cache.
-    fn bottom_tree<S: FindFirst>(&self, leaf_index: LeafIndex) -> Arc<BottomTree> {
+    fn bottom_tree<S: Parallel>(&self, leaf_index: LeafIndex) -> Arc<BottomTree> {
         let index = layer_index(leaf_index, 1);
         if let Some(bottom) = self.bottoms.lock().unwrap().get(index) {
             return bottom;
