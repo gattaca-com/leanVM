@@ -12,8 +12,8 @@ export interface SignedMessage {
 }
 
 /**
- * Starts the thread pool that proving and leanXMSS signing run on, with `threads` threads (0, the
- * default: one per physical core; 1: the calling thread). Signing never starts it, and signs on the calling
+ * Starts the thread pool that proving, key generation and signing run on, with `threads` threads (0, the default:
+ * one per physical core; 1: the calling thread). Key generation and signing never start it, and run on the calling
  * thread while it is not started or busy. Rejects when it already runs with another count.
  */
 export declare function setup(threads?: number): Promise<void>

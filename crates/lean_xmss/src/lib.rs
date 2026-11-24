@@ -28,7 +28,7 @@ use tree::*;
 use wots::*;
 
 #[cfg(feature = "std")]
-pub use scheme::{DEFAULT_BOTTOM_TREE_CACHE_SIZE, LeanXmssExpandedSecretKey, key_gen, sign, sign_with};
+pub use scheme::{DEFAULT_BOTTOM_TREE_CACHE_SIZE, LeanXmssExpandedSecretKey, key_gen, key_gen_with, sign, sign_with};
 pub use scheme::{LeanXmssPublicKey, LeanXmssSignature, verify};
 #[cfg(feature = "std")]
 pub use wots::{OnThisThread, Parallel};

@@ -419,9 +419,9 @@ proc vrfVerify*(root: VrfRoot, slot: uint64, proof: VrfProof): bool =
 ##############################################################
 
 proc leanPqSetup*(threads: int): Result[void, string] =
-  ## Starts the thread pool that proving and leanXMSS signing run on, with `threads` threads (0: one
-  ## per physical core, 1: the calling thread). Signing never starts it, and signs on the calling thread while
-  ## it is not started or busy. Fails if the pool already runs with another count.
+  ## Starts the thread pool that proving, key generation and signing run on, with `threads` threads (0: one per
+  ## physical core, 1: the calling thread). Key generation and signing never start it, and run on the calling thread
+  ## while it is not started or busy. Fails if the pool already runs with another count.
   if threads < 0:
     return err("threads must not be negative")
   check(lpqSetup(csize_t(threads)))

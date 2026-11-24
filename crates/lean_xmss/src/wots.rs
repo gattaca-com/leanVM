@@ -6,6 +6,7 @@
 //! zero, so those have no chain, and the other `v` sum to `T`. The signer grinds the
 //! randomizer `R` until it is, one permutation a trial.
 
+#[cfg(feature = "std")]
 use keccak256::RATE;
 
 use crate::*;
@@ -85,26 +86,40 @@ fn is_codeword(d: u128) -> bool {
 }
 
 /// Trials hashed at once.
+#[cfg(feature = "std")]
 const GRIND_BATCH: usize = 64;
 
 /// Batches of trials one [`Parallel::find_first`] call searches: enough to amortize a
 /// dispatch, few enough that every thread of a pool claims some.
+#[cfg(feature = "std")]
 const WINDOW_BATCHES: u64 = 1 << 10;
 
-/// How `sign_with` spreads the randomizer search over threads.
+/// How key generation and signing spread their work over threads: the randomizer
+/// searches, and the leaves of the trees they build. They never call a strategy from
+/// inside one of its own calls.
+#[cfg(feature = "std")]
 pub trait Parallel {
     /// The least `i < n` with `pred(i)`, or `None`. The least, whatever the order it
     /// tries them in: signing is deterministic.
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize>;
+
+    /// `f(i)` for every `i < n`, in order of `i`, whatever the order it runs them in.
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T>;
 }
 
-/// Searches on the calling thread.
+/// Runs on the calling thread.
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct OnThisThread;
 
+#[cfg(feature = "std")]
 impl Parallel for OnThisThread {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         (0..n).find(|&i| pred(i))
+    }
+
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        (0..n).map(f).collect()
     }
 }
 
@@ -113,6 +128,7 @@ impl Parallel for OnThisThread {
 /// codeword. Those bytes are zero in `input` and lie in its last block, so the blocks before
 /// are absorbed once and a trial costs one permutation. `S` searches a window of batches
 /// at a time.
+#[cfg(feature = "std")]
 fn least_trial<S: Parallel>(input: &[u8], base: u128) -> Option<u64> {
     let at = input.len() - RANDOMIZER_LEN;
     assert!(at.is_multiple_of(8) && at / RATE == input.len() / RATE);

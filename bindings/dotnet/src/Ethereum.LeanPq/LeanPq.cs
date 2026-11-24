@@ -28,9 +28,9 @@ public static unsafe class LeanPq
     public const int MaxChildren = 16;
 
     /// <summary>
-    /// Starts the thread pool that proving and leanXMSS signing run on, with <paramref name="threads"/>
-    /// threads (0: one per physical core, 1: the calling thread), before the first aggregation or signature.
-    /// Signing never starts it, and signs on the calling thread while it is not started or busy.
+    /// Starts the thread pool that proving, key generation and signing run on, with <paramref name="threads"/>
+    /// threads (0: one per physical core, 1: the calling thread), before the first aggregation or signature. Key
+    /// generation and signing never start it, and run on the calling thread while it is not started or busy.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="threads"/> is negative.</exception>
     /// <exception cref="LeanPqException">

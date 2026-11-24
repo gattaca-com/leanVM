@@ -1,5 +1,5 @@
-//! The thread pool that leanXMSS signing searches its randomizers on and, with `aggregation`, the
-//! prover proves on: one pool per process. With `aggregation`, signing and `setup` go through
+//! The thread pool that key generation and signing of both schemes run on and, with
+//! `aggregation`, the prover proves on: one pool per process. With `aggregation`, signing and `setup` go through
 //! `lean_vm`, so they reach the prover's own pool; without, this crate's dependency on the same pool
 //! crate, the experimental prover's.
 
@@ -19,14 +19,16 @@ pub(crate) static POOL_OWNER: AtomicU32 = AtomicU32::new(0);
 /// An owner that every process may use.
 pub(crate) const BUILT: u32 = u32::MAX;
 
-/// Starts the thread pool with `threads` threads (0: one per physical core), which leanXMSS signing
-/// and aggregation run on, and with `aggregation` builds the aggregation guest, once per process.
+/// Starts the thread pool with `threads` threads (0: one per physical core), which key generation,
+/// signing and aggregation run on, and with `aggregation` builds the aggregation guest, once per
+/// process.
 ///
-/// - Signing never starts the pool: before `setup` or a proof, it runs on the calling thread.
-/// - Signing uses the pool when it is free, and the calling thread while a proof or another
+/// - Key generation and signing never start the pool: before `setup` or a proof, they run on
+///   the calling thread.
+/// - They use the pool when it is free, and the calling thread while a proof or another key or
 ///   signature holds it, or in a process forked from one that started it.
-/// - `setup(1)` keeps signing and proving on the calling thread.
-/// - The signatures are the same on any number of threads.
+/// - `setup(1)` keeps everything on the calling thread.
+/// - Keys and signatures are the same on any number of threads.
 ///
 /// # Errors
 ///
@@ -63,8 +65,25 @@ pub(crate) fn start(threads: usize) -> Result<usize, Error> {
     }))
 }
 
-/// Signs on the pool when it is set up and free, else on the calling thread.
-pub(crate) fn sign(
+// Key generation and signing run on the pool when it is set up and free, else on the calling thread.
+
+pub(crate) fn xmss_key_gen(
+    seed: &lean_xmss::SecretKey,
+) -> (LeanXmssExpandedSecretKey, lean_xmss::LeanXmssPublicKey) {
+    #[cfg(feature = "aggregation")]
+    return lean_vm::lean_xmss::key_gen(seed);
+    #[cfg(not(feature = "aggregation"))]
+    return lean_xmss::key_gen_with::<Pool>(seed);
+}
+
+pub(crate) fn xmss_prepare(sk: &LeanXmssExpandedSecretKey, leaf_index: lean_xmss::LeafIndex) {
+    #[cfg(feature = "aggregation")]
+    lean_vm::lean_xmss::prepare(sk, leaf_index);
+    #[cfg(not(feature = "aggregation"))]
+    sk.prepare_with::<Pool>(leaf_index);
+}
+
+pub(crate) fn xmss_sign(
     sk: &LeanXmssExpandedSecretKey,
     message: &lean_xmss::Message,
     leaf_index: lean_xmss::LeafIndex,
@@ -75,7 +94,26 @@ pub(crate) fn sign(
     return lean_xmss::sign_with::<Pool>(sk, message, leaf_index);
 }
 
-/// The pool, as a randomizer search.
+pub(crate) fn sphincs_key_gen(
+    seed: &lean_sphincs::SecretKey,
+) -> lean_sphincs::LeanSphincsPublicKey {
+    #[cfg(feature = "aggregation")]
+    return lean_vm::lean_sphincs::key_gen(seed);
+    #[cfg(not(feature = "aggregation"))]
+    return lean_sphincs::key_gen_with::<Pool>(seed);
+}
+
+pub(crate) fn sphincs_sign(
+    seed: &lean_sphincs::SecretKey,
+    message: &lean_sphincs::Message,
+) -> lean_sphincs::LeanSphincsSignature {
+    #[cfg(feature = "aggregation")]
+    return lean_vm::lean_sphincs::sign(seed, message);
+    #[cfg(not(feature = "aggregation"))]
+    return lean_sphincs::sign_with::<Pool>(seed, message);
+}
+
+/// The pool, as the schemes' strategy.
 #[cfg(not(feature = "aggregation"))]
 struct Pool;
 
@@ -83,6 +121,17 @@ struct Pool;
 impl lean_xmss::Parallel for Pool {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         parallel::find_first_if_idle(n, pred)
+    }
+
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        parallel::map_collect_if_idle(n, f)
+    }
+}
+
+#[cfg(not(feature = "aggregation"))]
+impl lean_sphincs::Parallel for Pool {
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        parallel::map_collect_if_idle(n, f)
     }
 }
 

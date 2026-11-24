@@ -70,9 +70,9 @@ comptime {
     std.debug.assert(@sizeOf(Claim) == 64);
 }
 
-/// Starts the thread pool that proving and leanXMSS signing run on, with `threads` threads (0: one
-/// per physical core, 1: the calling thread). Signing never starts it, and signs on the calling thread while
-/// it is not started or busy. Fails if the pool already runs with another count.
+/// Starts the thread pool that proving, key generation and signing run on, with `threads` threads (0: one per
+/// physical core, 1: the calling thread). Key generation and signing never start it, and run on the calling thread
+/// while it is not started or busy. Fails if the pool already runs with another count.
 pub fn setup(threads: usize) Error!void {
     try checkStatus(c.lpq_setup(threads));
 }

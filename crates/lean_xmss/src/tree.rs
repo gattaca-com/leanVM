@@ -30,13 +30,21 @@ fn levels(pp: &PublicParam, layer: usize, first: u32, from: usize, to: usize, ba
     levels
 }
 
-/// Levels `0..=CACHED_LEVEL` under node `j` of [`CACHED_LEVEL`].
+/// Levels `0..=CACHED_LEVEL` under node `j` of [`CACHED_LEVEL`], its leaves `chunks` batches
+/// spread over threads by `S`.
 #[cfg(feature = "std")]
-fn subtree(pp: &PublicParam, seed: &SchemeSeed, layer: usize, j: u32) -> Vec<Vec<Digest>> {
-    let first = j << CACHED_LEVEL;
-    let leaves = wots_public_leaves(pp, seed, layer, first, 1 << CACHED_LEVEL);
-    levels(pp, layer, first, 0, CACHED_LEVEL, leaves)
+fn subtree<S: Parallel>(pp: &PublicParam, seed: &SchemeSeed, layer: usize, j: u32, chunks: usize) -> Vec<Vec<Digest>> {
+    let (first, chunk) = (j << CACHED_LEVEL, (1 << CACHED_LEVEL) / chunks);
+    let leaves = S::map(chunks, |c| {
+        wots_public_leaves(pp, seed, layer, first + (c * chunk) as u32, chunk)
+    });
+    levels(pp, layer, first, 0, CACHED_LEVEL, leaves.concat())
 }
+
+/// The batches a path's own leaves are spread over: enough for a pool's threads, each still
+/// many hashes to a stage.
+#[cfg(feature = "std")]
+const PATH_CHUNKS: usize = 8;
 
 /// The levels under one node of [`CACHED_LEVEL`]: its index, and levels `0..CACHED_LEVEL`.
 #[cfg(feature = "std")]
@@ -54,11 +62,13 @@ pub(crate) struct LayerTree {
 
 #[cfg(feature = "std")]
 impl LayerTree {
-    pub(crate) fn build(pp: &PublicParam, seed: &SchemeSeed, layer: usize, index: u32) -> Self {
+    /// The tree, its nodes of [`CACHED_LEVEL`] spread over threads by `S`, each built on
+    /// the thread `S` runs it on.
+    pub(crate) fn build<S: Parallel>(pp: &PublicParam, seed: &SchemeSeed, layer: usize, index: u32) -> Self {
         let first = index << (LAYER_HEIGHT - CACHED_LEVEL);
-        let nodes = (first..first + CACHED_NODES as u32)
-            .map(|j| subtree(pp, seed, layer, j)[CACHED_LEVEL][0])
-            .collect();
+        let nodes = S::map(CACHED_NODES, |j| {
+            subtree::<OnThisThread>(pp, seed, layer, first + j as u32, 1)[CACHED_LEVEL][0]
+        });
         Self::new(layer, index, nodes)
     }
 
@@ -79,14 +89,14 @@ impl LayerTree {
     /// built and kept. Never waits for the lock: a path that finds it held builds its
     /// own levels and leaves the kept ones, so no signature waits on another, and a
     /// process forked while another thread held it still signs.
-    fn lower(&self, pp: &PublicParam, seed: &SchemeSeed, j: u32) -> std::sync::Arc<Vec<Vec<Digest>>> {
+    fn lower<S: Parallel>(&self, pp: &PublicParam, seed: &SchemeSeed, j: u32) -> std::sync::Arc<Vec<Vec<Digest>>> {
         if let Ok(kept) = self.lower.try_lock()
             && let Some((kept, levels)) = &*kept
             && *kept == j
         {
             return levels.clone();
         }
-        let mut levels = subtree(pp, seed, self.layer, j);
+        let mut levels = subtree::<S>(pp, seed, self.layer, j, PATH_CHUNKS);
         levels.truncate(CACHED_LEVEL);
         let levels = std::sync::Arc::new(levels);
         // The replaced levels are freed after the lock is released.
@@ -108,10 +118,11 @@ impl LayerTree {
         self.upper(pp)[LAYER_HEIGHT - CACHED_LEVEL][0]
     }
 
-    /// The path of `leaf`, a leaf of this tree.
-    pub(crate) fn path(&self, pp: &PublicParam, seed: &SchemeSeed, leaf: u32) -> [Digest; LAYER_HEIGHT] {
+    /// The path of `leaf`, a leaf of this tree, the levels under its node of
+    /// [`CACHED_LEVEL`], when they are built, spread over threads by `S`.
+    pub(crate) fn path<S: Parallel>(&self, pp: &PublicParam, seed: &SchemeSeed, leaf: u32) -> [Digest; LAYER_HEIGHT] {
         // A level starts at a multiple of its length, hence the modulo.
-        let (lower, upper) = (self.lower(pp, seed, leaf >> CACHED_LEVEL), self.upper(pp));
+        let (lower, upper) = (self.lower::<S>(pp, seed, leaf >> CACHED_LEVEL), self.upper(pp));
         core::array::from_fn(|level| {
             let nodes = lower.get(level).unwrap_or_else(|| &upper[level - CACHED_LEVEL]);
             nodes[((leaf as usize >> level) ^ 1) % nodes.len()]

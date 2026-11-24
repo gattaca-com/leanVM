@@ -62,3 +62,30 @@ fn known_answer() {
     assert_eq!(signature.to_bytes()[..], sig_bytes[..]);
     assert!(verify(&pk, &message, &signature));
 }
+
+/// Runs every index, the last first, and returns the results in index order: a pool may
+/// run them in any order.
+struct LastFirst;
+
+impl Parallel for LastFirst {
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        let mut out: Vec<T> = (0..n).rev().map(f).collect();
+        out.reverse();
+        out
+    }
+}
+
+/// A strategy that runs out of order generates the calling thread's key and makes its
+/// signatures.
+#[test]
+fn any_strategy_order_keys_and_signs_as_the_calling_thread() {
+    let secret_key = [8; SECRET_KEY_LEN];
+    let pk = key_gen_with::<LastFirst>(&secret_key);
+    assert_eq!(pk, key_gen(&secret_key));
+    for m in 0..3u8 {
+        let message = [m; MESSAGE_LEN];
+        let signature = sign_with::<LastFirst>(&secret_key, &message);
+        assert_eq!(signature, sign(&secret_key, &message), "message {m}");
+        assert!(verify(&pk, &message, &signature));
+    }
+}

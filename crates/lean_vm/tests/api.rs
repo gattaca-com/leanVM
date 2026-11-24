@@ -17,7 +17,7 @@ fn public_api_end_to_end() {
     // share one tree.
     for (secret_key, _) in &keys {
         secret_key.set_bottom_tree_cache_size(4);
-        secret_key.prepare(7);
+        lean_xmss::prepare(secret_key, 7);
     }
     let mut lean_xmss_input = Vec::new();
     for (leaf_index, (message, count)) in (7..).zip([(MSG_0, 3), (MSG_1, 4), (MSG_2, 1)]) {
@@ -125,12 +125,21 @@ fn vrf_reveal() {
     assert!(lean_vrf::verify_vrf_proof(&key.root(), 150, &key.proof(150).unwrap()));
 }
 
-/// Signing on the prover's pool, by threads signing at once, some of them while the pool is busy with another,
-/// gives the signatures the calling thread's search gives.
+/// Key generation and signing on the prover's pool, by threads signing at once, some of them while the pool is busy
+/// with another, give the keys and signatures the calling thread gives.
 #[test]
 fn signing_on_the_pool_matches_the_calling_thread() {
     setup(0);
     let (secret_key, pub_key) = lean_xmss::key_gen(&[9; lean_xmss::SECRET_KEY_LEN]);
+    let (reference, reference_pub_key) = ::lean_xmss::key_gen(&[9; lean_xmss::SECRET_KEY_LEN]);
+    assert_eq!(pub_key, reference_pub_key);
+    assert_eq!(secret_key.cache_to_bytes(), reference.cache_to_bytes());
+    let sphincs_key = [9; lean_sphincs::SECRET_KEY_LEN];
+    let sphincs_pub_key = lean_sphincs::key_gen(&sphincs_key);
+    assert_eq!(sphincs_pub_key, ::lean_sphincs::key_gen(&sphincs_key));
+    let signature = lean_sphincs::sign(&sphincs_key, &MSG_1);
+    assert_eq!(signature, ::lean_sphincs::sign(&sphincs_key, &MSG_1));
+    assert!(lean_sphincs::verify(&sphincs_pub_key, &MSG_1, &signature));
     let leaves: [lean_xmss::LeafIndex; 4] = [5, 6, 300, (1 << 16) + 5];
     let secret_key = &secret_key;
     let on_pool: Vec<_> = std::thread::scope(|s| {

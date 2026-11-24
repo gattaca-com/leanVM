@@ -40,7 +40,7 @@ use wots::*;
 
 pub use scheme::{LeanSphincsPublicKey, LeanSphincsSignature, verify};
 #[cfg(feature = "std")]
-pub use scheme::{key_gen, sign};
+pub use scheme::{OnThisThread, Parallel, key_gen, key_gen_with, sign, sign_with};
 
 use keccak256::permutations;
 

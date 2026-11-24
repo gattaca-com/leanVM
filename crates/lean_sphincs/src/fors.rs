@@ -58,29 +58,31 @@ fn fors_key(pk_seed: &PkSeed, idx: u64, roots: &[Digest; FORS_TREES]) -> Digest 
     th_digests(pk_seed, &fors_adrs(idx, FORS_ROOTS), roots)
 }
 
-/// `fors_sign` and the public key it opens, each tree being built once: the key
-/// of instance `idx`, and its opening at `leaves`.
+/// `fors_sign` and the public key it opens, each tree being built once, the trees spread
+/// over threads by `S`: the key of instance `idx`, and its opening at `leaves`.
 #[cfg(feature = "std")]
-pub(crate) fn fors_open(sk: &ExpandedKey, idx: u64, leaves: &[usize; FORS_TREES]) -> (Digest, ForsOpening) {
+pub(crate) fn fors_open<S: Parallel>(
+    sk: &ExpandedKey,
+    idx: u64,
+    leaves: &[usize; FORS_TREES],
+) -> (Digest, ForsOpening) {
     let pk_seed = &sk.pk_seed;
     let seed: [Digest; 2] = *sk.sk_seed.as_chunks().0.as_array().unwrap();
-    let trees: Vec<_> = (0..FORS_TREES)
-        .map(|c| {
-            // As `fors_leaf` computes them: one batch for the secrets, one for the leaves.
-            let prf = (0..1 << FORS_HEIGHT).map(|s| (fors_secret_adrs(idx, c, s), seed));
-            let secrets = th_digests_many(pk_seed, prf);
-            let hashes = secrets.iter().enumerate();
-            let hashes = hashes.map(|(s, &secret)| (fors_node_adrs(idx, c, 0, s), [secret]));
-            let leaf_hashes = th_digests_many(pk_seed, hashes);
-            let levels = merkle_levels(pk_seed, leaf_hashes, FORS_HEIGHT, |z, j| fors_node_adrs(idx, c, z, j));
-            let s = leaves[c];
-            let opening = ForsTreeOpening {
-                secret: secrets[s],
-                path: core::array::from_fn(|z| levels[z][(s >> z) ^ 1]),
-            };
-            (levels[FORS_HEIGHT][0], opening)
-        })
-        .collect();
+    let trees = S::map(FORS_TREES, |c| {
+        // As `fors_leaf` computes them: one batch for the secrets, one for the leaves.
+        let prf = (0..1 << FORS_HEIGHT).map(|s| (fors_secret_adrs(idx, c, s), seed));
+        let secrets = th_digests_many(pk_seed, prf);
+        let hashes = secrets.iter().enumerate();
+        let hashes = hashes.map(|(s, &secret)| (fors_node_adrs(idx, c, 0, s), [secret]));
+        let leaf_hashes = th_digests_many(pk_seed, hashes);
+        let levels = merkle_levels(pk_seed, leaf_hashes, FORS_HEIGHT, |z, j| fors_node_adrs(idx, c, z, j));
+        let s = leaves[c];
+        let opening = ForsTreeOpening {
+            secret: secrets[s],
+            path: core::array::from_fn(|z| levels[z][(s >> z) ^ 1]),
+        };
+        (levels[FORS_HEIGHT][0], opening)
+    });
     let roots = core::array::from_fn(|c| trees[c].0);
     (fors_key(pk_seed, idx, &roots), core::array::from_fn(|c| trees[c].1))
 }

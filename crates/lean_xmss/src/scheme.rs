@@ -183,9 +183,15 @@ const _: () = assert!(CACHED_TREE_SIZE == 4096 && CACHED_BOTTOM_SIZE == 5300);
 /// computes the expanded secret key (for fast signing), and the public key, from a given secret key
 #[cfg(feature = "std")]
 pub fn key_gen(key_seed: &SecretKey) -> (LeanXmssExpandedSecretKey, LeanXmssPublicKey) {
+    key_gen_with::<OnThisThread>(key_seed)
+}
+
+/// [`key_gen`], the top tree's leaves spread over threads by `S`. The keys are [`key_gen`]'s.
+#[cfg(feature = "std")]
+pub fn key_gen_with<S: Parallel>(key_seed: &SecretKey) -> (LeanXmssExpandedSecretKey, LeanXmssPublicKey) {
     let seed = scheme_seed(key_seed);
     let public_param = public_param(&seed);
-    let sk = LeanXmssExpandedSecretKey::new(key_seed, LayerTree::build(&public_param, &seed, 1, 0));
+    let sk = LeanXmssExpandedSecretKey::new(key_seed, LayerTree::build::<S>(&public_param, &seed, 1, 0));
     let pk = sk.public_key;
     (sk, pk)
 }
@@ -202,8 +208,8 @@ pub fn sign(sk: &LeanXmssExpandedSecretKey, message: &Message, leaf_index: LeafI
     sign_with::<OnThisThread>(sk, message, leaf_index)
 }
 
-/// [`sign`], its randomizer searches spread over threads by `S`. The signature is
-/// [`sign`]'s.
+/// [`sign`], its randomizer searches and the trees it builds spread over threads by `S`.
+/// The signature is [`sign`]'s.
 #[cfg(feature = "std")]
 pub fn sign_with<S: Parallel>(
     sk: &LeanXmssExpandedSecretKey,
@@ -218,7 +224,7 @@ pub fn sign_with<S: Parallel>(
         bottom: LayerSignature {
             randomizer,
             chain_values,
-            path: bottom.tree.path(pp, &seed, leaf_index),
+            path: bottom.tree.path::<S>(pp, &seed, leaf_index),
         },
         top: bottom.top_signature.clone(),
     }
@@ -292,9 +298,16 @@ impl LeanXmssExpandedSecretKey {
     }
 
     /// Makes the future signing at `leaf_index` faster (by precomputing and caching the bottom tree).
-    /// See [`Self::set_bottom_tree_cache_size`] for how many bottom trees stay cached.
+    /// See [`Self::set_bottom_tree_cache_size`] for how many bottom trees stay cached. On the calling
+    /// thread; [`Self::prepare_with`] spreads it over threads.
     pub fn prepare(&self, leaf_index: LeafIndex) {
-        self.bottom_tree::<OnThisThread>(leaf_index);
+        self.prepare_with::<OnThisThread>(leaf_index);
+    }
+
+    /// [`Self::prepare`], the bottom tree's leaves and its top-layer signature's randomizer
+    /// search spread over threads by `S`.
+    pub fn prepare_with<S: Parallel>(&self, leaf_index: LeafIndex) {
+        self.bottom_tree::<S>(leaf_index);
     }
 
     /// Sets how many recently used bottom trees the key caches, [`DEFAULT_BOTTOM_TREE_CACHE_SIZE`]
@@ -314,14 +327,14 @@ impl LeanXmssExpandedSecretKey {
             return bottom;
         }
         let (pp, seed) = (&self.public_key.public_param, &scheme_seed(&self.key_seed));
-        let tree = LayerTree::build(pp, seed, 0, index);
+        let tree = LayerTree::build::<S>(pp, seed, 0, index);
         let (randomizer, chain_values) =
             wots_sign::<S>(pp, seed, 1, index, &tree.root(pp)).expect("an admissible encoding");
         let bottom = Arc::new(BottomTree {
             top_signature: LayerSignature {
                 randomizer,
                 chain_values,
-                path: self.top.path(pp, seed, index),
+                path: self.top.path::<S>(pp, seed, index),
             },
             tree,
         });

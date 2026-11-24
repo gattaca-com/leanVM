@@ -46,8 +46,8 @@ lean_vm = { git = "https://github.com/leanEthereum/leanVM.git", features = ["exp
 ## Proving
 
 - Prebuilt packages hold the prover once per CPU tier and run the fastest one the CPU supports, except Python, Java and .NET on Windows. A source build gets the tiers with `RUSTC_WRAPPER` set to the checkout's `scripts/tier-rustc` (not on Windows), or matches them with `RUSTFLAGS="-C target-cpu=native"` on the proving machine.
-- `setup(threads)`, before the first aggregation or leanXMSS signature, starts the thread pool both run on with `threads` threads (0: one per physical core, 1: the calling thread); it fails above the machine's parallelism. Proofs run one at a time per process.
-- leanXMSS signing never starts the pool. It searches on the pool when the pool is started and free, and on the calling thread otherwise: before `setup`, while a proof or another signature holds the pool, and in a process forked after it started. The signatures are the same either way.
+- `setup(threads)`, before the first aggregation, key generation or signature, starts the thread pool they run on with `threads` threads (0: one per physical core, 1: the calling thread); it fails above the machine's parallelism. Proofs run one at a time per process.
+- Key generation and signing never start the pool. They run on the pool when it is started and free, and on the calling thread otherwise: before `setup`, while a proof, a key or another signature holds the pool, and in a process forked after it started, which never uses the pool. Keys and signatures are the same either way.
 - When the build leaves a faster tier unused on this CPU, the first aggregation prints a warning on stderr, which `LEANVM_TIER` set to the tier it names silences.
 - Except on Windows, the Rust code allocates with jemalloc, which keeps freed pages: a process that aggregated keeps its peak memory.
 

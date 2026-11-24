@@ -25,7 +25,7 @@
 use std::fmt;
 
 use lean_xmss::{
-    key_gen, verify as xmss_verify, LeafIndex as UpstreamLeafIndex, LeanXmssExpandedSecretKey,
+    verify as xmss_verify, LeafIndex as UpstreamLeafIndex, LeanXmssExpandedSecretKey,
     LeanXmssPublicKey, LeanXmssSignature, SecretKey as UpstreamSecretKey,
     DEFAULT_BOTTOM_TREE_CACHE_SIZE, LOG_LIFETIME as UPSTREAM_LOG_LIFETIME, PUB_KEY_SIZE,
     SECRET_KEY_LEN as UPSTREAM_SECRET_KEY_LEN, SIG_SIZE,
@@ -153,13 +153,14 @@ impl SecretKey {
         Self::from_seed(crate::random_seed())
     }
 
-    /// Derives a key from its seed, deterministically.
+    /// Derives a key from its seed, deterministically, on the thread pool [`setup`](crate::setup)
+    /// sizes.
     ///
     /// The seed is the whole secret: never derive a second key from it.
     #[must_use]
     pub fn from_seed(seed: Seed) -> Self {
         // Key generation also returns the public key, which the expanded key already holds.
-        let (expanded, _) = key_gen(&seed);
+        let (expanded, _) = crate::pool::xmss_key_gen(&seed);
         Self { seed, expanded }
     }
 
@@ -219,11 +220,12 @@ impl SecretKey {
         PublicKey(self.expanded.public_key())
     }
 
-    /// Builds the bottom tree holding a leaf index, ahead of signing there.
+    /// Builds the bottom tree holding a leaf index, ahead of signing there, on the thread pool
+    /// [`setup`](crate::setup) sizes.
     ///
     /// Signing builds it on demand, so this only moves the cost earlier.
     pub fn prepare(&self, leaf_index: LeafIndex) {
-        self.expanded.prepare(leaf_index);
+        crate::pool::xmss_prepare(&self.expanded, leaf_index);
     }
 
     /// Sets how many recently used bottom trees the key caches, 8 by default. Each takes about 5 KiB.
@@ -242,7 +244,7 @@ impl SecretKey {
     /// probability below `2^-2954`.
     #[must_use]
     pub fn sign(&self, message: &Message, leaf_index: LeafIndex) -> Signature {
-        Signature(crate::pool::sign(&self.expanded, message, leaf_index))
+        Signature(crate::pool::xmss_sign(&self.expanded, message, leaf_index))
     }
 }
 

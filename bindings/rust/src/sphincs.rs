@@ -23,9 +23,9 @@
 use std::fmt;
 
 use lean_sphincs::{
-    key_gen, sign as sphincs_sign, verify as sphincs_verify, LeanSphincsPublicKey,
-    LeanSphincsSignature, SecretKey as UpstreamSecretKey, PUB_KEY_SIZE,
-    SECRET_KEY_LEN as UPSTREAM_SECRET_KEY_LEN, SIG_SIZE,
+    verify as sphincs_verify, LeanSphincsPublicKey, LeanSphincsSignature,
+    SecretKey as UpstreamSecretKey, PUB_KEY_SIZE, SECRET_KEY_LEN as UPSTREAM_SECRET_KEY_LEN,
+    SIG_SIZE,
 };
 
 use crate::{Encoding, Error, Message, PUBLIC_KEY_LEN};
@@ -122,12 +122,13 @@ impl SecretKey {
         Self::from_seed(crate::random_seed())
     }
 
-    /// Derives a key from its seed, deterministically.
+    /// Derives a key from its seed, deterministically, on the thread pool [`setup`](crate::setup)
+    /// sizes.
     ///
     /// The seed is the whole secret.
     #[must_use]
     pub fn from_seed(seed: Seed) -> Self {
-        let public_key = key_gen(&seed);
+        let public_key = crate::pool::sphincs_key_gen(&seed);
         Self { seed, public_key }
     }
 
@@ -159,7 +160,7 @@ impl SecretKey {
         PublicKey(self.public_key)
     }
 
-    /// Signs a message.
+    /// Signs a message, on the thread pool [`setup`](crate::setup) sizes.
     ///
     /// Signing is deterministic: the randomizer derives from the seed and the message.
     ///
@@ -169,7 +170,7 @@ impl SecretKey {
     /// probability below `2^-378193`.
     #[must_use]
     pub fn sign(&self, message: &Message) -> Signature {
-        Signature(sphincs_sign(&self.seed, message))
+        Signature(crate::pool::sphincs_sign(&self.seed, message))
     }
 }
 

@@ -19,19 +19,47 @@ pub mod lean_da {
     };
 }
 
-/// The prover's thread pool, as a randomizer search.
+/// The prover's thread pool, as the schemes' strategy: on the pool once [`setup`] or a proof has started it in this
+/// process, and on the calling thread while the pool is busy or before it starts, which key generation and signing
+/// never do. Keys and signatures are the same either way, on any number of threads.
 struct Pool;
 
 impl ::lean_xmss::Parallel for Pool {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         P::find_first_if_idle(n, pred)
     }
+
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        P::map_collect_if_idle(n, f)
+    }
 }
 
-/// Signs `message` at `leaf_index`, the randomizer searches on the prover's thread pool once [`setup`] or a proof has
-/// started it in this process, and on the calling thread while the pool is busy or before it starts, which signing
-/// never does. The signature is the same either way, on any number of threads. Never use the same key and leaf index
-/// to sign two different messages.
+impl ::lean_sphincs::Parallel for Pool {
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        P::map_collect_if_idle(n, f)
+    }
+}
+
+/// The leanXMSS key of `key_seed`, the top tree built on the prover's thread pool when [`setup`] or a proof has
+/// started it and it is free, else on the calling thread.
+pub fn xmss_key_gen(key_seed: &::lean_xmss::SecretKey) -> (::lean_xmss::LeanXmssExpandedSecretKey, LeanXmssPublicKey) {
+    ::lean_xmss::key_gen_with::<Pool>(key_seed)
+}
+
+/// Builds and caches the bottom tree of `leaf_index`, so that signing there is faster, on the prover's thread pool
+/// when [`setup`] or a proof has started it and it is free, else on the calling thread.
+pub fn xmss_prepare(sk: &::lean_xmss::LeanXmssExpandedSecretKey, leaf_index: ::lean_xmss::LeafIndex) {
+    sk.prepare_with::<Pool>(leaf_index);
+}
+
+/// Signs `message` at `leaf_index`, the randomizer searches and the trees signing builds on the prover's thread pool
+/// when [`setup`] or a proof has started it and it is free, else on the calling thread. Never use the same key and leaf
+/// index to sign two different messages. The first signature in a bottom tree builds it.
+///
+/// # Panics
+///
+/// When none of a layer's `2^32` randomizer trials gives a codeword, with probability below `2^-2954`: impossible in
+/// practice.
 pub fn xmss_sign(
     sk: &::lean_xmss::LeanXmssExpandedSecretKey,
     message: &::lean_xmss::Message,
@@ -40,9 +68,26 @@ pub fn xmss_sign(
     ::lean_xmss::sign_with::<Pool>(sk, message, leaf_index)
 }
 
-/// Call this function before generating / verifying proofs or signing with leanXMSS: it starts the prover's thread pool,
-/// with `threads` threads (0: one per physical core), picks the experimental prover's CPU tier, and builds the aggregation
-/// program.
+/// The leanSPHINCS public key of `secret_key`, its top tree built on the prover's thread pool when [`setup`] or a proof
+/// has started it and it is free, else on the calling thread.
+pub fn sphincs_key_gen(secret_key: &::lean_sphincs::SecretKey) -> LeanSphincsPublicKey {
+    ::lean_sphincs::key_gen_with::<Pool>(secret_key)
+}
+
+/// Signs `message`, deterministically and statelessly, the trees signing builds on the prover's thread pool when
+/// [`setup`] or a proof has started it and it is free, else on the calling thread. A key signs at most
+/// `2^LOG_LIFETIME` messages.
+///
+/// # Panics
+///
+/// When all encoding counters of a layer miss a codeword, with probability below `2^-378193`: impossible in practice.
+pub fn sphincs_sign(secret_key: &::lean_sphincs::SecretKey, message: &::lean_sphincs::Message) -> LeanSphincsSignature {
+    ::lean_sphincs::sign_with::<Pool>(secret_key, message)
+}
+
+/// Call this function before generating / verifying proofs, and before generating keys and signing to do so on the
+/// prover's thread pool: it starts the pool, with `threads` threads (0: one per physical core), picks the experimental
+/// prover's CPU tier, and builds the aggregation program.
 ///
 /// # Panics
 /// If the pool already runs with another thread count, or `LEANVM_TIER` names a tier this build does not run on this CPU.

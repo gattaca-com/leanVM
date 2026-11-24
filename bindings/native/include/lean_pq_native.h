@@ -29,10 +29,10 @@ int32_t lpq_last_error(lpq_buffer *out);
 void lpq_buffer_free(uint8_t *data, size_t len);
 
 /*
- * Starts the thread pool that proving and leanXMSS signing run on, with threads threads (0: one per
- * physical core, 1: the calling thread). Signing never starts it, and signs on the calling thread while it is
- * not started or busy. Fails above the machine's parallelism, if it runs with another count, or in
- * a process forked after it started.
+ * Starts the thread pool that proving, key generation and signing run on, with threads threads (0: one per physical
+ * core, 1: the calling thread). Key generation and signing never start it, and run on the calling thread while it is
+ * not started or busy. Fails above the machine's parallelism, if it runs with another count, or in a process forked
+ * after it started.
  */
 int32_t lpq_setup(size_t threads);
 

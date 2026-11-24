@@ -207,25 +207,68 @@ fn node_adrs(key: &OtsKey, z: usize, j: usize) -> Adrs {
         .with_tree_index(j as u32)
 }
 
-/// The levels of the tree holding `key`, its leaves first and its root last.
+/// How key generation and signing spread their work over threads: the leaves of the trees
+/// they build, and the FORS trees.
 #[cfg(feature = "std")]
-fn tree_levels(sk: &ExpandedKey, key: &OtsKey) -> Vec<Vec<Digest>> {
+pub trait Parallel {
+    /// `f(i)` for every `i < n`, in order of `i`, whatever the order it runs them in.
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T>;
+}
+
+/// Runs on the calling thread.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct OnThisThread;
+
+#[cfg(feature = "std")]
+impl Parallel for OnThisThread {
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        (0..n).map(f).collect()
+    }
+}
+
+/// The batches a tree's leaves are spread over: enough for a pool's threads, each still many
+/// hashes to a stage.
+#[cfg(feature = "std")]
+const TREE_CHUNKS: usize = 16;
+
+/// The levels of the tree holding `key`, its leaves first and its root last, the leaves
+/// [`TREE_CHUNKS`] batches spread over threads by `S`.
+#[cfg(feature = "std")]
+fn tree_levels<S: Parallel>(sk: &ExpandedKey, key: &OtsKey) -> Vec<Vec<Digest>> {
     let height = LAYER_HEIGHTS[key.layer];
-    let leaves = wots_public_leaves(sk, &OtsKey { leaf: 0, ..*key }, 1 << height);
+    let chunk = (1 << height) / TREE_CHUNKS;
+    let leaves = S::map(TREE_CHUNKS, |c| {
+        wots_public_leaves(
+            sk,
+            &OtsKey {
+                leaf: (c * chunk) as u32,
+                ..*key
+            },
+            chunk,
+        )
+    });
+    let leaves = leaves.concat();
     merkle_levels(&sk.pk_seed, leaves, height, |z, j| node_adrs(key, z, j))
 }
 
 /// Compute the public key, given the secret key.
 #[cfg(feature = "std")]
 pub fn key_gen(secret_key: &SecretKey) -> LeanSphincsPublicKey {
-    keygen(&ExpandedKey::new(secret_key)).0
+    key_gen_with::<OnThisThread>(secret_key)
+}
+
+/// [`key_gen`], the top tree's leaves spread over threads by `S`. The key is [`key_gen`]'s.
+#[cfg(feature = "std")]
+pub fn key_gen_with<S: Parallel>(secret_key: &SecretKey) -> LeanSphincsPublicKey {
+    keygen::<S>(&ExpandedKey::new(secret_key)).0
 }
 
 /// `slh_keygen_internal`: the public key, `PK.seed` and the top tree's root, with
 /// the top tree's levels, which signing reuses.
 #[cfg(feature = "std")]
-fn keygen(sk: &ExpandedKey) -> (LeanSphincsPublicKey, Vec<Vec<Digest>>) {
-    let top = tree_levels(sk, &OtsKey::of_index(LAYERS - 1, 0));
+fn keygen<S: Parallel>(sk: &ExpandedKey) -> (LeanSphincsPublicKey, Vec<Vec<Digest>>) {
+    let top = tree_levels::<S>(sk, &OtsKey::of_index(LAYERS - 1, 0));
     let pk = LeanSphincsPublicKey {
         pk_seed: sk.pk_seed,
         root: top[LAYER_HEIGHTS[LAYERS - 1]][0],
@@ -244,11 +287,17 @@ fn keygen(sk: &ExpandedKey) -> (LeanSphincsPublicKey, Vec<Vec<Digest>>) {
 /// and the top path, then the FORS instance and the two trees below.
 #[cfg(feature = "std")]
 pub fn sign(secret_key: &SecretKey, message: &Message) -> LeanSphincsSignature {
+    sign_with::<OnThisThread>(secret_key, message)
+}
+
+/// [`sign`], the trees it builds spread over threads by `S`. The signature is [`sign`]'s.
+#[cfg(feature = "std")]
+pub fn sign_with<S: Parallel>(secret_key: &SecretKey, message: &Message) -> LeanSphincsSignature {
     let sk = &ExpandedKey::new(secret_key);
-    let (pk, mut top) = keygen(sk);
+    let (pk, mut top) = keygen::<S>(sk);
     let r = prf_msg(&sk.sk_prf, &sk.pk_seed, message);
     let (idx, leaves) = message_digest(&pk, &r, message);
-    let (mut signed, fors) = fors_open(sk, idx, &leaves);
+    let (mut signed, fors) = fors_open::<S>(sk, idx, &leaves);
     let mut layers = [LayerSignature {
         counter: 0,
         wots: [[0; N]; V],
@@ -261,7 +310,7 @@ pub fn sign(secret_key: &SecretKey, message: &Message) -> LeanSphincsSignature {
         let levels = if layer == LAYERS - 1 {
             core::mem::take(&mut top)
         } else {
-            tree_levels(sk, &key)
+            tree_levels::<S>(sk, &key)
         };
         for (z, node) in paths[path_range(layer)].iter_mut().enumerate() {
             *node = levels[z][(key.leaf as usize >> z) ^ 1];

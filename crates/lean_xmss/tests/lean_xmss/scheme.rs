@@ -83,20 +83,72 @@ impl Parallel for LastFirst {
     fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
         (0..n).rev().filter(|&i| pred(i)).last()
     }
+
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        let mut out: Vec<T> = (0..n).rev().map(f).collect();
+        out.reverse();
+        out
+    }
 }
 
-/// A search that tries trials out of order signs as the calling thread's search, on
-/// both layers: the top layer's signature is made when the bottom tree is built.
+/// A strategy that runs out of order generates the calling thread's key and makes its
+/// signatures, on both layers: the top layer's signature is made when the bottom tree is
+/// built, by `prepare_with` or by the first signature in it.
 #[test]
-fn sign_with_any_search_order_matches_sign() {
+fn any_strategy_order_keys_and_signs_as_the_calling_thread() {
     let seed = [4; SECRET_KEY_LEN];
-    let (sk, pk) = key_gen(&seed);
-    let other = LeanXmssExpandedSecretKey::from_cache_bytes(&seed, &pk, &sk.cache_to_bytes()).unwrap();
+    let (sk, pk) = key_gen_with::<LastFirst>(&seed);
+    let (reference, reference_pk) = key_gen(&seed);
+    assert_eq!(pk, reference_pk);
+    assert_eq!(sk.cache_to_bytes(), reference.cache_to_bytes());
     let message = test_message();
-    let leaf_index = (2 << LAYER_HEIGHT) + 9;
-    let signature = sign_with::<LastFirst>(&sk, &message, leaf_index);
-    assert_eq!(signature, sign(&other, &message, leaf_index));
-    assert!(verify(&pk, &message, &signature));
+    for (leaf_index, prepared) in [((2 << LAYER_HEIGHT) + 9, false), ((3 << LAYER_HEIGHT) + 300, true)] {
+        if prepared {
+            sk.prepare_with::<LastFirst>(leaf_index);
+        }
+        let signature = sign_with::<LastFirst>(&sk, &message, leaf_index);
+        assert_eq!(signature, sign(&reference, &message, leaf_index), "leaf {leaf_index}");
+        assert!(verify(&pk, &message, &signature));
+    }
+    assert_eq!(sk.cache_to_bytes(), reference.cache_to_bytes());
+}
+
+std::thread_local! {
+    static IN_MAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs on the calling thread and panics when called from inside its own `map`, as a
+/// strategy over a pool that forbids nested dispatch would.
+struct NoNesting;
+
+impl Parallel for NoNesting {
+    fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
+        assert!(!IN_MAP.get(), "find_first called from inside map");
+        (0..n).find(|&i| pred(i))
+    }
+
+    fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        assert!(!IN_MAP.replace(true), "map called from inside map");
+        let out = (0..n).map(f).collect();
+        IN_MAP.set(false);
+        out
+    }
+}
+
+/// Key generation, preparation and signing never call a strategy from inside one of its
+/// own calls.
+#[test]
+fn strategies_are_never_nested() {
+    let (sk, pk) = key_gen_with::<NoNesting>(&[10; SECRET_KEY_LEN]);
+    let message = test_message();
+    sk.prepare_with::<NoNesting>(1 << LAYER_HEIGHT);
+    for leaf_index in [(1 << LAYER_HEIGHT) + 1, 300, (5 << LAYER_HEIGHT) + 7] {
+        assert!(verify(
+            &pk,
+            &message,
+            &sign_with::<NoNesting>(&sk, &message, leaf_index)
+        ));
+    }
 }
 
 /// A key loaded from its cache signs as the original.
