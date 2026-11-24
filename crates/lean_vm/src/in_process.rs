@@ -19,8 +19,30 @@ pub mod lean_da {
     };
 }
 
-/// Call this function before generating / verifying proofs: it starts the prover's thread pool, with `threads` threads
-/// (0: one per physical core), picks the experimental prover's CPU tier, and builds the aggregation program.
+/// The prover's thread pool, as a randomizer search.
+struct Pool;
+
+impl ::lean_xmss::FindFirst for Pool {
+    fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
+        P::find_first_if_idle(n, pred)
+    }
+}
+
+/// Signs `message` at `leaf_index`, the randomizer searches on the prover's thread pool once [`setup`] or a proof has
+/// started it in this process, and on the calling thread while the pool is busy or before it starts, which signing
+/// never does. The signature is the same either way, on any number of threads. Never use the same key and leaf index
+/// to sign two different messages.
+pub fn xmss_sign(
+    sk: &::lean_xmss::LeanXmssExpandedSecretKey,
+    message: &::lean_xmss::Message,
+    leaf_index: ::lean_xmss::LeafIndex,
+) -> LeanXmssSignature {
+    ::lean_xmss::sign_with::<Pool>(sk, message, leaf_index)
+}
+
+/// Call this function before generating / verifying proofs or signing with leanXMSS: it starts the prover's thread pool,
+/// with `threads` threads (0: one per physical core), picks the experimental prover's CPU tier, and builds the aggregation
+/// program.
 ///
 /// # Panics
 /// If the pool already runs with another thread count, or `LEANVM_TIER` names a tier this build does not run on this CPU.

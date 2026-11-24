@@ -199,9 +199,20 @@ pub fn key_gen(key_seed: &SecretKey) -> (LeanXmssExpandedSecretKey, LeanXmssPubl
 /// `2^-2954` (`doc/lean_xmss`): impossible in practice.
 #[cfg(feature = "std")]
 pub fn sign(sk: &LeanXmssExpandedSecretKey, message: &Message, leaf_index: LeafIndex) -> LeanXmssSignature {
-    let bottom = sk.bottom_tree(leaf_index);
+    sign_with::<OnThisThread>(sk, message, leaf_index)
+}
+
+/// [`sign`], its randomizer searches spread over threads by `S`. The signature is
+/// [`sign`]'s.
+#[cfg(feature = "std")]
+pub fn sign_with<S: FindFirst>(
+    sk: &LeanXmssExpandedSecretKey,
+    message: &Message,
+    leaf_index: LeafIndex,
+) -> LeanXmssSignature {
+    let bottom = sk.bottom_tree::<S>(leaf_index);
     let (pp, seed) = (&sk.public_key.public_param, scheme_seed(&sk.key_seed));
-    let (randomizer, chain_values) = wots_sign(pp, &seed, 0, leaf_index, message).expect("an admissible encoding");
+    let (randomizer, chain_values) = wots_sign::<S>(pp, &seed, 0, leaf_index, message).expect("an admissible encoding");
     LeanXmssSignature {
         leaf_index,
         bottom: LayerSignature {
@@ -283,7 +294,7 @@ impl LeanXmssExpandedSecretKey {
     /// Makes the future signing at `leaf_index` faster (by precomputing and caching the bottom tree).
     /// See [`Self::set_bottom_tree_cache_size`] for how many bottom trees stay cached.
     pub fn prepare(&self, leaf_index: LeafIndex) {
-        self.bottom_tree(leaf_index);
+        self.bottom_tree::<OnThisThread>(leaf_index);
     }
 
     /// Sets how many recently used bottom trees the key caches, [`DEFAULT_BOTTOM_TREE_CACHE_SIZE`]
@@ -297,14 +308,15 @@ impl LeanXmssExpandedSecretKey {
     /// The bottom tree `leaf_index` is in, with the top layer's signature of its root:
     /// the cached one, or built and cached. Built outside the lock, which is only ever
     /// held to read or update the cache.
-    fn bottom_tree(&self, leaf_index: LeafIndex) -> Arc<BottomTree> {
+    fn bottom_tree<S: FindFirst>(&self, leaf_index: LeafIndex) -> Arc<BottomTree> {
         let index = layer_index(leaf_index, 1);
         if let Some(bottom) = self.bottoms.lock().unwrap().get(index) {
             return bottom;
         }
         let (pp, seed) = (&self.public_key.public_param, &scheme_seed(&self.key_seed));
         let tree = LayerTree::build(pp, seed, 0, index);
-        let (randomizer, chain_values) = wots_sign(pp, seed, 1, index, &tree.root(pp)).expect("an admissible encoding");
+        let (randomizer, chain_values) =
+            wots_sign::<S>(pp, seed, 1, index, &tree.root(pp)).expect("an admissible encoding");
         let bottom = Arc::new(BottomTree {
             top_signature: LayerSignature {
                 randomizer,

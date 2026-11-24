@@ -18,9 +18,10 @@ pub use in_process::{AggregateError, AggregateProof, aggregate, lean_da, setup};
 pub mod lean_xmss {
     pub use lean_xmss::{
         DEFAULT_BOTTOM_TREE_CACHE_SIZE, LOG_LIFETIME, LeafIndex, LeanXmssExpandedSecretKey, LeanXmssPublicKey,
-        LeanXmssSignature, MESSAGE_LEN, Message, PUB_KEY_SIZE, SECRET_KEY_LEN, SIG_SIZE, SecretKey, key_gen, sign,
-        verify,
+        LeanXmssSignature, MESSAGE_LEN, Message, PUB_KEY_SIZE, SECRET_KEY_LEN, SIG_SIZE, SecretKey, key_gen, verify,
     };
+
+    pub use crate::in_process::xmss_sign as sign;
 }
 
 pub mod lean_sphincs {

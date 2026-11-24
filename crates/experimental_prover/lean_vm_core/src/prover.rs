@@ -44,6 +44,10 @@ impl isa::Prover for ExperimentalProver {
         parallel::map_collect(n, f)
     }
 
+    fn find_first_if_idle(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
+        parallel::find_first_if_idle(n, pred)
+    }
+
     fn combine_rows(rows: &[u64], weights: &[E]) -> Vec<E> {
         let width = rows.len() / weights.len();
         assert!(

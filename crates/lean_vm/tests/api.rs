@@ -124,3 +124,24 @@ fn vrf_reveal() {
     let key = lean_vrf::VrfKey::new([7; 32], 100..200).unwrap();
     assert!(lean_vrf::verify_vrf_proof(&key.root(), 150, &key.proof(150).unwrap()));
 }
+
+/// Signing on the prover's pool, by threads signing at once, some of them while the pool is busy with another,
+/// gives the signatures the calling thread's search gives.
+#[test]
+fn signing_on_the_pool_matches_the_calling_thread() {
+    setup(0);
+    let (secret_key, pub_key) = lean_xmss::key_gen(&[9; lean_xmss::SECRET_KEY_LEN]);
+    let leaves: [lean_xmss::LeafIndex; 4] = [5, 6, 300, (1 << 16) + 5];
+    let secret_key = &secret_key;
+    let on_pool: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = leaves
+            .iter()
+            .map(|&leaf_index| s.spawn(move || lean_xmss::sign(secret_key, &MSG_2, leaf_index)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (&leaf_index, signature) in leaves.iter().zip(&on_pool) {
+        assert!(lean_xmss::verify(&pub_key, &MSG_2, signature));
+        assert_eq!(*signature, ::lean_xmss::sign(secret_key, &MSG_2, leaf_index));
+    }
+}

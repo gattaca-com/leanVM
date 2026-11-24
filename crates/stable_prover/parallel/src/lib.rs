@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, Once, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, Once, OnceLock, TryLockError};
 
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
@@ -84,6 +84,8 @@ struct Pool {
     dispatch: Mutex<()>,
     /// The dispatch's first task-panic payload, re-raised by the dispatcher.
     panic: Mutex<Option<Box<dyn Any + Send>>>,
+    /// The process that started the workers: a process forked from it has none of them.
+    pid: u32,
 }
 
 /// Idempotent warm-up: spawn the workers and run one empty dispatch, which waits for every worker,
@@ -93,8 +95,10 @@ pub fn init() {
     INIT.call_once(|| for_each(num_threads(), |_| {}));
 }
 
+/// The pool, once a dispatch has started it.
+static POOL: OnceLock<&'static Pool> = OnceLock::new();
+
 fn pool() -> &'static Pool {
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             state: Mutex::new(State {
@@ -109,6 +113,7 @@ fn pool() -> &'static Pool {
             counter: AtomicUsize::new(0),
             dispatch: Mutex::new(()),
             panic: Mutex::new(None),
+            pid: std::process::id(),
         }));
         // The dispatcher is worker 0.
         for id in 1..num_threads() {
@@ -224,12 +229,15 @@ pub fn for_each_chunk<F: Fn(usize, usize) + Sync>(n_tasks: usize, f: F) {
     }
 
     let pool = pool();
-    let guard = pool.dispatch.lock().unwrap();
+    run(pool, pool.dispatch.lock().unwrap(), n_tasks, &f);
+}
 
+/// [`for_each_chunk`]'s dispatch, `guard` holding the dispatch lock, the caller marked as in a task.
+fn run<F: Fn(usize, usize) + Sync>(pool: &Pool, guard: MutexGuard<'_, ()>, n_tasks: usize, f: &F) {
     // SAFETY: erase the borrow to `'static` so it fits in `Job`; the dispatcher waits for every worker
     // before returning, so `f` outlives every dereference. `transmute` rather than a `*const dyn` cast,
     // which would force `F: 'static`.
-    let f_ref: &(dyn Fn(usize, usize) + Sync) = &f;
+    let f_ref: &(dyn Fn(usize, usize) + Sync) = f;
     let job = Job {
         f: unsafe { std::mem::transmute::<NonNull<_>, NonNull<_>>(NonNull::from(f_ref)) },
         n_tasks,
@@ -427,7 +435,40 @@ pub fn map_collect<T: Send, F: Fn(usize) -> T + Sync>(n_tasks: usize, f: F) -> V
 /// it, so the search stops early without giving up determinism.
 pub fn find_first<P: Fn(usize) -> bool + Sync>(n_tasks: usize, pred: P) -> Option<usize> {
     let best = AtomicUsize::new(usize::MAX);
-    for_each_chunk(n_tasks, |start, end| {
+    for_each_chunk(n_tasks, first_hits(&pred, &best));
+    let index = best.load(Ordering::Relaxed);
+    (index != usize::MAX).then_some(index)
+}
+
+/// [`find_first`] on the pool when it can start at once, else on the calling thread: the same answer either way.
+/// The pool takes it when a dispatch has started it in this process, no dispatch is running and the caller is not
+/// one of its tasks. It never starts the pool, sizes it or waits for it, so it may be called from anywhere,
+/// a task or a process forked from one with a pool included.
+pub fn find_first_if_idle<P: Fn(usize) -> bool + Sync>(n_tasks: usize, pred: P) -> Option<usize> {
+    let on_this_thread = |pred: &P| (0..n_tasks).find(|&i| pred(i));
+    let Some(&pool) = POOL.get() else {
+        return on_this_thread(&pred);
+    };
+    if IN_TASK.get() || pool.pid != std::process::id() || n_tasks <= 1 {
+        return on_this_thread(&pred);
+    }
+    let guard = match pool.dispatch.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return on_this_thread(&pred),
+    };
+    let _task = InTask::enter();
+    let best = AtomicUsize::new(usize::MAX);
+    run(pool, guard, n_tasks, &first_hits(&pred, &best));
+    let index = best.load(Ordering::Relaxed);
+    (index != usize::MAX).then_some(index)
+}
+
+/// The claim body of a least-index search: `pred` over a claim, up to the least hit `best` holds, which it lowers.
+fn first_hits<'a, P: Fn(usize) -> bool + Sync>(
+    pred: &'a P,
+    best: &'a AtomicUsize,
+) -> impl Fn(usize, usize) + Sync + 'a {
+    move |start, end| {
         for i in start..end {
             if i >= best.load(Ordering::Relaxed) {
                 return; // a smaller hit already exists
@@ -437,9 +478,7 @@ pub fn find_first<P: Fn(usize) -> bool + Sync>(n_tasks: usize, pred: P) -> Optio
                 return; // later hits in this claim are larger
             }
         }
-    });
-    let index = best.load(Ordering::Relaxed);
-    (index != usize::MAX).then_some(index)
+    }
 }
 
 /// One slot per cache line: a worker writes through its accumulator on the

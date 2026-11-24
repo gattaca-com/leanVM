@@ -87,17 +87,40 @@ fn is_codeword(d: u128) -> bool {
 /// Trials hashed at once.
 const GRIND_BATCH: usize = 64;
 
+/// Batches of trials one [`FindFirst::find_first`] call searches: enough to amortize a
+/// dispatch, few enough that every thread of a pool claims some.
+const WINDOW_BATCHES: u64 = 1 << 10;
+
+/// How `sign_with` spreads the randomizer search over threads.
+pub trait FindFirst {
+    /// The least `i < n` with `pred(i)`, or `None`. The least, whatever the order it
+    /// tries them in: signing is deterministic.
+    fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize>;
+}
+
+/// Searches on the calling thread.
+#[derive(Debug)]
+pub struct OnThisThread;
+
+impl FindFirst for OnThisThread {
+    fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
+        (0..n).find(|&i| pred(i))
+    }
+}
+
 /// The least `c` below `MAX_RANDOMIZER_TRIALS` whose randomizer `base + c`, as the last
 /// 16 bytes of `input`, makes its digest a codeword: the least, which keeps one key to one
 /// codeword. Those bytes are zero in `input` and lie in its last block, so the blocks before
-/// are absorbed once and a trial costs one permutation.
-fn least_trial(input: &[u8], base: u128) -> Option<u64> {
+/// are absorbed once and a trial costs one permutation. `S` searches a window of batches
+/// at a time.
+fn least_trial<S: FindFirst>(input: &[u8], base: u128) -> Option<u64> {
     let at = input.len() - RANDOMIZER_LEN;
     assert!(at.is_multiple_of(8) && at / RATE == input.len() / RATE);
     let template = keccak256::final_state(input);
-    let (mut values, mut digests) = ([0; GRIND_BATCH], [0; GRIND_BATCH]);
-    (0..MAX_RANDOMIZER_TRIALS).step_by(GRIND_BATCH).find_map(|first| {
+    // The first codeword among the batch of trials from `first`.
+    let batch = |first: u64| {
         let n = (MAX_RANDOMIZER_TRIALS - first).min(GRIND_BATCH as u64) as usize;
+        let (mut values, mut digests) = ([0; GRIND_BATCH], [0; GRIND_BATCH]);
         for (c, value) in (first..).zip(&mut values[..n]) {
             *value = base.wrapping_add(u128::from(c));
         }
@@ -106,6 +129,13 @@ fn least_trial(input: &[u8], base: u128) -> Option<u64> {
             .iter()
             .position(|&d| is_codeword(d))
             .map(|hit| first + hit as u64)
+    };
+    let batches = MAX_RANDOMIZER_TRIALS.div_ceil(GRIND_BATCH as u64);
+    (0..batches).step_by(WINDOW_BATCHES as usize).find_map(|start| {
+        let n = (batches - start).min(WINDOW_BATCHES) as usize;
+        let first = |b: usize| (start + b as u64) * GRIND_BATCH as u64;
+        let b = S::find_first(n, |b| batch(first(b)).is_some())?;
+        batch(first(b))
     })
 }
 
@@ -114,7 +144,7 @@ fn least_trial(input: &[u8], base: u128) -> Option<u64> {
 /// in its inputs, so signing one message again gives the same signature and a key
 /// never opens two codewords.
 #[cfg(feature = "std")]
-pub(crate) fn wots_sign(
+pub(crate) fn wots_sign<S: FindFirst>(
     pp: &PublicParam,
     seed: &SchemeSeed,
     layer: usize,
@@ -128,7 +158,9 @@ pub(crate) fn wots_sign(
     };
     let address = address(&tweak(TWEAK_MSG, layer_hi(layer, 0), e));
     let input = [pp.as_slice(), &address, message, &[0; RANDOMIZER_LEN]].concat();
-    let randomizer = base.wrapping_add(u128::from(least_trial(&input, base)?)).to_le_bytes();
+    let randomizer = base
+        .wrapping_add(u128::from(least_trial::<S>(&input, base)?))
+        .to_le_bytes();
     let x = codeword(&message_digest(pp, layer, e, &randomizer, message))?;
     let secrets = wots_secrets(pp, seed, layer, e);
     let values = core::array::from_fn(|i| chain(pp, layer, e, i, 0, x[i] as usize, secrets[i]));

@@ -182,6 +182,10 @@ impl Prover for ExperimentalProver {
         base::ExperimentalProver::map_collect(n, f)
     }
 
+    fn find_first_if_idle(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
+        base::ExperimentalProver::find_first_if_idle(n, pred)
+    }
+
     fn combine_rows(rows: &[u64], weights: &[E]) -> Vec<E> {
         tier().combine_rows(rows, weights)
     }

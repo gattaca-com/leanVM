@@ -75,6 +75,30 @@ fn concurrent_signatures_across_leaf_runs_match_serial_ones() {
     }
 }
 
+/// Tries every index, the last first, and returns the least hit: a pool may try them in
+/// any order.
+struct LastFirst;
+
+impl FindFirst for LastFirst {
+    fn find_first(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
+        (0..n).rev().filter(|&i| pred(i)).last()
+    }
+}
+
+/// A search that tries trials out of order signs as the calling thread's search, on
+/// both layers: the top layer's signature is made when the bottom tree is built.
+#[test]
+fn sign_with_any_search_order_matches_sign() {
+    let seed = [4; SECRET_KEY_LEN];
+    let (sk, pk) = key_gen(&seed);
+    let other = LeanXmssExpandedSecretKey::from_cache_bytes(&seed, &pk, &sk.cache_to_bytes()).unwrap();
+    let message = test_message();
+    let leaf_index = (2 << LAYER_HEIGHT) + 9;
+    let signature = sign_with::<LastFirst>(&sk, &message, leaf_index);
+    assert_eq!(signature, sign(&other, &message, leaf_index));
+    assert!(verify(&pk, &message, &signature));
+}
+
 /// A key loaded from its cache signs as the original.
 #[test]
 fn cache_round_trip() {

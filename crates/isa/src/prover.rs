@@ -28,6 +28,11 @@ pub trait Prover: 'static {
     /// `f(i)` for every `i < n`, on the thread pool. `f` must not dispatch to the pool itself.
     fn map_collect<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T>;
 
+    /// The least `i < n` with `pred(i)`, or `None`: on the thread pool when it can start at once (started in this
+    /// process, no dispatch running, not called from one of its tasks), else on the calling thread. It never starts,
+    /// sizes or waits for the pool. `pred` must not dispatch to the pool itself.
+    fn find_first_if_idle(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize>;
+
     // The deferred claims' batching (`aggregation`): its two passes over the stacked bytecode, in the prover's
     // fastest form.
 

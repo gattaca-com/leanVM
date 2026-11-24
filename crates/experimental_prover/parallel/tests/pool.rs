@@ -168,3 +168,51 @@ fn back_to_back_dispatches_leave_no_worker_in_a_finished_one() {
         assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1), "round {round}");
     }
 }
+
+/// The search that never waits for the pool finds what `find_first` does: on the pool, from inside a task, and while
+/// another thread holds a dispatch open, which it does not wait for.
+#[test]
+fn find_first_if_idle_answers_without_waiting_for_the_pool() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    parallel::init();
+    for n in SIZES {
+        let target = n / 3;
+        assert_eq!(
+            parallel::find_first_if_idle(n, |i| i >= target && i % 5 == target % 5),
+            parallel::find_first(n, |i| i >= target && i % 5 == target % 5),
+            "n = {n}"
+        );
+        assert_eq!(parallel::find_first_if_idle(n, |_| false), None, "n = {n}");
+    }
+    parallel::for_each(4, |_| {
+        assert_eq!(parallel::find_first_if_idle(1_000, |i| i == 500), Some(500))
+    });
+
+    let (started, on_start) = mpsc::channel();
+    let (release, on_release) = mpsc::channel::<()>();
+    let (on_release, released) = (Mutex::new(on_release), AtomicBool::new(false));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            parallel::for_each(2, |i| {
+                if i == 0 {
+                    started.send(()).unwrap();
+                    // Bounded, so a search that waits for this dispatch fails the test rather than hanging it: its
+                    // release then comes after the bound.
+                    let on_time = on_release.lock().unwrap().recv_timeout(Duration::from_secs(30)).is_ok();
+                    released.store(on_time, Ordering::SeqCst);
+                }
+            });
+        });
+        on_start.recv().unwrap();
+        assert_eq!(parallel::find_first_if_idle(10_000, |i| i == 7_777), Some(7_777));
+        // Sent once the search has returned: the dispatch sees it in time only if the search did not wait for it.
+        let _ = release.send(());
+    });
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the search waited for the open dispatch"
+    );
+}
