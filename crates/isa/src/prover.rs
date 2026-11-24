@@ -33,6 +33,10 @@ pub trait Prover: 'static {
     /// sizes or waits for the pool. `pred` must not dispatch to the pool itself.
     fn find_first_if_idle(n: usize, pred: impl Fn(usize) -> bool + Sync) -> Option<usize>;
 
+    /// `f(i)` for every `i < n`, in order: on the thread pool when it can start at once, else on the calling thread, as
+    /// [`Self::find_first_if_idle`] decides. `f` must not dispatch to the pool itself.
+    fn map_collect_if_idle<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T>;
+
     // The deferred claims' batching (`aggregation`): its two passes over the stacked bytecode, in the prover's
     // fastest form.
 

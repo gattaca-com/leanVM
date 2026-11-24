@@ -44,6 +44,10 @@ impl isa::Prover for StableProver {
         parallel::find_first_if_idle(n, pred)
     }
 
+    fn map_collect_if_idle<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        parallel::map_collect_if_idle(n, f)
+    }
+
     fn combine_rows(rows: &[u64], weights: &[E]) -> Vec<E> {
         let width = rows.len() / weights.len();
         let weights: Vec<F128> = weights.iter().copied().map(from_scalar).collect();

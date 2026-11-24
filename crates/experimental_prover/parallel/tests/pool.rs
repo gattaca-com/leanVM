@@ -216,3 +216,52 @@ fn find_first_if_idle_answers_without_waiting_for_the_pool() {
         "the search waited for the open dispatch"
     );
 }
+
+/// The map that never waits for the pool collects what `map_collect` does, in index order: on the pool, from inside a
+/// task, and while another thread holds a dispatch open, which it does not wait for.
+#[test]
+fn map_collect_if_idle_answers_without_waiting_for_the_pool() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    parallel::init();
+    for n in SIZES {
+        assert_eq!(
+            parallel::map_collect_if_idle(n, |i| i * i + 1),
+            parallel::map_collect(n, |i| i * i + 1),
+            "n = {n}"
+        );
+    }
+    parallel::for_each(4, |_| {
+        assert_eq!(
+            parallel::map_collect_if_idle(100, |i| 2 * i),
+            (0..100).map(|i| 2 * i).collect::<Vec<_>>()
+        );
+    });
+
+    let (started, on_start) = mpsc::channel();
+    let (release, on_release) = mpsc::channel::<()>();
+    let (on_release, released) = (Mutex::new(on_release), AtomicBool::new(false));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            parallel::for_each(2, |i| {
+                if i == 0 {
+                    started.send(()).unwrap();
+                    // Bounded, so a map that waits for this dispatch fails the test rather than hanging it: its
+                    // release then comes after the bound.
+                    let on_time = on_release.lock().unwrap().recv_timeout(Duration::from_secs(30)).is_ok();
+                    released.store(on_time, Ordering::SeqCst);
+                }
+            });
+        });
+        on_start.recv().unwrap();
+        assert_eq!(
+            parallel::map_collect_if_idle(1_000, |i| i + 3),
+            (3..1_003).collect::<Vec<_>>()
+        );
+        // Sent once the map has returned: the dispatch sees it in time only if the map did not wait for it.
+        let _ = release.send(());
+    });
+    assert!(released.load(Ordering::SeqCst), "the map waited for the open dispatch");
+}

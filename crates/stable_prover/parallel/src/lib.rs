@@ -445,22 +445,51 @@ pub fn find_first<P: Fn(usize) -> bool + Sync>(n_tasks: usize, pred: P) -> Optio
 /// one of its tasks. It never starts the pool, sizes it or waits for it, so it may be called from anywhere,
 /// a task or a process forked from one with a pool included.
 pub fn find_first_if_idle<P: Fn(usize) -> bool + Sync>(n_tasks: usize, pred: P) -> Option<usize> {
-    let on_this_thread = |pred: &P| (0..n_tasks).find(|&i| pred(i));
-    let Some(&pool) = POOL.get() else {
-        return on_this_thread(&pred);
-    };
-    if IN_TASK.get() || pool.pid != std::process::id() || n_tasks <= 1 {
-        return on_this_thread(&pred);
-    }
-    let guard = match pool.dispatch.try_lock() {
-        Ok(guard) => guard,
-        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return on_this_thread(&pred),
+    let Some((pool, guard)) = idle(n_tasks) else {
+        return (0..n_tasks).find(|&i| pred(i));
     };
     let _task = InTask::enter();
     let best = AtomicUsize::new(usize::MAX);
     run(pool, guard, n_tasks, &first_hits(&pred, &best));
     let index = best.load(Ordering::Relaxed);
     (index != usize::MAX).then_some(index)
+}
+
+/// [`map_collect`] on the pool when it can start at once, else on the calling thread, under the same conditions as
+/// [`find_first_if_idle`]: the same result either way, and it never starts, sizes or waits for the pool. As in
+/// [`map_collect`], a panic in `f` on the pool leaks the results already made.
+pub fn map_collect_if_idle<T: Send, F: Fn(usize) -> T + Sync>(n_tasks: usize, f: F) -> Vec<T> {
+    // Allocated before the dispatch lock, which a failed allocation would otherwise poison.
+    let mut out: Vec<T> = Vec::with_capacity(n_tasks);
+    let Some((pool, guard)) = idle(n_tasks) else {
+        out.extend((0..n_tasks).map(f));
+        return out;
+    };
+    let _task = InTask::enter();
+    let base = SendPtr(out.as_mut_ptr());
+    run(pool, guard, n_tasks, &|start, end| {
+        for i in start..end {
+            // SAFETY: distinct `i` write disjoint in-bounds slots, each exactly once, and the dispatch returns only
+            // after every write. A panic in `f` leaks the slots written so far and is re-raised here.
+            unsafe { base.add(i).write(f(i)) };
+        }
+    });
+    // SAFETY: every slot in `0..n_tasks` was initialized exactly once above.
+    unsafe { out.set_len(n_tasks) };
+    out
+}
+
+/// The pool and its dispatch lock, when a dispatch of `n_tasks` items can start at once: more than one item, a pool
+/// started it in this process, no dispatch running, and the caller not one of its tasks.
+fn idle(n_tasks: usize) -> Option<(&'static Pool, MutexGuard<'static, ()>)> {
+    let &pool = POOL.get()?;
+    if n_tasks <= 1 || IN_TASK.get() || pool.pid != std::process::id() {
+        return None;
+    }
+    match pool.dispatch.try_lock() {
+        Ok(guard) => Some((pool, guard)),
+        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => None,
+    }
 }
 
 /// The claim body of a least-index search: `pred` over a claim, up to the least hit `best` holds, which it lowers.
