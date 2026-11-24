@@ -7,13 +7,15 @@
 #[cfg(feature = "aggregation")]
 mod aggregate;
 mod error;
+mod pool;
 pub mod sphincs;
 pub mod vrf;
 pub mod xmss;
 
 #[cfg(feature = "aggregation")]
-pub use aggregate::{aggregate, aggregate_only, setup, Aggregate, MAX_CHILDREN};
+pub use aggregate::{aggregate, aggregate_only, Aggregate, MAX_CHILDREN};
 pub use error::{Encoding, Error};
+pub use pool::setup;
 
 /// Byte length of a message, the 256-bit digest both schemes sign.
 ///

@@ -25,11 +25,10 @@
 use std::fmt;
 
 use lean_xmss::{
-    key_gen, sign as xmss_sign, verify as xmss_verify, LeafIndex as UpstreamLeafIndex,
-    LeanXmssExpandedSecretKey, LeanXmssPublicKey, LeanXmssSignature,
-    SecretKey as UpstreamSecretKey, DEFAULT_BOTTOM_TREE_CACHE_SIZE,
-    LOG_LIFETIME as UPSTREAM_LOG_LIFETIME, PUB_KEY_SIZE, SECRET_KEY_LEN as UPSTREAM_SECRET_KEY_LEN,
-    SIG_SIZE,
+    key_gen, verify as xmss_verify, LeafIndex as UpstreamLeafIndex, LeanXmssExpandedSecretKey,
+    LeanXmssPublicKey, LeanXmssSignature, SecretKey as UpstreamSecretKey,
+    DEFAULT_BOTTOM_TREE_CACHE_SIZE, LOG_LIFETIME as UPSTREAM_LOG_LIFETIME, PUB_KEY_SIZE,
+    SECRET_KEY_LEN as UPSTREAM_SECRET_KEY_LEN, SIG_SIZE,
 };
 
 use crate::{Encoding, Error, Message, PUBLIC_KEY_LEN};
@@ -233,7 +232,7 @@ impl SecretKey {
         self.expanded.set_bottom_tree_cache_size(size);
     }
 
-    /// Signs a message at a leaf index.
+    /// Signs a message at a leaf index, on the thread pool [`setup`](crate::setup) sizes.
     ///
     /// Never sign two different messages at the same leaf index.
     ///
@@ -243,7 +242,7 @@ impl SecretKey {
     /// probability below `2^-2954`.
     #[must_use]
     pub fn sign(&self, message: &Message, leaf_index: LeafIndex) -> Signature {
-        Signature(xmss_sign(&self.expanded, message, leaf_index))
+        Signature(crate::pool::sign(&self.expanded, message, leaf_index))
     }
 }
 

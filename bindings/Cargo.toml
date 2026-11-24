@@ -21,6 +21,8 @@ lean_xmss = { path = "../crates/lean_xmss" }
 lean_sphincs = { path = "../crates/lean_sphincs" }
 lean_vrf = { path = "../crates/lean_vrf" }
 lean-pq = { path = "rust" }
+# The experimental prover's pool, which the prover links too.
+parallel = { package = "experimental_parallel", path = "../crates/experimental_prover/parallel" }
 
 [profile.release]
 lto = "thin"

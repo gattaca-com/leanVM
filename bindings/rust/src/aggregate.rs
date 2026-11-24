@@ -11,10 +11,10 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
 
 use lean_vm::{AggregateClaims, AggregateProof, OutputClaims, MAX_RECURSIONS};
 
+use crate::pool::{claim, start, BUILT, POOL_OWNER};
 use crate::{sphincs, xmss, Error, Message};
 
 /// The most children one aggregation recurses over.
@@ -24,67 +24,16 @@ pub const MAX_CHILDREN: usize = MAX_RECURSIONS;
 /// proof but slower proving.
 const LOG_INV_RATE: usize = 2;
 
-/// The pool's thread count, once it runs.
-static POOL: OnceLock<usize> = OnceLock::new();
-
-/// The process that started the pool, and the one building the guest (`BUILT` once built), each
-/// set before it starts: a child forked since inherits their state but not the threads running them.
-static POOL_OWNER: AtomicU32 = AtomicU32::new(0);
+/// The process building the guest, set before it starts, then `BUILT`: a child forked since
+/// inherits it but not the thread building it.
 static GUEST_OWNER: AtomicU32 = AtomicU32::new(0);
-const BUILT: u32 = u32::MAX;
-
-/// Starts the prover pool with `threads` threads (0: one per physical core) and builds the aggregation
-/// guest, once per process.
-///
-/// # Errors
-///
-/// - Fails when `threads` exceeds the machine's parallelism.
-/// - Fails when the pool already runs with another thread count.
-/// - Fails in a process forked while or after its parent started the pool.
-pub fn setup(threads: usize) -> Result<(), Error> {
-    let max = std::thread::available_parallelism().map_or(1, usize::from);
-    if threads > max {
-        return Err(Error::TooManyThreads { threads, max });
-    }
-    let running = start(threads)?;
-    if running != threads {
-        return Err(Error::SetupThreads { running, threads });
-    }
-    Ok(())
-}
-
-fn start(threads: usize) -> Result<usize, Error> {
-    claim(&POOL_OWNER)?;
-    build_guest()?;
-    Ok(*POOL.get_or_init(|| {
-        lean_vm::setup(threads);
-        threads
-    }))
-}
 
 /// Builds the aggregation guest, which decoding, verifying and proving read, unless another process is building it.
-fn build_guest() -> Result<(), Error> {
+pub(crate) fn build_guest() -> Result<(), Error> {
     claim(&GUEST_OWNER)?;
     aggregation::unified_guest();
     GUEST_OWNER.store(BUILT, Ordering::Release);
     Ok(())
-}
-
-/// Fails in a process forked from the one that claimed `owner`.
-fn unclaimed_or_ours(owner: &AtomicU32) -> Result<(), Error> {
-    match owner.load(Ordering::Acquire) {
-        0 | BUILT => Ok(()),
-        pid if pid == std::process::id() => Ok(()),
-        _ => Err(Error::ForkedAfterSetup),
-    }
-}
-
-fn claim(owner: &AtomicU32) -> Result<(), Error> {
-    let pid = std::process::id();
-    match owner.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire) {
-        Err(other) if other != pid && other != BUILT => Err(Error::ForkedAfterSetup),
-        _ => Ok(()),
-    }
 }
 
 /// Proves raw signatures and child aggregates together as one aggregate.
@@ -277,4 +226,13 @@ fn sorted_claims<K: Ord>(claims: impl Iterator<Item = (K, Message)>) -> Vec<(K, 
     claims.sort_unstable();
     claims.dedup();
     claims
+}
+
+/// Fails in a process forked from the one that claimed `owner`.
+fn unclaimed_or_ours(owner: &AtomicU32) -> Result<(), Error> {
+    match owner.load(Ordering::Acquire) {
+        0 | BUILT => Ok(()),
+        pid if pid == std::process::id() => Ok(()),
+        _ => Err(Error::ForkedAfterSetup),
+    }
 }

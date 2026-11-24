@@ -10,8 +10,9 @@ public final class LeanPq {
     private LeanPq() {}
 
     /**
-     * Starts the prover with {@code threads} threads (0: one per physical core). Throws
-     * {@link LeanPqException} if it already runs with another count.
+     * Starts the thread pool that proving and leanXMSS signing run on, with {@code threads} threads
+     * (0: one per physical core, 1: the calling thread). Signing never starts it, and signs on the calling
+     * thread while it is not started or busy. Throws {@link LeanPqException} if it already runs with another count.
      */
     public static void setup(int threads) {
         if (threads < 0) {

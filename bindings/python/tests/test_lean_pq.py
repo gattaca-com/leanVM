@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 
 import py_lean_pq as lpq
@@ -154,6 +155,27 @@ def test_aggregating_in_a_child_forked_after_setup_fails():
             lpq.aggregate()
         except lpq.LeanPqError as error:
             code = 0 if "forked" in str(error) else 3
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded")
+def test_signing_in_a_child_forked_after_setup_signs_on_its_own_thread():
+    lpq.setup()
+    key = lpq.XmssSecretKey.from_seed(b"\x05" * 32)
+    key.prepare(7)
+    signature = key.sign(MESSAGE, 7)
+    pid = os.fork()
+    if pid == 0:
+        # Whatever happens, the child must not return into pytest, nor wait forever on a pool
+        # whose threads it lacks.
+        code = 1
+        try:
+            signal.alarm(120)
+            code = 0 if key.sign(MESSAGE, 7) == signature else 3
         finally:
             os._exit(code)
     _, status = os.waitpid(pid, 0)

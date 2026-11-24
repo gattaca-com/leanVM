@@ -728,6 +728,7 @@ name = "lean-pq"
 version = "0.18.0"
 dependencies = [
  "aggregation",
+ "experimental_parallel",
  "getrandom 0.3.4",
  "lean_sphincs",
  "lean_vm",
