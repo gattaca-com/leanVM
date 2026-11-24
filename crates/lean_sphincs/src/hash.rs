@@ -92,6 +92,24 @@ pub fn th_digests(pk_seed: &PkSeed, adrs: &Adrs, values: &[Digest]) -> Digest {
     th(pk_seed, adrs, values.as_flattened())
 }
 
+/// [`th_digests`] of many inputs at once, through the batched hash: one digest per input, in order.
+#[cfg(feature = "std")]
+pub(crate) fn th_digests_many<const K: usize>(
+    pk_seed: &PkSeed,
+    inputs: impl ExactSizeIterator<Item = (Adrs, [Digest; K])>,
+) -> Vec<Digest> {
+    let len = PREFIX_LEN + K * N;
+    let mut data = Vec::with_capacity(inputs.len() * len);
+    for (adrs, payload) in inputs {
+        data.extend_from_slice(pk_seed);
+        data.extend_from_slice(adrs.as_bytes());
+        data.extend_from_slice(payload.as_flattened());
+    }
+    let mut out = vec![[0; keccak256::OUT_LEN]; data.len() / len];
+    keccak256::hash_many(&data, len, out.as_flattened_mut());
+    out.iter().map(|h| keccak256::truncate(*h)).collect()
+}
+
 /// `PRF(PK.seed, SK.seed, ADRS)`.
 pub fn prf(pk_seed: &PkSeed, sk_seed: &SecretKey, adrs: &Adrs) -> Digest {
     th(pk_seed, adrs, sk_seed)

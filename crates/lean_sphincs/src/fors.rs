@@ -37,10 +37,10 @@ fn fors_node_adrs(idx: u64, c: usize, z: usize, j: usize) -> Adrs {
         .with_tree_index(((c << (FORS_HEIGHT - z)) + j) as u32)
 }
 
-/// `fors_skGen`: the secret of leaf `s` of tree `c`.
-fn fors_secret(sk: &ExpandedKey, idx: u64, c: usize, s: usize) -> Digest {
-    let adrs = fors_adrs(idx, FORS_PRF).with_tree_index(((c << FORS_HEIGHT) + s) as u32);
-    prf(&sk.pk_seed, &sk.sk_seed, &adrs)
+/// `fors_skGen`'s address for the secret of leaf `s` of tree `c`.
+#[cfg(feature = "std")]
+fn fors_secret_adrs(idx: u64, c: usize, s: usize) -> Adrs {
+    fors_adrs(idx, FORS_PRF).with_tree_index(((c << FORS_HEIGHT) + s) as u32)
 }
 
 /// Leaf `s` of tree `c`: `F` of its secret.
@@ -63,17 +63,16 @@ fn fors_key(pk_seed: &PkSeed, idx: u64, roots: &[Digest; FORS_TREES]) -> Digest 
 #[cfg(feature = "std")]
 pub(crate) fn fors_open(sk: &ExpandedKey, idx: u64, leaves: &[usize; FORS_TREES]) -> (Digest, ForsOpening) {
     let pk_seed = &sk.pk_seed;
+    let seed: [Digest; 2] = *sk.sk_seed.as_chunks().0.as_array().unwrap();
     let trees: Vec<_> = (0..FORS_TREES)
         .map(|c| {
-            let secrets: Vec<Digest> = (0..1 << FORS_HEIGHT).map(|s| fors_secret(sk, idx, c, s)).collect();
-            let leaf_hashes = secrets
-                .iter()
-                .enumerate()
-                .map(|(s, secret)| fors_leaf(pk_seed, idx, c, s, secret))
-                .collect();
-            let levels = merkle_levels(leaf_hashes, FORS_HEIGHT, |z, j, pair| {
-                fors_node(pk_seed, idx, c, z, j, pair)
-            });
+            // As `fors_leaf` computes them: one batch for the secrets, one for the leaves.
+            let prf = (0..1 << FORS_HEIGHT).map(|s| (fors_secret_adrs(idx, c, s), seed));
+            let secrets = th_digests_many(pk_seed, prf);
+            let hashes = secrets.iter().enumerate();
+            let hashes = hashes.map(|(s, &secret)| (fors_node_adrs(idx, c, 0, s), [secret]));
+            let leaf_hashes = th_digests_many(pk_seed, hashes);
+            let levels = merkle_levels(pk_seed, leaf_hashes, FORS_HEIGHT, |z, j| fors_node_adrs(idx, c, z, j));
             let s = leaves[c];
             let opening = ForsTreeOpening {
                 secret: secrets[s],
