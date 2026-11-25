@@ -9,7 +9,7 @@ use super::error::AggregateError;
 use super::guest::{fs_seed, unified_guest};
 #[cfg(test)]
 use super::hints::FORGE;
-use super::hints::{Hints, lean_sphincs_hints, lean_xmss_hints};
+use super::hints::{Hints, lean_sphincs_hints, push_lean_xmss_hints};
 use super::proof::{AggregateProof, is_sorted};
 use super::statement::{lean_sphincs_claim_cells, lean_xmss_claim_cells, list_split, statement_digest};
 use super::{AggregateClaims, MAX_LOG_INV_RATE, MAX_RECURSIONS, MIN_LOG_INV_RATE, OutputClaims};
@@ -158,22 +158,14 @@ pub fn aggregate<P: Prover>(
     }
     // Each slot is hinted as an offset into its scheme's region, which is how one range check keeps a scheme's
     // writers off the other's claims.
-    let raw = [
-        ("raw_index", &cover.lean_xmss.raw, lean_xmss_hints::<P>(&raw_lean_xmss)),
-        (
-            "sp_raw_index",
-            &cover.lean_sphincs.raw,
-            P::map_collect(raw_lean_sphincs.len(), |i| {
-                let (pk, message, sig) = &raw_lean_sphincs[i];
-                lean_sphincs_hints(pk, sig, message)
-            }),
-        ),
-    ];
-    for (name, offsets, signatures) in raw {
-        for (&offset, signature) in offsets.iter().zip(signatures) {
-            hints.push(name, vec![count(offset)]);
-            hints.extend(signature?);
-        }
+    push_lean_xmss_hints::<P>(&mut hints, &raw_lean_xmss, &cover.lean_xmss.raw)?;
+    let lean_sphincs_hints = P::map_collect(raw_lean_sphincs.len(), |i| {
+        let (pk, message, sig) = &raw_lean_sphincs[i];
+        lean_sphincs_hints(pk, sig, message)
+    });
+    for (&offset, signature) in cover.lean_sphincs.raw.iter().zip(lean_sphincs_hints) {
+        hints.push("sp_raw_index", vec![count(offset)]);
+        hints.extend(signature?);
     }
 
     // Each child's fresh claim, the one its verification raises.

@@ -5,6 +5,7 @@ use super::error::AggregateError;
 use isa::Prover;
 use lean_sphincs::{LeanSphincsPublicKey, LeanSphincsSignature};
 use lean_vm_core::cpu::to_scalar;
+use lean_xmss::internals::{LAYER_HEIGHT, V};
 use lean_xmss::{LeanXmssPublicKey, LeanXmssSignature};
 use primitives::field::F128;
 
@@ -68,10 +69,29 @@ thread_local! {
 pub(super) struct Hints(pub(super) Vec<(String, Vec<Vec<F128>>)>);
 
 impl Hints {
+    fn stream(&mut self, name: &str) -> &mut Vec<Vec<F128>> {
+        let at = match self.0.iter().position(|(n, _)| n == name) {
+            Some(at) => at,
+            None => {
+                self.0.push((name.to_string(), Vec::new()));
+                self.0.len() - 1
+            }
+        };
+        &mut self.0[at].1
+    }
+
     pub(super) fn push(&mut self, name: &str, entry: Vec<F128>) {
-        match self.0.iter_mut().find(|(n, _)| n == name) {
-            Some((_, entries)) => entries.push(entry),
-            None => self.0.push((name.to_string(), vec![entry])),
+        self.stream(name).push(entry);
+    }
+
+    /// Each run's entries of stream `names[s]`, run after run, after the stream's own.
+    fn append<const K: usize>(&mut self, names: [&str; K], mut runs: Vec<Streams<K>>) {
+        for (s, name) in names.into_iter().enumerate() {
+            let entries = self.stream(name);
+            entries.reserve(runs.iter().map(|run| run[s].len()).sum());
+            for run in &mut runs {
+                entries.append(&mut run[s]);
+            }
         }
     }
 
@@ -113,55 +133,70 @@ fn digit_hints(codeword: &[u8], size: usize) -> impl Iterator<Item = Vec<F128>> 
 /// Signatures one pool item walks in lockstep.
 const GROUP: usize = 8;
 
+/// A run of entries for each of `K` streams.
+type Streams<const K: usize> = [Vec<Vec<F128>>; K];
+
 /// A raw leanXMSS signer as a node takes it.
 pub(super) type LeanXmssSigner = (LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature);
 
-/// Each raw leanXMSS signature's witness ([`lean_xmss_witness`]), in order, from the codewords a walk of a [`GROUP`]
-/// of them in lockstep reads (`lean_xmss::internals::walk`), a group to a pool item.
-pub(super) fn lean_xmss_hints<P: Prover>(raw: &[LeanXmssSigner]) -> Vec<Result<SubHints, AggregateError>> {
+/// The streams of the raw leanXMSS signatures, as [`push_lean_xmss_hints`] fills them, and the entries of each per
+/// signature.
+const LX_STREAMS: [&str; 7] = [
+    "raw_index",
+    "lx_index",
+    "lx_windows",
+    "lx_path",
+    "randomizer",
+    "lx_digits",
+    "chain_starts",
+];
+const LX_ENTRIES: [usize; 7] = [1, 1, 1, 2 * LAYER_HEIGHT, 2, 2, 2 * V];
+
+/// Pushes each raw leanXMSS signature's slot offset into `raw_index` and its witness ([`lean_xmss_witness`]), in order,
+/// or refuses them all if a digest is not a codeword. Each pool item walks a [`GROUP`] of signatures in lockstep
+/// (`lean_xmss::internals::walk`) and fills its own run of every stream, which the node appends in group order.
+pub(super) fn push_lean_xmss_hints<P: Prover>(
+    hints: &mut Hints,
+    raw: &[LeanXmssSigner],
+    offsets: &[usize],
+) -> Result<(), AggregateError> {
+    if raw.is_empty() {
+        return Ok(());
+    }
     let groups = P::map_collect(raw.len().div_ceil(GROUP), |g| {
-        let group = &raw[g * GROUP..raw.len().min((g + 1) * GROUP)];
-        let walks = group.iter().zip(lean_xmss::internals::walk(group));
-        let witness = |((_, _, sig), codewords): (&LeanXmssSigner, Option<_>)| {
-            Ok(lean_xmss_witness(
-                sig,
-                codewords.ok_or(AggregateError::InvalidSignature)?,
-            ))
-        };
-        walks.map(witness).collect::<Vec<_>>()
+        let range = g * GROUP..raw.len().min((g + 1) * GROUP);
+        let mut streams = LX_ENTRIES.map(|entries| Vec::with_capacity(range.len() * entries));
+        let (group, offsets) = (&raw[range.clone()], &offsets[range]);
+        for (((_, _, sig), codewords), &offset) in group.iter().zip(lean_xmss::internals::walk(group)).zip(offsets) {
+            streams[0].push(vec![count(offset)]);
+            lean_xmss_witness(sig, codewords.ok_or(AggregateError::InvalidSignature)?, &mut streams);
+        }
+        Ok(streams)
     });
-    groups.into_iter().flatten().collect()
+    hints.append(LX_STREAMS, groups.into_iter().collect::<Result<_, _>>()?);
+    Ok(())
 }
 
-/// One leanXMSS signature's witness: its leaf index shifted by each multiple of
-/// `LX_WINDOW` and those windows in the exponent, then per layer, bottom first, the
-/// sibling of every node on the path, the randomizer, the codeword's digits and the
-/// chain values they start from.
-fn lean_xmss_witness(sig: &LeanXmssSignature, codewords: [[u8; lean_xmss::internals::V]; 2]) -> SubHints {
-    let index = u64::from(sig.leaf_index());
-    let windows = (0..lean_xmss::LOG_LIFETIME).step_by(LX_WINDOW).map(|s| index >> s);
-    let mut hints: SubHints = vec![
-        ("lx_index", windows.clone().map(|x| F128::new(x, 0)).collect()),
-        (
-            "lx_windows",
-            windows.map(|x| count((x % (1 << LX_WINDOW)) as usize)).collect(),
-        ),
-    ];
+/// One leanXMSS signature's witness, onto the [`LX_STREAMS`] after `raw_index`: its leaf index shifted by each
+/// multiple of `LX_WINDOW` and those windows in the exponent, then per layer, bottom first, the sibling of every node
+/// on the path, the randomizer, the codeword's digits and the chain values they start from.
+fn lean_xmss_witness(sig: &LeanXmssSignature, codewords: [[u8; V]; 2], streams: &mut Streams<7>) {
+    let [_, index, windows, path, randomizer, digits, chain_starts] = streams;
+    let shifted = (0..lean_xmss::LOG_LIFETIME)
+        .step_by(LX_WINDOW)
+        .map(|s| u64::from(sig.leaf_index()) >> s);
+    index.push(shifted.clone().map(|x| F128::new(x, 0)).collect());
+    windows.push(shifted.map(|x| count((x % (1 << LX_WINDOW)) as usize)).collect());
     let layers = [
         lean_xmss::internals::sig_bottom(sig),
         lean_xmss::internals::sig_top(sig),
     ];
     for (layer_sig, codeword) in layers.into_iter().zip(codewords) {
-        for sibling in layer_sig.path() {
-            hints.push(("lx_path", vec![pack_16_bytes(sibling)]));
-        }
-        hints.push(("randomizer", vec![pack_16_bytes(layer_sig.randomizer())]));
-        hints.push(("lx_digits", digit_hints(&codeword, LX_DIGIT_GROUP).flatten().collect()));
-        for value in layer_sig.chain_values() {
-            hints.push(("chain_starts", vec![pack_16_bytes(value)]));
-        }
+        path.extend(layer_sig.path().iter().map(|sibling| vec![pack_16_bytes(sibling)]));
+        randomizer.push(vec![pack_16_bytes(layer_sig.randomizer())]);
+        digits.push(digit_hints(&codeword, LX_DIGIT_GROUP).flatten().collect());
+        chain_starts.extend(layer_sig.chain_values().iter().map(|value| vec![pack_16_bytes(value)]));
     }
-    hints
 }
 
 /// One leanSPHINCS signature's witness: the randomizer, the bytes of `H_msg`'s
