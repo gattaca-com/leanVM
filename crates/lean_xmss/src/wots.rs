@@ -43,13 +43,13 @@ fn prf_tweak(layer: usize, t: u32, e: u32) -> Tweak {
 }
 
 /// The hash input of the step of chain `i` of key `e` leaving position `from`.
-fn chain_input(layer: usize, e: u32, i: usize, from: usize, value: Digest) -> (Tweak, [Digest; 2]) {
+pub(crate) fn chain_input(layer: usize, e: u32, i: usize, from: usize, value: Digest) -> (Tweak, [Digest; 2]) {
     let tw = tweak(TWEAK_CHAIN, layer_hi(layer, 0), e).step(from);
     (tw, [value, (i as u128).to_le_bytes()])
 }
 
 /// The address of key `e`'s leaf on `layer`.
-fn leaf_tweak(layer: usize, e: u32) -> Tweak {
+pub(crate) fn leaf_tweak(layer: usize, e: u32) -> Tweak {
     tweak(TWEAK_LEAF, layer_hi(layer, 0), e)
 }
 

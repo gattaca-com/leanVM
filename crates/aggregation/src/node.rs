@@ -159,14 +159,7 @@ pub fn aggregate<P: Prover>(
     // Each slot is hinted as an offset into its scheme's region, which is how one range check keeps a scheme's
     // writers off the other's claims.
     let raw = [
-        (
-            "raw_index",
-            &cover.lean_xmss.raw,
-            P::map_collect(raw_lean_xmss.len(), |i| {
-                let (pk, message, sig) = &raw_lean_xmss[i];
-                lean_xmss_hints(pk, sig, message)
-            }),
-        ),
+        ("raw_index", &cover.lean_xmss.raw, lean_xmss_hints::<P>(&raw_lean_xmss)),
         (
             "sp_raw_index",
             &cover.lean_sphincs.raw,

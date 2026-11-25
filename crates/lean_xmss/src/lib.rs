@@ -15,6 +15,8 @@
 #![cfg_attr(not(feature = "std"), allow(dead_code))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+#[cfg(feature = "std")]
+mod batch;
 mod hash;
 mod scheme;
 mod tree;
@@ -68,6 +70,8 @@ pub const SIG_SIZE: usize = LEAF_INDEX_SIZE + 2 * LAYER_SIG_SIZE;
 /// The scheme's parameters, building blocks and cache layout, for the aggregation guest and the tests.
 /// Not the API: that is the crate root.
 pub mod internals {
+    #[cfg(feature = "std")]
+    pub use crate::batch::walk;
     pub use crate::hash::*;
     pub use crate::scheme::{CACHED_BOTTOM_SIZE, CACHED_TREE_SIZE, LayerSignature, layer_root};
     pub use crate::wots::*;

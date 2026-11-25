@@ -13,7 +13,7 @@ pub fn node(pp: &PublicParam, layer: usize, level: usize, j: u32, children: &[Di
 }
 
 /// The address of node `j` at `level` of `layer`.
-fn node_tweak(layer: usize, level: usize, j: u32) -> Tweak {
+pub(crate) fn node_tweak(layer: usize, level: usize, j: u32) -> Tweak {
     tweak(TWEAK_NODE, layer_hi(layer, level as u32), j)
 }
 
