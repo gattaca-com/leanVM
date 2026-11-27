@@ -30,6 +30,10 @@ pub type VrfProof = [Hash; VRF_TREE_DEPTH + 1];
 const VRF_SECRET_DOMAIN: &[u8] = b"VRF_SECRET";
 const VRF_LEAF_DOMAIN: &[u8] = b"VRF_LEAF";
 const VRF_SURROGATE_DOMAIN: &[u8] = b"VRF_SURROGATE";
+/// The bytes a slot's secret hashes: the domain, the seed and the slot.
+const SECRET_INPUT_LEN: usize = VRF_SECRET_DOMAIN.len() + 32 + 8;
+/// The bytes a slot's leaf hashes: the domain, the secret and the slot.
+const LEAF_INPUT_LEN: usize = VRF_LEAF_DOMAIN.len() + 32 + 8;
 
 /// A seed, its range of slots, and one cached layer of its tree.
 #[derive(Clone)]
@@ -57,8 +61,22 @@ impl VrfKey {
     /// `2^31`.
     pub fn new(seed: [u8; 32], slots: Range<u32>) -> Option<Self> {
         let (level, first, last) = layer(&slots)?;
+        let n = 1 << level;
+        let (start, end) = (u64::from(slots.start), u64::from(slots.end));
         let uncached = Self::uncached(seed, slots);
-        let cache = (first..=last).map(|j| uncached.node(level, j.into())).collect();
+        // A subtree whose slots all lie in the range is hashed in batches; the subtrees at the
+        // range's ends, which may hold surrogates, are hashed by `node`.
+        let mut subtrees = None;
+        let cache = (first..=last)
+            .map(|j| {
+                let lo = u64::from(j) << level;
+                if start <= lo && lo + n as u64 <= end {
+                    subtrees.get_or_insert_with(|| Subtrees::new(&seed, n)).root(lo)
+                } else {
+                    uncached.node(level, j.into())
+                }
+            })
+            .collect();
         Some(uncached.with_cache(level, cache))
     }
 
@@ -157,6 +175,56 @@ impl VrfKey {
             .update(&index.to_le_bytes())
             .update(&[level as u8])
             .finalize()
+    }
+}
+
+/// Scratch that hashes whole subtrees of `n` slots a level at a time, reused across a key's cached
+/// nodes.
+struct Subtrees {
+    n: usize,
+    /// `n` secret inputs; the domain and seed are written once, the slot per subtree.
+    secrets: Vec<u8>,
+    /// `n` leaf inputs; the domain is written once, the secret and slot per subtree.
+    leaves: Vec<u8>,
+    /// A level's `n` digests, then every other level's.
+    digests: Vec<u8>,
+    /// The levels between, `n / 2` digests at most.
+    parents: Vec<u8>,
+}
+
+impl Subtrees {
+    fn new(seed: &[u8; 32], n: usize) -> Self {
+        Self {
+            n,
+            secrets: [VRF_SECRET_DOMAIN, seed, &[0; 8]].concat().repeat(n),
+            leaves: [VRF_LEAF_DOMAIN, &[0; 40]].concat().repeat(n),
+            digests: vec![0; n * 32],
+            parents: vec![0; n * 16],
+        }
+    }
+
+    /// The root of the subtree of slots `first..first + n`.
+    fn root(&mut self, first: u64) -> Hash {
+        for (slot, input) in (first..).zip(self.secrets.chunks_exact_mut(SECRET_INPUT_LEN)) {
+            input[SECRET_INPUT_LEN - 8..].copy_from_slice(&slot.to_le_bytes());
+        }
+        keccak256::hash_many(&self.secrets, SECRET_INPUT_LEN, &mut self.digests);
+        let inputs = self.leaves.chunks_exact_mut(LEAF_INPUT_LEN);
+        for ((slot, input), secret) in (first..).zip(inputs).zip(self.digests.chunks_exact(32)) {
+            let (secret_bytes, slot_bytes) = input[VRF_LEAF_DOMAIN.len()..].split_at_mut(32);
+            secret_bytes.copy_from_slice(secret);
+            slot_bytes.copy_from_slice(&slot.to_le_bytes());
+        }
+        keccak256::hash_many(&self.leaves, LEAF_INPUT_LEN, &mut self.digests);
+        // Each level's nodes, side by side, are the next level's inputs, a pair each.
+        let (mut children, mut parents) = (&mut self.digests[..], &mut self.parents[..]);
+        let mut len = self.n * 32;
+        while len > 32 {
+            keccak256::hash_many(&children[..len], 64, &mut parents[..len / 2]);
+            std::mem::swap(&mut children, &mut parents);
+            len /= 2;
+        }
+        children[..32].try_into().expect("one node")
     }
 }
 
